@@ -38,13 +38,12 @@ is complete.
 
 Proxy configuration recognizes `http_proxy`, `http_proxy.user`,
 `http_proxy.password`, and `no_proxy`. An explicit config proxy takes
-precedence over the lowercase environment values used by NuGet. Credentials
-embedded in an environment proxy URL remain an HTTP-client concern. On
-Windows, separate config user/password keys fail explicitly until `NUGET-011`
-supplies encrypted-credential support; ciphertext is never mistaken for a
-plaintext Basic Auth password. NuGet ignores those keys on other platforms,
-and so does `dv`. Immutable results and reporter events expose only whether a
-proxy policy was configured.
+precedence over lowercase or uppercase environment values. `NUGET-011`
+extracts percent-decoded URL credentials into zeroized fields and removes them
+from the retained proxy URL. On Windows, separate config credentials use the
+same user-scoped DPAPI and NuGet entropy as source passwords. NuGet ignores
+those keys on other platforms, and so does `dv`. Immutable results and reporter
+events expose only proxy, authentication, and bypass-presence flags.
 
 Project evaluation parses `NuGetAudit`, `NuGetAuditMode`, and
 `NuGetAuditLevel` into booleans and compact enums. The .NET 10 default is

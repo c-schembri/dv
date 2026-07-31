@@ -747,9 +747,9 @@ boundary, not final drop-in parity.
   oracle measures `523.051 ms` for Microsoft versus `5.370 ms` for `dv`
   (`97.4x`) across 30 retained samples. Conditional HTTP caching, signature
   verification, and vulnerability execution remain in `RES-017/018`,
-  `RES-015`, and `RES-024`; encrypted proxy credentials remain in
-  `NUGET-011`. `require` signatures and enabled auditing fail explicitly until
-  their consumers land. `P2`
+  `RES-015`, and `RES-024`. Encrypted proxy credentials and the remaining HTTP
+  transport policy are implemented by `NUGET-011`. `require` signatures and
+  enabled auditing fail explicitly until their consumers land. `P2`
 - [x] `NUGET-005` Accept CLI source/config/packages-folder overrides with
   documented precedence. Repeatable source URIs replace configured sources;
   the singleton config and packages paths resolve from the working directory,
@@ -812,8 +812,17 @@ boundary, not final drop-in parity.
   `30.003 ms` for `dv` (`3.0x`) across 30 retained offline samples while both
   load one PFX and one `CurrentUser\\My` certificate. Redacted certificate
   authentication is published through event schema 10. `P5`
-- [~] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,
-  timeout, rate-limit, and offline behavior. `P2`
+- [x] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,
+  timeout, rate-limit, and offline behavior. Proxy URL credentials are stripped
+  into zeroized Basic fields; Windows config credentials use NuGet DPAPI.
+  Lower/uppercase proxy environment aliases, bypass lists, bounded per-source
+  semaphores, HTTPS-only ten-hop redirects, six-attempt enhanced retry controls,
+  `Retry-After`, 100-second requests, 60-second body stalls, and offline
+  zero-network behavior are enforced by one 16-byte policy record. Local-server
+  tests cover retry, redirect rejection, rate limiting, and stalled bodies. An
+  SDK-shipped NuGet.Configuration/Protocol oracle verifies the redacted policy;
+  the offline process benchmark measures `78.286 ms` for Microsoft versus
+  `6.934 ms` for `dv` (`11.3x`) across 30 retained samples. `P2`
 - [ ] `NUGET-012` Require explicit opt-in for insecure HTTP or disabled TLS
   validation and surface the security consequence. `P2`
 - [~] `NUGET-013` Mapping already filters package/version requests by the

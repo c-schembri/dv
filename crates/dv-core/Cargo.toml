@@ -6,6 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
+httpdate.workspace = true
+percent-encoding.workspace = true
 quick-xml.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "rustls"] }
 serde.workspace = true

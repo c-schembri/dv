@@ -18,10 +18,14 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{Reader, XmlVersion, events::Event};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinSet};
+use tokio::{
+  io::AsyncWriteExt,
+  sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+  task::JoinSet,
+};
 use zeroize::Zeroizing;
 use zip::ZipArchive;
 
@@ -41,6 +45,10 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_DOWNLOAD_WORKERS: usize = 24;
+const DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE: u16 = 64;
+const MAX_NETWORK_TRIES: u8 = 32;
+const MAX_RETRY_DELAY_MS: u32 = 60_000;
+const MAX_RETRY_AFTER_SECONDS: u32 = 86_400;
 const ASYNC_RUNTIME_WORKERS: usize = 2;
 const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
@@ -61,6 +69,128 @@ const SEARCH_TYPES: &[&str] = &["SearchQueryService/Versioned", "SearchQueryServ
 const VULNERABILITY_TYPES: &[&str] = &["VulnerabilityInfo/6.7.0"];
 const PACKAGE_PUBLISH_TYPES: &[&str] = &["PackagePublish/Versioned", "PackagePublish/2.0.0"];
 const NUGET_PROTOCOL_CLIENT_VERSION: &str = "7.0.0";
+
+const HTTP_RETRY_429: u8 = 1 << 0;
+const HTTP_OBSERVE_RETRY_AFTER: u8 = 1 << 1;
+const HTTP_PROXY_CONFIGURED: u8 = 1 << 2;
+const HTTP_PROXY_AUTHENTICATED: u8 = 1 << 3;
+const HTTP_NO_PROXY_CONFIGURED: u8 = 1 << 4;
+const HTTP_OFFLINE: u8 = 1 << 5;
+
+/// Compact immutable NuGet transport policy selected from config and environment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackageHttpPolicy {
+  retry_delay_ms: u32,
+  max_retry_after_seconds: u32,
+  request_timeout_seconds: u16,
+  download_timeout_seconds: u16,
+  max_requests_per_source: u16,
+  max_tries: u8,
+  flags: u8,
+}
+
+const DEFAULT_HTTP_POLICY: PackageHttpPolicy = PackageHttpPolicy {
+  retry_delay_ms: 1_000,
+  max_retry_after_seconds: 3_600,
+  request_timeout_seconds: 100,
+  download_timeout_seconds: 60,
+  max_requests_per_source: DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE,
+  max_tries: 6,
+  flags: HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER,
+};
+
+const _: () = assert!(size_of::<PackageHttpPolicy>() == 16);
+const _: () = assert!(align_of::<PackageHttpPolicy>() == 4);
+
+impl PackageHttpPolicy {
+  /// Maximum attempts for retryable HTTP work, including the first request.
+  pub const fn max_tries(self) -> u8 {
+    self.max_tries
+  }
+
+  /// Base delay used when a retryable response has no accepted `Retry-After`.
+  pub const fn retry_delay_ms(self) -> u32 {
+    self.retry_delay_ms
+  }
+
+  /// Maximum accepted server-directed retry delay.
+  pub const fn max_retry_after_seconds(self) -> u32 {
+    self.max_retry_after_seconds
+  }
+
+  /// Total request timeout in seconds.
+  pub const fn request_timeout_seconds(self) -> u16 {
+    self.request_timeout_seconds
+  }
+
+  /// Maximum idle interval between response-body chunks in seconds.
+  pub const fn download_timeout_seconds(self) -> u16 {
+    self.download_timeout_seconds
+  }
+
+  /// Configured concurrent-request limit for each package source.
+  pub const fn max_requests_per_source(self) -> u16 {
+    self.max_requests_per_source
+  }
+
+  /// Whether HTTP 429 responses are retried.
+  pub const fn retries_http_429(self) -> bool {
+    self.flags & HTTP_RETRY_429 != 0
+  }
+
+  /// Whether `Retry-After` response headers control retry delay.
+  pub const fn observes_retry_after(self) -> bool {
+    self.flags & HTTP_OBSERVE_RETRY_AFTER != 0
+  }
+
+  /// Whether an explicit proxy is configured.
+  pub const fn proxy_configured(self) -> bool {
+    self.flags & HTTP_PROXY_CONFIGURED != 0
+  }
+
+  /// Whether the proxy has redacted Basic credentials.
+  pub const fn proxy_authenticated(self) -> bool {
+    self.flags & HTTP_PROXY_AUTHENTICATED != 0
+  }
+
+  /// Whether the proxy has an explicit bypass list.
+  pub const fn no_proxy_configured(self) -> bool {
+    self.flags & HTTP_NO_PROXY_CONFIGURED != 0
+  }
+
+  /// Whether all network work is disabled for this operation.
+  pub const fn offline(self) -> bool {
+    self.flags & HTTP_OFFLINE != 0
+  }
+
+  /// TLS peer and hostname validation is always enabled for this policy.
+  pub const fn tls_validation(self) -> bool {
+    true
+  }
+
+  /// Maximum redirects for the general HTTP client.
+  pub const fn max_redirects(self) -> u8 {
+    10
+  }
+
+  const fn effective_request_limit(self) -> usize {
+    let configured = self.max_requests_per_source as usize;
+    if configured < MAX_DOWNLOAD_WORKERS {
+      configured
+    } else {
+      MAX_DOWNLOAD_WORKERS
+    }
+  }
+
+  const fn with_offline(mut self, offline: bool) -> Self {
+    if offline {
+      self.flags |= HTTP_OFFLINE;
+    } else {
+      self.flags &= !HTTP_OFFLINE;
+    }
+    self
+  }
+}
 
 /// Policy applied when validating NuGet package signatures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,11 +516,12 @@ pub struct PackageSourceInventory {
   text: Box<str>,
   sources: Box<[PackageSourceRecord]>,
   endpoints: Box<[PackageServiceEndpointRecord]>,
+  http_policy: PackageHttpPolicy,
   network_requests: u32,
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageSourceInventory>() == 64);
+const _: () = assert!(size_of::<PackageSourceInventory>() == 80);
 const _: () = assert!(align_of::<PackageSourceInventory>() == 8);
 
 impl PackageSourceInventory {
@@ -417,6 +548,11 @@ impl PackageSourceInventory {
   /// Returns the selected source authentication policy without exposing credentials.
   pub fn source_authentication(&self, source: usize) -> PackageSourceAuthentication {
     self.sources[source].authentication
+  }
+
+  /// Returns the effective redacted transport policy used by source discovery.
+  pub const fn http_policy(&self) -> PackageHttpPolicy {
+    self.http_policy
   }
 
   /// Returns selected endpoint indices for one source.
@@ -1400,6 +1536,8 @@ struct SourceCredential {
   origin: HttpsOrigin,
   provider: Option<Box<SourceProviderCredential>>,
   client: Option<reqwest::Client>,
+  limiter: Option<Arc<Semaphore>>,
+  http_policy: PackageHttpPolicy,
 }
 
 struct SourceProviderCredential {
@@ -1420,7 +1558,7 @@ struct ProviderCredentialState {
 const _: () = {
   assert!(size_of::<HttpsOrigin>() == 24);
   assert!(align_of::<HttpsOrigin>() == 8);
-  assert!(size_of::<SourceCredential>() == 80);
+  assert!(size_of::<SourceCredential>() == 104);
   assert!(align_of::<SourceCredential>() == 8);
 };
 
@@ -1590,6 +1728,7 @@ struct NugetConfiguration {
   source_mapping: Option<Arc<PackageSourceMapping>>,
   signature_validation: SignatureValidationMode,
   proxy: Option<ProxySettings>,
+  http_policy: PackageHttpPolicy,
 }
 
 #[derive(Default)]
@@ -1608,6 +1747,7 @@ struct NugetConfigMerge {
   proxy_user: Option<String>,
   proxy_password: Option<String>,
   no_proxy: Option<String>,
+  max_http_requests_per_source: Option<String>,
 }
 
 struct FallbackFolder {
@@ -1620,6 +1760,13 @@ struct FallbackFolder {
 struct ProxySettings {
   url: String,
   no_proxy: Option<String>,
+  username: Option<Zeroizing<String>>,
+  password: Option<Zeroizing<String>>,
+}
+
+struct ProxyCredential {
+  username: Zeroizing<String>,
+  password: Zeroizing<String>,
 }
 
 #[derive(Default)]
@@ -1765,6 +1912,7 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
       &config.credentials,
       !options.offline,
       options.probe_credentials,
+      config.http_policy.with_offline(options.offline),
     ))?);
   }
   Ok(inventories)
@@ -1776,6 +1924,7 @@ async fn inspect_source_batch(
   credentials: &SourceCredentialBatch,
   allow_network: bool,
   probe_credentials: bool,
+  http_policy: PackageHttpPolicy,
 ) -> Result<PackageSourceInventory, PackageError> {
   let mut discovered = std::iter::repeat_with(|| None)
     .take(sources.len())
@@ -1864,6 +2013,7 @@ async fn inspect_source_batch(
     text: text.text.into_boxed_str(),
     sources: source_rows.into_boxed_slice(),
     endpoints: endpoint_rows.into_boxed_slice(),
+    http_policy,
     network_requests,
     downloaded_bytes,
   })
@@ -2191,6 +2341,7 @@ fn discover_configuration(
     merge_config(&path, &mut merged)?;
   }
   let proxy = effective_proxy(&merged)?;
+  let http_policy = effective_http_policy(&merged, proxy.as_ref());
   let signature_validation = merged.signature_validation.unwrap_or(SignatureValidationMode::Accept);
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
@@ -2198,6 +2349,7 @@ fn discover_configuration(
   let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
   let mut credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
   attach_client_certificates(&sources, merged.client_certificates, proxy.as_ref(), project_directory, &mut credentials)?;
+  attach_http_policy(&sources, http_policy, project_directory, &mut credentials)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -2241,6 +2393,7 @@ fn discover_configuration(
     source_mapping,
     signature_validation,
     proxy,
+    http_policy,
   })
 }
 
@@ -2324,6 +2477,8 @@ fn resolve_source_credentials_with(
         origin: HttpsOrigin::parse(&source.url, context)?,
         provider,
         client: None,
+        limiter: None,
+        http_policy: DEFAULT_HTTP_POLICY,
       }))
     } else {
       None
@@ -2386,6 +2541,49 @@ fn attach_client_certificates(
         origin: HttpsOrigin::parse(&source.url, context)?,
         provider: None,
         client: Some(client),
+        limiter: None,
+        http_policy: DEFAULT_HTTP_POLICY,
+      }));
+    }
+  }
+  credentials.entries = entries.into_boxed_slice();
+  Ok(())
+}
+
+fn attach_http_policy(
+  sources: &[(String, PackageSource)],
+  policy: PackageHttpPolicy,
+  context: &Path,
+  credentials: &mut SourceCredentialBatch,
+) -> Result<(), PackageError> {
+  let runtime_changed = policy.max_tries != DEFAULT_HTTP_POLICY.max_tries
+    || policy.retry_delay_ms != DEFAULT_HTTP_POLICY.retry_delay_ms
+    || policy.max_retry_after_seconds != DEFAULT_HTTP_POLICY.max_retry_after_seconds
+    || policy.flags & (HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER) != DEFAULT_HTTP_POLICY.flags
+    || policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS;
+  if credentials.entries.is_empty() && !runtime_changed {
+    return Ok(());
+  }
+
+  let mut entries = std::mem::take(&mut credentials.entries).into_vec();
+  entries.resize_with(sources.len(), || None);
+  for (source_index, (_, source)) in sources.iter().enumerate() {
+    if source.protocol == NugetProtocol::Local {
+      continue;
+    }
+    let limiter = (policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS).then(|| Arc::new(Semaphore::new(policy.effective_request_limit())));
+    if let Some(credential) = entries[source_index].as_mut() {
+      let credential = Arc::get_mut(credential).expect("source policy is uniquely owned during configuration");
+      credential.http_policy = policy;
+      credential.limiter = limiter;
+    } else if runtime_changed {
+      entries[source_index] = Some(Arc::new(SourceCredential {
+        authorization: None,
+        origin: HttpsOrigin::parse(&source.url, context)?,
+        provider: None,
+        client: None,
+        limiter,
+        http_policy: policy,
       }));
     }
   }
@@ -2796,29 +2994,145 @@ fn default_nuget_temp() -> PathBuf {
 }
 
 fn effective_proxy(merged: &NugetConfigMerge) -> Result<Option<ProxySettings>, PackageError> {
+  effective_proxy_with(merged, environment_value)
+}
+
+fn effective_proxy_with(merged: &NugetConfigMerge, mut environment: impl FnMut(&str, &str) -> Option<String>) -> Result<Option<ProxySettings>, PackageError> {
   let configured = merged.proxy_url.as_ref().filter(|url| !url.is_empty());
   if let Some(url) = configured {
-    if cfg!(windows)
-      && (merged.proxy_user.as_ref().is_some_and(|value| !value.is_empty()) || merged.proxy_password.as_ref().is_some_and(|value| !value.is_empty()))
-    {
-      return Err(PackageError::new(
-        PackageErrorKind::Configuration,
-        "http_proxy",
-        "separate NuGet proxy credentials require encrypted credential support; use a credential-free proxy or an http_proxy URL until NUGET-011",
-      ));
-    }
-    return Ok(Some(ProxySettings {
-      url: url.clone(),
-      no_proxy: merged.no_proxy.clone().filter(|value| !value.is_empty()),
-    }));
+    let credentials = configured_proxy_credentials(merged)?;
+    return proxy_settings(url.clone(), merged.no_proxy.clone(), credentials);
   }
-  let Some(url) = env::var("http_proxy").ok().filter(|value| !value.is_empty()) else {
+  let Some(url) = environment("http_proxy", "HTTP_PROXY") else {
     return Ok(None);
   };
-  Ok(Some(ProxySettings {
-    url,
-    no_proxy: env::var("no_proxy").ok().filter(|value| !value.is_empty()),
+  proxy_settings(url, environment("no_proxy", "NO_PROXY"), None)
+}
+
+fn environment_value(primary: &str, fallback: &str) -> Option<String> {
+  env::var(primary)
+    .ok()
+    .filter(|value| !value.is_empty())
+    .or_else(|| env::var(fallback).ok().filter(|value| !value.is_empty()))
+}
+
+#[cfg(windows)]
+fn configured_proxy_credentials(merged: &NugetConfigMerge) -> Result<Option<ProxyCredential>, PackageError> {
+  let Some(username) = merged.proxy_user.as_ref().filter(|value| !value.is_empty()) else {
+    return Ok(None);
+  };
+  let Some(password) = merged.proxy_password.as_ref().filter(|value| !value.is_empty()) else {
+    return Ok(None);
+  };
+  Ok(Some(ProxyCredential {
+    username: Zeroizing::new(username.clone()),
+    password: decrypt_nuget_password("http_proxy", password, Path::new("http_proxy.password"))?,
   }))
+}
+
+#[cfg(not(windows))]
+fn configured_proxy_credentials(_merged: &NugetConfigMerge) -> Result<Option<ProxyCredential>, PackageError> {
+  Ok(None)
+}
+
+fn proxy_settings(raw_url: String, no_proxy: Option<String>, configured_credentials: Option<ProxyCredential>) -> Result<Option<ProxySettings>, PackageError> {
+  let raw_url = Zeroizing::new(raw_url);
+  let mut parsed = reqwest::Url::parse(&raw_url).map_err(|error| config_error(Path::new("http_proxy"), format!("invalid NuGet proxy address: {error}")))?;
+  if !parsed.has_host() || !matches!(parsed.scheme(), "http" | "https") {
+    return Err(config_error(
+      Path::new("http_proxy"),
+      "NuGet proxy address must be an absolute HTTP or HTTPS URL",
+    ));
+  }
+  let embedded = if parsed.username().is_empty() && parsed.password().is_none() {
+    None
+  } else {
+    let username = percent_encoding::percent_decode_str(parsed.username())
+      .decode_utf8()
+      .map_err(|_| config_error(Path::new("http_proxy"), "NuGet proxy username is not valid UTF-8"))?;
+    let password = percent_encoding::percent_decode_str(parsed.password().unwrap_or_default())
+      .decode_utf8()
+      .map_err(|_| config_error(Path::new("http_proxy"), "NuGet proxy password is not valid UTF-8"))?;
+    Some(ProxyCredential {
+      username: Zeroizing::new(username.into_owned()),
+      password: Zeroizing::new(password.into_owned()),
+    })
+  };
+  parsed
+    .set_username("")
+    .map_err(|()| config_error(Path::new("http_proxy"), "failed to remove proxy credentials from the retained URL"))?;
+  parsed
+    .set_password(None)
+    .map_err(|()| config_error(Path::new("http_proxy"), "failed to remove proxy credentials from the retained URL"))?;
+  let (username, password) = configured_credentials
+    .or(embedded)
+    .map_or((None, None), |credential| (Some(credential.username), Some(credential.password)));
+  Ok(Some(ProxySettings {
+    url: parsed.into(),
+    no_proxy: no_proxy.filter(|value| !value.is_empty()),
+    username,
+    password,
+  }))
+}
+
+fn effective_http_policy(merged: &NugetConfigMerge, proxy: Option<&ProxySettings>) -> PackageHttpPolicy {
+  effective_http_policy_with(merged, proxy, |name| env::var(name).ok())
+}
+
+fn effective_http_policy_with(
+  merged: &NugetConfigMerge,
+  proxy: Option<&ProxySettings>,
+  mut environment: impl FnMut(&str) -> Option<String>,
+) -> PackageHttpPolicy {
+  let mut policy = DEFAULT_HTTP_POLICY;
+  policy.max_requests_per_source = merged
+    .max_http_requests_per_source
+    .as_deref()
+    .and_then(|value| value.parse::<u16>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE);
+  policy.max_tries = environment("NUGET_ENHANCED_MAX_NETWORK_TRY_COUNT")
+    .and_then(|value| value.parse::<u8>().ok())
+    .filter(|value| (1..=MAX_NETWORK_TRIES).contains(value))
+    .unwrap_or(DEFAULT_HTTP_POLICY.max_tries);
+  policy.retry_delay_ms = environment("NUGET_ENHANCED_NETWORK_RETRY_DELAY_MILLISECONDS")
+    .and_then(|value| value.parse::<u32>().ok())
+    .filter(|value| *value <= MAX_RETRY_DELAY_MS)
+    .unwrap_or(DEFAULT_HTTP_POLICY.retry_delay_ms);
+  policy.max_retry_after_seconds = environment("NUGET_MAX_RETRY_AFTER_DELAY_SECONDS")
+    .and_then(|value| value.parse::<u32>().ok())
+    .filter(|value| *value <= MAX_RETRY_AFTER_SECONDS)
+    .unwrap_or(DEFAULT_HTTP_POLICY.max_retry_after_seconds);
+  set_http_flag(
+    &mut policy.flags,
+    HTTP_RETRY_429,
+    environment("NUGET_RETRY_HTTP_429").and_then(|value| value.parse::<bool>().ok()).unwrap_or(true),
+  );
+  set_http_flag(
+    &mut policy.flags,
+    HTTP_OBSERVE_RETRY_AFTER,
+    environment("NUGET_OBSERVE_RETRY_AFTER")
+      .and_then(|value| value.parse::<bool>().ok())
+      .unwrap_or(true),
+  );
+  if let Some(proxy) = proxy {
+    policy.flags |= HTTP_PROXY_CONFIGURED;
+    if proxy.username.is_some() {
+      policy.flags |= HTTP_PROXY_AUTHENTICATED;
+    }
+    if proxy.no_proxy.is_some() {
+      policy.flags |= HTTP_NO_PROXY_CONFIGURED;
+    }
+  }
+  policy
+}
+
+fn set_http_flag(flags: &mut u8, mask: u8, enabled: bool) {
+  if enabled {
+    *flags |= mask;
+  } else {
+    *flags &= !mask;
+  }
 }
 
 fn discover_config_paths(project_directory: &Path, explicit_config: Option<&Path>, roots: &NugetConfigRoots) -> Result<Vec<PathBuf>, PackageError> {
@@ -3023,6 +3337,9 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
           },
           ConfigSection::Config if key.eq_ignore_ascii_case("no_proxy") => {
             merged.no_proxy = Some(value);
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("maxHttpRequestsPerSource") => {
+            merged.max_http_requests_per_source = Some(value);
           },
           ConfigSection::Other | ConfigSection::ClientCertificates | ConfigSection::SourceMapping | ConfigSection::Config => {},
         }
@@ -3340,6 +3657,7 @@ impl NugetConfigMerge {
     self.proxy_user = None;
     self.proxy_password = None;
     self.no_proxy = None;
+    self.max_http_requests_per_source = None;
   }
 
   fn remove_config(&mut self, key: &str) {
@@ -3355,6 +3673,8 @@ impl NugetConfigMerge {
       self.proxy_password = None;
     } else if key.eq_ignore_ascii_case("no_proxy") {
       self.no_proxy = None;
+    } else if key.eq_ignore_ascii_case("maxHttpRequestsPerSource") {
+      self.max_http_requests_per_source = None;
     }
   }
 }
@@ -3611,14 +3931,32 @@ fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, Package
 }
 
 fn configured_http_client_builder(proxy: Option<&ProxySettings>) -> Result<reqwest::ClientBuilder, PackageError> {
-  let mut builder = reqwest::Client::builder().https_only(true).timeout(Duration::from_secs(60));
+  let mut builder = reqwest::Client::builder()
+    .https_only(true)
+    .timeout(Duration::from_secs(DEFAULT_HTTP_POLICY.request_timeout_seconds as u64))
+    .redirect(secure_redirect_policy());
   if let Some(settings) = proxy {
     let mut configured =
       reqwest::Proxy::all(&settings.url).map_err(|error| config_error(Path::new("http_proxy"), format!("invalid NuGet proxy address: {error}")))?;
     configured = configured.no_proxy(settings.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string));
+    if let (Some(username), Some(password)) = (&settings.username, &settings.password) {
+      configured = configured.basic_auth(username, password);
+    }
     builder = builder.no_proxy().proxy(configured);
   }
   Ok(builder)
+}
+
+fn secure_redirect_policy() -> reqwest::redirect::Policy {
+  reqwest::redirect::Policy::custom(|attempt| {
+    if attempt.previous().len() >= 10 {
+      return attempt.error("NuGet redirect limit exceeded");
+    }
+    if attempt.url().scheme() != "https" {
+      return attempt.error("NuGet redirects must preserve HTTPS");
+    }
+    attempt.follow()
+  })
 }
 
 async fn discover_service_endpoints(
@@ -4848,11 +5186,7 @@ async fn get_optional_bytes(
     return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
   }
   let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit) as usize);
-  while let Some(chunk) = response
-    .chunk()
-    .await
-    .map_err(|error| network_error(url, format!("read {kind} response: {error}")))?
-  {
+  while let Some(chunk) = response.chunk(url, kind).await? {
     if bytes.len().checked_add(chunk.len()).is_none_or(|length| length as u64 > limit) {
       return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
     }
@@ -5331,11 +5665,7 @@ async fn download_package(
     .map_err(|error| package_io("create package archive", destination, error))?;
   let mut hasher = Sha512::new();
   let mut total = 0u64;
-  while let Some(chunk) = response
-    .chunk()
-    .await
-    .map_err(|error| network_error(url, format!("read package response: {error}")))?
-  {
+  while let Some(chunk) = response.chunk(url, "package").await? {
     let read = chunk.len();
     total = total
       .checked_add(read as u64)
@@ -5370,11 +5700,7 @@ async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredentia
   }
   let capacity = response.content_length().unwrap_or(0).min(limit) as usize;
   let mut bytes = Vec::with_capacity(capacity);
-  while let Some(chunk) = response
-    .chunk()
-    .await
-    .map_err(|error| network_error(url, format!("read {kind} response: {error}")))?
-  {
+  while let Some(chunk) = response.chunk(url, kind).await? {
     let next = bytes
       .len()
       .checked_add(chunk.len())
@@ -5401,34 +5727,153 @@ async fn send_authenticated(
   credential: Option<&SourceCredential>,
   url: &str,
   operation: &str,
-) -> Result<reqwest::Response, PackageError> {
-  let credential = credential.filter(|credential| credential.origin.matches(url));
+) -> Result<AuthenticatedResponse, PackageError> {
+  let source = credential;
+  let credential = source.filter(|credential| credential.origin.matches(url));
   let client = credential.and_then(|credential| credential.client.as_ref()).unwrap_or(client);
-  for attempt in 0..=2 {
-    let (authorization, generation, provider_was_used) = match credential {
-      Some(credential) => credential.authorization_snapshot().await,
-      None => (None, 0, false),
-    };
-    let mut request = client.get(url);
-    if let Some(authorization) = authorization {
-      request = request.header(AUTHORIZATION, authorization);
-    }
-    let response = request
-      .send()
-      .await
-      .map_err(|error| network_error(url, format!("{operation} failed: {error}")))?;
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 2 {
-      return Ok(response);
-    }
-    let Some(credential) = credential else {
-      return Ok(response);
-    };
-    if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
-      return Ok(response);
-    }
-    drop(response);
+  let policy = source.map_or(DEFAULT_HTTP_POLICY, |credential| credential.http_policy);
+  let permit = match source.and_then(|credential| credential.limiter.as_ref()) {
+    Some(limiter) => Some(
+      Arc::clone(limiter)
+        .acquire_owned()
+        .await
+        .map_err(|_| network_error(url, "package-source request limiter closed"))?,
+    ),
+    None => None,
+  };
+  send_with_policy(client, credential, url, operation, policy, permit).await
+}
+
+struct AuthenticatedResponse {
+  response: reqwest::Response,
+  _permit: Option<OwnedSemaphorePermit>,
+  download_timeout: Duration,
+}
+
+impl std::ops::Deref for AuthenticatedResponse {
+  type Target = reqwest::Response;
+
+  fn deref(&self) -> &Self::Target {
+    &self.response
   }
-  unreachable!("the bounded authentication loop always returns")
+}
+
+impl std::ops::DerefMut for AuthenticatedResponse {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.response
+  }
+}
+
+impl AuthenticatedResponse {
+  async fn chunk(&mut self, url: &str, kind: &str) -> Result<Option<bytes::Bytes>, PackageError> {
+    tokio::time::timeout(self.download_timeout, self.response.chunk())
+      .await
+      .map_err(|_| network_error(url, format!("{kind} response stalled for {} seconds", self.download_timeout.as_secs())))?
+      .map_err(|error| network_error(url, format!("read {kind} response: {error}")))
+  }
+}
+
+async fn send_with_policy(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  url: &str,
+  operation: &str,
+  policy: PackageHttpPolicy,
+  permit: Option<OwnedSemaphorePermit>,
+) -> Result<AuthenticatedResponse, PackageError> {
+  'network: for network_attempt in 0..policy.max_tries {
+    for authentication_attempt in 0..=2 {
+      let (authorization, generation, provider_was_used) = match credential {
+        Some(credential) => credential.authorization_snapshot().await,
+        None => (None, 0, false),
+      };
+      let mut request = client.get(url);
+      if let Some(authorization) = authorization {
+        request = request.header(AUTHORIZATION, authorization);
+      }
+      let sent = tokio::time::timeout(Duration::from_secs(policy.request_timeout_seconds as u64), request.send()).await;
+      let response = match sent {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+          if network_attempt + 1 == policy.max_tries {
+            return Err(network_error(url, format!("{operation} failed after {} attempts: {error}", policy.max_tries)));
+          }
+          tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
+          continue 'network;
+        },
+        Err(_) => {
+          if network_attempt + 1 == policy.max_tries {
+            return Err(network_error(
+              url,
+              format!(
+                "{operation} timed out after {} seconds and {} attempts",
+                policy.request_timeout_seconds, policy.max_tries
+              ),
+            ));
+          }
+          tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
+          continue 'network;
+        },
+      };
+      if response.status() == reqwest::StatusCode::UNAUTHORIZED && authentication_attempt < 2 {
+        let Some(credential) = credential else {
+          return Ok(authenticated_response(response, permit, policy));
+        };
+        if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
+          return Ok(authenticated_response(response, permit, policy));
+        }
+        drop(response);
+        continue;
+      }
+      if retryable_status(response.status(), policy) && network_attempt + 1 < policy.max_tries {
+        let delay = response_retry_delay(&response, policy, network_attempt);
+        drop(response);
+        tokio::time::sleep(delay).await;
+        continue 'network;
+      }
+      return Ok(authenticated_response(response, permit, policy));
+    }
+  }
+  unreachable!("the bounded transport loop always returns")
+}
+
+fn authenticated_response(response: reqwest::Response, permit: Option<OwnedSemaphorePermit>, policy: PackageHttpPolicy) -> AuthenticatedResponse {
+  AuthenticatedResponse {
+    response,
+    _permit: permit,
+    download_timeout: Duration::from_secs(policy.download_timeout_seconds as u64),
+  }
+}
+
+fn retryable_status(status: reqwest::StatusCode, policy: PackageHttpPolicy) -> bool {
+  status.is_server_error()
+    || ((status == reqwest::StatusCode::REQUEST_TIMEOUT || status == reqwest::StatusCode::TOO_MANY_REQUESTS) && policy.retries_http_429())
+}
+
+fn response_retry_delay(response: &reqwest::Response, policy: PackageHttpPolicy, attempt: u8) -> Duration {
+  if policy.observes_retry_after()
+    && let Some(value) = response.headers().get(RETRY_AFTER).and_then(|value| value.to_str().ok())
+    && let Some(delay) = parse_retry_after(value, SystemTime::now())
+  {
+    return delay.min(Duration::from_secs(policy.max_retry_after_seconds as u64));
+  }
+  exponential_retry_delay(policy, attempt)
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+  if let Ok(seconds) = value.parse::<u64>() {
+    return Some(Duration::from_secs(seconds));
+  }
+  httpdate::parse_http_date(value).ok()?.duration_since(now).ok()
+}
+
+fn exponential_retry_delay(policy: PackageHttpPolicy, attempt: u8) -> Duration {
+  let multiplier = 1u32.checked_shl(u32::from(attempt.min(15))).unwrap_or(u32::MAX);
+  let milliseconds = policy
+    .retry_delay_ms
+    .saturating_mul(multiplier)
+    .min(policy.max_retry_after_seconds.saturating_mul(1_000));
+  Duration::from_millis(u64::from(milliseconds))
 }
 
 fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
@@ -6993,6 +7438,7 @@ impl TextTable {
 mod tests {
   use std::{
     env,
+    net::TcpListener,
     sync::atomic::{AtomicU64, Ordering},
   };
 
@@ -7002,6 +7448,20 @@ mod tests {
   use super::*;
 
   static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+  fn response_server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+      for response in responses {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+      }
+    });
+    (format!("http://{address}/index.json"), worker)
+  }
 
   struct TempDirectory(PathBuf);
 
@@ -7134,6 +7594,7 @@ mod tests {
       source_mapping: None,
       signature_validation: SignatureValidationMode::Accept,
       proxy: None,
+      http_policy: DEFAULT_HTTP_POLICY,
     };
 
     let result = read_warm_lock(&path, &config, &[], &project, "current-table").unwrap();
@@ -7455,7 +7916,16 @@ mod tests {
 
     let client = reqwest::Client::new();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let inventory = runtime.block_on(inspect_source_batch(&client, &sources, &credentials, false, false)).unwrap();
+    let inventory = runtime
+      .block_on(inspect_source_batch(
+        &client,
+        &sources,
+        &credentials,
+        false,
+        false,
+        DEFAULT_HTTP_POLICY.with_offline(true),
+      ))
+      .unwrap();
     assert_eq!(inventory.source_authentication(0), PackageSourceAuthentication::Basic);
     assert!(!inventory.text.contains("config-secret"));
     assert!(!inventory.text.contains("higher-secret"));
@@ -7888,6 +8358,206 @@ mod tests {
       let proxy = result.unwrap().unwrap();
       assert_eq!(proxy.url, "http://proxy.example.test:8080");
     }
+  }
+
+  #[test]
+  fn http_policy_matches_nuget_environment_and_bounds_untrusted_values() {
+    let merged = NugetConfigMerge {
+      max_http_requests_per_source: Some("7".into()),
+      ..NugetConfigMerge::default()
+    };
+    let policy = effective_http_policy_with(&merged, None, |name| {
+      Some(
+        match name {
+          "NUGET_ENHANCED_MAX_NETWORK_TRY_COUNT" => "9",
+          "NUGET_ENHANCED_NETWORK_RETRY_DELAY_MILLISECONDS" => "250",
+          "NUGET_MAX_RETRY_AFTER_DELAY_SECONDS" => "12",
+          "NUGET_RETRY_HTTP_429" => "false",
+          "NUGET_OBSERVE_RETRY_AFTER" => "false",
+          _ => return None,
+        }
+        .into(),
+      )
+    });
+
+    assert_eq!(policy.max_tries(), 9);
+    assert_eq!(policy.retry_delay_ms(), 250);
+    assert_eq!(policy.max_retry_after_seconds(), 12);
+    assert_eq!(policy.max_requests_per_source(), 7);
+    assert!(!policy.retries_http_429());
+    assert!(!policy.observes_retry_after());
+
+    let bounded = effective_http_policy_with(&NugetConfigMerge::default(), None, |name| {
+      (name == "NUGET_ENHANCED_MAX_NETWORK_TRY_COUNT").then(|| "255".into())
+    });
+    assert_eq!(bounded.max_tries(), DEFAULT_HTTP_POLICY.max_tries());
+  }
+
+  #[test]
+  fn proxy_url_credentials_are_zeroized_and_never_retained_in_the_url() {
+    let proxy = proxy_settings(
+      "http://us%65r:s%65cret@proxy.example.test:8080".into(),
+      Some("localhost,.example.test".into()),
+      None,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(proxy.url, "http://proxy.example.test:8080/");
+    assert_eq!(proxy.username.as_deref().map(String::as_str), Some("user"));
+    assert_eq!(proxy.password.as_deref().map(String::as_str), Some("secret"));
+    assert!(!proxy.url.contains("secret"));
+    let policy = effective_http_policy_with(&NugetConfigMerge::default(), Some(&proxy), |_| None);
+    assert!(policy.proxy_configured());
+    assert!(policy.proxy_authenticated());
+    assert!(policy.no_proxy_configured());
+  }
+
+  #[test]
+  fn uppercase_proxy_environment_is_used_when_lowercase_is_absent() {
+    let proxy = effective_proxy_with(&NugetConfigMerge::default(), |lower, upper| {
+      Some(
+        match (lower, upper) {
+          ("http_proxy", "HTTP_PROXY") => "http://proxy.example.test:8080",
+          ("no_proxy", "NO_PROXY") => "localhost,.example.test",
+          _ => return None,
+        }
+        .into(),
+      )
+    })
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(proxy.url, "http://proxy.example.test:8080/");
+    assert_eq!(proxy.no_proxy.as_deref(), Some("localhost,.example.test"));
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn windows_config_proxy_credentials_use_nuget_dpapi() {
+    let encrypted = windows_dpapi::encrypt_data(b"proxy-secret", windows_dpapi::Scope::User, Some(b"NuGet")).unwrap();
+    let merged = NugetConfigMerge {
+      proxy_url: Some("http://proxy.example.test:8080".into()),
+      proxy_user: Some("proxy-user".into()),
+      proxy_password: Some(BASE64.encode(encrypted)),
+      ..NugetConfigMerge::default()
+    };
+
+    let proxy = effective_proxy_with(&merged, |_, _| None).unwrap().unwrap();
+
+    assert_eq!(proxy.username.as_deref().map(String::as_str), Some("proxy-user"));
+    assert_eq!(proxy.password.as_deref().map(String::as_str), Some("proxy-secret"));
+    assert!(!proxy.url.contains("proxy-user"));
+    assert!(!proxy.url.contains("proxy-secret"));
+  }
+
+  #[test]
+  fn retryable_http_status_is_retried_before_the_response_is_exposed() {
+    let (url, worker) = response_server(vec![
+      "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+    ]);
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let policy = PackageHttpPolicy {
+      max_tries: 2,
+      retry_delay_ms: 0,
+      download_timeout_seconds: 1,
+      ..DEFAULT_HTTP_POLICY
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let mut response = runtime.block_on(send_with_policy(&client, None, &url, "test request", policy, None)).unwrap();
+    let body = runtime.block_on(response.chunk(&url, "test")).unwrap().unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(body.as_ref(), b"ok");
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn retry_429_switch_matches_nuget_for_request_timeout_and_rate_limit() {
+    let disabled = PackageHttpPolicy {
+      flags: DEFAULT_HTTP_POLICY.flags & !HTTP_RETRY_429,
+      ..DEFAULT_HTTP_POLICY
+    };
+
+    assert!(retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, disabled));
+    assert!(!retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT, disabled));
+    assert!(!retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS, disabled));
+    assert!(retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT, DEFAULT_HTTP_POLICY));
+    assert!(retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS, DEFAULT_HTTP_POLICY));
+  }
+
+  #[test]
+  fn secure_redirect_policy_rejects_an_http_destination() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let destination = format!("http://{address}/downgraded");
+    let response = format!("HTTP/1.1 302 Found\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let worker = thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0u8; 1024];
+      let _ = stream.read(&mut request).unwrap();
+      stream.write_all(response.as_bytes()).unwrap();
+    });
+    let client = reqwest::Client::builder().redirect(secure_redirect_policy()).build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let error = runtime.block_on(client.get(format!("http://{address}/start")).send()).unwrap_err();
+
+    assert!(error.is_redirect());
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn source_rate_limit_is_bounded_and_shared_by_all_source_requests() {
+    let sources = vec![(
+      "limited".into(),
+      PackageSource {
+        url: "https://packages.example.test/v3/index.json".into(),
+        protocol: NugetProtocol::V3,
+      },
+    )];
+    let mut credentials = SourceCredentialBatch::default();
+    let policy = PackageHttpPolicy {
+      max_requests_per_source: 2,
+      ..DEFAULT_HTTP_POLICY
+    };
+
+    attach_http_policy(&sources, policy, Path::new("NuGet.Config"), &mut credentials).unwrap();
+
+    let source = credentials.get(0).unwrap();
+    assert_eq!(source.limiter.as_ref().unwrap().available_permits(), 2);
+    assert_eq!(source.http_policy, policy);
+  }
+
+  #[test]
+  fn response_body_stall_uses_the_download_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0u8; 1024];
+      let _ = stream.read(&mut request).unwrap();
+      stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").unwrap();
+      stream.flush().unwrap();
+      thread::sleep(Duration::from_millis(1_250));
+      let _ = stream.write_all(b"ok");
+    });
+    let url = format!("http://{address}/slow");
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let policy = PackageHttpPolicy {
+      max_tries: 1,
+      download_timeout_seconds: 1,
+      ..DEFAULT_HTTP_POLICY
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let mut response = runtime.block_on(send_with_policy(&client, None, &url, "test request", policy, None)).unwrap();
+
+    let error = runtime.block_on(response.chunk(&url, "test")).unwrap_err();
+
+    assert!(error.to_string().contains("stalled for 1 seconds"));
+    worker.join().unwrap();
   }
 
   #[test]

@@ -9,12 +9,12 @@ use std::{
 
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
-  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageCancellation, PackageError, PackageErrorKind, PackageResolution,
-  PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, ProjectConfiguration, ProjectError,
-  ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
-  RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity,
-  discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
-  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent,
+  PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, ProjectConfiguration,
+  ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
+  RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
+  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -937,6 +937,7 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
         .collect(),
     })
     .collect();
+  let policy = inventory.http_policy();
   succeed(
     started,
     "project package-sources",
@@ -944,6 +945,22 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
     EventPayload::PackageSourcesInspected {
       project: project.project_path().display().to_string(),
       sources,
+      http_policy: PackageHttpPolicyEvent {
+        max_tries: policy.max_tries(),
+        retry_delay_ms: policy.retry_delay_ms(),
+        max_retry_after_seconds: policy.max_retry_after_seconds(),
+        request_timeout_seconds: policy.request_timeout_seconds(),
+        download_timeout_seconds: policy.download_timeout_seconds(),
+        max_requests_per_source: policy.max_requests_per_source(),
+        retry_http_429: policy.retries_http_429(),
+        observe_retry_after: policy.observes_retry_after(),
+        proxy_configured: policy.proxy_configured(),
+        proxy_authenticated: policy.proxy_authenticated(),
+        no_proxy_configured: policy.no_proxy_configured(),
+        offline: policy.offline(),
+        tls_validation: policy.tls_validation(),
+        max_redirects: policy.max_redirects(),
+      },
       network_requests: inventory.network_requests(),
       downloaded_bytes: inventory.downloaded_bytes(),
     },
@@ -953,6 +970,21 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
 fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   let mut output = String::with_capacity(1024);
   use std::fmt::Write as _;
+  let policy = inventory.http_policy();
+  writeln!(
+    output,
+    "HTTP: tries={}, delay={}ms, timeout={}s/{}s, per-source={}, proxy={}, proxy-auth={}, no-proxy={}, offline={}",
+    policy.max_tries(),
+    policy.retry_delay_ms(),
+    policy.request_timeout_seconds(),
+    policy.download_timeout_seconds(),
+    policy.max_requests_per_source(),
+    policy.proxy_configured(),
+    policy.proxy_authenticated(),
+    policy.no_proxy_configured(),
+    policy.offline()
+  )
+  .expect("writing a String succeeds");
   for source in inventory.sources() {
     writeln!(
       output,

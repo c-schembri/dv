@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 10;
+pub const EVENT_SCHEMA_VERSION: u16 = 11;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +69,39 @@ pub struct PackageSourceCapabilityEvent {
   pub authentication: String,
   /// Capability-ordered endpoint batch.
   pub endpoints: Vec<PackageServiceEndpointEvent>,
+}
+
+/// Redacted effective NuGet HTTP behavior for a package-source command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageHttpPolicyEvent {
+  /// Maximum attempts including the first request.
+  pub max_tries: u8,
+  /// Base retry delay in milliseconds.
+  pub retry_delay_ms: u32,
+  /// Maximum accepted `Retry-After` delay in seconds.
+  pub max_retry_after_seconds: u32,
+  /// Total request timeout in seconds.
+  pub request_timeout_seconds: u16,
+  /// Maximum response-body stall in seconds.
+  pub download_timeout_seconds: u16,
+  /// Configured concurrent request limit per source.
+  pub max_requests_per_source: u16,
+  /// Whether HTTP 429 is retried.
+  pub retry_http_429: bool,
+  /// Whether server `Retry-After` is observed.
+  pub observe_retry_after: bool,
+  /// Whether a proxy is configured; the address is deliberately omitted.
+  pub proxy_configured: bool,
+  /// Whether redacted proxy credentials are configured.
+  pub proxy_authenticated: bool,
+  /// Whether a proxy bypass list is configured; its hosts are omitted.
+  pub no_proxy_configured: bool,
+  /// Whether network work was disabled for this command.
+  pub offline: bool,
+  /// TLS peer and hostname validation is enabled.
+  pub tls_validation: bool,
+  /// Maximum secure redirects; redirects to non-HTTPS targets are rejected.
+  pub max_redirects: u8,
 }
 
 impl Event {
@@ -457,6 +490,8 @@ pub enum EventPayload {
     project: String,
     /// Sources in merged configuration order.
     sources: Vec<PackageSourceCapabilityEvent>,
+    /// Redacted effective HTTP behavior.
+    http_policy: PackageHttpPolicyEvent,
     /// Service-index HTTP requests performed.
     network_requests: u32,
     /// Service-index response bytes read.

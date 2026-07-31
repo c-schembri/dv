@@ -42,6 +42,7 @@ enum CaseKind {
   NugetCredentials,
   NugetCredentialProvider,
   NugetClientCertificates,
+  NugetHttpPolicy,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -72,6 +73,7 @@ struct Fixtures<'a> {
   nuget_credentials: &'a Path,
   nuget_credential_provider: &'a Path,
   nuget_client_certificates: &'a Path,
+  nuget_http_policy: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -342,6 +344,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_http_policy",
+    kind: CaseKind::NugetHttpPolicy,
+    args: &["oracle/bin/Release/HttpPolicyOracle.dll", "."],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -566,6 +574,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_http_policy",
+    kind: CaseKind::NugetHttpPolicy,
+    args: &["project", "package-sources", "HttpPolicyProject.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -703,6 +717,7 @@ fn run() -> Result<()> {
   let nuget_credentials_fixture = repository.join("benchmarks/fixtures/nuget-credentials");
   let nuget_credential_provider_fixture = repository.join("benchmarks/fixtures/nuget-credential-provider");
   let nuget_client_certificates_fixture = repository.join("benchmarks/fixtures/nuget-client-certificates");
+  let nuget_http_policy_fixture = repository.join("benchmarks/fixtures/nuget-http-policy");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -723,6 +738,7 @@ fn run() -> Result<()> {
     nuget_credentials: &nuget_credentials_fixture,
     nuget_credential_provider: &nuget_credential_provider_fixture,
     nuget_client_certificates: &nuget_client_certificates_fixture,
+    nuget_http_policy: &nuget_http_policy_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -793,6 +809,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_client_certificates") {
     verify_nuget_client_certificates(&repository, &dv_executable, &nuget_client_certificates_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_http_policy") {
+    verify_nuget_http_policy(&repository, &dv_executable, &nuget_http_policy_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
@@ -2724,6 +2743,78 @@ fn verify_nuget_client_certificates(repository: &Path, dv_executable: &Path, fix
   Ok(())
 }
 
+fn verify_nuget_http_policy(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let workspace = repository.join(format!("target/benchmark-nuget-http-policy-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &workspace)?;
+  reset_fixture(fixture, &workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "oracle/HttpPolicyOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &workspace,
+    "NuGet HTTP-policy oracle build",
+  )?;
+  let oracle = http_policy_command_json(
+    Path::new("dotnet"),
+    &["oracle/bin/Release/HttpPolicyOracle.dll", "."],
+    &workspace,
+    "NuGet HTTP-policy oracle",
+  )?;
+  let dv_output = http_policy_command_output(
+    dv_executable,
+    &["project", "package-sources", "HttpPolicyProject.csproj", "--offline", "--json"],
+    &workspace,
+    "dv HTTP-policy verification",
+  )?;
+  let dv = dv_output
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv HTTP-policy verification omitted package_sources_inspected")?;
+  let actual = dv.get("http_policy").ok_or("dv HTTP-policy verification omitted http_policy")?;
+  for (expected, observed) in [
+    ("maxTries", "max_tries"),
+    ("retryDelayMs", "retry_delay_ms"),
+    ("maxRetryAfterSeconds", "max_retry_after_seconds"),
+    ("requestTimeoutSeconds", "request_timeout_seconds"),
+    ("downloadTimeoutSeconds", "download_timeout_seconds"),
+    ("maxRequestsPerSource", "max_requests_per_source"),
+    ("retryHttp429", "retry_http_429"),
+    ("observeRetryAfter", "observe_retry_after"),
+    ("proxyConfigured", "proxy_configured"),
+    ("proxyAuthenticated", "proxy_authenticated"),
+    ("noProxyConfigured", "no_proxy_configured"),
+  ] {
+    if oracle.get(expected) != actual.get(observed) {
+      return Err(format!("NuGet HTTP-policy field differs for {observed}: oracle={oracle} dv={actual}").into());
+    }
+  }
+  if actual.get("offline").and_then(serde_json::Value::as_bool) != Some(true)
+    || actual.get("tls_validation").and_then(serde_json::Value::as_bool) != Some(true)
+    || actual.get("max_redirects").and_then(serde_json::Value::as_u64) != Some(10)
+  {
+    return Err(format!("dv HTTP-policy security/offline fields are invalid: {actual}").into());
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) {
+    return Err("offline HTTP-policy verification performed network work".into());
+  }
+  Ok(())
+}
+
+fn http_policy_command_json(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<serde_json::Value> {
+  Ok(serde_json::from_str(&http_policy_command_output(executable, args, cwd, purpose)?)?)
+}
+
+fn http_policy_command_output(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_http_policy_environment(&mut command, cwd);
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, purpose)?;
+  Ok(String::from_utf8(output.stdout)?)
+}
+
 fn verify_credential_provider_interactive(dv_executable: &Path, workspace: &Path) -> Result<()> {
   const LOGIN_MESSAGE: &str = "fixture device login required";
   let trace = workspace.join("dv-provider-interactive.trace");
@@ -3147,6 +3238,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetCredentials
       | CaseKind::NugetCredentialProvider
       | CaseKind::NugetClientCertificates
+      | CaseKind::NugetHttpPolicy
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -3201,6 +3293,14 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       ],
       workspace,
       "NuGet client-certificate oracle build",
+    )?;
+  }
+  if matches!(case.kind, CaseKind::NugetHttpPolicy) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &["build", "oracle/HttpPolicyOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+      workspace,
+      "NuGet HTTP-policy oracle build",
     )?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
@@ -3621,7 +3721,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
-    CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates => Ok(()),
+    CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates | CaseKind::NugetHttpPolicy => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
@@ -3693,6 +3793,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetCredentials => fixtures.nuget_credentials,
     CaseKind::NugetCredentialProvider => fixtures.nuget_credential_provider,
     CaseKind::NugetClientCertificates => fixtures.nuget_client_certificates,
+    CaseKind::NugetHttpPolicy => fixtures.nuget_http_policy,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -3718,6 +3819,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetCredentials => Some("nuget-credentials"),
     CaseKind::NugetCredentialProvider => Some("nuget-credential-provider"),
     CaseKind::NugetClientCertificates => Some("nuget-client-certificates"),
+    CaseKind::NugetHttpPolicy => Some("nuget-http-policy"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -3740,6 +3842,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetCredentials
       | CaseKind::NugetCredentialProvider
       | CaseKind::NugetClientCertificates
+      | CaseKind::NugetHttpPolicy
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd)?;
   }
@@ -3772,7 +3875,11 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   } else if !is_dotnet(executable)
     && matches!(
       case.kind,
-      CaseKind::NugetServiceIndex | CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates
+      CaseKind::NugetServiceIndex
+        | CaseKind::NugetCredentials
+        | CaseKind::NugetCredentialProvider
+        | CaseKind::NugetClientCertificates
+        | CaseKind::NugetHttpPolicy
     )
   {
     Some(parse_source_work_evidence(&output.stdout)?)
@@ -3994,6 +4101,21 @@ fn apply_nuget_client_certificate_environment(command: &mut Command, cwd: &Path)
   Ok(())
 }
 
+fn apply_nuget_http_policy_environment(command: &mut Command, cwd: &Path) {
+  apply_nuget_config_environment(command, cwd);
+  command
+    .env("NUGET_HTTP_CACHE_PATH", cwd.join(".http-cache"))
+    .env("NUGET_ENHANCED_MAX_NETWORK_TRY_COUNT", "9")
+    .env("NUGET_ENHANCED_NETWORK_RETRY_DELAY_MILLISECONDS", "250")
+    .env("NUGET_MAX_RETRY_AFTER_DELAY_SECONDS", "12")
+    .env("NUGET_RETRY_HTTP_429", "false")
+    .env("NUGET_OBSERVE_RETRY_AFTER", "false")
+    .env_remove("http_proxy")
+    .env_remove("HTTP_PROXY")
+    .env_remove("no_proxy")
+    .env_remove("NO_PROXY");
+}
+
 fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) -> Result<()> {
   if matches!(kind, CaseKind::NugetStoragePolicy) {
     apply_nuget_storage_environment(command, cwd);
@@ -4008,6 +4130,8 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
     apply_nuget_credential_provider_environment(command, cwd);
   } else if matches!(kind, CaseKind::NugetClientCertificates) {
     apply_nuget_client_certificate_environment(command, cwd)?;
+  } else if matches!(kind, CaseKind::NugetHttpPolicy) {
+    apply_nuget_http_policy_environment(command, cwd);
   } else {
     apply_nuget_config_environment(command, cwd);
   }
@@ -4272,6 +4396,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_credentials"
           | "nuget_credential_provider"
           | "nuget_client_certificates"
+          | "nuget_http_policy"
       )
     })
     .collect::<Vec<_>>();
@@ -4408,6 +4533,7 @@ fn case_label(case: &str) -> &str {
     "nuget_credentials" => "NuGet credentials",
     "nuget_credential_provider" => "NuGet credential provider",
     "nuget_client_certificates" => "NuGet client certificates",
+    "nuget_http_policy" => "NuGet HTTP policy",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
