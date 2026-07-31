@@ -138,7 +138,7 @@ repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
-Current output is command-local human text or a schema-v7 JSON-lines event
+Current output is command-local human text or a schema-v8 JSON-lines event
 batch. Drop-in modes must also reproduce documented or observed
 machine-consumed text/JSON/XML/binary-log formats and tool-specific exit
 behavior. Future workflows must additionally own:
@@ -227,7 +227,7 @@ prove that nothing changed.
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
 | Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
-| Package resolution and cache | Initial subset | exact versions, dependency-only meta-packages, bounded streaming resolution, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
+| Package resolution and cache | Initial subset | version ranges, dependency-only meta-packages, bounded streaming resolution, local and NuGet v2/v3 HTTPS sources, official service-index capability discovery, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore | Initial subset | exact package restore is implemented; most reference flags and graph cases remain |
 | Build execution, run, and test | Missing | build only plans inputs; run/test remain unsupported |
@@ -766,8 +766,17 @@ boundary, not final drop-in parity.
   flat-container discovery. The cold two-package local-feed oracle measures
   `670.534 ms` for Microsoft versus `64.522 ms` for `dv` (`10.4x`) across 30
   retained samples with 2,980,145 source bytes and zero HTTP requests. `P1`
-- [~] `NUGET-007` Resolve registration, flat-container, search, vulnerability,
-  and package-publish endpoints from service-index resources. `P2`
+- [x] `NUGET-007` Resolve registration, flat-container, search, vulnerability,
+  and package-publish endpoints from service-index resources. Selection uses
+  NuGet.Client's ordered resource types, string-or-array types, compatible
+  `clientVersion` precedence, stable equivalent-endpoint order, URI filtering,
+  and HTTPS policy. Independent v3 indexes are fetched through a bounded Tokio
+  batch, then compacted into one text allocation, one span batch, and five
+  fixed capability ranges. `project package-sources` exposes the effective
+  inventory through human output and event schema 8. The live one-request
+  oracle measures `344.113 ms` for Microsoft versus `277.336 ms` for `dv`
+  (`1.24x`) across 30 retained samples; `dv` also evaluates the project and
+  configuration hierarchy inside its timed command. `P2`
 - [ ] `NUGET-008` Support Basic/PAT credentials from config and environment
   without persisting or reporting plaintext. `P2`
 - [ ] `NUGET-009` Define a credential-provider protocol for private feeds,

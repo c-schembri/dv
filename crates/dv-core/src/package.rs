@@ -37,6 +37,20 @@ const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
 const LOCK_SCHEMA_VERSION: u16 = 3;
+const SERVICE_CAPABILITY_COUNT: usize = 5;
+const PACKAGE_BASE_TYPES: &[&str] = &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"];
+const REGISTRATION_TYPES: &[&str] = &[
+  "RegistrationsBaseUrl/Versioned",
+  "RegistrationsBaseUrl/3.6.0",
+  "RegistrationsBaseUrl/3.4.0",
+  "RegistrationsBaseUrl/3.0.0-rc",
+  "RegistrationsBaseUrl/3.0.0-beta",
+  "RegistrationsBaseUrl",
+];
+const SEARCH_TYPES: &[&str] = &["SearchQueryService/Versioned", "SearchQueryService/3.4.0", "SearchQueryService/3.0.0-beta"];
+const VULNERABILITY_TYPES: &[&str] = &["VulnerabilityInfo/6.7.0"];
+const PACKAGE_PUBLISH_TYPES: &[&str] = &["PackagePublish/Versioned", "PackagePublish/2.0.0"];
+const NUGET_PROTOCOL_CLIENT_VERSION: &str = "7.0.0";
 
 /// Policy applied when validating NuGet package signatures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +87,39 @@ const _: () = assert!(size_of::<TextSpan>() == 8);
 const _: () = assert!(align_of::<TextSpan>() == 4);
 const _: () = assert!(size_of::<ItemRange>() == 8);
 const _: () = assert!(align_of::<ItemRange>() == 4);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NugetServiceEndpoints {
+  text: Box<str>,
+  entries: Box<[TextSpan]>,
+  ranges: [ItemRange; SERVICE_CAPABILITY_COUNT],
+}
+
+impl NugetServiceEndpoints {
+  fn package_base_address(&self) -> Option<&str> {
+    self.values(ServiceCapability::PackageBase).next()
+  }
+
+  fn values(&self, capability: ServiceCapability) -> impl ExactSizeIterator<Item = &str> {
+    self.entries[range(self.ranges[capability as usize])].iter().map(|span| {
+      let start = span.start as usize;
+      &self.text[start..start + span.len as usize]
+    })
+  }
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum ServiceCapability {
+  PackageBase,
+  Registration,
+  Search,
+  Vulnerability,
+  PackagePublish,
+}
+
+const _: () = assert!(size_of::<NugetServiceEndpoints>() == 72);
+const _: () = assert!(align_of::<NugetServiceEndpoints>() == 8);
 
 /// Stable semantic partition for selected package assets.
 ///
@@ -221,6 +268,123 @@ pub struct PackageResolveOptions {
   pub offline: bool,
   /// Write or refresh `dv.lock.json` after successful resolution.
   pub write_lock: bool,
+}
+
+/// A NuGet v3 capability selected from a source service index.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum PackageServiceKind {
+  /// Per-package metadata and version registration documents.
+  Registration,
+  /// Flat-container version lists, manifests, and package archives.
+  PackageContent,
+  /// Keyword package search.
+  Search,
+  /// Bulk package vulnerability information.
+  Vulnerability,
+  /// Package push and delete operations.
+  PackagePublish,
+}
+
+impl PackageServiceKind {
+  /// Returns the stable event and human-output spelling.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Registration => "registration",
+      Self::PackageContent => "package_content",
+      Self::Search => "search",
+      Self::Vulnerability => "vulnerability",
+      Self::PackagePublish => "package_publish",
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageSourceRecord {
+  name: TextSpan,
+  location: TextSpan,
+  endpoints: ItemRange,
+  protocol: NugetProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageServiceEndpointRecord {
+  location: TextSpan,
+  kind: PackageServiceKind,
+}
+
+const _: () = assert!(size_of::<PackageSourceRecord>() == 28);
+const _: () = assert!(align_of::<PackageSourceRecord>() == 4);
+const _: () = assert!(size_of::<PackageServiceEndpointRecord>() == 12);
+const _: () = assert!(align_of::<PackageServiceEndpointRecord>() == 4);
+
+/// Immutable effective package-source and service-capability batches.
+///
+/// Source rows retain configuration order. Each row owns one consecutive
+/// endpoint range, ordered by [`PackageServiceKind`] and then service-index
+/// resource order. All variable text is stored once in `text`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageSourceInventory {
+  text: Box<str>,
+  sources: Box<[PackageSourceRecord]>,
+  endpoints: Box<[PackageServiceEndpointRecord]>,
+  network_requests: u32,
+  downloaded_bytes: u64,
+}
+
+const _: () = assert!(size_of::<PackageSourceInventory>() == 64);
+const _: () = assert!(align_of::<PackageSourceInventory>() == 8);
+
+impl PackageSourceInventory {
+  /// Returns source indices in merged configuration order.
+  pub fn sources(&self) -> std::ops::Range<usize> {
+    0..self.sources.len()
+  }
+
+  /// Returns the configured source name.
+  pub fn source_name(&self, source: usize) -> &str {
+    self.get(self.sources[source].name)
+  }
+
+  /// Returns the configured source URL or local path.
+  pub fn source_location(&self, source: usize) -> &str {
+    self.get(self.sources[source].location)
+  }
+
+  /// Returns `local`, `v2`, or `v3`.
+  pub fn source_protocol(&self, source: usize) -> &'static str {
+    self.sources[source].protocol.as_str()
+  }
+
+  /// Returns selected endpoint indices for one source.
+  pub fn source_endpoints(&self, source: usize) -> std::ops::Range<usize> {
+    range(self.sources[source].endpoints)
+  }
+
+  /// Returns an endpoint capability.
+  pub fn endpoint_kind(&self, endpoint: usize) -> PackageServiceKind {
+    self.endpoints[endpoint].kind
+  }
+
+  /// Returns an absolute selected endpoint URL.
+  pub fn endpoint_location(&self, endpoint: usize) -> &str {
+    self.get(self.endpoints[endpoint].location)
+  }
+
+  /// Returns service-index HTTP requests performed by discovery.
+  pub fn network_requests(&self) -> u32 {
+    self.network_requests
+  }
+
+  /// Returns service-index response bytes read by discovery.
+  pub fn downloaded_bytes(&self) -> u64 {
+    self.downloaded_bytes
+  }
+
+  fn get(&self, span: TextSpan) -> &str {
+    let start = span.start as usize;
+    &self.text[start..start + span.len as usize]
+  }
 }
 
 /// One immutable resolved package graph and its selected assets.
@@ -1059,6 +1223,16 @@ impl PackageSource {
       return Err(config_error(context, "package source cannot be empty"));
     }
     if value.starts_with("https://") {
+      let parsed = reqwest::Url::parse(&value).map_err(|error| config_error(context, format!("invalid HTTPS package source {value:?}: {error}")))?;
+      if !parsed.has_host() {
+        return Err(config_error(context, format!("HTTPS package source {value:?} must include a host")));
+      }
+      if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(config_error(
+          context,
+          "package-source URLs must not embed credentials; credential support is tracked by NUGET-008",
+        ));
+      }
       return Ok(Self {
         protocol: NugetProtocol::parse_http(protocol, &value, context)?,
         url: value,
@@ -1123,7 +1297,7 @@ enum ServiceEndpoint {
   },
   V3 {
     source: String,
-    package_base: String,
+    services: Arc<NugetServiceEndpoints>,
     source_index: u32,
   },
 }
@@ -1307,6 +1481,126 @@ pub fn resolve_package_inputs(projects: &[&ProjectSpec], options: &PackageResolv
     }
   }
   Ok(resolutions)
+}
+
+/// Discovers effective package sources and their supported v3 capabilities.
+///
+/// The transform is batch-first. V3 service indexes are fetched concurrently
+/// through a bounded task set, then compacted in project/configuration order.
+/// Local and v2 sources require no network work and have empty endpoint ranges.
+pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResolveOptions) -> Result<Vec<PackageSourceInventory>, PackageError> {
+  if projects.is_empty() {
+    return Ok(Vec::new());
+  }
+  let runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(ASYNC_RUNTIME_WORKERS)
+    .enable_all()
+    .build()
+    .map_err(|error| {
+      PackageError::new(
+        PackageErrorKind::Io,
+        "package-source scheduler",
+        format!("failed to create async runtime: {error}"),
+      )
+    })?;
+  let mut inventories = Vec::with_capacity(projects.len());
+  for project in projects {
+    let config = discover_configuration(
+      project.project_directory(),
+      options.packages_directory.as_deref(),
+      options.config_file.as_deref(),
+      &options.sources,
+    )?;
+    let client = http_client(config.proxy.as_ref())?;
+    inventories.push(runtime.block_on(inspect_source_batch(&client, &config.sources, !options.offline))?);
+  }
+  Ok(inventories)
+}
+
+async fn inspect_source_batch(
+  client: &reqwest::Client,
+  sources: &[(String, PackageSource)],
+  allow_network: bool,
+) -> Result<PackageSourceInventory, PackageError> {
+  let mut discovered = std::iter::repeat_with(|| None)
+    .take(sources.len())
+    .collect::<Vec<Option<(NugetServiceEndpoints, u64)>>>();
+  if allow_network {
+    let jobs = sources
+      .iter()
+      .enumerate()
+      .filter(|(_, (_, source))| source.protocol == NugetProtocol::V3)
+      .map(|(index, (_, source))| (index, source.url.clone()))
+      .collect::<Vec<_>>();
+    let mut tasks = JoinSet::new();
+    let mut next = 0usize;
+    while next < jobs.len() || !tasks.is_empty() {
+      while next < jobs.len() && tasks.len() < MAX_DOWNLOAD_WORKERS {
+        let (index, source) = jobs[next].clone();
+        let client = client.clone();
+        tasks.spawn(async move { (index, fetch_v3_service_index(&client, &source).await) });
+        next += 1;
+      }
+      let (index, result) = tasks
+        .join_next()
+        .await
+        .ok_or_else(|| PackageError::new(PackageErrorKind::Io, "package-source scheduler", "service-index task set ended early"))?
+        .map_err(|error| PackageError::new(PackageErrorKind::Io, "package-source scheduler", format!("service-index task failed: {error}")))?;
+      discovered[index] = Some(result?);
+    }
+  }
+
+  let text_capacity = sources
+    .iter()
+    .map(|(name, source)| name.len() + source.url.len())
+    .sum::<usize>()
+    .saturating_add(discovered.iter().flatten().map(|(services, _)| services.text.len()).sum::<usize>());
+  let mut text = TextTable::with_capacity(text_capacity);
+  let mut source_rows = Vec::with_capacity(sources.len());
+  let mut endpoint_rows = Vec::new();
+  let mut network_requests = 0u32;
+  let mut downloaded_bytes = 0u64;
+  for (index, (name, source)) in sources.iter().enumerate() {
+    let start = u32_len(endpoint_rows.len(), "package-source endpoint range")?;
+    if let Some((services, bytes)) = discovered[index].take() {
+      network_requests = network_requests
+        .checked_add(1)
+        .ok_or_else(|| network_error(&source.url, "package-source request count overflow"))?;
+      downloaded_bytes = downloaded_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| network_error(&source.url, "package-source response byte count overflow"))?;
+      for (kind, capability) in [
+        (PackageServiceKind::Registration, ServiceCapability::Registration),
+        (PackageServiceKind::PackageContent, ServiceCapability::PackageBase),
+        (PackageServiceKind::Search, ServiceCapability::Search),
+        (PackageServiceKind::Vulnerability, ServiceCapability::Vulnerability),
+        (PackageServiceKind::PackagePublish, ServiceCapability::PackagePublish),
+      ] {
+        for endpoint in services.values(capability) {
+          endpoint_rows.push(PackageServiceEndpointRecord {
+            location: text.push(endpoint)?,
+            kind,
+          });
+        }
+      }
+    }
+    source_rows.push(PackageSourceRecord {
+      name: text.push(name)?,
+      location: text.push(&source.url)?,
+      endpoints: ItemRange {
+        start,
+        len: u32_len(endpoint_rows.len() - start as usize, "package-source endpoint range")?,
+      },
+      protocol: source.protocol,
+    });
+  }
+  Ok(PackageSourceInventory {
+    text: text.text.into_boxed_str(),
+    sources: source_rows.into_boxed_slice(),
+    endpoints: endpoint_rows.into_boxed_slice(),
+    network_requests,
+    downloaded_bytes,
+  })
 }
 
 fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Result<PackageResolution, PackageError> {
@@ -2407,11 +2701,15 @@ async fn discover_service_endpoints(
         source_index,
       }),
       NugetProtocol::V3 if allow_network => {
-        let document: serde_json::Value = get_json(client, &source.url).await?;
+        let (services, _) = fetch_v3_service_index(client, &source.url).await?;
         requests += 1;
+        let services = Arc::new(services);
+        if services.package_base_address().is_none() {
+          return Err(network_error(&source.url, "NuGet v3 source has no compatible PackageBaseAddress resource"));
+        }
         remote.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
-          package_base: package_base_from_service_index(&source.url, &document)?,
+          services,
           source_index,
         });
       },
@@ -2492,23 +2790,154 @@ fn hierarchical_source_entry_exists(identity_root: &Path, version_root: &Path) -
     && version_root.join(format!("{stem}.nupkg.sha512")).is_file()
 }
 
-fn package_base_from_service_index(source: &str, document: &serde_json::Value) -> Result<String, PackageError> {
+fn service_types(capability: ServiceCapability) -> &'static [&'static str] {
+  match capability {
+    ServiceCapability::PackageBase => PACKAGE_BASE_TYPES,
+    ServiceCapability::Registration => REGISTRATION_TYPES,
+    ServiceCapability::Search => SEARCH_TYPES,
+    ServiceCapability::Vulnerability => VULNERABILITY_TYPES,
+    ServiceCapability::PackagePublish => PACKAGE_PUBLISH_TYPES,
+  }
+}
+
+async fn fetch_v3_service_index(client: &reqwest::Client, source: &str) -> Result<(NugetServiceEndpoints, u64), PackageError> {
+  let bytes = get_bytes(client, source, MAX_JSON_BYTES, "NuGet service index").await?;
+  let document: serde_json::Value =
+    serde_json::from_slice(&bytes).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
+  let endpoints = parse_v3_service_index(source, &document)?;
+  Ok((endpoints, bytes.len() as u64))
+}
+
+fn parse_v3_service_index(source: &str, document: &serde_json::Value) -> Result<NugetServiceEndpoints, PackageError> {
+  let schema = document
+    .get("version")
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| network_error(source, "NuGet service index has no schema version"))?;
+  let schema_version =
+    PackageVersion::parse(schema).map_err(|error| network_error(source, format!("invalid NuGet service-index schema version {schema:?}: {error}")))?;
+  if schema_version.numbers[0] != 3 {
+    return Err(network_error(
+      source,
+      format!("unsupported NuGet service-index schema version {schema:?}; expected major version 3"),
+    ));
+  }
   let resources = document
     .get("resources")
     .and_then(serde_json::Value::as_array)
     .ok_or_else(|| network_error(source, "NuGet service index has no resources array"))?;
-  let base = resources
-    .iter()
-    .find_map(|resource| {
-      resource_type_matches(resource.get("@type"), "PackageBaseAddress/3.0.0")
-        .then(|| resource.get("@id").and_then(serde_json::Value::as_str))
-        .flatten()
-    })
-    .ok_or_else(|| network_error(source, "NuGet source has no PackageBaseAddress/3.0.0 resource"))?;
-  if !base.starts_with("https://") {
-    return Err(network_error(base, "NuGet PackageBaseAddress must use HTTPS"));
+  if resources.len() > MAX_ARCHIVE_ENTRIES {
+    return Err(network_error(source, "NuGet service index exceeds the resource count limit"));
   }
-  Ok(with_trailing_slash(base.to_owned()))
+  // This is a protocol-compatibility level, not a selected .NET SDK version.
+  // It is isolated here so adding a newly implemented NuGet contract changes
+  // one boundary instead of scattering version checks through consumers.
+  let supported_client = PackageVersion::parse(NUGET_PROTOCOL_CLIENT_VERSION).expect("the supported NuGet protocol version is valid");
+  let mut text = TextTable::with_capacity(resources.len().saturating_mul(64));
+  let mut endpoints = Vec::new();
+  let mut ranges = [ItemRange { start: 0, len: 0 }; SERVICE_CAPABILITY_COUNT];
+  for capability in [
+    ServiceCapability::PackageBase,
+    ServiceCapability::Registration,
+    ServiceCapability::Search,
+    ServiceCapability::Vulnerability,
+    ServiceCapability::PackagePublish,
+  ] {
+    let start = u32_len(endpoints.len(), "NuGet service endpoint range")?;
+    append_selected_service_endpoints(resources, service_types(capability), &supported_client, &mut text, &mut endpoints)?;
+    ranges[capability as usize] = ItemRange {
+      start,
+      len: u32_len(endpoints.len() - start as usize, "NuGet service endpoint range")?,
+    };
+  }
+  Ok(NugetServiceEndpoints {
+    text: text.text.into_boxed_str(),
+    entries: endpoints.into_boxed_slice(),
+    ranges,
+  })
+}
+
+fn append_selected_service_endpoints(
+  resources: &[serde_json::Value],
+  ordered_types: &[&str],
+  supported_client: &PackageVersion,
+  text: &mut TextTable,
+  endpoints: &mut Vec<TextSpan>,
+) -> Result<(), PackageError> {
+  for resource_type in ordered_types {
+    let best = resources
+      .iter()
+      .filter(|resource| resource_type_matches(resource.get("@type"), resource_type))
+      .filter(|resource| valid_service_location(resource).is_some())
+      .filter_map(|resource| best_compatible_client_version(resource.get("clientVersion"), supported_client))
+      .max();
+    let Some(best) = best else {
+      continue;
+    };
+    for resource in resources.iter().filter(|resource| resource_type_matches(resource.get("@type"), resource_type)) {
+      if !resource_supports_client_version(resource.get("clientVersion"), &best) {
+        continue;
+      }
+      let Some(location) = valid_service_location(resource) else {
+        continue;
+      };
+      let url = reqwest::Url::parse(location).expect("selected NuGet service location was validated");
+      if !url.username().is_empty() || url.password().is_some() {
+        return Err(network_error(
+          location,
+          format!("NuGet service resource {resource_type} must not embed credentials in its URL"),
+        ));
+      }
+      if url.scheme() != "https" {
+        return Err(network_error(
+          location,
+          format!("NuGet service resource {resource_type} uses insecure HTTP; explicit opt-in remains tracked by NUGET-012"),
+        ));
+      }
+      endpoints.push(text.push(location)?);
+    }
+    return Ok(());
+  }
+  Ok(())
+}
+
+fn valid_service_location(resource: &serde_json::Value) -> Option<&str> {
+  let location = resource.get("@id").and_then(serde_json::Value::as_str)?;
+  let url = reqwest::Url::parse(location).ok()?;
+  (url.has_host() && matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none()).then_some(location)
+}
+
+fn best_compatible_client_version(value: Option<&serde_json::Value>, supported: &PackageVersion) -> Option<PackageVersion> {
+  match value {
+    None => Some(zero_package_version()),
+    Some(serde_json::Value::String(value)) => PackageVersion::parse(value).ok().filter(|version| version <= supported),
+    Some(serde_json::Value::Array(values)) => values
+      .iter()
+      .filter_map(serde_json::Value::as_str)
+      .filter_map(|value| PackageVersion::parse(value).ok())
+      .filter(|version| version <= supported)
+      .max(),
+    Some(_) => None,
+  }
+}
+
+fn resource_supports_client_version(value: Option<&serde_json::Value>, selected: &PackageVersion) -> bool {
+  match value {
+    None => selected == &zero_package_version(),
+    Some(serde_json::Value::String(value)) => PackageVersion::parse(value).is_ok_and(|version| &version == selected),
+    Some(serde_json::Value::Array(values)) => values
+      .iter()
+      .filter_map(serde_json::Value::as_str)
+      .any(|value| PackageVersion::parse(value).is_ok_and(|version| &version == selected)),
+    Some(_) => false,
+  }
+}
+
+fn zero_package_version() -> PackageVersion {
+  PackageVersion {
+    normalized: "0.0.0".to_owned(),
+    numbers: [0; 4],
+    prerelease_start: None,
+  }
 }
 
 fn resource_type_matches(value: Option<&serde_json::Value>, expected: &str) -> bool {
@@ -3070,8 +3499,10 @@ async fn load_node_metadata(
     }
     match endpoint {
       ServiceEndpoint::Local { .. } => versions.extend(enumerate_local_versions(endpoint, lower_id)?),
-      ServiceEndpoint::V3 { package_base, .. } => {
-        let url = format!("{package_base}{lower_id}/index.json");
+      ServiceEndpoint::V3 { services, .. } => {
+        let package_base = services.package_base_address().expect("v3 endpoint discovery requires package content");
+        let separator = if package_base.ends_with('/') { "" } else { "/" };
+        let url = format!("{package_base}{separator}{lower_id}/index.json");
         let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
           requests += 1;
           continue;
@@ -3582,7 +4013,10 @@ async fn download_and_publish(
   let metadata = match endpoint {
     ServiceEndpoint::Local { .. } => unreachable!("local package acquisition returned above"),
     ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, request, base).await?,
-    ServiceEndpoint::V3 { package_base, .. } => v3_package_metadata(request, package_base),
+    ServiceEndpoint::V3 { services, .. } => v3_package_metadata(
+      request,
+      services.package_base_address().expect("v3 endpoint discovery requires package content"),
+    ),
   };
   if let Some(size) = metadata.expected_size
     && size > MAX_PACKAGE_BYTES
@@ -3796,9 +4230,10 @@ fn publish_package_directory(staged: &Path, destination: &Path) -> Result<bool, 
 }
 
 fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageMetadata {
+  let separator = if package_base.ends_with('/') { "" } else { "/" };
   PackageMetadata {
     content_url: format!(
-      "{package_base}{}/{}/{}.{}.nupkg",
+      "{package_base}{separator}{}/{}/{}.{}.nupkg",
       request.lower_id, request.version, request.lower_id, request.version
     ),
     expected_hash: None,
@@ -3956,11 +4391,6 @@ async fn download_package(client: &reqwest::Client, url: &str, destination: &Pat
     ));
   }
   Ok((BASE64.encode(hasher.finalize()), total))
-}
-
-async fn get_json<T: for<'de> Deserialize<'de>>(client: &reqwest::Client, url: &str) -> Result<T, PackageError> {
-  let bytes = get_bytes(client, url, MAX_JSON_BYTES, "JSON").await?;
-  serde_json::from_slice(&bytes).map_err(|error| network_error(url, format!("invalid JSON response: {error}")))
 }
 
 async fn get_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
@@ -5901,6 +6331,21 @@ mod tests {
   }
 
   #[test]
+  fn package_source_rejects_embedded_credentials_before_reporting() {
+    let error = PackageSource::parse(
+      "https://user:secret@packages.example.test/v3/index.json".into(),
+      Some("3"),
+      Path::new("NuGet.Config"),
+      Path::new("."),
+    )
+    .err()
+    .expect("embedded credentials must be rejected");
+
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert!(error.message.contains("must not embed credentials"));
+  }
+
+  #[test]
   fn nuget_audit_sources_and_source_mappings_merge_as_typed_batches() {
     let temp = TempDirectory::new();
     let lower = temp.write(
@@ -6374,16 +6819,18 @@ mod tests {
   #[test]
   fn exact_v3_package_uses_only_the_discovered_flat_container() {
     let service_index = serde_json::json!({
+      "version": "3.0.0",
       "resources": [{
         "@id": "https://content.example.test/arbitrary/root",
         "@type": ["PackageBaseAddress/3.0.0", "Other/1.0.0"]
       }]
     });
-    let package_base = package_base_from_service_index("https://feed.example.test/custom-index", &service_index).unwrap();
+    let services = parse_v3_service_index("https://feed.example.test/custom-index", &service_index).unwrap();
+    let package_base = services.package_base_address().unwrap();
 
-    let metadata = v3_package_metadata(&request(), &package_base);
+    let metadata = v3_package_metadata(&request(), package_base);
 
-    assert_eq!(package_base, "https://content.example.test/arbitrary/root/");
+    assert_eq!(package_base, "https://content.example.test/arbitrary/root");
     assert_eq!(
       metadata.content_url,
       "https://content.example.test/arbitrary/root/sample.package/1.2.3/sample.package.1.2.3.nupkg"
@@ -6391,6 +6838,62 @@ mod tests {
     assert_eq!(metadata.expected_hash, None);
     assert_eq!(metadata.expected_size, None);
     assert_eq!(metadata.requests, 0);
+  }
+
+  #[test]
+  fn service_index_selects_official_type_order_and_compatible_client_version() {
+    let document = serde_json::json!({
+      "version": "3.1.0",
+      "resources": [
+        { "@id": "https://feed.test/registration-legacy/", "@type": "RegistrationsBaseUrl/3.6.0" },
+        { "@id": "https://feed.test/registration-current-a/", "@type": "RegistrationsBaseUrl/Versioned", "clientVersion": ["4.3.0-alpha", "4.3.0"] },
+        { "@id": "not an absolute URL", "@type": "RegistrationsBaseUrl/Versioned", "clientVersion": "6.0.0" },
+        { "@id": "https://secret@feed.test/registration/", "@type": "RegistrationsBaseUrl/Versioned", "clientVersion": "5.0.0" },
+        { "@id": "https://feed.test/registration-future/", "@type": "RegistrationsBaseUrl/Versioned", "clientVersion": "8.0.0" },
+        { "@id": "https://feed.test/registration-current-b/", "@type": ["Other", "RegistrationsBaseUrl/Versioned"], "clientVersion": "4.3.0" },
+        { "@id": "https://feed.test/content/", "@type": ["PackageBaseAddress/3.0.0", "Other"] },
+        { "@id": "https://feed.test/search-a", "@type": "SearchQueryService/3.0.0-beta" },
+        { "@id": "https://feed.test/search-b", "@type": "SearchQueryService/3.0.0-beta" },
+        { "@id": "https://feed.test/vulnerabilities", "@type": "VulnerabilityInfo/6.7.0" },
+        { "@id": "https://feed.test/publish", "@type": "PackagePublish/2.0.0" }
+      ]
+    });
+
+    let services = parse_v3_service_index("https://feed.test/index.json", &document).unwrap();
+
+    assert_eq!(services.package_base_address(), Some("https://feed.test/content/"));
+    assert_eq!(
+      services.values(ServiceCapability::Registration).collect::<Vec<_>>(),
+      ["https://feed.test/registration-current-a/", "https://feed.test/registration-current-b/"]
+    );
+    assert_eq!(
+      services.values(ServiceCapability::Search).collect::<Vec<_>>(),
+      ["https://feed.test/search-a", "https://feed.test/search-b"]
+    );
+    assert_eq!(
+      services.values(ServiceCapability::Vulnerability).collect::<Vec<_>>(),
+      ["https://feed.test/vulnerabilities"]
+    );
+    assert_eq!(
+      services.values(ServiceCapability::PackagePublish).collect::<Vec<_>>(),
+      ["https://feed.test/publish"]
+    );
+  }
+
+  #[test]
+  fn service_index_rejects_unsupported_schema_and_insecure_selected_resources() {
+    let schema = serde_json::json!({ "version": "4.0.0", "resources": [] });
+    let error = parse_v3_service_index("https://feed.test/index.json", &schema).err().unwrap();
+    assert_eq!(error.kind(), PackageErrorKind::Network);
+    assert!(error.to_string().contains("expected major version 3"));
+
+    let insecure = serde_json::json!({
+      "version": "3.0.0",
+      "resources": [{ "@id": "http://feed.test/content/", "@type": "PackageBaseAddress/3.0.0" }]
+    });
+    let error = parse_v3_service_index("https://feed.test/index.json", &insecure).err().unwrap();
+    assert_eq!(error.kind(), PackageErrorKind::Network);
+    assert!(error.to_string().contains("NUGET-012"));
   }
 
   #[test]

@@ -77,9 +77,39 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":7"));
+  assert!(lines[0].contains("\"schema_version\":8"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
+}
+
+#[test]
+fn package_source_inspection_reports_the_effective_offline_batch() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="offline" value="local-feed" /></packageSources></configuration>"#,
+  );
+  fs::create_dir_all(temp.0.join("local-feed")).unwrap();
+
+  let output = dv()
+    .args(["project", "package-sources", "App.csproj", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"package_sources_inspected\""));
+  assert!(stdout.contains("\"name\":\"offline\""));
+  assert!(stdout.contains("\"location\":"));
+  assert!(stdout.contains("\"protocol\":\"local\""));
+  assert!(stdout.contains("\"endpoints\":[]"));
+  assert!(stdout.contains("\"network_requests\":0"));
+  assert!(stdout.contains("\"downloaded_bytes\":0"));
 }
 
 #[test]
@@ -482,6 +512,43 @@ fn restore_accepts_a_relative_local_cli_source() {
 
   assert_eq!(output.status.code(), Some(2));
   assert!(String::from_utf8(output.stderr).unwrap().contains("missing.csproj does not exist"));
+}
+
+#[test]
+fn package_source_inspection_keeps_offline_discovery_network_free() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+  let output = dv()
+    .args([
+      "project",
+      "package-sources",
+      "App.csproj",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--offline",
+      "--json",
+    ])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let event = String::from_utf8(output.stdout)
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .unwrap();
+  assert_eq!(event.get("network_requests").and_then(serde_json::Value::as_u64), Some(0));
+  assert_eq!(event.pointer("/sources/0/protocol").and_then(serde_json::Value::as_str), Some("v3"));
+  assert_eq!(
+    event.pointer("/sources/0/endpoints").and_then(serde_json::Value::as_array).map(Vec::len),
+    Some(0)
+  );
 }
 
 #[test]

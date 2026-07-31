@@ -38,6 +38,7 @@ enum CaseKind {
   NugetStoragePolicy,
   NugetCliOverrides,
   NugetLocalSources,
+  NugetServiceIndex,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -64,6 +65,7 @@ struct Fixtures<'a> {
   nuget_storage_policy: &'a Path,
   nuget_cli_overrides: &'a Path,
   nuget_local_sources: &'a Path,
+  nuget_service_index: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -310,6 +312,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_service_index",
+    kind: CaseKind::NugetServiceIndex,
+    args: &["oracle/bin/Release/ServiceIndexOracle.dll", "https://api.nuget.org/v3/index.json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -503,6 +511,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_service_index",
+    kind: CaseKind::NugetServiceIndex,
+    args: &["project", "package-sources", "ServiceIndex.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -636,6 +650,7 @@ fn run() -> Result<()> {
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
+  let nuget_service_index_fixture = repository.join("benchmarks/fixtures/nuget-service-index");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -652,6 +667,7 @@ fn run() -> Result<()> {
     nuget_storage_policy: &nuget_storage_policy_fixture,
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
     nuget_local_sources: &nuget_local_sources_fixture,
+    nuget_service_index: &nuget_service_index_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -711,6 +727,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_local_sources") {
     verify_nuget_local_sources(&repository, &dv_executable, &nuget_local_sources_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_service_index") {
+    verify_nuget_service_index(&repository, &dv_executable, &nuget_service_index_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -730,7 +749,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 12,
+    schema_version: 13,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2347,6 +2366,81 @@ fn verify_nuget_local_sources(repository: &Path, dv_executable: &Path, fixture: 
   Ok(())
 }
 
+fn verify_nuget_service_index(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let workspace = repository.join(format!("target/benchmark-nuget-service-index-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &workspace)?;
+  reset_fixture(fixture, &workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "oracle/ServiceIndexOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &workspace,
+    "NuGet service-index oracle build",
+  )?;
+  reset_service_index_iteration(&workspace)?;
+  let oracle_text = service_index_command_text(
+    Path::new("dotnet"),
+    &["oracle/bin/Release/ServiceIndexOracle.dll", "https://api.nuget.org/v3/index.json"],
+    &workspace,
+  )?;
+  let oracle: serde_json::Value = serde_json::from_str(&oracle_text)?;
+  reset_service_index_iteration(&workspace)?;
+  let dv_text = service_index_command_text(dv_executable, &["project", "package-sources", "ServiceIndex.csproj", "--json"], &workspace)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv service-index verification omitted package_sources_inspected")?;
+  let source = dv
+    .get("sources")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|sources| sources.first())
+    .ok_or("dv service-index verification omitted its source")?;
+  if required_string(source, "name")? != "nuget.org"
+    || required_string(source, "location")? != "https://api.nuget.org/v3/index.json"
+    || required_string(source, "protocol")? != "v3"
+  {
+    return Err(format!("dv service-index source differs: {source}").into());
+  }
+  for (oracle_field, kind) in [
+    ("registration", "registration"),
+    ("packageContent", "package_content"),
+    ("search", "search"),
+    ("vulnerability", "vulnerability"),
+    ("packagePublish", "package_publish"),
+  ] {
+    let expected = string_array(&oracle, oracle_field)?;
+    let actual = package_service_endpoints(source, kind)?;
+    if expected != actual {
+      return Err(format!("NuGet {kind} endpoint mismatch: oracle={expected:?} dv={actual:?}").into());
+    }
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(1)
+    || dv.get("downloaded_bytes").and_then(serde_json::Value::as_u64).is_none_or(|bytes| bytes == 0)
+  {
+    return Err("dv service-index verification did not report one nonempty response".into());
+  }
+  Ok(())
+}
+
+fn package_service_endpoints(source: &serde_json::Value, kind: &str) -> Result<Vec<String>> {
+  source
+    .get("endpoints")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv package source omitted endpoints")?
+    .iter()
+    .filter(|endpoint| endpoint.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+    .map(|endpoint| {
+      endpoint
+        .get("location")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("dv {kind} endpoint omitted location").into())
+    })
+    .collect()
+}
+
 fn assert_relative_policy_path(value: &serde_json::Value, field: &str, workspace: &Path, expected: &str) -> Result<()> {
   let path = value
     .get(field)
@@ -2628,6 +2722,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
+      | CaseKind::NugetServiceIndex
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -2635,6 +2730,14 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
+  }
+  if matches!(case.kind, CaseKind::NugetServiceIndex) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &["build", "oracle/ServiceIndexOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+      workspace,
+      "NuGet service-index oracle build",
+    )?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
     run_checked(executable, &["restore", "--nologo", "--verbosity", "quiet"], workspace, "compiler plan restore")?;
@@ -3055,6 +3158,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
+    CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
       reset_fixture(fixture, workspace)
@@ -3065,6 +3169,10 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     },
     CaseKind::Startup | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm => Ok(()),
   }
+}
+
+fn reset_service_index_iteration(workspace: &Path) -> Result<()> {
+  remove_generated_path(&workspace.join(".http-cache"))
 }
 
 fn reset_pack_inventory_cache(workspace: &Path) -> Result<()> {
@@ -3116,6 +3224,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
+    CaseKind::NugetServiceIndex => fixtures.nuget_service_index,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -3137,6 +3246,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
+    CaseKind::NugetServiceIndex => Some("nuget-service-index"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -3155,6 +3265,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
+      | CaseKind::NugetServiceIndex
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd);
   }
@@ -3184,6 +3295,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetLocalSources
     ) {
     Some(parse_work_evidence(&output.stdout)?)
+  } else if !is_dotnet(executable) && matches!(case.kind, CaseKind::NugetServiceIndex) {
+    Some(parse_source_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
     Some(reference_package_work(cwd)?)
   } else {
@@ -3247,6 +3360,23 @@ fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
         .transpose()?
         .ok_or("dv package event omitted packages")?,
     ),
+  })
+}
+
+fn parse_source_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
+  let text = std::str::from_utf8(stdout)?;
+  let event = text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv source inspection did not emit package_sources_inspected")?;
+  Ok(WorkEvidence {
+    network_requests: event.get("network_requests").and_then(serde_json::Value::as_u64),
+    downloaded_bytes: event.get("downloaded_bytes").and_then(serde_json::Value::as_u64),
+    downloaded_packages: None,
+    resolved_packages: None,
   })
 }
 
@@ -3349,6 +3479,9 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
     apply_nuget_storage_environment(command, cwd);
   } else if matches!(kind, CaseKind::NugetCliOverrides) {
     apply_nuget_cli_environment(command, cwd);
+  } else if matches!(kind, CaseKind::NugetServiceIndex) {
+    apply_nuget_config_environment(command, cwd);
+    command.env("NUGET_HTTP_CACHE_PATH", cwd.join(".http-cache"));
   } else {
     apply_nuget_config_environment(command, cwd);
   }
@@ -3407,6 +3540,15 @@ fn nuget_config_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Re
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+fn service_index_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_case_nuget_environment(&mut command, CaseKind::NugetServiceIndex, cwd);
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, "NuGet service-index command")?;
+  Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
 fn nuget_storage_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
   let mut command = Command::new(executable);
   command.args(args).current_dir(cwd);
@@ -3426,9 +3568,7 @@ fn nuget_cli_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Resul
 }
 
 fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
-  if destination.exists() {
-    fs::remove_dir_all(destination)?;
-  }
+  remove_generated_path(destination)?;
   copy_directory(source, destination)
 }
 
@@ -3558,6 +3698,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_storage_policy"
           | "nuget_cli_overrides"
           | "nuget_local_sources"
+          | "nuget_service_index"
       )
     })
     .collect::<Vec<_>>();
@@ -3603,6 +3744,10 @@ fn render_summary(report: &Report, color: bool) -> String {
             format_integer(downloaded),
             format_integer(bytes)
           )
+        },
+        (_, None, None, Some(requests), Some(bytes)) => {
+          let request_label = if requests == 1 { "request" } else { "requests" };
+          format!("max {requests} HTTP {request_label} · max {} response bytes", format_integer(bytes))
         },
         _ => "not exposed by command".to_owned(),
       };
@@ -3686,6 +3831,7 @@ fn case_label(case: &str) -> &str {
     "nuget_storage_policy" => "NuGet storage policy",
     "nuget_cli_overrides" => "NuGet CLI overrides",
     "nuget_local_sources" => "NuGet local sources",
+    "nuget_service_index" => "NuGet service index",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -3769,7 +3915,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 12,
+      schema_version: 13,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -3833,7 +3979,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 12,
+      schema_version: 13,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

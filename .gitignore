@@ -23,3 +23,4 @@
 /benchmarks/fixtures/nuget-local-sources/.seed/
 /benchmarks/fixtures/nuget-local-sources/feeds/
 /benchmarks/fixtures/nuget-local-sources/dv.lock.json
+/benchmarks/fixtures/nuget-service-index/.http-cache/

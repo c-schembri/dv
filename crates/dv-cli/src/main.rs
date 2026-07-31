@@ -10,10 +10,11 @@ use std::{
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
   FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions,
-  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
-  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, ProjectConfiguration, ProjectError, ProjectErrorKind,
+  ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
+  RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity,
+  discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
+  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -55,6 +56,8 @@ Usage:
   dv project inspect [PROJECT] [--configuration Debug|Release]
   dv project frameworks [PROJECT] [--packages PATH]
   dv project runtime-packs [PROJECT] [--packages PATH]
+  dv project package-sources [PROJECT] [-s|--source SOURCE]...
+                             [--configfile PATH] [--offline]
 ";
 
 const BUILD_HELP: &str = "\
@@ -202,21 +205,7 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Ok(project) => project,
     Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
-  let options = PackageResolveOptions {
-    packages_directory: options
-      .packages_directory
-      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
-    config_file: options
-      .config_file
-      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
-    sources: options
-      .sources
-      .into_iter()
-      .map(|source| normalize_command_source(source, &current_directory))
-      .collect(),
-    offline: options.offline,
-    write_lock: true,
-  };
+  let options = normalize_package_options(options, &current_directory, true);
   let resolutions = match resolve_package_inputs(&[&project], &options) {
     Ok(resolutions) => resolutions,
     Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
@@ -226,6 +215,24 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     return write_package_resolution(resolution);
   }
   succeed(started, command, args, package_resolution_payload(&project, resolution))
+}
+
+fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> PackageResolveOptions {
+  PackageResolveOptions {
+    packages_directory: options
+      .packages_directory
+      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
+    config_file: options
+      .config_file
+      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
+    sources: options
+      .sources
+      .into_iter()
+      .map(|source| normalize_command_source(source, current_directory))
+      .collect(),
+    offline: options.offline,
+    write_lock,
+  }
 }
 
 struct PackageCommandOptions {
@@ -720,6 +727,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     || matches!(project_args, [inspect, argument] if inspect == "inspect" && matches!(argument.as_str(), "help" | "--help" | "-h"))
     || matches!(project_args, [frameworks, argument] if frameworks == "frameworks" && matches!(argument.as_str(), "help" | "--help" | "-h"))
     || matches!(project_args, [packs, argument] if packs == "runtime-packs" && matches!(argument.as_str(), "help" | "--help" | "-h"))
+    || matches!(project_args, [sources, argument] if sources == "package-sources" && matches!(argument.as_str(), "help" | "--help" | "-h"))
   {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
@@ -729,6 +737,9 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   }
   if project_args.first().map(String::as_str) == Some("frameworks") {
     return project_frameworks(started, json, args, &project_args[1..]);
+  }
+  if project_args.first().map(String::as_str) == Some("package-sources") {
+    return project_package_sources(started, json, args, &project_args[1..]);
   }
   if project_args.first().map(String::as_str) != Some("inspect") {
     let subcommand = project_args.first().map_or("<missing>", String::as_str);
@@ -829,6 +840,99 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     self_contained: project.self_contained(),
   };
   succeed(started, "project inspect", args, payload)
+}
+
+fn project_package_sources(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+  let parsed = match parse_package_args("project package-sources", project_args) {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "project package-sources",
+        args,
+        diagnostic(
+          "DV0002",
+          problem,
+          None,
+          Some("Use `dv project package-sources --help` to inspect the accepted arguments."),
+        ),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "project package-sources",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, parsed.project.as_deref(), ProjectConfiguration::Debug) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "project package-sources", args, project_diagnostic(error)),
+  };
+  let options = normalize_package_options(parsed, &current_directory, false);
+  let inventories = match inspect_package_sources(&[&project], &options) {
+    Ok(inventories) => inventories,
+    Err(error) => return fail(started, json, "project package-sources", args, package_diagnostic(error)),
+  };
+  let inventory = &inventories[0];
+  if !json {
+    return write_package_sources(inventory);
+  }
+  let sources = inventory
+    .sources()
+    .map(|source| PackageSourceCapabilityEvent {
+      name: inventory.source_name(source).to_owned(),
+      location: inventory.source_location(source).to_owned(),
+      protocol: inventory.source_protocol(source).to_owned(),
+      endpoints: inventory
+        .source_endpoints(source)
+        .map(|endpoint| PackageServiceEndpointEvent {
+          kind: inventory.endpoint_kind(endpoint).as_str().to_owned(),
+          location: inventory.endpoint_location(endpoint).to_owned(),
+        })
+        .collect(),
+    })
+    .collect();
+  succeed(
+    started,
+    "project package-sources",
+    args,
+    EventPayload::PackageSourcesInspected {
+      project: project.project_path().display().to_string(),
+      sources,
+      network_requests: inventory.network_requests(),
+      downloaded_bytes: inventory.downloaded_bytes(),
+    },
+  )
+}
+
+fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
+  let mut output = String::with_capacity(1024);
+  use std::fmt::Write as _;
+  for source in inventory.sources() {
+    writeln!(output, "{} ({})", inventory.source_name(source), inventory.source_protocol(source)).expect("writing a String succeeds");
+    for endpoint in inventory.source_endpoints(source) {
+      writeln!(
+        output,
+        "  {:<15} {}",
+        inventory.endpoint_kind(endpoint).as_str(),
+        inventory.endpoint_location(endpoint)
+      )
+      .expect("writing a String succeeds");
+    }
+  }
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing package-source output to stdout succeeds");
+  ExitCode::SUCCESS
 }
 
 fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {

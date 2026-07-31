@@ -39,8 +39,8 @@ mapping ahead of service-index requests and emitting a dedicated unmapped-ID
 diagnostic is the remaining `NUGET-013` work.
 
 Audit source rows are parsed, merged, typed, and retained. Audit mode and level
-selection are implemented by `NUGET-004`; vulnerability endpoint discovery and
-advisory evaluation remain in `NUGET-007` and `RES-024`.
+selection are implemented by `NUGET-004`, and vulnerability endpoint discovery
+by `NUGET-007`; advisory evaluation remains in `RES-024`.
 
 ## Layout And Cost
 

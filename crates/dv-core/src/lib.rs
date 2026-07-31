@@ -16,8 +16,9 @@ mod sdk;
 pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_compiler_inputs, plan_compiler_inputs_with_packages};
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
-  CacheOutcome, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
-  ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent, SdkInstallationEvent, validate_events,
+  CacheOutcome, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
+  ProjectFrameworkReferenceEvent, ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent, SdkInstallationEvent,
+  validate_events,
 };
 pub use framework::{FrameworkFamily, TargetFramework, TargetFrameworkError};
 pub use framework_reference::{
@@ -25,8 +26,8 @@ pub use framework_reference::{
 };
 pub use pack_requirement::{PackAcquisition, PackKind, PackRequirement};
 pub use package::{
-  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, SignatureValidationMode,
-  resolve_package_inputs,
+  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, PackageServiceKind, PackageSourceInventory, ResolvedPackage,
+  RuntimeTargetKind, SignatureValidationMode, inspect_package_sources, resolve_package_inputs,
 };
 pub use project::{
   FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec,

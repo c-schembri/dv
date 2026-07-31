@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 7;
+pub const EVENT_SCHEMA_VERSION: u16 = 8;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,6 +45,28 @@ pub struct Event {
   /// Event-specific data.
   #[serde(flatten)]
   pub payload: EventPayload,
+}
+
+/// One selected NuGet service endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageServiceEndpointEvent {
+  /// Stable capability spelling.
+  pub kind: String,
+  /// Absolute endpoint URL advertised by the source.
+  pub location: String,
+}
+
+/// One effective package source and its selected capabilities.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageSourceCapabilityEvent {
+  /// Configuration key or command-line source identity.
+  pub name: String,
+  /// Configured source URL or local path.
+  pub location: String,
+  /// `local`, `v2`, or `v3`.
+  pub protocol: String,
+  /// Capability-ordered endpoint batch.
+  pub endpoints: Vec<PackageServiceEndpointEvent>,
 }
 
 impl Event {
@@ -425,6 +447,17 @@ pub enum EventPayload {
     /// HTTP requests made.
     network_requests: u32,
     /// Package payload bytes downloaded.
+    downloaded_bytes: u64,
+  },
+  /// Effective package sources and v3 capabilities were inspected.
+  PackageSourcesInspected {
+    /// Full project-file path whose configuration hierarchy was used.
+    project: String,
+    /// Sources in merged configuration order.
+    sources: Vec<PackageSourceCapabilityEvent>,
+    /// Service-index HTTP requests performed.
+    network_requests: u32,
+    /// Service-index response bytes read.
     downloaded_bytes: u64,
   },
   /// A structured diagnostic was produced.

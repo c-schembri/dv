@@ -237,6 +237,7 @@ name = "dv-cli"
 version = "0.1.0"
 dependencies = [
  "dv-core",
+ "serde_json",
 ]
 
 [[package]]

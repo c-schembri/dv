@@ -12,8 +12,11 @@ explicitly unsupported until their pack and compiler policies are captured.
 
 NuGet sources are typed records containing URL and protocol generation:
 
-- v3 sources discover `PackageBaseAddress` from the service index and derive
-  exact normalized package-content URLs from that advertised base;
+- v3 sources resolve registration, package-content, search, vulnerability,
+  and package-publish resources using NuGet's ordered type and compatible
+  client-version rules; restore derives exact normalized package URLs from the
+  selected `PackageBaseAddress`, while the other endpoint consumers remain
+  separate features;
 - v2 sources enumerate ranged versions through bounded, cycle-checked
   `FindPackagesById` Atom continuations, then read the exact OData package
   entry and its advertised content URL, SHA-512, and size;
@@ -251,6 +254,12 @@ The local-source case maps two public packages across flat and hierarchical
 feeds, clears the global cache and restore outputs before every sample, and
 compares configured source paths, identities, versions, and SHA-512 values.
 `dv` must publish both entries while reporting zero HTTP requests.
+
+The service-index case performs one live, uncached HTTPS request in each tool
+and compares every selected registration, package-content, search,
+vulnerability, and publish endpoint with the SDK-shipped `NuGet.Protocol`
+implementation. The protocol client version is explicit and independent of
+the selected .NET SDK version.
 
 The next cold-path optimization is a persistent conditional service-index
 cache keyed by normalized source URL and validators such as ETag or
