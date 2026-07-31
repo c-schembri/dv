@@ -156,6 +156,9 @@ Initial codes:
 | `DV0407` | Package cache or lock filesystem failure |
 | `DV0408` | Package path is not Unicode |
 | `DV0409` | Package compact range overflow |
+| `DV0410` | NuGet credential-provider discovery or protocol failure |
+| `DV0411` | Package authentication or provider work was cancelled |
+| `DV0412` | Package-source mapping selected no enabled source for an uncached identity |
 
 Codes are never reused for a different meaning.
 

@@ -35,6 +35,7 @@ enum CaseKind {
   NugetConfigHierarchy,
   NugetConfigMerge,
   NugetSourceSections,
+  NugetSourceMapping,
   NugetStoragePolicy,
   NugetCliOverrides,
   NugetLocalSources,
@@ -67,6 +68,7 @@ struct Fixtures<'a> {
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
+  nuget_source_mapping: &'a Path,
   nuget_storage_policy: &'a Path,
   nuget_cli_overrides: &'a Path,
   nuget_local_sources: &'a Path,
@@ -264,6 +266,22 @@ const DOTNET_CASES: &[Case] = &[
       "restore",
       "SourceSections.csproj",
       "--locked-mode",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "nuget_source_mapping",
+    kind: CaseKind::NugetSourceMapping,
+    args: &[
+      "restore",
+      "SourceMapping.csproj",
+      "--packages",
+      ".packages",
       "--no-http-cache",
       "-p:NuGetAudit=false",
       "--nologo",
@@ -522,6 +540,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_source_mapping",
+    kind: CaseKind::NugetSourceMapping,
+    args: &["restore", "SourceMapping.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_storage_policy",
     kind: CaseKind::NugetStoragePolicy,
     args: &["restore", "StoragePolicy.csproj", "--offline", "--json"],
@@ -724,6 +748,7 @@ fn run() -> Result<()> {
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
+  let nuget_source_mapping_fixture = repository.join("benchmarks/fixtures/nuget-source-mapping");
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
@@ -746,6 +771,7 @@ fn run() -> Result<()> {
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
+    nuget_source_mapping: &nuget_source_mapping_fixture,
     nuget_storage_policy: &nuget_storage_policy_fixture,
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
     nuget_local_sources: &nuget_local_sources_fixture,
@@ -805,6 +831,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_source_sections") {
     verify_nuget_source_sections(&repository, &dv_executable, &nuget_source_sections_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_source_mapping") {
+    verify_nuget_source_mapping(&repository, &dv_executable, &nuget_source_mapping_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "nuget_storage_policy") {
     verify_nuget_storage_policy(&repository, &dv_executable, &nuget_storage_policy_fixture)?;
   }
@@ -851,7 +880,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 16,
+    schema_version: 17,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -1357,6 +1386,47 @@ fn validate_pack_failure(output: &Output, reference: bool) -> Result<()> {
   }
   if diagnostic.get("help").and_then(serde_json::Value::as_str) != Some("Restore the required pack from a configured package source.") {
     return Err("dv unavailable-pack diagnostic omitted acquisition guidance".into());
+  }
+  Ok(())
+}
+
+fn validate_source_mapping_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("unmapped package-source benchmark unexpectedly succeeded".into());
+  }
+  if reference {
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    if !text.contains("NU1100") || !text.contains("Unmapped.Package") || !text.contains("PackageSourceMapping is enabled") {
+      return Err(format!("dotnet unmapped-package diagnostic omitted source-mapping evidence: {text}").into());
+    }
+    if text.contains("NU1301") {
+      return Err(format!("dotnet contacted the unreachable source before applying package-source mapping: {text}").into());
+    }
+    return Ok(());
+  }
+  if !output.stderr.is_empty() {
+    return Err(format!("dv JSON source-mapping diagnostic wrote stderr: {}", String::from_utf8_lossy(&output.stderr)).into());
+  }
+  let diagnostic = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic").cloned())
+    .ok_or("dv unmapped-package command omitted its diagnostic event")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0412") {
+    return Err(format!("dv unmapped-package diagnostic is not DV0412: {diagnostic}").into());
+  }
+  let identity = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+    context.iter().find_map(|field| {
+      (field.get("name").and_then(serde_json::Value::as_str) == Some("package_id"))
+        .then(|| field.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    })
+  });
+  if identity != Some("unmapped.package") {
+    return Err(format!("dv unmapped-package diagnostic has the wrong package_id: {diagnostic}").into());
   }
   Ok(())
 }
@@ -2082,6 +2152,37 @@ fn verify_nuget_source_sections(repository: &Path, dv_executable: &Path, fixture
     return Err("NuGet source-section package hash differs between dotnet and dv".into());
   }
   Ok(())
+}
+
+fn verify_nuget_source_mapping(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join("target/benchmark-nuget-source-mapping-verification");
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+
+  let dotnet_args = [
+    "restore",
+    "SourceMapping.csproj",
+    "--packages",
+    ".packages",
+    "--no-http-cache",
+    "-p:NuGetAudit=false",
+    "--nologo",
+    "--verbosity",
+    "quiet",
+  ];
+  let mut dotnet = Command::new("dotnet");
+  dotnet.args(dotnet_args).current_dir(&dotnet_workspace);
+  apply_nuget_config_environment(&mut dotnet, &dotnet_workspace);
+  validate_source_mapping_failure(&dotnet.output()?, true)?;
+
+  let dv_args = ["restore", "SourceMapping.csproj", "--packages", ".packages", "--json"];
+  let mut dv = Command::new(dv_executable);
+  dv.args(dv_args).current_dir(&dv_workspace);
+  apply_nuget_config_environment(&mut dv, &dv_workspace);
+  validate_source_mapping_failure(&dv.output()?, false)
 }
 
 fn verify_nuget_storage_policy(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -3319,6 +3420,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
+      | CaseKind::NugetSourceMapping
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -3834,9 +3936,12 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
-    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
-      reset_fixture(fixture, workspace)
-    },
+    CaseKind::RestoreCold
+    | CaseKind::PackageSyncCold
+    | CaseKind::PackageGraphCold
+    | CaseKind::PackageGraphMassive
+    | CaseKind::PackDiagnostic
+    | CaseKind::NugetSourceMapping => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
       run_checked(executable, restore_args(executable), workspace, "clean build restore")
@@ -3895,6 +4000,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
+    CaseKind::NugetSourceMapping => fixtures.nuget_source_mapping,
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
@@ -3922,6 +4028,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
+    CaseKind::NugetSourceMapping => Some("nuget-source-mapping"),
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
@@ -3946,6 +4053,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
+      | CaseKind::NugetSourceMapping
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -3962,13 +4070,22 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
   if matches!(case.kind, CaseKind::PackDiagnostic) {
     validate_pack_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
+    validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else {
     check_output(output.clone(), executable, case.args, "measured command")?;
   }
   if !is_dotnet(executable) && matches!(case.kind, CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold) {
     validate_pack_inventory_cache(cwd)?;
   }
-  let work = if !is_dotnet(executable)
+  let work = if matches!(case.kind, CaseKind::NugetSourceMapping) {
+    Some(WorkEvidence {
+      network_requests: Some(0),
+      downloaded_bytes: Some(0),
+      downloaded_packages: None,
+      resolved_packages: None,
+    })
+  } else if !is_dotnet(executable)
     && matches!(
       case.kind,
       CaseKind::PackageSyncCold
@@ -3982,7 +4099,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetStoragePolicy
         | CaseKind::NugetCliOverrides
         | CaseKind::NugetLocalSources
-    ) {
+    )
+  {
     Some(parse_work_evidence(&output.stdout)?)
   } else if !is_dotnet(executable)
     && matches!(
@@ -4502,6 +4620,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_config_hierarchy"
           | "nuget_config_merge"
           | "nuget_source_sections"
+          | "nuget_source_mapping"
           | "nuget_storage_policy"
           | "nuget_cli_overrides"
           | "nuget_local_sources"
@@ -4640,6 +4759,7 @@ fn case_label(case: &str) -> &str {
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",
     "nuget_source_sections" => "NuGet source sections",
+    "nuget_source_mapping" => "NuGet source mapping",
     "nuget_storage_policy" => "NuGet storage policy",
     "nuget_cli_overrides" => "NuGet CLI overrides",
     "nuget_local_sources" => "NuGet local sources",
@@ -4732,7 +4852,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 16,
+      schema_version: 17,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -4796,7 +4916,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 16,
+      schema_version: 17,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

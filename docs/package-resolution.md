@@ -81,10 +81,12 @@ as package sources; audit execution remains a later policy feature.
 `packageSourceMapping` stores source rows with contiguous pattern ranges.
 Exact matches outrank prefix wildcards, longer prefixes outrank shorter ones,
 and equally specific matches may select multiple sources. Matching is
-case-insensitive and allocation-free during graph work. It currently filters
-package metadata/version and archive requests after service-index discovery;
-moving that filter ahead of every network request and diagnosing unmapped IDs
-is tracked by `NUGET-013`.
+case-insensitive and allocation-free during graph work. Restore applies the
+winning source set before local-feed inspection, v2 endpoint materialization,
+or v3 service-index I/O, then lazily activates newly required sources as the
+dependency graph expands. Exact and ranged cache hits remain source-independent;
+an uncached identity with no enabled winner fails as `DV0412` without source
+work.
 
 `dv restore` and `dv sync` dispatch to the same package transform with
 identical options, cache behavior, lock behavior, diagnostics, and output
@@ -229,6 +231,9 @@ them. `dv.lock.json` is project-owned persistent state.
 | Cache or lock I/O failure | `DV0407` |
 | Non-Unicode retained path | `DV0408` |
 | Compact range or text overflow | `DV0409` |
+| Credential-provider discovery or protocol failure | `DV0410` |
+| Package authentication or provider work cancelled | `DV0411` |
+| Uncached identity has no enabled winning source mapping | `DV0412` |
 
 Unsupported package build-target execution, signature enforcement, floating
 versions, and advanced conflict rules fail instead of being approximated.

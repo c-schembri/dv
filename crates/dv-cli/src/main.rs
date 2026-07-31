@@ -1445,6 +1445,11 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
 }
 
 fn package_diagnostic(error: PackageError) -> Diagnostic {
+  let context_name = if error.kind() == PackageErrorKind::UnmappedIdentity {
+    "package_id"
+  } else {
+    "context"
+  };
   let code = match error.kind() {
     PackageErrorKind::Configuration => "DV0400",
     PackageErrorKind::Resolution => "DV0401",
@@ -1458,6 +1463,7 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     PackageErrorKind::TextOverflow => "DV0409",
     PackageErrorKind::CredentialProvider => "DV0410",
     PackageErrorKind::Cancelled => "DV0411",
+    PackageErrorKind::UnmappedIdentity => "DV0412",
   };
   let help = match error.kind() {
     PackageErrorKind::OfflineMiss => Some("Populate the global package cache or rerun without --offline."),
@@ -1466,6 +1472,7 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     PackageErrorKind::Network => Some("Check source availability, proxy settings, and package identity/version."),
     PackageErrorKind::CredentialProvider => Some("Install a self-contained NuGet V2 credential provider and check its timeout and login policy."),
     PackageErrorKind::Cancelled => Some("Rerun the command when package authentication can complete."),
+    PackageErrorKind::UnmappedIdentity => Some("Add a matching packageSourceMapping pattern for this package identity and an enabled source."),
     PackageErrorKind::Integrity | PackageErrorKind::Archive => Some("Remove the corrupt cache entry and retry from a trusted source."),
     PackageErrorKind::Resolution | PackageErrorKind::Io | PackageErrorKind::NonUnicodePath | PackageErrorKind::TextOverflow => None,
   };
@@ -1473,7 +1480,7 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     code,
     error.to_string(),
     Some(ContextField {
-      name: "context".into(),
+      name: context_name.into(),
       value: error.context().into(),
     }),
     help,

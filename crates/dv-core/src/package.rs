@@ -949,6 +949,8 @@ pub enum PackageErrorKind {
   CredentialProvider,
   /// Package work was cooperatively cancelled.
   Cancelled,
+  /// Package-source mapping selected no enabled source for an identity.
+  UnmappedIdentity,
 }
 
 /// A package failure with stable path or source context.
@@ -1866,10 +1868,14 @@ struct SourcePattern {
   prefix: bool,
 }
 
-const _: () = assert!(size_of::<SourceMappingEntry>() == 12);
-const _: () = assert!(align_of::<SourceMappingEntry>() == 4);
-const _: () = assert!(size_of::<SourcePattern>() == 12);
-const _: () = assert!(align_of::<SourcePattern>() == 4);
+const _: () = {
+  assert!(size_of::<PackageSourceMapping>() == 48);
+  assert!(align_of::<PackageSourceMapping>() == 8);
+  assert!(size_of::<SourceMappingEntry>() == 12);
+  assert!(align_of::<SourceMappingEntry>() == 4);
+  assert!(size_of::<SourcePattern>() == 12);
+  assert!(align_of::<SourcePattern>() == 4);
+};
 
 struct PendingSourceMapping {
   source: String,
@@ -3924,6 +3930,7 @@ impl PackageSourceMapping {
 
   /// Mapping is parsed once, then queried for every graph identity. The query
   /// scans only compact records and the shared text buffer; it never allocates.
+  #[cfg(test)]
   fn allows(&self, source_index: u32, package_id: &str) -> bool {
     let mut best = 0usize;
     let mut source_best = 0usize;
@@ -3940,6 +3947,43 @@ impl PackageSourceMapping {
       }
     }
     best != 0 && source_best == best
+  }
+
+  fn required_rank(&self, package_id: &str) -> Option<usize> {
+    let mut best = 0usize;
+    for source in &self.sources {
+      for pattern in &self.patterns[range(source.patterns)] {
+        let Some(rank) = self.pattern_rank(*pattern, package_id) else {
+          continue;
+        };
+        best = best.max(rank);
+      }
+    }
+    (best != 0).then_some(best)
+  }
+
+  fn enabled_rank(&self, package_id: &str) -> Option<usize> {
+    let required = self.required_rank(package_id)?;
+    self.source_indices_at_rank(package_id, required).next().map(|_| required)
+  }
+
+  fn source_indices_at_rank<'a>(&'a self, package_id: &'a str, required: usize) -> impl Iterator<Item = u32> + 'a {
+    self.sources.iter().filter_map(move |source| {
+      (source.source_index != u32::MAX
+        && self.patterns[range(source.patterns)]
+          .iter()
+          .any(|pattern| self.pattern_rank(*pattern, package_id) == Some(required)))
+      .then_some(source.source_index)
+    })
+  }
+
+  fn source_matches_rank(&self, source_index: u32, package_id: &str, required: usize) -> bool {
+    self
+      .sources
+      .iter()
+      .filter(|source| source.source_index == source_index)
+      .flat_map(|source| &self.patterns[range(source.patterns)])
+      .any(|pattern| self.pattern_rank(*pattern, package_id) == Some(required))
   }
 
   fn pattern_rank(&self, pattern: SourcePattern, package_id: &str) -> Option<usize> {
@@ -4076,53 +4120,162 @@ fn source_redirect_policy(allow_insecure: bool) -> reqwest::redirect::Policy {
   })
 }
 
-async fn discover_service_endpoints(
-  client: &reqwest::Client,
-  sources: &[(String, PackageSource)],
-  credentials: &SourceCredentialBatch,
+struct LazyServiceEndpoints {
+  slots: Vec<Option<ServiceEndpoint>>,
+  snapshot: Arc<[ServiceEndpoint]>,
+}
+
+#[derive(Clone, Copy)]
+struct ServiceDiscoveryOptions {
+  worker_budget: usize,
   allow_network: bool,
-) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
-  let mut local = Vec::with_capacity(sources.len());
-  let mut remote = Vec::with_capacity(sources.len());
-  let mut requests = 0;
-  for (index, (_, source)) in sources.iter().enumerate() {
-    let source_index = u32_len(index, "NuGet package-source index")?;
-    match source.protocol {
-      NugetProtocol::Local => {
-        let root = PathBuf::from(&source.url);
-        local.push(ServiceEndpoint::Local {
-          source: source.url.clone(),
-          layout: detect_local_feed_layout(&root)?,
-          root,
-          source_index,
-        });
-      },
-      NugetProtocol::V2 if allow_network => remote.push(ServiceEndpoint::V2 {
-        source: source.url.clone(),
-        base: with_trailing_slash(source.url.clone()),
-        credential: credentials.get(index).cloned(),
-        source_index,
-      }),
-      NugetProtocol::V3 if allow_network => {
-        let credential = credentials.get(index).cloned();
-        let (services, _) = fetch_v3_service_index(client, credential.as_deref(), &source.url).await?;
-        requests += 1;
-        let services = Arc::new(services);
-        if services.package_base_address().is_none() {
-          return Err(network_error(&source.url, "NuGet v3 source has no compatible PackageBaseAddress resource"));
-        }
-        remote.push(ServiceEndpoint::V3 {
-          source: source.url.clone(),
-          services,
-          credential,
-          source_index,
-        });
-      },
-      NugetProtocol::V2 | NugetProtocol::V3 => {},
+}
+
+const _: () = assert!(size_of::<LazyServiceEndpoints>() == 40);
+const _: () = assert!(align_of::<LazyServiceEndpoints>() == 8);
+const _: () = assert!(size_of::<ServiceDiscoveryOptions>() == 16);
+const _: () = assert!(align_of::<ServiceDiscoveryOptions>() == 8);
+
+impl LazyServiceEndpoints {
+  fn new(source_count: usize) -> Self {
+    Self {
+      slots: std::iter::repeat_with(|| None).take(source_count).collect(),
+      snapshot: Arc::from([]),
     }
   }
-  local.extend(remote);
-  Ok((local, requests))
+
+  async fn ensure_identity(
+    &mut self,
+    client: &reqwest::Client,
+    sources: &[(String, PackageSource)],
+    credentials: &SourceCredentialBatch,
+    mapping: Option<&PackageSourceMapping>,
+    package_id: &str,
+    options: ServiceDiscoveryOptions,
+  ) -> Result<u32, PackageError> {
+    debug_assert!(options.worker_budget > 0);
+    let worker_budget = options.worker_budget.max(1);
+    let required_rank = mapping.and_then(|mapping| mapping.enabled_rank(package_id));
+    if mapping.is_some() && required_rank.is_none() {
+      return Err(unmapped_identity(package_id));
+    }
+
+    let mut matched = false;
+    let mut changed = false;
+    let mut jobs = Vec::new();
+    let mut select_source = |index: usize| -> Result<(), PackageError> {
+      let (_, source) = &sources[index];
+      let source_index = u32_len(index, "NuGet package-source index")?;
+      matched = true;
+      if self.slots[index].is_some() {
+        return Ok(());
+      }
+      match source.protocol {
+        NugetProtocol::Local => {
+          let root = PathBuf::from(&source.url);
+          self.slots[index] = Some(ServiceEndpoint::Local {
+            source: source.url.clone(),
+            layout: detect_local_feed_layout(&root)?,
+            root,
+            source_index,
+          });
+          changed = true;
+        },
+        NugetProtocol::V2 if options.allow_network => {
+          self.slots[index] = Some(ServiceEndpoint::V2 {
+            source: source.url.clone(),
+            base: with_trailing_slash(source.url.clone()),
+            credential: credentials.get(index).cloned(),
+            source_index,
+          });
+          changed = true;
+        },
+        NugetProtocol::V3 if options.allow_network => jobs.push((index, source.url.clone(), credentials.get(index).cloned())),
+        NugetProtocol::V2 | NugetProtocol::V3 => {},
+      }
+      Ok(())
+    };
+    if let Some(mapping) = mapping {
+      for source_index in mapping.source_indices_at_rank(package_id, required_rank.expect("mapped identity has a rank")) {
+        select_source(source_index as usize)?;
+      }
+    } else {
+      for index in 0..sources.len() {
+        select_source(index)?;
+      }
+    }
+    if !matched {
+      return if mapping.is_some() { Err(unmapped_identity(package_id)) } else { Ok(0) };
+    }
+
+    let request_count =
+      u32::try_from(jobs.len()).map_err(|_| PackageError::new(PackageErrorKind::TextOverflow, package_id, "service-index request count exceeds u32"))?;
+    let mut pending = jobs.into_iter();
+    let mut tasks = JoinSet::new();
+    let mut completed = Vec::with_capacity(request_count as usize);
+    loop {
+      while tasks.len() < worker_budget {
+        let Some((index, source, credential)) = pending.next() else {
+          break;
+        };
+        let client = client.clone();
+        tasks.spawn(async move {
+          let result = fetch_v3_service_index(&client, credential.as_deref(), &source).await;
+          (index, source, credential, result)
+        });
+      }
+      let Some(result) = tasks.join_next().await else {
+        break;
+      };
+      completed
+        .push(result.map_err(|error| PackageError::new(PackageErrorKind::Io, "package-source scheduler", format!("service-index task failed: {error}")))?);
+    }
+    completed.sort_unstable_by_key(|(index, ..)| *index);
+    for (index, source, credential, result) in completed {
+      let (services, _) = result?;
+      if services.package_base_address().is_none() {
+        return Err(network_error(&source, "NuGet v3 source has no compatible PackageBaseAddress resource"));
+      }
+      self.slots[index] = Some(ServiceEndpoint::V3 {
+        source,
+        services: Arc::new(services),
+        credential,
+        source_index: u32_len(index, "NuGet package-source index")?,
+      });
+      changed = true;
+    }
+    if changed {
+      self.snapshot = endpoint_snapshot(&self.slots);
+    }
+    Ok(request_count)
+  }
+
+  fn snapshot(&self) -> Arc<[ServiceEndpoint]> {
+    Arc::clone(&self.snapshot)
+  }
+}
+
+fn endpoint_snapshot(slots: &[Option<ServiceEndpoint>]) -> Arc<[ServiceEndpoint]> {
+  slots
+    .iter()
+    .flatten()
+    .filter(|endpoint| endpoint.protocol() == NugetProtocol::Local)
+    .chain(slots.iter().flatten().filter(|endpoint| endpoint.protocol() != NugetProtocol::Local))
+    .cloned()
+    .collect::<Vec<_>>()
+    .into()
+}
+
+fn unmapped_identity(package_id: &str) -> PackageError {
+  PackageError::new(
+    PackageErrorKind::UnmappedIdentity,
+    package_id,
+    format!("package source mapping selects no enabled source for package {package_id}"),
+  )
+}
+
+fn source_mapping_selects(mapping: Option<&PackageSourceMapping>, selected_rank: Option<usize>, package_id: &str, source_index: u32) -> bool {
+  mapping.is_none_or(|mapping| selected_rank.is_some_and(|required| mapping.source_matches_rank(source_index, package_id, required)))
 }
 
 fn detect_local_feed_layout(root: &Path) -> Result<LocalFeedLayout, PackageError> {
@@ -4403,7 +4556,7 @@ async fn resolve_streaming_graph(
   }
   let mut ready = BTreeSet::new();
   stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
-  let mut endpoints: Option<Arc<[ServiceEndpoint]>> = None;
+  let mut endpoints: Option<LazyServiceEndpoints> = None;
   let mut network_requests = 0;
   let mut downloaded_bytes = 0;
   let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
@@ -4429,23 +4582,44 @@ async fn resolve_streaming_graph(
         version: version.normalized.clone(),
         direct: node.direct.is_some(),
       });
-      let cache_miss = request
-        .as_ref()
-        .is_none_or(|request| find_package_root(&config.cache_root, &config.fallback_roots, request).is_none());
-      if cache_miss && endpoints.is_none() {
+      let mapping_available = config.source_mapping.as_ref().is_none_or(|mapping| mapping.enabled_rank(&lower_id).is_some());
+      let needs_sources = match request.as_ref() {
+        Some(request) => find_package_root(&config.cache_root, &config.fallback_roots, request).is_none(),
+        None if !mapping_available => enumerate_cached_versions(&config.cache_root, &config.fallback_roots, &lower_id)?.is_empty(),
+        None => true,
+      };
+      if needs_sources {
+        if !mapping_available {
+          return Err(unmapped_identity(&lower_id));
+        }
         if !config.cache_root.is_dir() {
           fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
         }
-        let (discovered, requests) = discover_service_endpoints(client, &config.sources, &config.credentials, !options.offline).await?;
-        network_requests += requests;
-        endpoints = Some(discovered.into());
+        if endpoints.is_none() {
+          endpoints = Some(LazyServiceEndpoints::new(config.sources.len()));
+        }
+        network_requests += endpoints
+          .as_mut()
+          .expect("lazy endpoint state was initialized")
+          .ensure_identity(
+            client,
+            &config.sources,
+            &config.credentials,
+            config.source_mapping.as_deref(),
+            &lower_id,
+            ServiceDiscoveryOptions {
+              worker_budget: MAX_DOWNLOAD_WORKERS - tasks.len(),
+              allow_network: !options.offline,
+            },
+          )
+          .await?;
       }
 
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
       let task_fallback_roots = Arc::clone(&config.fallback_roots);
       let task_temp_root = config.temp_root.clone();
-      let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let generation = node.generation;
       let task_version = request.as_ref().map(|request| request.version.clone());
@@ -4565,7 +4739,7 @@ async fn resolve_streaming_graph(
       let task_cache_root = config.cache_root.clone();
       let task_fallback_roots = Arc::clone(&config.fallback_roots);
       let task_temp_root = config.temp_root.clone();
-      let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
       acquisition_tasks.spawn(async move {
@@ -4844,7 +5018,12 @@ async fn load_node_metadata(
   source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
 ) -> Result<MetadataTaskResult, PackageError> {
-  if request.is_none() && endpoints.is_empty() {
+  let selected_rank = source_mapping.and_then(|mapping| mapping.enabled_rank(lower_id));
+  let unmapped = source_mapping.is_some() && selected_rank.is_none();
+  let has_selected_endpoint = endpoints
+    .iter()
+    .any(|endpoint| source_mapping_selects(source_mapping, selected_rank, lower_id, endpoint.source_index()));
+  if request.is_none() && !has_selected_endpoint {
     let cached_versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
     if !cached_versions.is_empty() {
       return Ok(MetadataTaskResult::Versions {
@@ -4854,21 +5033,25 @@ async fn load_node_metadata(
       });
     }
   }
-  if let Some(request) = request {
-    if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
-      let request = request.clone();
-      let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
-        .await
-        .map_err(package_blocking_task_error)??;
-      return Ok(MetadataTaskResult::Requirements {
-        dependencies,
-        requests: 0,
-        bytes: 0,
-        package: None,
-      });
-    }
-
-    if endpoints.is_empty() {
+  if let Some(request) = request
+    && let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request)
+  {
+    let request = request.clone();
+    let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
+      .await
+      .map_err(package_blocking_task_error)??;
+    return Ok(MetadataTaskResult::Requirements {
+      dependencies,
+      requests: 0,
+      bytes: 0,
+      package: None,
+    });
+  }
+  if unmapped {
+    return Err(unmapped_identity(lower_id));
+  }
+  if !has_selected_endpoint {
+    if request.is_some() {
       let cached_versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
       if !cached_versions.is_empty() {
         return Ok(MetadataTaskResult::Versions {
@@ -4878,7 +5061,14 @@ async fn load_node_metadata(
         });
       }
     }
+    return Err(PackageError::new(
+      PackageErrorKind::OfflineMiss,
+      lower_id,
+      format!("package {lower_id} has no compatible version in the global package cache"),
+    ));
+  }
 
+  if let Some(request) = request {
     match ensure_package(client, request, storage, endpoints, source_mapping, target, false).await {
       Ok(cached) => {
         let dependencies = match &cached.dependencies {
@@ -4897,14 +5087,6 @@ async fn load_node_metadata(
     }
   }
 
-  if endpoints.is_empty() {
-    return Err(PackageError::new(
-      PackageErrorKind::OfflineMiss,
-      lower_id,
-      format!("package {lower_id} has no compatible version in the global package cache"),
-    ));
-  }
-
   // NuGet considers the global packages folder alongside enabled sources for
   // floating/ranged requests. Local sources must not hide already cached
   // versions merely because they remain available in offline mode.
@@ -4912,7 +5094,7 @@ async fn load_node_metadata(
   let mut requests = 0u32;
   let mut bytes = 0u64;
   for endpoint in endpoints {
-    if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), lower_id)) {
+    if !source_mapping_selects(source_mapping, selected_rank, lower_id, endpoint.source_index()) {
       continue;
     }
     match endpoint {
@@ -5351,9 +5533,13 @@ async fn ensure_package(
       .await
       .map_err(package_blocking_task_error)?;
   }
+  let selected_rank = source_mapping.and_then(|mapping| mapping.enabled_rank(&request.lower_id));
+  if source_mapping.is_some() && selected_rank.is_none() {
+    return Err(unmapped_identity(&request.id));
+  }
   let mut last_error = None;
   for endpoint in endpoints {
-    if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), &request.lower_id)) {
+    if !source_mapping_selects(source_mapping, selected_rank, &request.lower_id, endpoint.source_index()) {
       continue;
     }
     match download_and_publish(client, request, storage.cache_root, storage.temp_root, endpoint, target, parallel_extract).await {
@@ -8402,6 +8588,290 @@ mod tests {
 
     assert!(!mapping.allows(0, "Private.Package"));
     assert!(mapping.allows(0, "Public.Package"));
+  }
+
+  #[test]
+  fn source_mapping_filters_service_discovery_before_network_io() {
+    let document = r#"{"version":"3.0.0","resources":[{"@id":"https://content.example.test/v3-flat/","@type":"PackageBaseAddress/3.0.0"}]}"#;
+    let response = format!(
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{document}",
+      document.len()
+    );
+    let (selected_url, worker) = response_server(vec![response]);
+    let sources = vec![
+      (
+        "decoy".to_owned(),
+        PackageSource {
+          url: "http://127.0.0.1:9/v3/index.json".to_owned(),
+          protocol: NugetProtocol::V3,
+          security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+        },
+      ),
+      (
+        "selected".to_owned(),
+        PackageSource {
+          url: selected_url,
+          protocol: NugetProtocol::V3,
+          security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+        },
+      ),
+    ];
+    let mapping = PackageSourceMapping::compile(
+      MergedSourceMapping {
+        sources: vec![MergedSourceMappingEntry {
+          source: "selected".to_owned(),
+          patterns: ItemRange { start: 0, len: 1 },
+        }],
+        patterns: vec!["Selected.*".to_owned()],
+      },
+      &sources,
+    )
+    .unwrap();
+    let mut endpoints = LazyServiceEndpoints::new(sources.len());
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let requests = runtime
+      .block_on(endpoints.ensure_identity(
+        &client,
+        &sources,
+        &SourceCredentialBatch::default(),
+        Some(&mapping),
+        "selected.package",
+        ServiceDiscoveryOptions {
+          worker_budget: MAX_DOWNLOAD_WORKERS,
+          allow_network: true,
+        },
+      ))
+      .unwrap();
+
+    assert_eq!(requests, 1);
+    assert_eq!(endpoints.snapshot().len(), 1);
+    assert_eq!(endpoints.snapshot()[0].source_index(), 1);
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn unmapped_identity_fails_before_service_discovery() {
+    let sources = vec![(
+      "decoy".to_owned(),
+      PackageSource {
+        url: "http://127.0.0.1:9/v3/index.json".to_owned(),
+        protocol: NugetProtocol::V3,
+        security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+      },
+    )];
+    let mapping = PackageSourceMapping::compile(
+      MergedSourceMapping {
+        sources: vec![MergedSourceMappingEntry {
+          source: "decoy".to_owned(),
+          patterns: ItemRange { start: 0, len: 1 },
+        }],
+        patterns: vec!["Mapped.*".to_owned()],
+      },
+      &sources,
+    )
+    .unwrap();
+    let mut endpoints = LazyServiceEndpoints::new(sources.len());
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let error = runtime
+      .block_on(endpoints.ensure_identity(
+        &client,
+        &sources,
+        &SourceCredentialBatch::default(),
+        Some(&mapping),
+        "unmapped.package",
+        ServiceDiscoveryOptions {
+          worker_budget: MAX_DOWNLOAD_WORKERS,
+          allow_network: true,
+        },
+      ))
+      .unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::UnmappedIdentity);
+    assert!(endpoints.snapshot().is_empty());
+  }
+
+  #[test]
+  fn empty_source_batch_without_mapping_is_not_an_unmapped_identity() {
+    let mut endpoints = LazyServiceEndpoints::new(0);
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let requests = runtime
+      .block_on(endpoints.ensure_identity(
+        &client,
+        &[],
+        &SourceCredentialBatch::default(),
+        None,
+        "missing.package",
+        ServiceDiscoveryOptions {
+          worker_budget: MAX_DOWNLOAD_WORKERS,
+          allow_network: true,
+        },
+      ))
+      .unwrap();
+
+    assert_eq!(requests, 0);
+    assert!(endpoints.snapshot().is_empty());
+  }
+
+  #[test]
+  fn winning_pattern_on_a_disabled_source_is_unmapped() {
+    let mapping = PackageSourceMapping::compile(
+      MergedSourceMapping {
+        sources: vec![MergedSourceMappingEntry {
+          source: "disabled".to_owned(),
+          patterns: ItemRange { start: 0, len: 1 },
+        }],
+        patterns: vec!["Selected.*".to_owned()],
+      },
+      &[],
+    )
+    .unwrap();
+    let mut endpoints = LazyServiceEndpoints::new(0);
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let error = runtime
+      .block_on(endpoints.ensure_identity(
+        &client,
+        &[],
+        &SourceCredentialBatch::default(),
+        Some(&mapping),
+        "selected.package",
+        ServiceDiscoveryOptions {
+          worker_budget: MAX_DOWNLOAD_WORKERS,
+          allow_network: true,
+        },
+      ))
+      .unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::UnmappedIdentity);
+    assert!(endpoints.snapshot().is_empty());
+  }
+
+  #[test]
+  fn unmapped_identity_can_select_an_existing_cached_version() {
+    let temp = TempDirectory::new();
+    let cache_root = temp.0.join("packages");
+    let temp_root = temp.0.join("temp");
+    fs::create_dir_all(cache_root.join("unmapped.package/1.2.3")).unwrap();
+    fs::create_dir_all(&temp_root).unwrap();
+    let sources = vec![(
+      "selected".to_owned(),
+      PackageSource {
+        url: "http://127.0.0.1:9/v3/index.json".to_owned(),
+        protocol: NugetProtocol::V3,
+        security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+      },
+    )];
+    let mapping = PackageSourceMapping::compile(
+      MergedSourceMapping {
+        sources: vec![MergedSourceMappingEntry {
+          source: "selected".to_owned(),
+          patterns: ItemRange { start: 0, len: 1 },
+        }],
+        patterns: vec!["Mapped.*".to_owned()],
+      },
+      &sources,
+    )
+    .unwrap();
+    let unrelated_endpoint = ServiceEndpoint::V2 {
+      source: sources[0].1.url.clone(),
+      base: sources[0].1.url.clone(),
+      credential: None,
+      source_index: 0,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let result = runtime
+      .block_on(load_node_metadata(
+        &reqwest::Client::new(),
+        None,
+        "unmapped.package",
+        PackageStorage {
+          cache_root: &cache_root,
+          fallback_roots: &[],
+          temp_root: &temp_root,
+        },
+        &[unrelated_endpoint],
+        Some(&mapping),
+        TargetFramework::parse("net10.0").unwrap(),
+      ))
+      .unwrap();
+
+    let MetadataTaskResult::Versions { versions, requests, bytes } = result else {
+      panic!("cached ranged identity should return its version batch");
+    };
+    assert_eq!(versions.iter().map(|version| version.normalized.as_str()).collect::<Vec<_>>(), ["1.2.3"]);
+    assert_eq!(requests, 0);
+    assert_eq!(bytes, 0);
+  }
+
+  #[test]
+  fn unmapped_identity_can_read_an_exact_cached_package() {
+    let temp = TempDirectory::new();
+    let cache_root = temp.0.join("packages");
+    let temp_root = temp.0.join("temp");
+    temp.write(
+      "packages/unmapped.package/1.2.3/Unmapped.Package.nuspec",
+      r#"<package><metadata><id>Unmapped.Package</id><version>1.2.3</version></metadata></package>"#,
+    );
+    let sources = vec![(
+      "selected".to_owned(),
+      PackageSource {
+        url: DEFAULT_SOURCE.to_owned(),
+        protocol: NugetProtocol::V3,
+        security_flags: 0,
+      },
+    )];
+    let mapping = PackageSourceMapping::compile(
+      MergedSourceMapping {
+        sources: vec![MergedSourceMappingEntry {
+          source: "selected".to_owned(),
+          patterns: ItemRange { start: 0, len: 1 },
+        }],
+        patterns: vec!["Mapped.*".to_owned()],
+      },
+      &sources,
+    )
+    .unwrap();
+    let request = PackageRequest {
+      id: "Unmapped.Package".to_owned(),
+      lower_id: "unmapped.package".to_owned(),
+      version: "1.2.3".to_owned(),
+      direct: true,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let result = runtime
+      .block_on(load_node_metadata(
+        &reqwest::Client::new(),
+        Some(&request),
+        &request.lower_id,
+        PackageStorage {
+          cache_root: &cache_root,
+          fallback_roots: &[],
+          temp_root: &temp_root,
+        },
+        &[],
+        Some(&mapping),
+        TargetFramework::parse("net10.0").unwrap(),
+      ))
+      .unwrap();
+
+    let MetadataTaskResult::Requirements {
+      dependencies, requests, bytes, ..
+    } = result
+    else {
+      panic!("exact cached identity should return its dependency batch");
+    };
+    assert!(dependencies.is_empty());
+    assert_eq!(requests, 0);
+    assert_eq!(bytes, 0);
   }
 
   #[test]

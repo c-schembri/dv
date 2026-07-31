@@ -832,9 +832,16 @@ boundary, not final drop-in parity.
   schema 12 reports redacted per-source and aggregate consequences. The
   SDK-shipped NuGet.Configuration oracle measures `71.416 ms` for Microsoft
   versus `5.742 ms` for `dv` (`12.4x`) across 30 retained offline samples. `P2`
-- [~] `NUGET-013` Mapping already filters package/version requests by the
-  longest effective pattern. Move filtering ahead of service-index discovery
-  and add a typed unmapped-identity diagnostic. `P2`
+- [x] `NUGET-013` Package-source mapping computes the longest effective
+  pattern before touching a source. Source-indexed lazy endpoint state activates
+  only winning local/v2/v3 sources as new graph identities arrive; tied v3
+  indexes are fetched concurrently through the bounded Tokio set and merged in
+  deterministic source order. Global/fallback cache hits remain
+  source-independent. An uncached identity with no enabled winning source fails
+  as typed `DV0412` before URL, credential, DNS, TLS, or HTTP work. A fresh
+  expected-failure fixture validates Microsoft's `NU1100` against `DV0412` and
+  zero requests; 30 Windows samples measure `639.131 ms` for Microsoft versus
+  `8.445 ms` for `dv` (`75.7x`). `P2`
 - [~] `NUGET-014` Bound concurrent requests per source and globally; the
   current twenty-four-task Tokio set provides global backpressure and
   deterministic graph merge, while distinct per-source budgets remain. `P2`

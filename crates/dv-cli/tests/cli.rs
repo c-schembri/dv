@@ -336,6 +336,37 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 }
 
 #[test]
+fn restore_reports_unmapped_package_before_source_discovery() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration>
+<packageSources><clear /><add key="decoy" value="http://127.0.0.1:9/v3/index.json" protocolVersion="3" allowInsecureConnections="true" /></packageSources>
+<packageSourceMapping><packageSource key="decoy"><package pattern="Mapped.*" /></packageSource></packageSourceMapping>
+</configuration>"#,
+  );
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Unmapped.Package" Version="1.0.0" /></ItemGroup></Project>"#,
+  );
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(output.stderr.is_empty());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0412\""));
+  assert!(stdout.contains("\"name\":\"package_id\",\"value\":\"unmapped.package\""));
+  assert!(stdout.contains("Add a matching packageSourceMapping pattern"));
+  assert!(!stdout.contains("DV0404"));
+}
+
+#[test]
 fn explicit_nuget_config_replaces_the_implicit_hierarchy() {
   let temp = TempDirectory::new();
   temp.write(

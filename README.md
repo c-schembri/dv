@@ -50,6 +50,9 @@ dv restore (config merge)       9.422 ms median
 dotnet restore (source policy) 527.659 ms median
 dv restore (source policy)       5.850 ms median
 
+dotnet restore (unmapped source) 639.131 ms median
+dv restore (unmapped source)       8.445 ms median
+
 dotnet restore (storage policy) 523.051 ms median
 dv restore (storage policy)       5.370 ms median
 
@@ -119,7 +122,7 @@ The project is in the first implementation phase.
 | Actionable unavailable-pack diagnostics | Implemented |
 | Machine/user/repository/explicit NuGet config discovery | Implemented |
 | Keyed NuGet config merge and environment expansion | Implemented |
-| NuGet package/audit sources, protocols, and source mapping | Implemented |
+| NuGet package/audit sources, protocols, and pre-discovery source mapping | Implemented |
 | NuGet storage, fallback, signature, proxy, and audit policy | Implemented |
 | NuGet CLI source, config, and package-folder overrides | Implemented |
 | NuGet flat and hierarchical local sources | Implemented |
@@ -335,6 +338,7 @@ Initial machine:
 | Validate a six-file NuGet configuration hierarchy | `dotnet restore ConfigHierarchy.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigHierarchy.csproj --offline --json` | 532.948 ms | 5.651 ms | 94.3x | 545.049 ms | 6.296 ms |
 | Merge keyed NuGet configuration | `dotnet restore ConfigMerge.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigMerge.csproj --offline --json` | 558.126 ms | 9.422 ms | 59.2x | 648.298 ms | 10.606 ms |
 | Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
+| Reject an unmapped package before source discovery | `dotnet restore SourceMapping.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceMapping.csproj --packages .packages --json` | 639.131 ms | 8.445 ms | 75.7x | 1684.299 ms | 9.459 ms |
 | Resolve NuGet storage and restore policy | `dotnet restore StoragePolicy.csproj --locked-mode --no-http-cache --nologo --verbosity quiet` | `dv restore StoragePolicy.csproj --offline --json` | 523.051 ms | 5.370 ms | 97.4x | 605.407 ms | 6.526 ms |
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
@@ -373,8 +377,14 @@ sources, and `%NAME%` expansion across four precedence levels, then applies
 the same package and cache parity gate. The source-policy case uses the SDK's
 official `NuGet.Configuration` assembly to verify enabled and disabled package
 sources, audit sources, v2/v3 metadata, and longest-pattern mapping queries
-before applying the same package and cache parity gate. The storage-policy
-case uses that same official assembly plus an MSBuild property query to verify
+before applying the same package and cache parity gate. The source-mapping
+fixture follows that policy into restore: `Unmapped.Package` has no winning
+enabled source while the only configured v3 endpoint is deliberately
+unreachable. Microsoft must emit `NU1100`, `dv` must emit typed `DV0412`, and
+either source-contact error fails preflight. This makes the retained
+`639.131 ms` versus `8.445 ms` comparison like-for-like with zero HTTP work.
+The storage-policy case uses that same official assembly plus an MSBuild
+property query to verify
 global, HTTP-cache, scratch, ordered fallback, signature, audit, and proxy
 policy. Both tools then resolve the same locked package from the fallback root
 with empty global roots and zero timed network work. The CLI-override case
@@ -433,6 +443,7 @@ recorded in the curated
 [NuGet configuration baseline](docs/performance-baselines/2026-08-01-nuget-config-discovery-windows.md),
 [NuGet keyed-merge baseline](docs/performance-baselines/2026-08-01-nuget-config-merge-windows.md),
 [NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
+[NuGet source-mapping baseline](docs/performance-baselines/2026-08-01-nuget-source-mapping-windows.md),
 [NuGet storage-policy baseline](docs/performance-baselines/2026-08-01-nuget-storage-policy-windows.md),
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
@@ -490,6 +501,7 @@ cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
 cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
+cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
 cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
@@ -551,6 +563,7 @@ See:
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)
 - [NuGet configuration discovery contract](docs/nuget-config-discovery.md)
 - [NuGet keyed configuration merge contract](docs/nuget-config-merge.md)
+- [NuGet source sections and mapping contract](docs/nuget-source-sections.md)
 - [NuGet storage and restore policy contract](docs/nuget-storage-policy.md)
 - [NuGet CLI override contract](docs/nuget-cli-overrides.md)
 - [NuGet local source contract](docs/nuget-local-sources.md)

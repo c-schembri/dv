@@ -34,9 +34,20 @@ pattern, matching NuGet's search-tree behavior.
 
 Package/version enumeration and archive acquisition skip ineligible endpoints.
 Matching scans the immutable source and pattern arrays without allocation.
-Service indexes are still discovered as one batch before that filter; moving
-mapping ahead of service-index requests and emitting a dedicated unmapped-ID
-diagnostic is the remaining `NUGET-013` work.
+On a cache miss, restore now computes the global winning specificity before it
+touches a source. Only enabled sources tied at that rank may perform local-feed
+discovery, v2 materialization, or v3 service-index I/O. An identity discovered
+later in the dependency graph can activate another mapped source without
+eagerly discovering every configured feed. Tied v3 sources are discovered
+concurrently through the existing bounded 24-task Tokio set.
+
+The global packages and fallback caches remain source-independent, matching
+NuGet: an exact cached package or a cached version batch can satisfy an
+otherwise unmapped identity without source work. A cache miss with no pattern,
+or with a winning pattern attached only to disabled or removed sources, fails
+as `DV0412` before URL resolution, DNS, TLS, credentials, or HTTP. With no
+`packageSourceMapping` section, all enabled sources retain their previous
+behavior.
 
 Audit source rows are parsed, merged, typed, and retained. Audit mode and level
 selection are implemented by `NUGET-004`, and vulnerability endpoint discovery
@@ -51,20 +62,39 @@ source and pattern records are contiguous boxed slices. The temporary XML merge
 owns external variable strings only until compaction, then drops them before
 the graph walk.
 
+`PackageSourceMapping` is 48 bytes with eight-byte alignment. The restore-owned
+`LazyServiceEndpoints` state is 40 bytes with eight-byte alignment and owns one
+source-indexed `Vec<Option<ServiceEndpoint>>` plus an immutable `Arc` snapshot
+borrowed by in-flight tasks. These layouts have compile-time assertions.
+`ASSUMPTION: the Windows x64 benchmark host has 64-byte cache lines - affects
+the expectation that either hot control record fits in one cache line; neither
+record is explicitly over-aligned because workers read snapshots rather than
+mutating adjacent records.`
+
+The hot mapping pass reads source rows, their contiguous pattern ranges, and
+the shared text buffer linearly. The common matching branches are predictable
+for exact IDs and namespace prefixes; source selection then scans only the
+small winning source set. Variable source counts require one restore-lifetime
+slot allocation. A snapshot allocation and endpoint clone occur only when a
+new source becomes reachable, amortized across later identities; an empty or
+already-discovered selection does not allocate endpoint work. Network jobs are
+created only for selected, undiscovered v3 sources and remain globally bounded.
+
 A configured mapping batch is shared with Tokio tasks through one `Arc`; task
 creation clones only the reference count. The common no-mapping path stores
 `None`, so it allocates no policy object and performs no atomic reference-count
-updates. The expected configured case has single-digit source and pattern
-counts, so a predictable linear scan is smaller and faster than a heap-built
-trie. A compiled index should be considered only after a measured real
-configuration crosses that threshold.
+updates. `ASSUMPTION: ordinary developer configurations contain single-digit
+source and pattern counts - affects retaining the compact linear scan instead
+of a heap-built trie.` A compiled index should be considered only after
+representative configuration measurements cross that threshold.
 
 ## Verification
 
 Unit tests cover audit-source protocol replacement, nested mapping replacement
 and clear, duplicate/empty group rejection, case-insensitive exact matching,
-wildcard prefixes, longest-pattern selection, tied sources, and the global
-fallback pattern.
+wildcard prefixes, longest-pattern selection, tied sources, the global fallback
+pattern, pre-discovery filtering, pre-network unmapped failure, and cached exact
+and ranged identities that require no mapped source.
 
 The process fixture has four machine, additional-user, main-user, and
 repository levels. An oracle adapter built outside timing uses the selected
@@ -82,3 +112,18 @@ and `5.850 ms` for `dv restore`, a `90.2x` median improvement.
 ```powershell
 cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
 ```
+
+`NUGET-013` has a separate fresh-workspace failure fixture. Both tools reject
+`Unmapped.Package` under an enabled mapping while an unreachable v3 source is
+configured, and preflight rejects any source-contact diagnostic. The timed
+commands therefore compare project/config discovery, cache-miss proof,
+longest-pattern selection, and structured failure with zero HTTP requests:
+
+```powershell
+cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
+```
+
+Thirty retained Windows samples measured `639.131 ms` for Microsoft and
+`8.445 ms` for `dv`, a `75.7x` median improvement. The full distribution and
+commands are retained in the
+[source-mapping baseline](performance-baselines/2026-08-01-nuget-source-mapping-windows.md).
