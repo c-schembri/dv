@@ -26,7 +26,8 @@ Commands:
   init       Create project files
   add        Add a package reference
   remove     Remove a package reference
-  sync       Resolve and cache dependencies
+  restore    Resolve and cache dependencies
+  sync       Alias for restore
   build      Build a project or workspace
   run        Build and run an application
   test       Build and run tests
@@ -55,8 +56,9 @@ Usage:
   dv build --plan [PROJECT] [--configuration Debug|Release]
 ";
 
-const SYNC_HELP: &str = "\
+const PACKAGE_HELP: &str = "\
 Usage:
+  dv restore [PROJECT] [--packages PATH] [--offline]
   dv sync [PROJECT] [--packages PATH] [--offline]
 ";
 
@@ -120,7 +122,7 @@ fn main() -> ExitCode {
     Some("sdk") => run_sdk(started, json, args, &semantic_args[1..]),
     Some("project") => run_project(started, json, args, &semantic_args[1..]),
     Some("build") => run_build(started, json, args, &semantic_args[1..]),
-    Some("sync") => run_sync(started, json, args, &semantic_args[1..]),
+    Some(command @ ("restore" | "sync")) => run_package_command(started, json, command, args, &semantic_args[1..]),
     Some(command) if is_known_command(command) => fail(
       started,
       json,
@@ -154,20 +156,25 @@ fn main() -> ExitCode {
   }
 }
 
-fn run_sync(started: Instant, json: bool, args: Vec<String>, sync_args: &[String]) -> ExitCode {
-  if matches!(sync_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
-    print!("{SYNC_HELP}");
+fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<String>, command_args: &[String]) -> ExitCode {
+  if matches!(command_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
+    print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
   }
-  let (requested_path, packages_directory, offline) = match parse_sync_args(sync_args) {
+  let (requested_path, packages_directory, offline) = match parse_package_args(command, command_args) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
         started,
         json,
-        "sync",
+        command,
         args,
-        diagnostic("DV0002", problem, None, Some("Use `dv sync --help` to inspect the accepted arguments.")),
+        diagnostic(
+          "DV0002",
+          problem,
+          None,
+          Some("Use `dv restore --help` or `dv sync --help` to inspect the accepted arguments."),
+        ),
       );
     },
   };
@@ -177,7 +184,7 @@ fn run_sync(started: Instant, json: bool, args: Vec<String>, sync_args: &[String
       return fail(
         started,
         json,
-        "sync",
+        command,
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
       );
@@ -185,7 +192,7 @@ fn run_sync(started: Instant, json: bool, args: Vec<String>, sync_args: &[String
   };
   let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "sync", args, project_diagnostic(error)),
+    Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
   let options = PackageResolveOptions {
     packages_directory,
@@ -194,16 +201,16 @@ fn run_sync(started: Instant, json: bool, args: Vec<String>, sync_args: &[String
   };
   let resolutions = match resolve_package_inputs(&[&project], &options) {
     Ok(resolutions) => resolutions,
-    Err(error) => return fail(started, json, "sync", args, package_diagnostic(error)),
+    Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
   };
   let resolution = &resolutions[0];
   if !json {
     return write_package_resolution(resolution);
   }
-  succeed(started, "sync", args, package_resolution_payload(&project, resolution))
+  succeed(started, command, args, package_resolution_payload(&project, resolution))
 }
 
-fn parse_sync_args(arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>, bool), String> {
+fn parse_package_args(command: &str, arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>, bool), String> {
   let mut project = None;
   let mut packages = None;
   let mut offline = false;
@@ -215,9 +222,9 @@ fn parse_sync_args(arguments: &[String]) -> Result<(Option<PathBuf>, Option<Path
         packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
       },
       "--offline" => offline = true,
-      value if value.starts_with('-') => return Err(format!("unknown sync option {value:?}")),
+      value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
       value if project.is_none() => project = Some(PathBuf::from(value)),
-      value => return Err(format!("unexpected sync argument {value:?}")),
+      value => return Err(format!("unexpected {command} argument {value:?}")),
     }
     index += 1;
   }
@@ -400,7 +407,7 @@ fn decode_args(raw_args: &[OsString]) -> Result<Vec<String>, &OsString> {
 fn is_known_command(command: &str) -> bool {
   matches!(
     command,
-    "init" | "add" | "remove" | "sync" | "build" | "run" | "test" | "pack" | "publish" | "sdk" | "project"
+    "init" | "add" | "remove" | "restore" | "sync" | "build" | "run" | "test" | "pack" | "publish" | "sdk" | "project"
   )
 }
 
@@ -747,7 +754,7 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
     CompilerPlanErrorKind::PackNotFound => Some("Install the targeting pack required by the project target framework."),
     CompilerPlanErrorKind::InvalidManifest | CompilerPlanErrorKind::MissingAsset => Some("Repair or reinstall the selected .NET SDK."),
     CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable SDK compatible with the project target framework."),
-    CompilerPlanErrorKind::PackageResolution => Some("Run `dv sync` for every package-bearing project before compiler planning."),
+    CompilerPlanErrorKind::PackageResolution => Some("Run `dv restore` (or `dv sync`) for every package-bearing project before compiler planning."),
     CompilerPlanErrorKind::Io | CompilerPlanErrorKind::NonUnicodePath | CompilerPlanErrorKind::TextOverflow => None,
   };
   diagnostic(

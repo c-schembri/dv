@@ -69,9 +69,9 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 7,452 source lines,
-and 40 `#[test]` functions. These counts describe the current repository, not
-the expected shape of real customer repositories.
+The Rust workspace currently has 12 Rust source files, 7,617 nonblank source
+lines, and 42 `#[test]` functions. These counts describe the current
+repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
@@ -158,7 +158,7 @@ prove that nothing changed.
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
 | Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
-| Package resolution and cache | Initial subset | exact versions, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and `sync` |
+| Package resolution and cache | Initial subset | exact versions, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore, build, run, test | Missing | commands return `DV0003` |
 | Pack, publish, SDK/runtime install | Missing | commands return `DV0003` |

@@ -55,12 +55,19 @@ Invalid input behavior:
 | `cli_version` | none | `dv` process launch and self-version output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `restore_cold` | fresh fixture copy | restore |
+| `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
+| `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
 
 Cold OS page-cache state is not currently controlled. `restore_cold` means
-fresh project state, not a cold machine cache.
+fresh project state, not a cold machine cache. `package_sync_cold` additionally
+removes the isolated package directory for every iteration and passes
+`--no-http-cache` to `dotnet restore`. It is the reproducible cold-dependency
+boundary. A machine-cold measurement requires a newly provisioned environment;
+the harness does not pretend to flush Windows page cache, DNS, TLS, or CDN
+state.
 
 `ASSUMPTION: repeated local samples are representative enough to expose gross
 startup and orchestration regressions - affects use of this harness for early
@@ -88,6 +95,8 @@ sampled; see `issues/`.
 - Record latency and throughput separately.
 - Record peak memory, bytes read/written, process count, network requests,
   allocation count, and CPU utilization as soon as those workflows exist.
+- Record typed request and downloaded-payload counts when the measured command
+  exposes them. Do not infer missing reference-tool counters from console text.
 - Never time fixture copying or prerequisite restore when the named case is
   build latency.
 - Keep warm-up output out of the raw sample batch.
@@ -128,4 +137,11 @@ Measure only like-for-like project evaluation:
 
 ```text
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
+```
+
+Measure first dependency readiness with a fresh package cache and no NuGet HTTP
+cache reuse:
+
+```text
+cargo bench-all --case package_sync_cold --samples 5 --warmups 1
 ```

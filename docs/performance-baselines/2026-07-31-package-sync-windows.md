@@ -6,7 +6,7 @@
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - `Newtonsoft.Json` `13.0.3`, 2,441,966-byte package
-- release `dv` binary from the working tree based on `e171e92`
+- release `dv` binary from the working tree based on `c23f2b3`
 
 ## Like-For-Like Warm Locked Result
 
@@ -17,10 +17,10 @@ package identity, exact version, archive SHA-512, and compile assets.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 446.029 ms | 459.179 ms | 440.757 ms | 459.179 ms |
-| `dv` | `dv sync PackageConsole.csproj --packages .packages --offline --json` | 4.459 ms | 5.255 ms | 4.162 ms | 5.255 ms |
+| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 454.249 ms | 456.167 ms | 451.008 ms | 456.167 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 4.469 ms | 4.954 ms | 4.300 ms | 4.954 ms |
 
-Ten samples were retained after three warm-ups. The median ratio is `100.0x`.
+Ten samples were retained after three warm-ups. The median ratio is `101.6x`.
 The `dv` timing includes process startup and JSON event reporting.
 
 Reproduce:
@@ -29,24 +29,32 @@ Reproduce:
 cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 
-## Cold Package-Cache Observation
+## Cold Dependency Readiness
 
-A quick cold-cache run retained three samples after one warm-up:
+Each timed iteration used a fresh project copy and an empty isolated
+global-packages directory. The reference command included `--no-http-cache`, so
+neither tool reused package payloads or metadata from an HTTP cache. Preflight
+established the same exact dependency graph and selected compile assets.
 
-| Tool | Median | P95 |
-|---|---:|---:|
-| `dotnet` | 728.739 ms | 767.345 ms |
-| `dv` | 799.022 ms | 1,512.216 ms |
+| Tool | Exact command | Median | P95 | Min | Max |
+|---|---|---:|---:|---:|---:|
+| `dotnet` | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 910.292 ms | 952.869 ms | 885.639 ms | 952.869 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --json` | 803.122 ms | 1,926.573 ms | 793.164 ms | 1,926.573 ms |
 
-This result is not promoted to the README comparison. Each iteration removed
-the isolated global-packages directory, but `dotnet` could reuse its separate
-user HTTP cache while `dv` deliberately has no HTTP metadata/payload cache yet.
-The network states are therefore not like-for-like. The measurement still
-covers the cold `dv` path: v3 discovery, metadata, a 2.4 MB streamed download,
-SHA-512 verification, bounded ZIP validation/extraction, and atomic publish.
+Five samples were retained after one warm-up. The median ratio is `1.1x`.
+`dv` reported four HTTP requests and 2,441,966 downloaded payload bytes for
+every retained sample. The reference command does not expose typed request or
+byte counters.
 
-Reproduce the observation:
+The result covers v3 discovery, metadata, a streamed download, SHA-512
+verification, bounded ZIP validation/extraction, and atomic publish. It is
+deliberately retained despite a 1,926.573 ms `dv` outlier: first-restore
+latency is network-sensitive, and hiding its tail would make the record less
+useful. The benchmark does not claim to reset Windows page cache, DNS, TLS, or
+CDN state.
+
+Reproduce:
 
 ```powershell
-cargo bench-all --case package_sync_cold --quick
+cargo bench-all --case package_sync_cold --samples 5 --warmups 1
 ```

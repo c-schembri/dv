@@ -27,6 +27,11 @@ files in precedence order. `packageSources` supports add, remove, and clear;
 `--packages` path wins over `NUGET_PACKAGES`, which wins over
 `globalPackagesFolder`, which wins over the platform default.
 
+`dv restore` and `dv sync` dispatch to the same package transform with
+identical options, cache behavior, lock behavior, diagnostics, and output
+payload. Structured command lifecycle events retain the spelling invoked by
+the caller.
+
 Exact `Newtonsoft.Json` `13.0.3` is the representative package. Its 2,441,966
 byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`
 fixture. A v3 miss performs four requests: service index, registration leaf,
@@ -107,7 +112,9 @@ archive traversal rejection. Live verification downloads the same public
 package through both NuGet v2 and v3 and compares identity, archive SHA-512,
 size, and selected compile asset.
 
-The benchmark preflight compares `dotnet restore` and `dv sync` package
+The benchmark preflight compares `dotnet restore` and `dv restore` package
 identity, exact version, archive SHA-512, target framework, and compile assets
-before retaining samples. Cold package-cache and warm locked states are
-reported separately.
+before retaining samples. Cold dependency readiness uses a fresh isolated
+package directory per iteration and disables the reference tool's HTTP cache.
+Warm locked restore is reported separately. `dv` request and payload counts are
+recorded as typed benchmark evidence.

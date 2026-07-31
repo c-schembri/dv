@@ -80,6 +80,7 @@ const DOTNET_CASES: &[Case] = &[
       "PackageConsole.csproj",
       "--packages",
       ".packages",
+      "--no-http-cache",
       "--nologo",
       "--verbosity",
       "quiet",
@@ -155,13 +156,13 @@ const DV_CASES: &[Case] = &[
   Case {
     name: "package_sync_cold",
     kind: CaseKind::PackageSyncCold,
-    args: &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+    args: &["restore", "PackageConsole.csproj", "--packages", ".packages", "--json"],
     implemented: true,
   },
   Case {
     name: "package_sync_warm",
     kind: CaseKind::PackageSyncWarm,
-    args: &["sync", "PackageConsole.csproj", "--packages", ".packages", "--offline", "--json"],
+    args: &["restore", "PackageConsole.csproj", "--packages", ".packages", "--offline", "--json"],
     implemented: true,
   },
   Case {
@@ -219,6 +220,10 @@ struct Run {
   warmups: usize,
   samples_ns: Vec<u64>,
   statistics_ns: Option<Statistics>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  network_requests: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  downloaded_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -234,6 +239,17 @@ struct Statistics {
   median: u64,
   p95: u64,
   max: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WorkEvidence {
+  network_requests: u64,
+  downloaded_bytes: u64,
+}
+
+struct Measurement {
+  elapsed_ns: u64,
+  work: Option<WorkEvidence>,
 }
 
 fn main() {
@@ -292,7 +308,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 2,
+    schema_version: 3,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -468,6 +484,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
       "PackageConsole.csproj",
       "--packages",
       ".packages",
+      "--no-http-cache",
       "--nologo",
       "--verbosity",
       "quiet",
@@ -477,7 +494,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
   )?;
   let dv_text = command_text(
     dv_executable,
-    &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+    &["restore", "PackageConsole.csproj", "--packages", ".packages", "--json"],
     &dv_workspace,
   )?;
   let dv = dv_text
@@ -486,7 +503,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
     .collect::<std::result::Result<Vec<_>, _>>()?
     .into_iter()
     .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
-    .ok_or("dv sync did not emit package_resolution_created")?;
+    .ok_or("dv restore did not emit package_resolution_created")?;
   let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
   let framework = assets
     .pointer("/project/frameworks")
@@ -684,6 +701,8 @@ fn run_tool(
         warmups: 0,
         samples_ns: Vec::new(),
         statistics_ns: None,
+        network_requests: None,
+        downloaded_bytes: None,
       });
       continue;
     }
@@ -691,12 +710,14 @@ fn run_tool(
     prepare_persistent_case(executable, case, case_fixture, &case_workspace)?;
 
     let mut samples_ns = Vec::with_capacity(options.samples);
+    let mut work = None;
     let total = options.warmups + options.samples;
     for index in 0..total {
       prepare_iteration(executable, case, case_fixture, &case_workspace)?;
-      let elapsed_ns = measure(executable, case.args, case_cwd(case, case_fixture, &case_workspace))?;
+      let measurement = measure(executable, case, case_cwd(case, case_fixture, &case_workspace))?;
       if index >= options.warmups {
-        samples_ns.push(elapsed_ns);
+        samples_ns.push(measurement.elapsed_ns);
+        merge_work_evidence(&mut work, measurement.work, tool_name, case.name)?;
       }
     }
 
@@ -711,6 +732,8 @@ fn run_tool(
       warmups: options.warmups,
       samples_ns,
       statistics_ns: Some(statistics_ns),
+      network_requests: work.map(|evidence| evidence.network_requests),
+      downloaded_bytes: work.map(|evidence| evidence.downloaded_bytes),
     });
   }
 
@@ -737,6 +760,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
           "--use-lock-file",
           "--packages",
           ".packages",
+          "--no-http-cache",
           "--nologo",
           "--verbosity",
           "quiet",
@@ -747,7 +771,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
     } else {
       run_checked(
         executable,
-        &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+        &["restore", "PackageConsole.csproj", "--packages", ".packages", "--json"],
         workspace,
         "warm package sync setup",
       )?;
@@ -814,12 +838,49 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
   }
 }
 
-fn measure(executable: &Path, args: &[&str], cwd: &Path) -> Result<u64> {
+fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let started = Instant::now();
-  let output = Command::new(executable).args(args).current_dir(cwd).output()?;
+  let output = Command::new(executable).args(case.args).current_dir(cwd).output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-  check_output(output, executable, args, "measured command")?;
-  Ok(elapsed)
+  check_output(output.clone(), executable, case.args, "measured command")?;
+  let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm) {
+    Some(parse_work_evidence(&output.stdout)?)
+  } else {
+    None
+  };
+  Ok(Measurement { elapsed_ns: elapsed, work })
+}
+
+fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
+  let text = std::str::from_utf8(stdout)?;
+  let event = text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv restore did not emit package_resolution_created")?;
+  Ok(WorkEvidence {
+    network_requests: event
+      .get("network_requests")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv package event omitted network_requests")?,
+    downloaded_bytes: event
+      .get("downloaded_bytes")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv package event omitted downloaded_bytes")?,
+  })
+}
+
+fn merge_work_evidence(current: &mut Option<WorkEvidence>, observed: Option<WorkEvidence>, tool: &str, case: &str) -> Result<()> {
+  let Some(observed) = observed else {
+    return Ok(());
+  };
+  if current.is_some_and(|current| current != observed) {
+    return Err(format!("{tool} {case} reported inconsistent request or byte counts across retained samples").into());
+  }
+  *current = Some(observed);
+  Ok(())
 }
 
 fn run_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
@@ -953,6 +1014,39 @@ fn render_summary(report: &Report, color: bool) -> String {
   }
 
   write_border(&mut output, '╰', '┴', '╯', &widths);
+
+  let package_runs = report
+    .runs
+    .iter()
+    .filter(|run| matches!(run.case.as_str(), "package_sync_cold" | "package_sync_warm"))
+    .collect::<Vec<_>>();
+  if !package_runs.is_empty() {
+    output.push('\n');
+    if color {
+      output.push_str("\x1b[1m");
+    }
+    output.push_str("  Observed work");
+    if color {
+      output.push_str("\x1b[0m");
+    }
+    output.push('\n');
+    let evidence_label_width = package_runs
+      .iter()
+      .map(|run| run.tool.len() + case_label(&run.case).len() + 3)
+      .max()
+      .unwrap_or(0);
+    for run in package_runs {
+      let label = format!("{} · {}", run.tool, case_label(&run.case));
+      let evidence = match (run.network_requests, run.downloaded_bytes) {
+        (Some(requests), Some(bytes)) => {
+          format!("{requests} HTTP requests · {} payload bytes", format_integer(bytes))
+        },
+        _ => "not exposed by command".to_owned(),
+      };
+      writeln!(output, "  {label:<evidence_label_width$}  {evidence}").expect("writing a String succeeds");
+    }
+  }
+
   output.push('\n');
   if color {
     output.push_str("\x1b[1m");
@@ -1014,8 +1108,8 @@ fn case_label(case: &str) -> &str {
     "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
-    "package_sync_cold" => "Cold package sync",
-    "package_sync_warm" => "Warm package sync",
+    "package_sync_cold" => "Cold dependency readiness",
+    "package_sync_warm" => "Warm locked restore",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -1046,6 +1140,19 @@ fn write_command(output: &mut String, command: &[String]) {
 
 fn format_milliseconds(nanoseconds: u64) -> String {
   format!("{:.3} ms", millis(nanoseconds))
+}
+
+fn format_integer(value: u64) -> String {
+  let digits = value.to_string();
+  let first_group = digits.len() % 3;
+  let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+  for (index, digit) in digits.char_indices() {
+    if index > 0 && index % 3 == first_group {
+      output.push(',');
+    }
+    output.push(digit);
+  }
+  output
 }
 
 fn millis(nanoseconds: u64) -> f64 {
@@ -1086,7 +1193,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 2,
+      schema_version: 3,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1110,6 +1217,8 @@ mod tests {
             p95: 12_346_000,
             max: 12_346_000,
           }),
+          network_requests: None,
+          downloaded_bytes: None,
         },
         Run {
           tool: "dv".into(),
@@ -1121,6 +1230,8 @@ mod tests {
           warmups: 0,
           samples_ns: Vec::new(),
           statistics_ns: None,
+          network_requests: None,
+          downloaded_bytes: None,
         },
       ],
     };
@@ -1137,5 +1248,51 @@ mod tests {
     assert!(output.contains('╭'));
     assert!(output.contains('╯'));
     assert!(!output.contains("\x1b["));
+  }
+
+  #[test]
+  fn summary_reports_package_work_evidence() {
+    let report = Report {
+      schema_version: 3,
+      generated_unix_seconds: 0,
+      environment: Environment {
+        os: "windows",
+        arch: "x86_64",
+        logical_cpus: 24,
+        repository_commit: None,
+      },
+      runs: vec![Run {
+        tool: "dv".into(),
+        tool_version: "dv 0.1.0".into(),
+        fixture: Some("package-console".into()),
+        case: "package_sync_cold".into(),
+        command: vec!["dv".into(), "restore".into()],
+        status: RunStatus::Measured,
+        warmups: 1,
+        samples_ns: vec![1],
+        statistics_ns: Some(Statistics {
+          min: 1,
+          median: 1,
+          p95: 1,
+          max: 1,
+        }),
+        network_requests: Some(4),
+        downloaded_bytes: Some(2_441_966),
+      }],
+    };
+
+    let output = render_summary(&report, false);
+
+    assert!(output.contains("Cold dependency readiness"));
+    assert!(output.contains("4 HTTP requests · 2,441,966 payload bytes"));
+    assert!(output.find("Observed work").unwrap() < output.find("Commands").unwrap());
+  }
+
+  #[test]
+  fn integer_counts_have_thousands_separators() {
+    assert_eq!(format_integer(0), "0");
+    assert_eq!(format_integer(999), "999");
+    assert_eq!(format_integer(1_000), "1,000");
+    assert_eq!(format_integer(2_441_966), "2,441,966");
   }
 }

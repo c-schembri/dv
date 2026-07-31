@@ -44,6 +44,7 @@ fn help_exposes_the_initial_command_surface() {
   assert!(output.status.success());
   let stdout = String::from_utf8(output.stdout).unwrap();
   assert!(stdout.contains("dv <command>"));
+  assert!(stdout.contains("restore"));
   assert!(stdout.contains("sync"));
   assert!(stdout.contains("project"));
   assert!(stdout.contains("--json"));
@@ -180,7 +181,7 @@ fn project_inspect_rejects_ambiguous_selection() {
 }
 
 #[test]
-fn sync_reuses_a_verified_v2_cache_entry_without_network_access() {
+fn sync_and_restore_share_the_verified_offline_operation() {
   let temp = TempDirectory::new();
   temp.write(
     "NuGet.Config",
@@ -218,6 +219,19 @@ fn sync_reuses_a_verified_v2_cache_entry_without_network_access() {
   assert!(stdout.contains("\"source_protocol\":\"v2\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("lib\\\\net6.0\\\\Sample.Package.dll") || stdout.contains("lib/net6.0/Sample.Package.dll"));
+
+  let alias = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
+  let stdout = String::from_utf8(alias.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"command_started\",\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"package_resolution_created\""));
+  assert!(stdout.contains("\"network_requests\":0"));
+  assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));
 }
 
 #[test]
