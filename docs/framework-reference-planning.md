@@ -84,6 +84,12 @@ Planning fails before runtime-config or compiler work when:
 Unsupported project XML still fails in project evaluation rather than being
 silently approximated.
 
+Unavailable targeting packs and shared frameworks retain a typed requirement
+with identity, requested version, TFM, and either
+`install_sdk_or_restore_package` or `install_runtime`; reporters never scrape
+these values from error prose. See the
+[unavailable pack diagnostic contract](pack-diagnostics.md).
+
 ## Command
 
 ```powershell

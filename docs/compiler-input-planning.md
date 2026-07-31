@@ -75,6 +75,9 @@ source paths are planned but their contents are not materialized yet.
 | Compact text exceeds 4 GiB | `DV0306` |
 
 No error path invokes `dotnet`, MSBuild, or an ambient compiler.
+Missing reference-pack and unsupported-target errors retain an actionable
+targeting-pack requirement for the reporting edge; see the
+[unavailable pack diagnostic contract](pack-diagnostics.md).
 
 ## Verification
 

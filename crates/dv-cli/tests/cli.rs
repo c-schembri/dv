@@ -365,6 +365,47 @@ fn runtime_pack_json_reports_manifest_selected_assets_and_apphost() {
 }
 
 #[test]
+fn unavailable_runtime_pack_reports_identity_version_dimensions_and_action() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>linux-arm</RuntimeIdentifier><SelfContained>true</SelfContained></PropertyGroup></Project>"#,
+  );
+  temp.write(
+    "sdk/10.0.100/Microsoft.NETCoreSdk.BundledVersions.props",
+    r#"<Project><ItemGroup>
+      <KnownFrameworkReference Include="Microsoft.NETCore.App" TargetFramework="net10.0" DefaultRuntimeFrameworkVersion="10.0.0" LatestRuntimeFrameworkVersion="10.0.0" RuntimePackNamePatterns="Microsoft.NETCore.App.Runtime.**RID**" RuntimePackRuntimeIdentifiers="linux-arm" />
+      <KnownAppHostPack Include="Microsoft.NETCore.App" TargetFramework="net10.0" AppHostPackNamePattern="Microsoft.NETCore.App.Host.**RID**" AppHostPackVersion="10.0.0" AppHostRuntimeIdentifiers="linux-arm" />
+    </ItemGroup></Project>"#,
+  );
+  temp.write(
+    "sdk/10.0.100/PortableRuntimeIdentifierGraph.json",
+    r##"{"runtimes":{"linux-arm":{"#import":[]}}}"##,
+  );
+  fs::create_dir_all(temp.0.join("packages")).unwrap();
+  temp.write(&format!("dotnet{}", env::consts::EXE_SUFFIX), "not an executable");
+
+  let output = dv()
+    .args(["project", "runtime-packs", "App.csproj", "--packages", "packages", "--json"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0124\""));
+  assert!(stdout.contains("\"name\":\"pack_kind\",\"value\":\"runtime_pack\""));
+  assert!(stdout.contains("\"name\":\"pack_identity\",\"value\":\"Microsoft.NETCore.App.Runtime.linux-arm\""));
+  assert!(stdout.contains("\"name\":\"pack_version\",\"value\":\"10.0.0\""));
+  assert!(stdout.contains("\"name\":\"target_framework\",\"value\":\"net10.0\""));
+  assert!(stdout.contains("\"name\":\"runtime_identifier\",\"value\":\"linux-arm\""));
+  assert!(stdout.contains("\"name\":\"acquisition\",\"value\":\"restore_package\""));
+  assert!(stdout.contains("\"help\":\"Restore the required pack from a configured package source.\""));
+}
+
+#[test]
 fn framework_plan_json_resolves_explicit_reference_and_shared_runtime() {
   let temp = TempDirectory::new();
   temp.write("Program.cs", "");

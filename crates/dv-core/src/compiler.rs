@@ -8,7 +8,9 @@ use std::{
 
 use quick_xml::{Reader, XmlVersion, events::Event};
 
-use crate::{PackageResolution, ProjectConfiguration, ProjectOutputType, ProjectSpec, SdkInventory, TargetFramework};
+use crate::{
+  PackAcquisition, PackKind, PackRequirement, PackageResolution, ProjectConfiguration, ProjectOutputType, ProjectSpec, SdkInventory, TargetFramework,
+};
 
 const FRAMEWORK_IDENTIFIER: &str = ".NETCoreApp";
 const FRAMEWORK_PACK: &str = "Microsoft.NETCore.App.Ref";
@@ -190,6 +192,7 @@ pub struct CompilerPlanError {
   kind: CompilerPlanErrorKind,
   path: PathBuf,
   message: String,
+  requirement: Option<PackRequirement>,
 }
 
 impl CompilerPlanError {
@@ -203,12 +206,23 @@ impl CompilerPlanError {
     &self.path
   }
 
+  /// Returns the exact unavailable-pack requirement when selection reached one.
+  pub fn requirement(&self) -> Option<&PackRequirement> {
+    self.requirement.as_ref()
+  }
+
   fn new(kind: CompilerPlanErrorKind, path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
     Self {
       kind,
       path: path.into(),
       message: message.into(),
+      requirement: None,
     }
+  }
+
+  fn with_requirement(mut self, requirement: PackRequirement) -> Self {
+    self.requirement = Some(requirement);
+    self
   }
 }
 
@@ -287,11 +301,21 @@ fn plan_compiler_inputs_inner(
     ));
   }
   if selected.version.major() < u32::from(target.major()) {
-    return Err(CompilerPlanError::new(
-      CompilerPlanErrorKind::UnsupportedSdk,
-      inventory.installation_path(selected),
-      format!(".NET SDK {} cannot compile target {}", selected.version, projects[0].target_framework()),
-    ));
+    return Err(
+      CompilerPlanError::new(
+        CompilerPlanErrorKind::UnsupportedSdk,
+        inventory.installation_path(selected),
+        format!(".NET SDK {} cannot compile target {}", selected.version, projects[0].target_framework()),
+      )
+      .with_requirement(PackRequirement::new(
+        PackKind::Targeting,
+        FRAMEWORK_PACK,
+        None,
+        projects[0].target_framework(),
+        None,
+        PackAcquisition::InstallSdk,
+      )),
+    );
   }
 
   let sdk_root = inventory.installation_path(selected);
@@ -333,6 +357,14 @@ fn discover_framework_assets(dotnet_root: &Path, target: TargetFramework, target
       &packs_root,
       format!("failed to enumerate {FRAMEWORK_PACK}: {error}"),
     )
+    .with_requirement(PackRequirement::new(
+      PackKind::Targeting,
+      FRAMEWORK_PACK,
+      None,
+      target_text,
+      None,
+      PackAcquisition::InstallSdk,
+    ))
   })?;
   let mut selected: Option<((u32, u32, u32), String, PathBuf)> = None;
   for entry in entries {
@@ -363,6 +395,14 @@ fn discover_framework_assets(dotnet_root: &Path, target: TargetFramework, target
       &packs_root,
       format!("no installed {FRAMEWORK_PACK} pack supports {target_text}"),
     )
+    .with_requirement(PackRequirement::new(
+      PackKind::Targeting,
+      FRAMEWORK_PACK,
+      None,
+      target_text,
+      None,
+      PackAcquisition::InstallSdk,
+    ))
   })?;
 
   let manifest = root.join("data/FrameworkList.xml");
@@ -812,6 +852,21 @@ mod tests {
 
     let error = plan_compiler_inputs(&[&project], &inventory).unwrap_err();
     assert_eq!(error.kind(), CompilerPlanErrorKind::InvalidManifest);
+  }
+
+  #[test]
+  fn missing_targeting_pack_keeps_identity_target_and_install_action() {
+    let (temp, project, inventory) = fixture();
+    fs::remove_dir_all(temp.0.join("dotnet/packs/Microsoft.NETCore.App.Ref")).unwrap();
+
+    let error = plan_compiler_inputs(&[&project], &inventory).unwrap_err();
+    assert_eq!(error.kind(), CompilerPlanErrorKind::PackNotFound);
+    let requirement = error.requirement().unwrap();
+    assert_eq!(requirement.kind(), PackKind::Targeting);
+    assert_eq!(requirement.identity(), "Microsoft.NETCore.App.Ref");
+    assert_eq!(requirement.version(), None);
+    assert_eq!(requirement.target_framework(), "net10.0");
+    assert_eq!(requirement.acquisition(), PackAcquisition::InstallSdk);
   }
 
   #[test]

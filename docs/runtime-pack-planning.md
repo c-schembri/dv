@@ -70,8 +70,9 @@ Planning fails before output work when:
 - a manifest path is absolute, escapes its pack, or is not valid Unicode;
 - compact storage exceeds its 32-bit index space.
 
-Missing-pack diagnostics name the exact manifest-derived identity and version.
-Automated pack acquisition is tracked separately by `PACKS-009`.
+Missing or incompatible pack diagnostics retain the exact manifest-derived
+identity, version, TFM, requested RID, pack kind, and one acquisition action.
+See the [unavailable pack diagnostic contract](pack-diagnostics.md).
 
 ## Command
 

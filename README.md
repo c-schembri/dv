@@ -79,6 +79,7 @@ The project is in the first implementation phase.
 | Target-aware framework and compiler input planning | Implemented |
 | Framework references and shared-runtime roll-forward | Implemented |
 | Runtime, host, native asset, and apphost planning | Implemented |
+| Actionable unavailable-pack diagnostics | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -101,7 +102,9 @@ compatibility ranges; it never guesses compatibility by splitting RID text.
 pack manifest, the restored runtime manifest, and the installed host pack. It
 selects manifest-defined identities and patch versions, separates managed and
 native runtime assets, and returns the exact platform apphost template without
-hard-coded SDK or package versions.
+hard-coded SDK or package versions. An unavailable TFM, RID, runtime pack, host
+pack, targeting pack, or shared framework produces typed identity, version,
+target, RID, and acquisition fields instead of leaving the remedy in prose.
 
 `dv project frameworks` resolves the implicit Core and explicit framework
 references from the selected SDK manifest, applies project and item-level
@@ -207,12 +210,11 @@ Initial machine:
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, runtime-pack planning, and the
-  framework-reference plan, 203-package asset plan, and one-package cold case;
-  compiler planning uses
-  5 warm-ups; 10
-  retained samples after 2 warm-ups for the large cold graph; 10 retained
-  samples after 3 warm-ups for warm locked restore; the massive graph uses 5
-  retained samples after 1 warm-up
+  framework-reference plan, unavailable-pack diagnostic, 203-package asset
+  plan, and one-package cold case; compiler planning uses 5 warm-ups; 10
+  retained samples after 2 warm-ups for the large cold graph; warm locked
+  restore uses 10 retained samples after 3 warm-ups; the massive graph uses
+  5 retained samples after 1 warm-up
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
@@ -223,6 +225,7 @@ Initial machine:
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan runtime and host packs | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --json` | 376.764 ms | 8.030 ms | 46.9x | 416.959 ms | 9.425 ms |
+| Diagnose an unavailable runtime pack | `dotnet restore UnavailablePackProject.csproj --source offline-source --packages .packages --no-cache --disable-build-servers -p:NuGetAudit=false --nologo --verbosity minimal` | `dv project runtime-packs UnavailablePackProject.csproj --packages .packages --json` | 532.652 ms | 6.378 ms | 83.5x | 596.360 ms | 6.931 ms |
 | Plan framework references and shared runtimes | `dotnet msbuild FrameworkReferenceProject.csproj -t:ResolveTargetingPackAssets` framework item query | `dv project frameworks FrameworkReferenceProject.csproj --json` | 352.715 ms | 5.585 ms | 63.2x | 390.432 ms | 6.530 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
@@ -242,6 +245,10 @@ compares the selected runtime and host RIDs, manifest-derived identities and
 versions, pack roots, all 172 managed and 15 native assets in order, and the
 apphost template. For package sync it also compares the complete package
 identity, exact-version, archive-SHA-512, and selected asset batches. The
+unavailable-pack case uses an empty checked-in source and isolated package
+cache; both commands must fail and name
+`Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
+version, TFM, RID, pack kind, acquisition action, and human guidance. The
 massive case additionally compares runtime, resource, content, analyzer,
 build, build-multitargeting, native, and RID runtime-target paths plus
 runtime-target metadata. The warm asset-plan case retains that exact parity
@@ -255,7 +262,8 @@ recorded in the curated
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
 [runtime pack baseline](docs/performance-baselines/2026-08-01-runtime-pack-windows.md),
-[framework reference baseline](docs/performance-baselines/2026-08-01-framework-reference-windows.md), and
+[unavailable pack diagnostic baseline](docs/performance-baselines/2026-08-01-pack-diagnostic-windows.md),
+[framework reference baseline](docs/performance-baselines/2026-08-01-framework-reference-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -297,6 +305,7 @@ cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3
+cargo bench-all --case pack_diagnostic --samples 30 --warmups 3
 cargo bench-all --case framework_reference_plan --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
@@ -350,6 +359,7 @@ See:
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Project evaluation contract](docs/project-evaluation.md)
 - [Runtime pack planning contract](docs/runtime-pack-planning.md)
+- [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)
 - [Package resolution and cache contract](docs/package-resolution.md)

@@ -71,6 +71,14 @@ Every diagnostic contains:
 - an ordered causal chain without wrapper duplication;
 - an optional next action.
 
+Unavailable-pack diagnostics append stable ordered context fields from the
+same typed requirement retained by the planner: `pack_kind`, `pack_identity`,
+optional `pack_version`, `target_framework`, optional `runtime_identifier`,
+and `acquisition`. Valid acquisition values are `install_sdk`,
+`install_sdk_or_restore_package`, `restore_package`, `install_runtime`, and
+`choose_runtime_identifier`.
+Reporters do not recover these fields by parsing the human message.
+
 Malformed diagnostic identifiers are rejected at construction. Empty diagnostic
 messages are programmer errors. External malformed data becomes a normal
 diagnostic at the boundary where it is parsed.

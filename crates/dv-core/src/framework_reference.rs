@@ -7,7 +7,9 @@ use std::{
 
 use quick_xml::{Reader, XmlVersion, events::Event};
 
-use crate::{FrameworkReference, ProjectSpec, RuntimeRollForward, SdkInventory, package::global_packages_directory};
+use crate::{
+  FrameworkReference, PackAcquisition, PackKind, PackRequirement, ProjectSpec, RuntimeRollForward, SdkInventory, package::global_packages_directory,
+};
 
 const BUNDLED_VERSIONS_FILE: &str = "Microsoft.NETCoreSdk.BundledVersions.props";
 const IMPLICIT_FRAMEWORK_REFERENCE: &str = "Microsoft.NETCore.App";
@@ -183,6 +185,7 @@ pub struct FrameworkReferenceError {
   kind: FrameworkReferenceErrorKind,
   path: PathBuf,
   message: String,
+  requirement: Option<PackRequirement>,
 }
 
 impl FrameworkReferenceError {
@@ -191,7 +194,13 @@ impl FrameworkReferenceError {
       kind,
       path: path.into(),
       message: message.into(),
+      requirement: None,
     }
+  }
+
+  fn with_requirement(mut self, requirement: PackRequirement) -> Self {
+    self.requirement = Some(requirement);
+    self
   }
 
   /// Returns the stable failure category.
@@ -202,6 +211,11 @@ impl FrameworkReferenceError {
   /// Returns the project, manifest, pack, or shared root associated with the failure.
   pub fn path(&self) -> &Path {
     &self.path
+  }
+
+  /// Returns the exact unavailable-pack requirement when selection reached one.
+  pub fn requirement(&self) -> Option<&PackRequirement> {
+    self.requirement.as_ref()
   }
 }
 
@@ -341,12 +355,19 @@ fn plan_project(
       &mut global_packages,
       &definition.targeting_pack_id,
       targeting_pack_version,
+      project.target_framework(),
     )?;
     let (selected_version, shared_root) = if project.self_contained() {
       (None, None)
     } else {
       let shared_base = dotnet_root.join("shared").join(&definition.runtime_name);
-      let selected = select_installed_runtime(&shared_base, &requested_parsed, project.roll_forward())?;
+      let selected = select_installed_runtime(
+        &shared_base,
+        &definition.runtime_name,
+        project.target_framework(),
+        &requested_parsed,
+        project.roll_forward(),
+      )?;
       let root = shared_base.join(&selected.text);
       (Some(selected.text), Some(root))
     };
@@ -391,6 +412,7 @@ fn locate_targeting_pack(
   global_packages: &mut Option<PathBuf>,
   id: &str,
   version: &str,
+  target_framework: &str,
 ) -> Result<PathBuf, FrameworkReferenceError> {
   let installed = dotnet_root.join("packs").join(id).join(version);
   if installed.is_dir() {
@@ -410,15 +432,25 @@ fn locate_targeting_pack(
   if cached.is_dir() {
     return Ok(cached);
   }
-  Err(FrameworkReferenceError::new(
-    FrameworkReferenceErrorKind::TargetingPackNotFound,
-    &cached,
-    format!(
-      "required targeting pack {id} {version} is not installed under {} or restored under {}",
-      installed.display(),
-      cached.display()
-    ),
-  ))
+  Err(
+    FrameworkReferenceError::new(
+      FrameworkReferenceErrorKind::TargetingPackNotFound,
+      &cached,
+      format!(
+        "required targeting pack {id} {version} is not installed under {} or restored under {}",
+        installed.display(),
+        cached.display()
+      ),
+    )
+    .with_requirement(PackRequirement::new(
+      PackKind::Targeting,
+      id,
+      Some(version),
+      target_framework,
+      None,
+      PackAcquisition::InstallSdkOrRestorePackage,
+    )),
+  )
 }
 
 fn read_framework_definitions(path: &Path, projects: &[&ProjectSpec]) -> Result<Vec<KnownFramework>, FrameworkReferenceError> {
@@ -607,7 +639,13 @@ fn compare_prerelease(left: Option<&str>, right: Option<&str>) -> Ordering {
   }
 }
 
-fn select_installed_runtime(base: &Path, requested: &RuntimeVersion, policy: RuntimeRollForward) -> Result<RuntimeVersion, FrameworkReferenceError> {
+fn select_installed_runtime(
+  base: &Path,
+  runtime_name: &str,
+  target_framework: &str,
+  requested: &RuntimeVersion,
+  policy: RuntimeRollForward,
+) -> Result<RuntimeVersion, FrameworkReferenceError> {
   let entries = fs::read_dir(base).map_err(|error| {
     if error.kind() == io::ErrorKind::NotFound {
       FrameworkReferenceError::new(
@@ -615,6 +653,14 @@ fn select_installed_runtime(base: &Path, requested: &RuntimeVersion, policy: Run
         base,
         format!("shared framework {} is not installed", base.display()),
       )
+      .with_requirement(PackRequirement::new(
+        PackKind::SharedFramework,
+        runtime_name,
+        Some(&requested.text),
+        target_framework,
+        None,
+        PackAcquisition::InstallRuntime,
+      ))
     } else {
       io_error("enumerate shared frameworks", base, error)
     }
@@ -653,6 +699,14 @@ fn select_installed_runtime(base: &Path, requested: &RuntimeVersion, policy: Run
         policy.as_str()
       ),
     )
+    .with_requirement(PackRequirement::new(
+      PackKind::SharedFramework,
+      runtime_name,
+      Some(&requested.text),
+      target_framework,
+      None,
+      PackAcquisition::InstallRuntime,
+    ))
   })
 }
 
@@ -934,10 +988,40 @@ mod tests {
     let packages_root = temp.0.join("packages");
     let mut discovered = None;
 
-    let selected = locate_targeting_pack(&dotnet, &temp.0, Some(&packages_root), &mut discovered, "Example.Ref", "10.0.0").unwrap();
+    let selected = locate_targeting_pack(&dotnet, &temp.0, Some(&packages_root), &mut discovered, "Example.Ref", "10.0.0", "net10.0").unwrap();
 
     assert_eq!(selected, packages);
     assert_eq!(discovered.as_deref(), Some(packages_root.as_path()));
+  }
+
+  #[test]
+  fn unavailable_targeting_and_shared_packs_keep_actionable_requirements() {
+    let temp = TempDirectory::new();
+    let dotnet = temp.directory("dotnet");
+    let packages_root = temp.directory("packages");
+    let mut discovered = None;
+
+    let targeting = locate_targeting_pack(&dotnet, &temp.0, Some(&packages_root), &mut discovered, "Example.Ref", "10.0.0", "net10.0").unwrap_err();
+    let requirement = targeting.requirement().unwrap();
+    assert_eq!(requirement.kind(), PackKind::Targeting);
+    assert_eq!(requirement.identity(), "Example.Ref");
+    assert_eq!(requirement.version(), Some("10.0.0"));
+    assert_eq!(requirement.acquisition(), PackAcquisition::InstallSdkOrRestorePackage);
+
+    let requested = RuntimeVersion::parse("10.0.0").unwrap();
+    let shared = select_installed_runtime(
+      &temp.0.join("shared/Microsoft.NETCore.App"),
+      "Microsoft.NETCore.App",
+      "net10.0",
+      &requested,
+      RuntimeRollForward::Minor,
+    )
+    .unwrap_err();
+    let requirement = shared.requirement().unwrap();
+    assert_eq!(requirement.kind(), PackKind::SharedFramework);
+    assert_eq!(requirement.identity(), "Microsoft.NETCore.App");
+    assert_eq!(requirement.version(), Some("10.0.0"));
+    assert_eq!(requirement.acquisition(), PackAcquisition::InstallRuntime);
   }
 
   #[test]

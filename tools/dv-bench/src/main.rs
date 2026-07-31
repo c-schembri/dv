@@ -22,6 +22,7 @@ enum CaseKind {
   RuntimeEvaluate,
   RuntimePackPlan,
   FrameworkReferencePlan,
+  PackDiagnostic,
   CompilerPlan,
   RestoreCold,
   PackageSyncCold,
@@ -47,6 +48,7 @@ struct Fixtures<'a> {
   runtime: &'a Path,
   runtime_pack: &'a Path,
   framework_reference: &'a Path,
+  unavailable_pack: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
@@ -113,6 +115,25 @@ const DOTNET_CASES: &[Case] = &[
       "-t:ResolveTargetingPackAssets",
       "-getProperty:TargetFramework,RollForward,SelfContained",
       "-getItem:RuntimeFramework,ResolvedFrameworkReference",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "pack_diagnostic",
+    kind: CaseKind::PackDiagnostic,
+    args: &[
+      "restore",
+      "UnavailablePackProject.csproj",
+      "--source",
+      "offline-source",
+      "--packages",
+      ".packages",
+      "--no-cache",
+      "--disable-build-servers",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "minimal",
     ],
     implemented: true,
   },
@@ -267,6 +288,12 @@ const DV_CASES: &[Case] = &[
     name: "framework_reference_plan",
     kind: CaseKind::FrameworkReferencePlan,
     args: &["project", "frameworks", "FrameworkReferenceProject.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "pack_diagnostic",
+    kind: CaseKind::PackDiagnostic,
+    args: &["project", "runtime-packs", "UnavailablePackProject.csproj", "--packages", ".packages", "--json"],
     implemented: true,
   },
   Case {
@@ -425,6 +452,7 @@ fn run() -> Result<()> {
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
   let runtime_pack_fixture = repository.join("benchmarks/fixtures/runtime-pack-project");
   let framework_reference_fixture = repository.join("benchmarks/fixtures/framework-reference-project");
+  let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
@@ -434,6 +462,7 @@ fn run() -> Result<()> {
     runtime: &runtime_fixture,
     runtime_pack: &runtime_pack_fixture,
     framework_reference: &framework_reference_fixture,
+    unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
@@ -458,6 +487,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "framework_reference_plan") {
     verify_framework_reference_plan(&repository, &dv_executable, &framework_reference_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "pack_diagnostic") {
+    verify_pack_diagnostic(&repository, &dv_executable, &unavailable_pack_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
     verify_compiler_plan(&repository, &dv_executable, &fixture)?;
@@ -898,6 +930,95 @@ fn verify_framework_reference_plan(repository: &Path, dv_executable: &Path, fixt
     if reference != actual {
       return Err(format!("installed shared-framework selection mismatch for {runtime_name}: host={reference:?} dv={actual:?}").into());
     }
+  }
+  Ok(())
+}
+
+fn verify_pack_diagnostic(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-pack-diagnostic-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  let dotnet_workspace = verification.join("dotnet");
+  let dv_workspace = verification.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+
+  let reference = Command::new("dotnet")
+    .args([
+      "restore",
+      "UnavailablePackProject.csproj",
+      "--source",
+      "offline-source",
+      "--packages",
+      ".packages",
+      "--no-cache",
+      "--disable-build-servers",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "minimal",
+    ])
+    .current_dir(&dotnet_workspace)
+    .output()?;
+  validate_pack_failure(&reference, true)?;
+
+  let actual = Command::new(dv_executable)
+    .args(["project", "runtime-packs", "UnavailablePackProject.csproj", "--packages", ".packages", "--json"])
+    .current_dir(&dv_workspace)
+    .output()?;
+  validate_pack_failure(&actual, false)
+}
+
+fn validate_pack_failure(output: &Output, reference: bool) -> Result<()> {
+  const IDENTITY: &str = "Microsoft.NETCore.App.Runtime.linux-arm";
+  if output.status.success() {
+    return Err("unavailable-pack oracle unexpectedly succeeded".into());
+  }
+  if reference {
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    if !text.contains("NU1101") || !text.contains(IDENTITY) {
+      return Err(format!("dotnet unavailable-pack diagnostic omitted NU1101 or {IDENTITY}: {text}").into());
+    }
+    return Ok(());
+  }
+  if !output.stderr.is_empty() {
+    return Err(format!("dv JSON diagnostic wrote stderr: {}", String::from_utf8_lossy(&output.stderr)).into());
+  }
+  let diagnostic = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic").cloned())
+    .ok_or("dv unavailable-pack command omitted its diagnostic event")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0124") {
+    return Err("dv unavailable-pack diagnostic code is not DV0124".into());
+  }
+  let context = diagnostic
+    .get("context")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv unavailable-pack diagnostic omitted context")?;
+  for (name, expected) in [
+    ("pack_kind", "runtime_pack"),
+    ("pack_identity", IDENTITY),
+    ("pack_version", "10.0.0"),
+    ("target_framework", "net10.0"),
+    ("runtime_identifier", "linux-arm"),
+    ("acquisition", "restore_package"),
+  ] {
+    let actual = context.iter().find_map(|field| {
+      if field.get("name").and_then(serde_json::Value::as_str) == Some(name) {
+        field.get("value").and_then(serde_json::Value::as_str)
+      } else {
+        None
+      }
+    });
+    if actual != Some(expected) {
+      return Err(format!("dv unavailable-pack context {name} mismatch: expected={expected:?} actual={actual:?}").into());
+    }
+  }
+  if diagnostic.get("help").and_then(serde_json::Value::as_str) != Some("Restore the required pack from a configured package source.") {
+    return Err("dv unavailable-pack diagnostic omitted acquisition guidance".into());
   }
   Ok(())
 }
@@ -1634,7 +1755,9 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::FrameworkReferencePlan
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan => Ok(()),
-    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
+    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
+      reset_fixture(fixture, workspace)
+    },
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
       run_checked(executable, restore_args(executable), workspace, "clean build restore")
@@ -1676,6 +1799,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
+    CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
@@ -1690,6 +1814,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
+    CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
@@ -1699,9 +1824,15 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
 
 fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let started = Instant::now();
-  let output = Command::new(executable).args(case.args).current_dir(cwd).output()?;
+  let mut command = Command::new(executable);
+  command.args(case.args).current_dir(cwd);
+  let output = command.output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-  check_output(output.clone(), executable, case.args, "measured command")?;
+  if matches!(case.kind, CaseKind::PackDiagnostic) {
+    validate_pack_failure(&output, is_dotnet(executable))?;
+  } else {
+    check_output(output.clone(), executable, case.args, "measured command")?;
+  }
   let work = if !is_dotnet(executable)
     && matches!(
       case.kind,
@@ -1855,6 +1986,9 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     let source_path = entry.path();
     let destination_path = destination.join(entry.file_name());
     if entry.file_type()?.is_dir() {
+      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages")) {
+        continue;
+      }
       copy_directory(&source_path, &destination_path)?;
     } else {
       fs::copy(source_path, destination_path)?;
@@ -2064,6 +2198,7 @@ fn case_label(case: &str) -> &str {
     "project_evaluate" => "Project evaluation",
     "runtime_pack_plan" => "Runtime pack plan",
     "framework_reference_plan" => "Framework reference plan",
+    "pack_diagnostic" => "Unavailable pack diagnostic",
     "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",

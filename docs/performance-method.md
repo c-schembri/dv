@@ -22,7 +22,9 @@ Transform:
    evaluation must return identical requested properties and item identities.
 2. Prepare fixture state outside the timed interval.
 3. Launch one process and wait for its terminal status.
-4. Reject non-zero status and retain its output in the failure message.
+4. Validate the case-specific terminal status and output. Success cases reject
+   non-zero status; diagnostic cases require the expected failure status and
+   semantic diagnostic fields.
 5. Record elapsed monotonic nanoseconds.
 6. Repeat as a batch, discard warm-ups, sort a copy, and calculate min, median,
    p95, and max while preserving raw samples.
@@ -44,7 +46,8 @@ Ownership and lifetime:
 Invalid input behavior:
 
 - zero samples, unknown options, unsafe work paths, missing tools, setup
-  failures, command failures, and malformed counts fail the entire run;
+  failures, unexpected command statuses, and malformed counts fail the entire
+  run;
 - measurements from a failed or partially prepared command are never reported.
 
 ## Initial Cases
@@ -58,6 +61,7 @@ Invalid input behavior:
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
 | `runtime_pack_plan` | restored immutable `runtime-pack-project` fixture and installed SDK packs | process launch, SDK/graph/manifest parsing, runtime and host pack selection, validation of 187 runtime assets, apphost selection, and JSON output |
 | `framework_reference_plan` | restored immutable `framework-reference-project` fixture and installed targeting/shared packs | process launch, project/SDK manifest parsing, two framework and targeting-pack resolutions, installed shared-framework roll-forward, and JSON output |
+| `pack_diagnostic` | fresh `unavailable-pack-project` copy, empty local source, empty isolated packages | process launch, SDK/manifest/RID evaluation, missing-pack proof, and actionable failure output |
 | `restore_cold` | fresh fixture copy | restore |
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
@@ -89,6 +93,7 @@ directional decisions.`
 | `runtime-project` | 1 project, 1 selected RID, 3 ordered RID expansion values | compact target expansion and selected-index lookup | executable with property parity preflight |
 | `runtime-pack-project` | 1 `net10.0` executable, `win-x64`, 172 managed runtime assets, 15 native assets, and 1 apphost template | manifest-driven pack/RID/asset selection | executable for both tools with complete pack and asset parity preflight |
 | `framework-reference-project` | 1 `net10.0` executable, implicit Core plus explicit ASP.NET Core, `LatestPatch` | framework/targeting-pack parity and actual host shared-runtime selection | executable for both tools with item and host-launch parity preflight |
+| `unavailable-pack-project` | 1 self-contained `net10.0` executable, SDK-known `linux-arm`, empty local source and isolated package cache | deterministic missing runtime-pack identity and acquisition guidance | executable for both tools with expected-failure preflight |
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
 | `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
@@ -174,6 +179,12 @@ Measure framework references, targeting packs, and shared-runtime roll-forward:
 
 ```text
 cargo bench-all --case framework_reference_plan --samples 30 --warmups 3
+```
+
+Measure deterministic unavailable-pack diagnosis without network variance:
+
+```text
+cargo bench-all --case pack_diagnostic --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

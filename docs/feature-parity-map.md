@@ -117,11 +117,11 @@ Repository-owned representative input currently consists of:
 
 - raw OS argument vectors shaped like `dotnet`, MSBuild, NuGet, and VSTest
   invocations, although a checked-in compatibility corpus does not yet exist;
-- eleven SDK-style C# projects;
+- twelve SDK-style C# projects;
 - ten C# source files;
 - three project-reference edges;
 - 53 exact package references across single-package and real graph fixtures;
-- eight single-project fixtures and one three-project acyclic fixture;
+- nine single-project fixtures and one three-project acyclic fixture;
 - one observed Windows machine with three x64 SDK installations and five
   installed versions in each of the Core, ASP.NET Core, and Windows Desktop
   shared-framework families.
@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 15 Rust source files, 14,175 nonblank source
-lines, and 85 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 14,812 nonblank source
+lines, and 90 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -695,8 +695,15 @@ boundary, not final drop-in parity.
   matches every portable `project.assets.json` family. A 30-sample locked
   restore oracle measures `702.904 ms` versus `107.385 ms` for `dv` (`6.5x`).
   `P1`
-- [~] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the
-  required pack identity and acquisition action. `P1`
+- [x] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the
+  required pack identity and acquisition action. Runtime, host, targeting, and
+  shared-framework failures retain one 56-byte typed requirement with one text
+  allocation, exact dimensions, and a stable action; successful planning does
+  not construct it. The offline `linux-arm`
+  fixture requires both tools to name
+  `Microsoft.NETCore.App.Runtime.linux-arm`; `dv` also reports version, TFM,
+  RID, kind, acquisition, and guidance. A 30-sample restore oracle measures
+  `532.652 ms` versus `6.378 ms` for `dv` (`83.5x`). `P1`
 - [ ] `PACKS-010` Cache immutable SDK pack inventories by selected SDK
   fingerprint and invalidate on installation changes. `P2`
 

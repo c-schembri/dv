@@ -7,7 +7,10 @@ use std::{
 
 use quick_xml::{Reader, XmlVersion, events::Event};
 
-use crate::{ProjectSpec, RuntimeIdentifierGraph, SdkInventory, load_portable_runtime_graph, package::global_packages_directory};
+use crate::{
+  PackAcquisition, PackKind, PackRequirement, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, load_portable_runtime_graph,
+  package::global_packages_directory,
+};
 
 const BUNDLED_VERSIONS_FILE: &str = "Microsoft.NETCoreSdk.BundledVersions.props";
 const RUNTIME_LIST_FILE: &str = "data/RuntimeList.xml";
@@ -183,6 +186,7 @@ pub struct RuntimePackError {
   kind: RuntimePackErrorKind,
   path: PathBuf,
   message: String,
+  requirement: Option<PackRequirement>,
 }
 
 impl RuntimePackError {
@@ -191,7 +195,13 @@ impl RuntimePackError {
       kind,
       path: path.into(),
       message: message.into(),
+      requirement: None,
     }
+  }
+
+  fn with_requirement(mut self, requirement: PackRequirement) -> Self {
+    self.requirement = Some(requirement);
+    self
   }
 
   /// Returns the stable failure category.
@@ -202,6 +212,11 @@ impl RuntimePackError {
   /// Returns the manifest, pack, project, or asset associated with the failure.
   pub fn path(&self) -> &Path {
     &self.path
+  }
+
+  /// Returns the exact unavailable-pack requirement when selection reached one.
+  pub fn requirement(&self) -> Option<&PackRequirement> {
+    self.requirement.as_ref()
   }
 }
 
@@ -235,6 +250,15 @@ struct RuntimeAsset {
   path: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+struct PackSelection<'a> {
+  label: &'static str,
+  kind: PackKind,
+  pattern: &'a str,
+  version: &'a str,
+  target_framework: &'a str,
+}
+
 /// Selects runtime and host packs for a project's active runtime identifier.
 ///
 /// Pack identities, versions, and supported RIDs come from the selected SDK.
@@ -266,9 +290,27 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
     requested_runtime_identifier,
     &definitions.runtime_identifiers,
     &manifest,
-    "runtime pack",
+    PackSelection {
+      label: "runtime pack",
+      kind: PackKind::Runtime,
+      pattern: &definitions.runtime_pattern,
+      version: runtime_pack_version,
+      target_framework: project.target_framework(),
+    },
   )?;
-  let host_runtime_identifier = select_pack_runtime_identifier(&graph, requested_runtime_identifier, &definitions.host_identifiers, &manifest, "host pack")?;
+  let host_runtime_identifier = select_pack_runtime_identifier(
+    &graph,
+    requested_runtime_identifier,
+    &definitions.host_identifiers,
+    &manifest,
+    PackSelection {
+      label: "host pack",
+      kind: PackKind::Host,
+      pattern: &definitions.host_pattern,
+      version: &definitions.host_version,
+      target_framework: project.target_framework(),
+    },
+  )?;
   let runtime_pack_id = expand_pack_pattern(&definitions.runtime_pattern, runtime_identifier, &manifest, "runtime pack")?;
   let host_pack_id = expand_pack_pattern(&definitions.host_pattern, host_runtime_identifier, &manifest, "host pack")?;
   let global_packages = global_packages_directory(project.project_directory(), packages_directory).map_err(|error| {
@@ -279,8 +321,24 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
     )
   })?;
   let dotnet_root = inventory.root(selected);
-  let runtime_pack_root = locate_pack(dotnet_root, &global_packages, &runtime_pack_id, runtime_pack_version)?;
-  let host_pack_root = locate_pack(dotnet_root, &global_packages, &host_pack_id, &definitions.host_version)?;
+  let runtime_pack_root = locate_pack(
+    dotnet_root,
+    &global_packages,
+    &runtime_pack_id,
+    runtime_pack_version,
+    PackKind::Runtime,
+    project.target_framework(),
+    requested_runtime_identifier,
+  )?;
+  let host_pack_root = locate_pack(
+    dotnet_root,
+    &global_packages,
+    &host_pack_id,
+    &definitions.host_version,
+    PackKind::Host,
+    project.target_framework(),
+    requested_runtime_identifier,
+  )?;
   let runtime_manifest = runtime_pack_root.join(RUNTIME_LIST_FILE);
   let framework_version = project.target().framework_version();
   let runtime_assets = read_runtime_assets(&runtime_manifest, &runtime_pack_root, project.target_framework(), &framework_version)?;
@@ -403,18 +461,30 @@ fn select_pack_runtime_identifier<'a>(
   requested: &'a str,
   supported: &str,
   manifest: &Path,
-  pack_kind: &str,
+  pack: PackSelection<'_>,
 ) -> Result<&'a str, RuntimePackError> {
-  graph
+  if let Some(selected) = graph
     .compatible_rids(requested)
     .find(|candidate| supported.split(';').any(|supported| supported == *candidate))
-    .ok_or_else(|| {
-      RuntimePackError::new(
-        RuntimePackErrorKind::UnsupportedRuntime,
-        manifest,
-        format!("selected SDK provides no {pack_kind} compatible with runtime identifier {requested:?}"),
-      )
-    })
+  {
+    return Ok(selected);
+  }
+  let identity = expand_pack_pattern(pack.pattern, requested, manifest, pack.label)?;
+  Err(
+    RuntimePackError::new(
+      RuntimePackErrorKind::UnsupportedRuntime,
+      manifest,
+      format!("selected SDK provides no {} compatible with runtime identifier {requested:?}", pack.label),
+    )
+    .with_requirement(PackRequirement::new(
+      pack.kind,
+      &identity,
+      Some(pack.version),
+      pack.target_framework,
+      Some(requested),
+      PackAcquisition::ChooseRuntimeIdentifier,
+    )),
+  )
 }
 
 fn expand_pack_pattern(pattern: &str, runtime_identifier: &str, manifest: &Path, pack_kind: &str) -> Result<String, RuntimePackError> {
@@ -437,7 +507,15 @@ fn expand_pack_pattern(pattern: &str, runtime_identifier: &str, manifest: &Path,
   Ok(identity)
 }
 
-fn locate_pack(dotnet_root: &Path, global_packages: &Path, package_id: &str, version: &str) -> Result<PathBuf, RuntimePackError> {
+fn locate_pack(
+  dotnet_root: &Path,
+  global_packages: &Path,
+  package_id: &str,
+  version: &str,
+  kind: PackKind,
+  target_framework: &str,
+  requested_runtime_identifier: &str,
+) -> Result<PathBuf, RuntimePackError> {
   let installed = dotnet_root.join("packs").join(package_id).join(version);
   let cached = global_packages.join(package_id.to_ascii_lowercase()).join(version.to_ascii_lowercase());
   let candidates = [&installed, &cached];
@@ -451,6 +529,14 @@ fn locate_pack(dotnet_root: &Path, global_packages: &Path, package_id: &str, ver
         cached.display()
       ),
     )
+    .with_requirement(PackRequirement::new(
+      kind,
+      package_id,
+      Some(version),
+      target_framework,
+      Some(requested_runtime_identifier),
+      PackAcquisition::RestorePackage,
+    ))
   })
 }
 
@@ -817,8 +903,49 @@ mod tests {
     let graph_path = TempDirectory::new();
     let path = graph_path.write("graph.json", r##"{"runtimes":{"linux-x64":{"#import":[]}}}"##);
     let graph = RuntimeIdentifierGraph::load(&path).unwrap();
-    let error = select_pack_runtime_identifier(&graph, "linux-custom-x64", "linux-x64", &path, "runtime pack").unwrap_err();
+    let error = select_pack_runtime_identifier(
+      &graph,
+      "linux-custom-x64",
+      "linux-x64",
+      &path,
+      PackSelection {
+        label: "runtime pack",
+        kind: PackKind::Runtime,
+        pattern: "Runtime.**RID**",
+        version: "10.0.0",
+        target_framework: "net10.0",
+      },
+    )
+    .unwrap_err();
     assert_eq!(error.kind(), RuntimePackErrorKind::UnsupportedRuntime);
+    let requirement = error.requirement().unwrap();
+    assert_eq!(requirement.identity(), "Runtime.linux-custom-x64");
+    assert_eq!(requirement.runtime_identifier(), Some("linux-custom-x64"));
+    assert_eq!(requirement.acquisition(), PackAcquisition::ChooseRuntimeIdentifier);
+  }
+
+  #[test]
+  fn missing_host_pack_keeps_exact_identity_version_dimensions_and_action() {
+    let temp = TempDirectory::new();
+    let error = locate_pack(
+      &temp.0.join("dotnet"),
+      &temp.0.join("packages"),
+      "Microsoft.NETCore.App.Host.win-x64",
+      "10.0.0",
+      PackKind::Host,
+      "net10.0",
+      "win-x64",
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), RuntimePackErrorKind::PackNotFound);
+    let requirement = error.requirement().unwrap();
+    assert_eq!(requirement.kind(), PackKind::Host);
+    assert_eq!(requirement.identity(), "Microsoft.NETCore.App.Host.win-x64");
+    assert_eq!(requirement.version(), Some("10.0.0"));
+    assert_eq!(requirement.target_framework(), "net10.0");
+    assert_eq!(requirement.runtime_identifier(), Some("win-x64"));
+    assert_eq!(requirement.acquisition(), PackAcquisition::RestorePackage);
   }
 
   #[test]

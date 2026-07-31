@@ -5,6 +5,7 @@ mod diagnostic;
 mod event;
 mod framework;
 mod framework_reference;
+mod pack_requirement;
 mod package;
 mod project;
 mod reporter;
@@ -22,6 +23,7 @@ pub use framework::{FrameworkFamily, TargetFramework, TargetFrameworkError};
 pub use framework_reference::{
   FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, ResolvedFrameworkReference, plan_framework_references,
 };
+pub use pack_requirement::{PackAcquisition, PackKind, PackRequirement};
 pub use package::{
   PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, resolve_package_inputs,
 };

@@ -9,11 +9,11 @@ use std::{
 
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
-  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration,
-  ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
-  RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
-  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
-  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions,
+  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
+  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
+  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -1124,14 +1124,17 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
     CompilerPlanErrorKind::TextOverflow => "DV0306",
     CompilerPlanErrorKind::PackageResolution => "DV0307",
   };
-  let help = match error.kind() {
-    CompilerPlanErrorKind::PackNotFound => Some("Install the targeting pack required by the project target framework."),
-    CompilerPlanErrorKind::InvalidManifest | CompilerPlanErrorKind::MissingAsset => Some("Repair or reinstall the selected .NET SDK."),
-    CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable SDK compatible with the project target framework."),
-    CompilerPlanErrorKind::PackageResolution => Some("Run `dv restore` (or `dv sync`) for every package-bearing project before compiler planning."),
-    CompilerPlanErrorKind::Io | CompilerPlanErrorKind::NonUnicodePath | CompilerPlanErrorKind::TextOverflow => None,
-  };
-  diagnostic(
+  let help = error
+    .requirement()
+    .map(|requirement| requirement.acquisition().help())
+    .or_else(|| match error.kind() {
+      CompilerPlanErrorKind::PackNotFound => Some("Install the targeting pack required by the project target framework."),
+      CompilerPlanErrorKind::InvalidManifest | CompilerPlanErrorKind::MissingAsset => Some("Repair or reinstall the selected .NET SDK."),
+      CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable SDK compatible with the project target framework."),
+      CompilerPlanErrorKind::PackageResolution => Some("Run `dv restore` (or `dv sync`) for every package-bearing project before compiler planning."),
+      CompilerPlanErrorKind::Io | CompilerPlanErrorKind::NonUnicodePath | CompilerPlanErrorKind::TextOverflow => None,
+    });
+  let mut diagnostic = diagnostic(
     code,
     error.to_string(),
     Some(ContextField {
@@ -1139,7 +1142,11 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
       value: error.path().display().to_string(),
     }),
     help,
-  )
+  );
+  if let Some(requirement) = error.requirement() {
+    append_pack_requirement(&mut diagnostic, requirement);
+  }
+  diagnostic
 }
 
 fn package_diagnostic(error: PackageError) -> Diagnostic {
@@ -1231,21 +1238,31 @@ fn runtime_graph_diagnostic(error: RuntimeGraphError) -> Diagnostic {
 }
 
 fn runtime_pack_diagnostic(error: RuntimePackError) -> Diagnostic {
-  let (code, help) = match error.kind() {
-    RuntimePackErrorKind::Io => ("DV0120", None),
-    RuntimePackErrorKind::InvalidManifest => ("DV0121", Some("Repair or reinstall the selected .NET SDK or pack.")),
-    RuntimePackErrorKind::RuntimeRequired => ("DV0122", Some("Set one RuntimeIdentifier in the project.")),
-    RuntimePackErrorKind::UnsupportedRuntime => (
-      "DV0123",
-      Some("Choose a RID supported by the selected SDK's portable RID graph and pack manifest."),
-    ),
-    RuntimePackErrorKind::PackNotFound => ("DV0124", Some("Restore the required pack or install the matching SDK workload.")),
-    RuntimePackErrorKind::MissingAsset => ("DV0125", Some("Restore, repair, or reinstall the selected pack.")),
-    RuntimePackErrorKind::Configuration => ("DV0126", Some("Correct NuGet.Config or set NUGET_PACKAGES.")),
-    RuntimePackErrorKind::NonUnicodePath => ("DV0127", None),
-    RuntimePackErrorKind::TextOverflow => ("DV0128", Some("Use a bounded SDK and package installation.")),
+  let code = match error.kind() {
+    RuntimePackErrorKind::Io => "DV0120",
+    RuntimePackErrorKind::InvalidManifest => "DV0121",
+    RuntimePackErrorKind::RuntimeRequired => "DV0122",
+    RuntimePackErrorKind::UnsupportedRuntime => "DV0123",
+    RuntimePackErrorKind::PackNotFound => "DV0124",
+    RuntimePackErrorKind::MissingAsset => "DV0125",
+    RuntimePackErrorKind::Configuration => "DV0126",
+    RuntimePackErrorKind::NonUnicodePath => "DV0127",
+    RuntimePackErrorKind::TextOverflow => "DV0128",
   };
-  diagnostic(
+  let help = error
+    .requirement()
+    .map(|requirement| requirement.acquisition().help())
+    .or_else(|| match error.kind() {
+      RuntimePackErrorKind::Io | RuntimePackErrorKind::NonUnicodePath => None,
+      RuntimePackErrorKind::InvalidManifest => Some("Repair or reinstall the selected .NET SDK or pack."),
+      RuntimePackErrorKind::RuntimeRequired => Some("Set one RuntimeIdentifier in the project."),
+      RuntimePackErrorKind::UnsupportedRuntime => Some("Choose a RID supported by the selected SDK's portable RID graph and pack manifest."),
+      RuntimePackErrorKind::PackNotFound => Some("Restore the required pack or install the matching SDK workload."),
+      RuntimePackErrorKind::MissingAsset => Some("Restore, repair, or reinstall the selected pack."),
+      RuntimePackErrorKind::Configuration => Some("Correct NuGet.Config or set NUGET_PACKAGES."),
+      RuntimePackErrorKind::TextOverflow => Some("Use a bounded SDK and package installation."),
+    });
+  let mut diagnostic = diagnostic(
     code,
     error.to_string(),
     Some(ContextField {
@@ -1253,28 +1270,39 @@ fn runtime_pack_diagnostic(error: RuntimePackError) -> Diagnostic {
       value: error.path().display().to_string(),
     }),
     help,
-  )
+  );
+  if let Some(requirement) = error.requirement() {
+    append_pack_requirement(&mut diagnostic, requirement);
+  }
+  diagnostic
 }
 
 fn framework_reference_diagnostic(error: FrameworkReferenceError) -> Diagnostic {
-  let (code, help) = match error.kind() {
-    FrameworkReferenceErrorKind::Io => ("DV0130", None),
-    FrameworkReferenceErrorKind::InvalidManifest => ("DV0131", Some("Repair or reinstall the selected .NET SDK.")),
-    FrameworkReferenceErrorKind::UnknownFramework => (
-      "DV0132",
-      Some("Choose a FrameworkReference supported by the selected SDK and target framework."),
-    ),
-    FrameworkReferenceErrorKind::InvalidVersion => ("DV0133", Some("Use a valid three-part .NET runtime or targeting-pack version.")),
-    FrameworkReferenceErrorKind::TargetingPackNotFound => ("DV0134", Some("Restore the required targeting pack or install the matching SDK.")),
-    FrameworkReferenceErrorKind::SharedFrameworkNotFound => (
-      "DV0135",
-      Some("Install a compatible shared framework or adjust the project's RollForward policy."),
-    ),
-    FrameworkReferenceErrorKind::Configuration => ("DV0136", Some("Correct NuGet.Config or set NUGET_PACKAGES.")),
-    FrameworkReferenceErrorKind::NonUnicodePath => ("DV0137", None),
-    FrameworkReferenceErrorKind::TextOverflow => ("DV0138", Some("Use a bounded SDK and framework installation.")),
+  let code = match error.kind() {
+    FrameworkReferenceErrorKind::Io => "DV0130",
+    FrameworkReferenceErrorKind::InvalidManifest => "DV0131",
+    FrameworkReferenceErrorKind::UnknownFramework => "DV0132",
+    FrameworkReferenceErrorKind::InvalidVersion => "DV0133",
+    FrameworkReferenceErrorKind::TargetingPackNotFound => "DV0134",
+    FrameworkReferenceErrorKind::SharedFrameworkNotFound => "DV0135",
+    FrameworkReferenceErrorKind::Configuration => "DV0136",
+    FrameworkReferenceErrorKind::NonUnicodePath => "DV0137",
+    FrameworkReferenceErrorKind::TextOverflow => "DV0138",
   };
-  diagnostic(
+  let help = error
+    .requirement()
+    .map(|requirement| requirement.acquisition().help())
+    .or_else(|| match error.kind() {
+      FrameworkReferenceErrorKind::Io | FrameworkReferenceErrorKind::NonUnicodePath => None,
+      FrameworkReferenceErrorKind::InvalidManifest => Some("Repair or reinstall the selected .NET SDK."),
+      FrameworkReferenceErrorKind::UnknownFramework => Some("Choose a FrameworkReference supported by the selected SDK and target framework."),
+      FrameworkReferenceErrorKind::InvalidVersion => Some("Use a valid three-part .NET runtime or targeting-pack version."),
+      FrameworkReferenceErrorKind::TargetingPackNotFound => Some("Restore the required targeting pack or install the matching SDK."),
+      FrameworkReferenceErrorKind::SharedFrameworkNotFound => Some("Install a compatible shared framework or adjust the project's RollForward policy."),
+      FrameworkReferenceErrorKind::Configuration => Some("Correct NuGet.Config or set NUGET_PACKAGES."),
+      FrameworkReferenceErrorKind::TextOverflow => Some("Use a bounded SDK and framework installation."),
+    });
+  let mut diagnostic = diagnostic(
     code,
     error.to_string(),
     Some(ContextField {
@@ -1282,7 +1310,42 @@ fn framework_reference_diagnostic(error: FrameworkReferenceError) -> Diagnostic 
       value: error.path().display().to_string(),
     }),
     help,
-  )
+  );
+  if let Some(requirement) = error.requirement() {
+    append_pack_requirement(&mut diagnostic, requirement);
+  }
+  diagnostic
+}
+
+fn append_pack_requirement(diagnostic: &mut Diagnostic, requirement: &PackRequirement) {
+  diagnostic.context.push(ContextField {
+    name: "pack_kind".into(),
+    value: requirement.kind().as_str().into(),
+  });
+  diagnostic.context.push(ContextField {
+    name: "pack_identity".into(),
+    value: requirement.identity().into(),
+  });
+  if let Some(version) = requirement.version() {
+    diagnostic.context.push(ContextField {
+      name: "pack_version".into(),
+      value: version.into(),
+    });
+  }
+  diagnostic.context.push(ContextField {
+    name: "target_framework".into(),
+    value: requirement.target_framework().into(),
+  });
+  if let Some(runtime_identifier) = requirement.runtime_identifier() {
+    diagnostic.context.push(ContextField {
+      name: "runtime_identifier".into(),
+      value: runtime_identifier.into(),
+    });
+  }
+  diagnostic.context.push(ContextField {
+    name: "acquisition".into(),
+    value: requirement.acquisition().as_str().into(),
+  });
 }
 
 fn path_text(path: &Path, meaning: &str) -> Result<String, Box<Diagnostic>> {
