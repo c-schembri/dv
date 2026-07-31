@@ -31,7 +31,8 @@ use zeroize::Zeroizing;
 use zip::ZipArchive;
 
 use crate::{
-  CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageCancellation, ProjectSpec, TargetFramework,
+  BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
+  PackageCancellation, ProjectSpec, TargetFramework,
   credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
   discover_sdks,
 };
@@ -56,7 +57,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 3;
+const LOCK_SCHEMA_VERSION: u16 = 4;
 const SERVICE_CAPABILITY_COUNT: usize = 5;
 const PACKAGE_BASE_TYPES: &[&str] = &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"];
 const REGISTRATION_TYPES: &[&str] = &[
@@ -483,6 +484,25 @@ struct PackageExtendedAssets {
 const _: () = assert!(size_of::<PackageExtendedAssets>() == 56);
 const _: () = assert!(align_of::<PackageExtendedAssets>() == 4);
 
+/// Cold direct-reference policy kept separate from graph and asset hot rows.
+///
+/// Six fields occupy 32 bytes at four-byte alignment. Two rows fit in one
+/// assumed 64-byte benchmark-host cache line; 51 direct references retain
+/// 1,632 bytes plus the one contiguous allocation header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectPackagePolicy {
+  no_warn: TextSpan,
+  aliases: TextSpan,
+  path_property: TextSpan,
+  package_index: u32,
+  include_assets: PackageAssetFlags,
+  private_assets: PackageAssetFlags,
+}
+
+const _: () = assert!(size_of::<DirectPackagePolicy>() == 32);
+const _: () = assert!(align_of::<DirectPackagePolicy>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<DirectPackagePolicy>() == 2);
+
 /// The role assigned to an RID-specific runtime target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -503,37 +523,7 @@ struct RuntimeTargetAsset {
 const _: () = assert!(size_of::<RuntimeTargetAsset>() == 20);
 const _: () = assert!(align_of::<RuntimeTargetAsset>() == 4);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AssetFlags(u8);
-
-impl AssetFlags {
-  const NONE: Self = Self(0);
-  const RUNTIME: Self = Self(1 << 0);
-  const COMPILE: Self = Self(1 << 1);
-  const BUILD: Self = Self(1 << 2);
-  const NATIVE: Self = Self(1 << 3);
-  const CONTENT_FILES: Self = Self(1 << 4);
-  const ANALYZERS: Self = Self(1 << 5);
-  const BUILD_TRANSITIVE: Self = Self(1 << 6);
-  const ALL: Self = Self((1 << 7) - 1);
-  const NO_CONTENT: Self = Self(Self::ALL.0 & !Self::CONTENT_FILES.0);
-
-  const fn contains(self, other: Self) -> bool {
-    self.0 & other.0 == other.0
-  }
-
-  const fn union(self, other: Self) -> Self {
-    Self(self.0 | other.0)
-  }
-
-  const fn intersect(self, other: Self) -> Self {
-    Self(self.0 & other.0)
-  }
-
-  const fn without(self, other: Self) -> Self {
-    Self(self.0 & !other.0)
-  }
-}
+type AssetFlags = PackageAssetFlags;
 
 /// Options controlling exact package resolution.
 #[derive(Clone, Debug, Default)]
@@ -794,6 +784,7 @@ pub struct PackageResolution {
   fallback_roots: Box<[TextSpan]>,
   package_assets: Box<[PackageAssets]>,
   package_extended_assets: Box<[PackageExtendedAssets]>,
+  direct_policies: Box<[DirectPackagePolicy]>,
   dependencies: Box<[u32]>,
   assets: Box<[TextSpan]>,
   asset_ranges: PackageAssetRanges,
@@ -805,7 +796,7 @@ pub struct PackageResolution {
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 328);
+const _: () = assert!(size_of::<PackageResolution>() == 344);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
@@ -947,6 +938,49 @@ impl PackageResolution {
     self.dependencies[range].iter().copied()
   }
 
+  /// Iterates direct-reference policy rows in package identity order.
+  pub fn direct_policies(&self) -> std::ops::Range<usize> {
+    0..self.direct_policies.len()
+  }
+
+  /// Returns the resolved package index owned by a direct policy row.
+  pub fn direct_policy_package(&self, policy: usize) -> u32 {
+    self.direct_policies[policy].package_index
+  }
+
+  /// Returns the effective asset families consumed through a direct reference.
+  pub fn direct_policy_include_assets(&self, policy: usize) -> PackageAssetFlags {
+    self.direct_policies[policy].include_assets
+  }
+
+  /// Returns the asset families hidden from consuming projects.
+  pub fn direct_policy_private_assets(&self, policy: usize) -> PackageAssetFlags {
+    self.direct_policies[policy].private_assets
+  }
+
+  /// Returns the package-scoped warning suppression list.
+  pub fn direct_policy_no_warn(&self, policy: usize) -> Option<&str> {
+    let span = self.direct_policies[policy].no_warn;
+    (span.len != 0).then(|| self.get(span))
+  }
+
+  /// Returns compiler aliases applied to this package's compile assemblies.
+  pub fn direct_policy_aliases(&self, policy: usize) -> Option<&str> {
+    let span = self.direct_policies[policy].aliases;
+    (span.len != 0).then(|| self.get(span))
+  }
+
+  /// Returns the generated MSBuild-compatible property and package root.
+  pub fn direct_policy_path_property(&self, policy: usize) -> Option<(&str, &Path)> {
+    let policy = self.direct_policies[policy];
+    (policy.path_property.len != 0).then(|| {
+      (
+        self.get(policy.path_property),
+        Path::new(self.get(self.package_roots[policy.package_index as usize])),
+      )
+    })
+  }
+
   /// Iterates selected compile assemblies across the graph.
   pub fn compile_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
     self.assets(PackageAssetFamily::Compile)
@@ -1036,9 +1070,15 @@ impl PackageResolution {
     self.downloaded_bytes
   }
 
-  fn package_compile_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+  pub(crate) fn package_compile_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_assets[index].compile);
     self.assets[range].iter().map(|span| self.get(*span))
+  }
+
+  pub(crate) fn package_compile_reference_range(&self, index: usize) -> std::ops::Range<usize> {
+    let selected = self.package_assets[index].compile;
+    let start = (selected.start - self.asset_ranges.compile.start) as usize;
+    start..start + selected.len as usize
   }
 
   fn package_runtime_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
@@ -1104,11 +1144,22 @@ impl PackageResolution {
         let Ok(range) = VersionRange::parse(project.package_version(*reference)) else {
           return false;
         };
-        self.packages.iter().copied().any(|package| {
+        let Some(package_index) = self.packages.iter().copied().position(|package| {
           package.direct
             && self.package_id(package).eq_ignore_ascii_case(project.package_id(*reference))
             && PackageVersion::parse(self.package_version(package)).is_ok_and(|version| range.contains(&version))
-        })
+        }) else {
+          return false;
+        };
+        let Some(policy) = self.direct_policies.iter().find(|policy| policy.package_index as usize == package_index) else {
+          return false;
+        };
+        let policy_text = |span: TextSpan| (span.len != 0).then(|| self.get(span));
+        policy.include_assets == project.package_effective_assets(*reference)
+          && policy.private_assets == project.package_private_assets(*reference)
+          && policy_text(policy.no_warn) == project.package_no_warn(*reference)
+          && policy_text(policy.aliases) == project.package_aliases(*reference)
+          && (policy.path_property.len != 0) == project.package_generate_path_property(*reference)
       })
   }
 }
@@ -1697,6 +1748,8 @@ struct WorkRuntimeTarget {
 }
 
 struct ResolutionContext<'a> {
+  project: &'a ProjectSpec,
+  direct: &'a [PackageRequirement],
   cache_root: &'a Path,
   http_cache_root: &'a Path,
   temp_root: &'a Path,
@@ -2307,6 +2360,13 @@ struct LockFile {
 struct LockDirect {
   id: String,
   version: String,
+  include_assets: u8,
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq)]
+struct LockDependency {
+  id: String,
+  version: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2315,7 +2375,7 @@ struct LockPackage {
   version: String,
   sha512: String,
   direct: bool,
-  dependencies: Vec<LockDirect>,
+  dependencies: Vec<LockDependency>,
   compile_assets: Vec<String>,
   runtime_assets: Vec<String>,
   analyzers: Vec<String>,
@@ -2551,6 +2611,8 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   let source_location = redact_report_location(raw_source_location);
   let resolution = materialize_resolution(
     ResolutionContext {
+      project,
+      direct: &direct,
       cache_root: &config.cache_root,
       http_cache_root: &config.http_cache_root,
       temp_root: &config.temp_root,
@@ -2607,26 +2669,24 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, Pac
     let lower_id = normalize_id(id)?;
     let version_text = project.package_version(*package).trim();
     let range = VersionRange::parse(version_text)?;
-    if let Some((existing_range, existing_text)) = seen.insert(lower_id.clone(), (range.clone(), version_text.to_owned()))
-      && existing_range != range
-    {
-      return Err(PackageError::new(
-        PackageErrorKind::Resolution,
-        id,
-        format!("package {id} is directly referenced with conflicting versions {existing_text} and {version_text}"),
-      ));
+    if let Some((existing_range, existing_text)) = seen.insert(lower_id.clone(), (range.clone(), version_text.to_owned())) {
+      let message = if existing_range == range {
+        format!("package {id} is directly referenced more than once; consolidate its metadata into one PackageReference")
+      } else {
+        format!("package {id} is directly referenced with conflicting versions {existing_text} and {version_text}")
+      };
+      return Err(PackageError::new(PackageErrorKind::Resolution, id, message));
     }
     direct.push(PackageRequirement {
       id: id.into(),
       lower_id,
       range,
       direct: true,
-      include_assets: AssetFlags::ALL,
-      suppress_parent: AssetFlags::NONE,
+      include_assets: project.package_effective_assets(*package),
+      suppress_parent: project.package_private_assets(*package),
     });
   }
   direct.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id));
-  direct.dedup_by(|left, right| left.lower_id == right.lower_id);
   Ok(direct)
 }
 
@@ -5240,7 +5300,7 @@ async fn resolve_streaming_graph(
     acquired.insert(request.lower_id.clone(), (request, cached));
   }
 
-  let asset_flags = flatten_asset_flags(&nodes);
+  let asset_flags = flatten_asset_flags(&nodes, direct);
   let mut resolved = BTreeMap::<String, WorkPackage>::new();
   for (lower_id, (request, cached)) in acquired {
     let dependencies = concrete_dependencies(&nodes, &request.lower_id)?;
@@ -5255,12 +5315,12 @@ async fn resolve_streaming_graph(
   })
 }
 
-fn flatten_asset_flags(nodes: &BTreeMap<String, ConstraintNode>) -> BTreeMap<String, AssetFlags> {
+fn flatten_asset_flags(nodes: &BTreeMap<String, ConstraintNode>, direct: &[PackageRequirement]) -> BTreeMap<String, AssetFlags> {
   let mut result = BTreeMap::<String, AssetFlags>::new();
   let mut queue = VecDeque::<(&str, AssetFlags)>::new();
-  for (id, node) in nodes {
-    if node.direct.is_some() && !node.pruned {
-      queue.push_back((id, AssetFlags::ALL));
+  for reference in direct {
+    if nodes.get(&reference.lower_id).is_some_and(|node| !node.pruned) {
+      queue.push_back((&reference.lower_id, reference.include_assets));
     }
   }
   while let Some((id, incoming)) = queue.pop_front() {
@@ -7109,14 +7169,14 @@ fn parse_cached_package(
   let runtime_assets = select_if(flags.contains(AssetFlags::RUNTIME), || select_runtime_assets(&cached.root, target))?;
   // Package analyzers are resolved graph-wide by ResolvePackageAssets rather
   // than serialized as a target-library family in project.assets.json.
-  let analyzers = collect_analyzers(&cached.root)?;
+  let analyzers = select_if(flags.contains(AssetFlags::ANALYZERS), || collect_analyzers(&cached.root))?;
   let resource_assets = select_if(flags.contains(AssetFlags::RUNTIME), || select_resource_assets(&cached.root, target))?;
   let content_files = select_content_files(&cached.root, target, flags.contains(AssetFlags::CONTENT_FILES))?;
   let native_assets = select_if(flags.contains(AssetFlags::NATIVE), || select_legacy_native_assets(&cached.root))?;
   let runtime_targets = select_runtime_targets(&cached.root, target, flags)?;
   let selected_build = select_build_assets(&cached.root, "build", &request.id, target, true)?;
   let selected_build_transitive = select_build_assets(&cached.root, "buildTransitive", &request.id, target, true)?;
-  let build_transitive_assets = if flags.contains(AssetFlags::BUILD) || flags.contains(AssetFlags::BUILD_TRANSITIVE) {
+  let build_transitive_assets = if flags.contains(AssetFlags::BUILD_TRANSITIVE) {
     selected_build_transitive
   } else {
     Vec::new()
@@ -7136,7 +7196,7 @@ fn parse_cached_package(
     })
   });
   let selected_build_multi_targeting = select_build_assets(&cached.root, "buildMultiTargeting", &request.id, target, false)?;
-  let build_multi_targeting_assets = if flags.contains(AssetFlags::BUILD) {
+  let build_multi_targeting_assets = if flags.contains(AssetFlags::BUILD_MULTI_TARGETING) {
     selected_build_multi_targeting
   } else {
     excluded_asset_marker(&selected_build_multi_targeting)
@@ -7342,6 +7402,8 @@ fn parse_asset_flags(value: Option<&str>, default: AssetFlags, path: &Path) -> R
       AssetFlags::CONTENT_FILES
     } else if token.eq_ignore_ascii_case("analyzers") {
       AssetFlags::ANALYZERS
+    } else if token.eq_ignore_ascii_case("buildMultiTargeting") {
+      AssetFlags::BUILD_MULTI_TARGETING
     } else if token.eq_ignore_ascii_case("buildTransitive") {
       AssetFlags::BUILD_TRANSITIVE.union(AssetFlags::BUILD)
     } else {
@@ -7739,7 +7801,17 @@ fn materialize_resolution(
     + context.source_name.len()
     + context.source_location.len()
     + context.sources.iter().map(|(name, _)| name.len()).sum::<usize>()
-    + context.prune_fingerprint.len();
+    + context.prune_fingerprint.len()
+    + context
+      .project
+      .package_references()
+      .iter()
+      .map(|reference| {
+        context.project.package_no_warn(*reference).map_or(0, str::len)
+          + context.project.package_aliases(*reference).map_or(0, str::len)
+          + usize::from(context.project.package_generate_path_property(*reference)) * (context.project.package_id(*reference).len() + 3)
+      })
+      .sum::<usize>();
   let mut table = TextTable::with_capacity(estimated);
   let cache_root_span = table.push_path(context.cache_root)?;
   let http_cache_root_span = table.push_path(context.http_cache_root)?;
@@ -7878,6 +7950,51 @@ fn materialize_resolution(
   debug_assert_eq!(asset_cursors[7], asset_ranges.build_transitive.start + asset_ranges.build_transitive.len);
   debug_assert_eq!(asset_cursors[8], asset_ranges.native.start + asset_ranges.native.len);
 
+  let empty = TextSpan { start: 0, len: 0 };
+  let mut direct_policies = Vec::with_capacity(context.direct.len());
+  for requirement in context.direct {
+    let package_index = *indices.get(requirement.lower_id.as_str()).ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::Resolution,
+        &requirement.id,
+        format!("resolved graph omitted direct package {}", requirement.id),
+      )
+    })?;
+    let reference = context
+      .project
+      .package_references()
+      .iter()
+      .copied()
+      .find(|reference| context.project.package_id(*reference).eq_ignore_ascii_case(&requirement.id))
+      .expect("direct requests originate from project package references");
+    let no_warn = context
+      .project
+      .package_no_warn(reference)
+      .map(|value| table.push(value))
+      .transpose()?
+      .unwrap_or(empty);
+    let aliases = context
+      .project
+      .package_aliases(reference)
+      .map(|value| table.push(value))
+      .transpose()?
+      .unwrap_or(empty);
+    let path_property = if context.project.package_generate_path_property(reference) {
+      let name = package_path_property(context.project.package_id(reference));
+      table.push(&name)?
+    } else {
+      empty
+    };
+    direct_policies.push(DirectPackagePolicy {
+      no_warn,
+      aliases,
+      path_property,
+      package_index,
+      include_assets: requirement.include_assets,
+      private_assets: requirement.suppress_parent,
+    });
+  }
+
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
     cache_root: cache_root_span,
@@ -7899,6 +8016,7 @@ fn materialize_resolution(
     fallback_roots,
     package_assets: package_assets.into_boxed_slice(),
     package_extended_assets: package_extended_assets.into_boxed_slice(),
+    direct_policies: direct_policies.into_boxed_slice(),
     dependencies: dependencies.into_boxed_slice(),
     assets: assets.into_boxed_slice(),
     asset_ranges,
@@ -7955,6 +8073,18 @@ fn plan_asset_ranges(work: &BTreeMap<String, WorkPackage>) -> Result<(PackageAss
   Ok((ranges, start))
 }
 
+fn package_path_property(id: &str) -> String {
+  // The external package identifier determines this opted-in property length;
+  // one exact cold allocation avoids reserving worst-case space per reference.
+  let mut property = String::with_capacity(id.len() + 3);
+  property.push_str("Pkg");
+  property.extend(id.chars().map(|character| match character {
+    '.' | '-' => '_',
+    other => other,
+  }));
+  property
+}
+
 fn push_asset_range(table: &mut TextTable, target: &mut [TextSpan], cursor: &mut u32, paths: &[PathBuf]) -> Result<ItemRange, PackageError> {
   let start = *cursor;
   let len = u32_len(paths.len(), "package asset range")?;
@@ -7997,6 +8127,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     fallback_roots: Box::new([]),
     package_assets: Box::new([]),
     package_extended_assets: Box::new([]),
+    direct_policies: Box::new([]),
     dependencies: Box::new([]),
     assets: Box::new([]),
     asset_ranges: PackageAssetRanges {
@@ -8045,8 +8176,9 @@ fn read_warm_lock(
         .direct
         .iter()
         .find(|locked| locked.id.eq_ignore_ascii_case(&request.id))
-        .and_then(|locked| PackageVersion::parse(&locked.version).ok())
-        .is_some_and(|version| request.range.contains(&version))
+        .is_some_and(|locked| {
+          locked.include_assets == request.include_assets.bits() && PackageVersion::parse(&locked.version).is_ok_and(|version| request.range.contains(&version))
+        })
     });
   let selected_source = config
     .sources
@@ -8167,6 +8299,8 @@ fn read_warm_lock(
   let source_work = source_work_table(config.sources.len())?;
   materialize_resolution(
     ResolutionContext {
+      project,
+      direct,
       cache_root: &config.cache_root,
       http_cache_root: &config.http_cache_root,
       temp_root: &config.temp_root,
@@ -8256,16 +8390,22 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
     let id = resolution.package_id(package).to_owned();
     let version = resolution.package_version(package).to_owned();
     if package.direct {
+      let policy = resolution
+        .direct_policies
+        .iter()
+        .find(|policy| policy.package_index as usize == index)
+        .expect("every direct package has one policy row");
       direct.push(LockDirect {
         id: id.clone(),
         version: version.clone(),
+        include_assets: policy.include_assets.bits(),
       });
     }
     let dependencies = resolution
       .package_dependencies(package)
       .map(|dependency| {
         let dependency = resolution.packages[dependency as usize];
-        LockDirect {
+        LockDependency {
           id: resolution.package_id(dependency).to_owned(),
           version: resolution.package_version(dependency).to_owned(),
         }
@@ -10670,6 +10810,79 @@ mod tests {
         .iter()
         .any(|asset| asset.kind == RuntimeTargetKind::Native && asset.runtime_identifier == "linux-x64")
     );
+  }
+
+  #[test]
+  fn direct_package_policy_filters_assets_and_survives_the_warm_lock() {
+    let temp = TempDirectory::new();
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" IncludeAssets="compile;runtime" ExcludeAssets="runtime" PrivateAssets="all" NoWarn="NU1603;NU1701" Aliases="SampleAlias" GeneratePathProperty="true" /></ItemGroup></Project>"#,
+    );
+    temp.write(
+      "packages/sample.package/1.2.3/sample.package.nuspec",
+      r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+    );
+    temp.write("packages/sample.package/1.2.3/ref/net10.0/Sample.Package.dll", []);
+    temp.write("packages/sample.package/1.2.3/lib/net10.0/Sample.Package.dll", []);
+    temp.write("packages/sample.package/1.2.3/analyzers/dotnet/cs/Sample.Analyzer.dll", []);
+    temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg", []);
+    temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512", BASE64.encode([0u8; 64]));
+    temp.write("packages/sample.package/1.2.3/.dv.metadata.json", "{}");
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      offline: true,
+      write_lock: true,
+      ..PackageResolveOptions::default()
+    };
+
+    let cold = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+
+    assert_eq!(cold.compile_assets().len(), 1);
+    assert_eq!(cold.runtime_assets().len(), 0);
+    assert_eq!(cold.analyzers().len(), 0);
+    assert_eq!(cold.direct_policies().len(), 1);
+    let policy = cold.direct_policies().start;
+    assert_eq!(cold.direct_policy_include_assets(policy), AssetFlags::COMPILE);
+    assert_eq!(cold.direct_policy_private_assets(policy), AssetFlags::ALL);
+    assert_eq!(cold.direct_policy_no_warn(policy), Some("NU1603;NU1701"));
+    assert_eq!(cold.direct_policy_aliases(policy), Some("SampleAlias"));
+    let (name, root) = cold.direct_policy_path_property(policy).unwrap();
+    assert_eq!(name, "PkgSample_Package");
+    assert_eq!(root, temp.0.join("packages/sample.package/1.2.3"));
+
+    let warm = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    assert_eq!(warm.compile_assets().len(), 1);
+    assert_eq!(warm.runtime_assets().len(), 0);
+    assert_eq!(warm.direct_policy_aliases(0), Some("SampleAlias"));
+    assert_eq!(warm.cache_hits(), 1);
+    assert!(warm.matches_project(&project));
+
+    temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" IncludeAssets="runtime" /></ItemGroup></Project>"#,
+    );
+    let changed = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    assert!(!warm.matches_project(&changed));
+    let changed = resolve_package_inputs(&[&changed], &options).unwrap().remove(0);
+    assert_eq!(changed.compile_assets().len(), 0);
+    assert_eq!(changed.runtime_assets().len(), 1);
+  }
+
+  #[test]
+  fn duplicate_direct_references_fail_before_metadata_can_be_merged_ambiguously() {
+    let temp = TempDirectory::new();
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" IncludeAssets="compile" /><PackageReference Include="sample.package" Version="1.2.3" IncludeAssets="runtime" /></ItemGroup></Project>"#,
+    );
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+
+    let error = direct_requests(&project).unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Resolution);
+    assert!(error.to_string().contains("more than once"));
   }
 
   #[test]

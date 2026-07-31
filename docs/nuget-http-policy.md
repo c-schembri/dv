@@ -64,7 +64,7 @@ Malformed proxy URLs fail before client construction. Unsupported schemes,
 missing hosts, invalid UTF-8 credentials, closed rate limiters, timeout, and
 retry exhaustion produce typed configuration or network errors. No proxy URL,
 username, password, bypass entry, or authorization header reaches reporter
-text. Event schema 13 preserves the schema 12 redacted policy and
+text. Event schema 14 preserves the schema 12 redacted policy and
 source-security fields while adding only credential-free source-work counters
 and timings.
 

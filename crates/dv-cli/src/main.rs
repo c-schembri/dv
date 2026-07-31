@@ -8,13 +8,14 @@ use std::{
 };
 
 use dv_core::{
-  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
-  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent,
-  PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent,
-  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
-  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent,
+  Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags,
+  PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions,
+  PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError,
+  ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
+  RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity,
+  discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
+  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -448,6 +449,24 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
     return write_compiler_plan(plan);
   }
 
+  let references = plan.references().map(str::to_owned).collect::<Vec<_>>();
+  let reference_aliases = plan
+    .reference_aliases()
+    .map(|(reference_index, aliases)| CompilerReferenceAliasEvent {
+      reference_index,
+      reference: references[reference_index as usize].clone(),
+      aliases: aliases.to_owned(),
+    })
+    .collect();
+  let package_path_properties = packages
+    .direct_policies()
+    .filter_map(|policy| packages.direct_policy_path_property(policy))
+    .map(|(name, value)| PackagePathPropertyEvent {
+      name: name.to_owned(),
+      value: value.display().to_string(),
+    })
+    .collect();
+
   succeed(
     started,
     "build --plan",
@@ -469,7 +488,9 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
       reference_output: plan.reference_output().into(),
       sources: plan.sources().map(str::to_owned).collect(),
       generated_sources: plan.generated_sources().map(str::to_owned).collect(),
-      references: plan.references().map(str::to_owned).collect(),
+      references,
+      reference_aliases,
+      package_path_properties,
       analyzers: plan.analyzers().map(str::to_owned).collect(),
       analyzer_configs: plan.analyzer_configs().map(str::to_owned).collect(),
       defines: plan.defines().map(str::to_owned).collect(),
@@ -498,6 +519,20 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
       cache_outcome: resolution.package_cache_outcome(package),
     })
     .collect();
+  let direct_policies = resolution
+    .direct_policies()
+    .map(|policy| DirectPackagePolicyEvent {
+      package_index: resolution.direct_policy_package(policy),
+      include_assets: package_asset_names(resolution.direct_policy_include_assets(policy)),
+      private_assets: package_asset_names(resolution.direct_policy_private_assets(policy)),
+      no_warn: metadata_values(resolution.direct_policy_no_warn(policy)),
+      aliases: resolution.direct_policy_aliases(policy).map(str::to_owned),
+      path_property: resolution.direct_policy_path_property(policy).map(|(name, value)| PackagePathPropertyEvent {
+        name: name.to_owned(),
+        value: value.display().to_string(),
+      }),
+    })
+    .collect();
   EventPayload::PackageResolutionCreated {
     project: project.project_path().display().to_string(),
     cache_root: resolution.cache_root().display().to_string(),
@@ -524,6 +559,7 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
       })
       .collect(),
     packages,
+    direct_policies,
     compile_assets: resolution.compile_assets().map(|path| path.display().to_string()).collect(),
     runtime_assets: resolution.runtime_assets().map(|path| path.display().to_string()).collect(),
     analyzers: resolution.analyzers().map(|path| path.display().to_string()).collect(),
@@ -861,6 +897,12 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     .map(|package| ProjectPackageEvent {
       id: project.package_id(*package).into(),
       version: project.package_version(*package).into(),
+      include_assets: package_asset_names(project.package_include_assets(*package)),
+      exclude_assets: package_asset_names(project.package_exclude_assets(*package)),
+      private_assets: package_asset_names(project.package_private_assets(*package)),
+      no_warn: metadata_values(project.package_no_warn(*package)),
+      aliases: project.package_aliases(*package).map(str::to_owned),
+      generate_path_property: project.package_generate_path_property(*package),
     })
     .collect();
   let frameworks = project
@@ -1390,6 +1432,23 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
   writeln!(output, "Package references  {}", project.package_references().len()).expect("writing a String succeeds");
   for package in project.package_references() {
     writeln!(output, "  {} {}", project.package_id(*package), project.package_version(*package)).expect("writing a String succeeds");
+    writeln!(
+      output,
+      "    include={} exclude={} private={}",
+      package_asset_names(project.package_include_assets(*package)).join(";"),
+      package_asset_names(project.package_exclude_assets(*package)).join(";"),
+      package_asset_names(project.package_private_assets(*package)).join(";")
+    )
+    .expect("writing a String succeeds");
+    if let Some(no_warn) = project.package_no_warn(*package) {
+      writeln!(output, "    no-warn={no_warn}").expect("writing a String succeeds");
+    }
+    if let Some(aliases) = project.package_aliases(*package) {
+      writeln!(output, "    aliases={aliases}").expect("writing a String succeeds");
+    }
+    if project.package_generate_path_property(*package) {
+      writeln!(output, "    generate-path-property=true").expect("writing a String succeeds");
+    }
   }
   writeln!(output, "Framework references {}", project.framework_references().len()).expect("writing a String succeeds");
   for reference in project.framework_references() {
@@ -1404,6 +1463,33 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
 
 fn toggle_text(enabled: bool) -> &'static str {
   if enabled { "enable" } else { "disable" }
+}
+
+fn package_asset_names(flags: PackageAssetFlags) -> Vec<String> {
+  [
+    (PackageAssetFlags::RUNTIME, "runtime"),
+    (PackageAssetFlags::COMPILE, "compile"),
+    (PackageAssetFlags::BUILD, "build"),
+    (PackageAssetFlags::BUILD_MULTI_TARGETING, "buildMultitargeting"),
+    (PackageAssetFlags::BUILD_TRANSITIVE, "buildTransitive"),
+    (PackageAssetFlags::NATIVE, "native"),
+    (PackageAssetFlags::CONTENT_FILES, "contentFiles"),
+    (PackageAssetFlags::ANALYZERS, "analyzers"),
+  ]
+  .into_iter()
+  .filter(|(flag, _)| flags.contains(*flag))
+  .map(|(_, name)| name.to_owned())
+  .collect()
+}
+
+fn metadata_values(value: Option<&str>) -> Vec<String> {
+  value
+    .into_iter()
+    .flat_map(|value| value.split([',', ';']))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_owned)
+    .collect()
 }
 
 fn project_diagnostic(error: ProjectError) -> Diagnostic {

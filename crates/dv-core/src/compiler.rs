@@ -9,7 +9,8 @@ use std::{
 use quick_xml::{Reader, XmlVersion, events::Event};
 
 use crate::{
-  PackAcquisition, PackKind, PackRequirement, PackageResolution, ProjectConfiguration, ProjectOutputType, ProjectSpec, SdkInventory, TargetFramework,
+  BENCHMARK_CACHE_LINE_BYTES, PackAcquisition, PackKind, PackRequirement, PackageResolution, ProjectConfiguration, ProjectOutputType, ProjectSpec,
+  SdkInventory, TargetFramework,
 };
 
 const FRAMEWORK_IDENTIFIER: &str = ".NETCoreApp";
@@ -23,6 +24,20 @@ struct TextSpan {
 
 const _: () = assert!(size_of::<TextSpan>() == 8);
 const _: () = assert!(align_of::<TextSpan>() == 4);
+
+/// Sparse alias metadata for one compiler reference index.
+///
+/// Three fields occupy 12 bytes at four-byte alignment, so five rows fit in
+/// one assumed 64-byte benchmark-host cache line with four bytes unused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompilerReferenceAlias {
+  reference_index: u32,
+  aliases: TextSpan,
+}
+
+const _: () = assert!(size_of::<CompilerReferenceAlias>() == 12);
+const _: () = assert!(align_of::<CompilerReferenceAlias>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<CompilerReferenceAlias>() == 5);
 
 /// One immutable Roslyn input plan.
 ///
@@ -44,6 +59,7 @@ pub struct CompilerPlan {
   sources: Box<[TextSpan]>,
   generated_sources: Box<[TextSpan]>,
   references: Box<[TextSpan]>,
+  reference_aliases: Box<[CompilerReferenceAlias]>,
   analyzers: Box<[TextSpan]>,
   analyzer_configs: Box<[TextSpan]>,
   defines: Box<[TextSpan]>,
@@ -138,6 +154,11 @@ impl CompilerPlan {
   /// Iterates framework reference assemblies in manifest order.
   pub fn references(&self) -> impl ExactSizeIterator<Item = &str> {
     self.values(&self.references)
+  }
+
+  /// Iterates sparse compiler aliases in ascending reference order.
+  pub fn reference_aliases(&self) -> impl ExactSizeIterator<Item = (u32, &str)> {
+    self.reference_aliases.iter().map(|alias| (alias.reference_index, self.get(alias.aliases)))
   }
 
   /// Iterates SDK and framework analyzers in compiler order.
@@ -602,6 +623,13 @@ fn materialize_plan(
     .map(|p| p.as_os_str().len())
     .sum::<usize>()
     + define_values.iter().map(String::len).sum::<usize>()
+    + packages.map_or(0, |packages| {
+      packages
+        .direct_policies()
+        .filter_map(|policy| packages.direct_policy_aliases(policy))
+        .map(str::len)
+        .sum::<usize>()
+    })
     + language_version.len()
     + 1024;
   let mut table = TextTable::with_capacity(estimated_text);
@@ -617,6 +645,41 @@ fn materialize_plan(
   let sources = table.push_paths(&source_paths)?;
   let generated_sources = table.push_paths(&generated_paths)?;
   let references = table.push_paths(&reference_paths)?;
+  let alias_count = packages.map_or(0, |packages| {
+    packages
+      .direct_policies()
+      .filter(|policy| packages.direct_policy_aliases(*policy).is_some())
+      .map(|policy| packages.package_compile_reference_range(packages.direct_policy_package(policy) as usize).len())
+      .sum()
+  });
+  let mut reference_aliases = Vec::with_capacity(alias_count);
+  if let Some(packages) = packages {
+    for policy in packages.direct_policies() {
+      let Some(aliases) = packages.direct_policy_aliases(policy) else {
+        continue;
+      };
+      let alias_span = table.push(aliases)?;
+      let package_index = packages.direct_policy_package(policy) as usize;
+      for package_reference in packages.package_compile_reference_range(package_index) {
+        let reference_index = framework
+          .references
+          .len()
+          .checked_add(package_reference)
+          .and_then(|index| u32::try_from(index).ok())
+          .ok_or_else(|| {
+            CompilerPlanError::new(
+              CompilerPlanErrorKind::TextOverflow,
+              project.project_path(),
+              "compiler reference alias index exceeds the compact 32-bit range",
+            )
+          })?;
+        reference_aliases.push(CompilerReferenceAlias {
+          reference_index,
+          aliases: alias_span,
+        });
+      }
+    }
+  }
   let analyzers = table.push_paths(&analyzer_paths)?;
   let analyzer_configs = table.push_paths(&config_paths)?;
   let define_refs: Vec<&str> = define_values.iter().map(String::as_str).collect();
@@ -636,6 +699,7 @@ fn materialize_plan(
     sources,
     generated_sources,
     references,
+    reference_aliases: reference_aliases.into_boxed_slice(),
     analyzers,
     analyzer_configs,
     defines,
@@ -736,7 +800,9 @@ mod tests {
     time::{SystemTime, UNIX_EPOCH},
   };
 
-  use crate::{SdkVersion, evaluate_project_path};
+  use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+  use crate::{PackageResolveOptions, SdkVersion, evaluate_project_path, resolve_package_inputs};
 
   use super::*;
 
@@ -819,6 +885,46 @@ mod tests {
     assert_eq!(plan.analyzers().len(), 3);
     assert_eq!(plan.generated_sources().len(), 3);
     assert!(plan.defines().any(|define| define == "NET10_0_OR_GREATER"));
+  }
+
+  #[test]
+  fn plans_sparse_aliases_for_direct_package_compile_assets() {
+    let (temp, _project, inventory) = fixture();
+    temp.write(
+      "app/App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" IncludeAssets="compile" Aliases="SampleAlias" GeneratePathProperty="true" /></ItemGroup></Project>"#,
+    );
+    for relative in [
+      "packages/sample.package/1.2.3/sample.package.nuspec",
+      "packages/sample.package/1.2.3/ref/net10.0/Sample.Package.dll",
+      "packages/sample.package/1.2.3/sample.package.1.2.3.nupkg",
+      "packages/sample.package/1.2.3/.dv.metadata.json",
+    ] {
+      temp.write(relative, "");
+    }
+    temp.write(
+      "packages/sample.package/1.2.3/sample.package.nuspec",
+      r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+    );
+    temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512", &BASE64.encode([0u8; 64]));
+    let project = evaluate_project_path(&temp.0.join("app/App.csproj"), ProjectConfiguration::Debug).unwrap();
+    let packages = resolve_package_inputs(
+      &[&project],
+      &PackageResolveOptions {
+        packages_directory: Some(temp.0.join("packages")),
+        offline: true,
+        ..PackageResolveOptions::default()
+      },
+    )
+    .unwrap();
+
+    let plans = plan_compiler_inputs_with_packages(&[&project], &inventory, &packages).unwrap();
+    let plan = &plans[0];
+    let aliases = plan.reference_aliases().collect::<Vec<_>>();
+
+    assert_eq!(plan.references().len(), 3);
+    assert_eq!(aliases, [(2, "SampleAlias")]);
+    assert!(plan.references().nth(2).unwrap().ends_with("Sample.Package.dll"));
   }
 
   #[test]

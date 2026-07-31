@@ -41,6 +41,9 @@ dv restore (50 packages)       598.220 ms median
 dotnet restore (warm locked)   552.265 ms median
 dv restore (warm locked)         7.019 ms median
 
+dotnet PackageReference policy 456.722 ms median
+dv PackageReference policy       6.611 ms median
+
 dotnet restore (config stack) 532.948 ms median
 dv restore (config stack)       5.651 ms median
 
@@ -134,6 +137,7 @@ The project is in the first implementation phase.
 | NuGet CLI source, config, and package-folder overrides | Implemented |
 | NuGet flat and hierarchical local sources | Implemented |
 | NuGet interval and floating version selection | Implemented |
+| PackageReference asset, warning, alias, and path-property policy | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -184,6 +188,13 @@ one compact target-dimension batch rather than copies of the project. Target
 family and version are parsed once and shared by pack, compiler,
 dependency-group, and package-asset selection. Unsupported MSBuild behavior
 fails explicitly.
+
+Direct package references normalize `IncludeAssets`, `ExcludeAssets`, and
+`PrivateAssets` into eight-bit family masks during evaluation. The effective
+mask flows through dependency discovery, while `NoWarn`, `Aliases`, and
+generated `Pkg*` package-root properties stay in a separate 32-byte cold policy
+batch. Compiler aliases are sparse index records rather than metadata copied
+onto every framework reference.
 
 The baseline tracks [.NET 10](https://dotnet.microsoft.com/en-us/download/dotnet/10.0),
 the latest stable LTS release as of 2026-08-01. Preview TFMs are not selected
@@ -324,7 +335,8 @@ Initial machine:
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
-  overrides, local sources, floating version selection, service-index
+  overrides, local sources, floating version selection, PackageReference
+  metadata, service-index
   capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
@@ -357,6 +369,7 @@ Initial machine:
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
+| Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -428,6 +441,12 @@ outside timing, then asks both tools for the highest stable `Newtonsoft.Json`
 exact identity, selected version, archive hash, target, and asset batches; this
 run selected `13.0.4`, with `dv` publishing one 2,484,726-byte archive and
 making zero HTTP requests in every sample. The
+PackageReference metadata case applies all six policy fields to the same warm
+locked `Newtonsoft.Json` graph. Preflight compares Microsoft
+`project.assets.json` include/suppress-parent fields, warning codes, compile
+aliases, runtime exclusion, and the generated `PkgNewtonsoft_Json` root before
+retaining samples. The measured medians are `456.722 ms` for Microsoft and
+`6.611 ms` for `dv` (`69.1x`), with no timed network or download work. The
 unavailable-pack case
 uses an empty checked-in source and isolated package cache; both commands must
 fail and name
@@ -484,6 +503,7 @@ recorded in the curated
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
 [NuGet floating-version baseline](docs/performance-baselines/2026-08-01-nuget-floating-version-windows.md),
+[PackageReference metadata baseline](docs/performance-baselines/2026-08-01-package-reference-metadata-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -545,6 +565,7 @@ cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
+cargo bench-all --case package_reference_metadata --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3

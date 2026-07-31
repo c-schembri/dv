@@ -36,6 +36,7 @@ enum CaseKind {
   PackageGraphCold,
   PackageGraphMassive,
   PackageAssetPlan,
+  PackageReferenceMetadata,
   PackageSyncWarm,
   NugetConfigHierarchy,
   NugetConfigMerge,
@@ -73,6 +74,7 @@ struct Fixtures<'a> {
   framework_reference: &'a Path,
   unavailable_pack: &'a Path,
   package: &'a Path,
+  package_reference_metadata: &'a Path,
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
@@ -230,6 +232,21 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "PackageConsole.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_reference_metadata",
+    kind: CaseKind::PackageReferenceMetadata,
+    args: &[
+      "restore",
+      "MetadataProject.csproj",
       "--locked-mode",
       "--packages",
       ".packages",
@@ -580,6 +597,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_reference_metadata",
+    kind: CaseKind::PackageReferenceMetadata,
+    args: &["restore", "MetadataProject.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_config_hierarchy",
     kind: CaseKind::NugetConfigHierarchy,
     args: &["restore", "ConfigHierarchy.csproj", "--offline", "--json"],
@@ -821,6 +844,7 @@ fn run() -> Result<()> {
   let framework_reference_fixture = repository.join("benchmarks/fixtures/framework-reference-project");
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
+  let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
@@ -846,6 +870,7 @@ fn run() -> Result<()> {
     framework_reference: &framework_reference_fixture,
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
+    package_reference_metadata: &package_reference_metadata_fixture,
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
@@ -901,6 +926,9 @@ fn run() -> Result<()> {
     .is_none_or(|case| matches!(case, "package_sync_cold" | "package_sync_warm"))
   {
     verify_package_sync(&repository, &dv_executable, &package_fixture, "PackageConsole.csproj", 1)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_reference_metadata") {
+    verify_package_reference_metadata(&repository, &dv_executable, &package_reference_metadata_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_config_hierarchy") {
     verify_nuget_config_hierarchy(&repository, &dv_executable, &nuget_config_fixture)?;
@@ -963,7 +991,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 18,
+    schema_version: 19,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -1870,6 +1898,142 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, 
       .into(),
     );
   }
+  Ok(())
+}
+
+fn verify_package_reference_metadata(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  verify_package_sync(repository, dv_executable, fixture, "MetadataProject.csproj", 1)?;
+  let root = repository.join(format!("target/benchmark-package-reference-metadata-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet-policy");
+  let dv_workspace = root.join("dv-policy");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "MetadataProject.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &dotnet_workspace,
+    "PackageReference metadata oracle restore",
+  )?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let dependency = assets
+    .pointer("/project/frameworks/net10.0/dependencies/Newtonsoft.Json")
+    .ok_or("Microsoft assets omitted direct PackageReference policy")?;
+  if dependency.get("include").and_then(serde_json::Value::as_str) != Some("Compile")
+    || dependency.get("suppressParent").and_then(serde_json::Value::as_str) != Some("All")
+    || dependency.get("aliases").and_then(serde_json::Value::as_str) != Some("JsonAlias")
+    || dependency.get("generatePathProperty").and_then(serde_json::Value::as_bool) != Some(true)
+  {
+    return Err("Microsoft PackageReference policy oracle changed".into());
+  }
+  let reference_no_warn = dependency
+    .get("noWarn")
+    .and_then(serde_json::Value::as_array)
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .collect::<Vec<_>>();
+  if reference_no_warn != ["NU1603", "NU1701"] {
+    return Err(format!("Microsoft PackageReference NoWarn oracle changed: {reference_no_warn:?}").into());
+  }
+  let target = assets
+    .pointer("/targets/net10.0/Newtonsoft.Json~113.0.3")
+    .ok_or("Microsoft assets omitted the metadata fixture package target")?;
+  let compile = target
+    .get("compile")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft assets omitted the included compile family")?;
+  if compile
+    .values()
+    .any(|metadata| metadata.get("aliases").and_then(serde_json::Value::as_str) != Some("JsonAlias"))
+  {
+    return Err("Microsoft did not apply JsonAlias to every direct compile asset".into());
+  }
+  if target
+    .get("runtime")
+    .and_then(serde_json::Value::as_object)
+    .is_none_or(|runtime| runtime.keys().any(|asset| !asset.ends_with("/_._")))
+  {
+    return Err("Microsoft did not exclude the runtime family".into());
+  }
+  let property_value = command_text(
+    Path::new("dotnet"),
+    &["msbuild", "MetadataProject.csproj", "-nologo", "-getProperty:PkgNewtonsoft_Json"],
+    &dotnet_workspace,
+  )?;
+  let property_relative = relative_policy_path(&property_value, &dotnet_workspace)?;
+  if property_relative != ".packages/newtonsoft.json/13.0.3" {
+    return Err(format!("Microsoft generated a different package path property: {property_relative:?}").into());
+  }
+
+  let dv_text = command_text(
+    dv_executable,
+    &["restore", "MetadataProject.csproj", "--packages", ".packages", "--json"],
+    &dv_workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv restore omitted package_resolution_created")?;
+  let policy = dv
+    .get("direct_policies")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|policies| policies.first())
+    .ok_or("dv restore omitted direct package policy")?;
+  if string_array(policy, "include_assets")? != ["compile"]
+    || string_array(policy, "no_warn")? != ["NU1603", "NU1701"]
+    || policy.get("aliases").and_then(serde_json::Value::as_str) != Some("JsonAlias")
+  {
+    return Err("dv direct PackageReference policy differs from Microsoft assets".into());
+  }
+  let path_property = policy.get("path_property").ok_or("dv direct policy omitted its path property")?;
+  if path_property.get("name").and_then(serde_json::Value::as_str) != Some("PkgNewtonsoft_Json") {
+    return Err("dv generated a different package path property name".into());
+  }
+  assert_relative_policy_path(path_property, "value", &dv_workspace, ".packages/newtonsoft.json/13.0.3")?;
+
+  let plan_text = command_text(dv_executable, &["build", "--plan", "MetadataProject.csproj", "--json"], &dv_workspace)?;
+  let plan = plan_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("compiler_plan_created"))
+    .ok_or("dv build plan omitted compiler_plan_created")?;
+  let reference_alias = plan
+    .get("reference_aliases")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|aliases| aliases.first())
+    .ok_or("dv compiler plan omitted the direct package alias")?;
+  if reference_alias.get("aliases").and_then(serde_json::Value::as_str) != Some("JsonAlias")
+    || reference_alias
+      .get("reference")
+      .and_then(serde_json::Value::as_str)
+      .is_none_or(|reference| !reference.ends_with("Newtonsoft.Json.dll"))
+  {
+    return Err("dv compiler plan attached JsonAlias to the wrong reference".into());
+  }
+  let plan_property = plan
+    .get("package_path_properties")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|properties| properties.first())
+    .ok_or("dv compiler plan omitted PkgNewtonsoft_Json")?;
+  if plan_property.get("name").and_then(serde_json::Value::as_str) != Some("PkgNewtonsoft_Json") {
+    return Err("dv compiler plan generated a different package property name".into());
+  }
+  assert_relative_policy_path(plan_property, "value", &dv_workspace, ".packages/newtonsoft.json/13.0.3")?;
   Ok(())
 }
 
@@ -3583,6 +3747,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CompilerPlan
       | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
+      | CaseKind::PackageReferenceMetadata
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
@@ -3884,6 +4049,33 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
         &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--json"],
         workspace,
         "package asset plan setup",
+      )?;
+    }
+  }
+  if matches!(case.kind, CaseKind::PackageReferenceMetadata) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "MetadataProject.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "PackageReference metadata setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "MetadataProject.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "PackageReference metadata setup",
       )?;
     }
   }
@@ -4537,6 +4729,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::FrameworkReferencePlan
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan
+    | CaseKind::PackageReferenceMetadata
     | CaseKind::NugetConfigHierarchy
     | CaseKind::NugetConfigMerge
     | CaseKind::NugetSourceSections
@@ -4613,6 +4806,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
+    CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
@@ -4643,6 +4837,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
+    CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
@@ -4718,6 +4913,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageGraphCold
         | CaseKind::PackageGraphMassive
         | CaseKind::PackageAssetPlan
+        | CaseKind::PackageReferenceMetadata
         | CaseKind::PackageSyncWarm
         | CaseKind::NugetConfigHierarchy
         | CaseKind::NugetConfigMerge
@@ -5220,8 +5416,10 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     let source_path = entry.path();
     let destination_path = destination.join(entry.file_name());
     if entry.file_type()?.is_dir() {
-      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed" | ".seed-project"))
-        || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
+      if matches!(
+        entry.file_name().to_str(),
+        Some("obj" | "bin" | ".packages" | ".oracle-packages" | ".seed" | ".seed-project")
+      ) || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
         || (local_sources_root && entry.file_name() == OsStr::new("feeds"))
       {
         continue;
@@ -5329,6 +5527,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "package_graph_cold"
           | "package_graph_massive"
           | "package_asset_plan"
+          | "package_reference_metadata"
           | "package_sync_warm"
           | "nuget_config_hierarchy"
           | "nuget_config_merge"
@@ -5470,6 +5669,7 @@ fn case_label(case: &str) -> &str {
     "package_graph_cold" => "Cold large dependency graph",
     "package_graph_massive" => "Cold massive solution graph",
     "package_asset_plan" => "Warm package asset plan",
+    "package_reference_metadata" => "PackageReference metadata",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",

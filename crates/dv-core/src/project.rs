@@ -9,7 +9,7 @@ use quick_xml::{
   events::{BytesRef, BytesStart, Event},
 };
 
-use crate::TargetFramework;
+use crate::{BENCHMARK_CACHE_LINE_BYTES, TargetFramework};
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
@@ -74,15 +74,65 @@ struct TextSpan {
 const _: () = assert!(size_of::<TextSpan>() == 8);
 const _: () = assert!(align_of::<TextSpan>() == 4);
 
-/// One exact package dependency stored as two compact text-table spans.
+/// NuGet asset families selected by PackageReference metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackageAssetFlags(u8);
+
+impl PackageAssetFlags {
+  pub const NONE: Self = Self(0);
+  pub const RUNTIME: Self = Self(1 << 0);
+  pub const COMPILE: Self = Self(1 << 1);
+  pub const BUILD: Self = Self(1 << 2);
+  pub const NATIVE: Self = Self(1 << 3);
+  pub const CONTENT_FILES: Self = Self(1 << 4);
+  pub const ANALYZERS: Self = Self(1 << 5);
+  pub const BUILD_MULTI_TARGETING: Self = Self(1 << 6);
+  pub const BUILD_TRANSITIVE: Self = Self(1 << 7);
+  pub const ALL: Self = Self(u8::MAX);
+  const DEFAULT_PRIVATE: Self = Self(Self::CONTENT_FILES.0 | Self::ANALYZERS.0 | Self::BUILD.0);
+  pub(crate) const NO_CONTENT: Self = Self(Self::ALL.0 & !Self::CONTENT_FILES.0);
+
+  pub const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+  }
+
+  pub(crate) const fn bits(self) -> u8 {
+    self.0
+  }
+
+  pub(crate) const fn union(self, other: Self) -> Self {
+    Self(self.0 | other.0)
+  }
+
+  pub(crate) const fn intersect(self, other: Self) -> Self {
+    Self(self.0 & other.0)
+  }
+
+  pub(crate) const fn without(self, other: Self) -> Self {
+    Self(self.0 & !other.0)
+  }
+}
+
+/// One package dependency stored as compact text-table spans and inline policy.
+///
+/// Eight fields occupy 36 bytes at four-byte alignment. One full row fits in
+/// an assumed 64-byte benchmark-host cache line; the checked 51-reference
+/// solution retains 1,836 bytes in one contiguous allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackageReference {
   id: TextSpan,
   version: TextSpan,
+  no_warn: TextSpan,
+  aliases: TextSpan,
+  include_assets: PackageAssetFlags,
+  exclude_assets: PackageAssetFlags,
+  private_assets: PackageAssetFlags,
+  generate_path_property: bool,
 }
 
-const _: () = assert!(size_of::<PackageReference>() == 16);
+const _: () = assert!(size_of::<PackageReference>() == 36);
 const _: () = assert!(align_of::<PackageReference>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PackageReference>() == 1);
 
 /// One explicit shared-framework dependency and its supported version overrides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,6 +403,41 @@ impl ProjectSpec {
     self.text(package.version)
   }
 
+  /// Returns the asset families explicitly or implicitly included.
+  pub fn package_include_assets(&self, package: PackageReference) -> PackageAssetFlags {
+    package.include_assets
+  }
+
+  /// Returns the asset families explicitly excluded.
+  pub fn package_exclude_assets(&self, package: PackageReference) -> PackageAssetFlags {
+    package.exclude_assets
+  }
+
+  /// Returns the effective asset families consumed by this project.
+  pub fn package_effective_assets(&self, package: PackageReference) -> PackageAssetFlags {
+    package.include_assets.without(package.exclude_assets)
+  }
+
+  /// Returns the asset families kept private from a consuming project.
+  pub fn package_private_assets(&self, package: PackageReference) -> PackageAssetFlags {
+    package.private_assets
+  }
+
+  /// Returns package-scoped warning suppressions.
+  pub fn package_no_warn(&self, package: PackageReference) -> Option<&str> {
+    (package.no_warn != NO_TEXT).then(|| self.text(package.no_warn))
+  }
+
+  /// Returns compiler reference aliases for this package.
+  pub fn package_aliases(&self, package: PackageReference) -> Option<&str> {
+    (package.aliases != NO_TEXT).then(|| self.text(package.aliases))
+  }
+
+  /// Returns whether the package root must be exposed as a generated property.
+  pub fn package_generate_path_property(&self, package: PackageReference) -> bool {
+    package.generate_path_property
+  }
+
   /// Returns the compact batch of explicit framework references.
   pub fn framework_references(&self) -> &[FrameworkReference] {
     &self.framework_references
@@ -507,6 +592,17 @@ enum FrameworkMetadata {
 }
 
 #[derive(Clone, Copy)]
+enum PackageMetadata {
+  Version,
+  IncludeAssets,
+  ExcludeAssets,
+  PrivateAssets,
+  NoWarn,
+  Aliases,
+  GeneratePathProperty,
+}
+
+#[derive(Clone, Copy)]
 enum Element {
   Document,
   Project,
@@ -515,7 +611,7 @@ enum Element {
   Property(Property),
   ProjectReference,
   PackageReference(usize),
-  PackageVersion(usize),
+  PackageMetadata(usize, PackageMetadata),
   FrameworkReference(usize),
   FrameworkMetadata(usize, FrameworkMetadata),
 }
@@ -546,6 +642,12 @@ struct RawProject {
 struct RawPackageReference {
   id: String,
   version: Option<String>,
+  include_assets: Option<String>,
+  exclude_assets: Option<String>,
+  private_assets: Option<String>,
+  no_warn: Option<String>,
+  aliases: Option<String>,
+  generate_path_property: Option<String>,
 }
 
 struct RawFrameworkReference {
@@ -653,7 +755,7 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
         if depth == MAX_XML_DEPTH {
           return Err(ProjectError::new(ProjectErrorKind::Unsupported, path, "project XML nesting is too deep"));
         }
-        if matches!(next, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
+        if matches!(next, Element::Property(_) | Element::PackageMetadata(_, _) | Element::FrameworkMetadata(_, _)) {
           text.clear();
         }
         stack[depth] = next;
@@ -672,7 +774,10 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
       },
       Ok(Event::Text(value)) => {
         let current = stack[depth - 1];
-        if matches!(current, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
+        if matches!(
+          current,
+          Element::Property(_) | Element::PackageMetadata(_, _) | Element::FrameworkMetadata(_, _)
+        ) {
           text.push_str(
             &value
               .xml10_content()
@@ -688,7 +793,10 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
       },
       Ok(Event::GeneralRef(value)) => {
         let current = stack[depth - 1];
-        if !matches!(current, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
+        if !matches!(
+          current,
+          Element::Property(_) | Element::PackageMetadata(_, _) | Element::FrameworkMetadata(_, _)
+        ) {
           return Err(ProjectError::new(
             ProjectErrorKind::Unsupported,
             path,
@@ -780,10 +888,28 @@ fn start_element(
       Ok(Element::ProjectReference)
     },
     Element::ItemGroup if name == "PackageReference" => {
-      let include = required_attribute(path, reader, element, "Include", &["Version"])?;
+      const METADATA: &[&str] = &[
+        "Version",
+        "IncludeAssets",
+        "ExcludeAssets",
+        "PrivateAssets",
+        "NoWarn",
+        "Aliases",
+        "GeneratePathProperty",
+      ];
+      let include = required_attribute(path, reader, element, "Include", METADATA)?;
       let version = optional_attribute(path, reader, element, "Version")?;
       let index = raw.package_references.len();
-      raw.package_references.push(RawPackageReference { id: include, version });
+      raw.package_references.push(RawPackageReference {
+        id: include,
+        version,
+        include_assets: optional_attribute(path, reader, element, "IncludeAssets")?,
+        exclude_assets: optional_attribute(path, reader, element, "ExcludeAssets")?,
+        private_assets: optional_attribute(path, reader, element, "PrivateAssets")?,
+        no_warn: optional_attribute(path, reader, element, "NoWarn")?,
+        aliases: optional_attribute(path, reader, element, "Aliases")?,
+        generate_path_property: optional_attribute(path, reader, element, "GeneratePathProperty")?,
+      });
       Ok(Element::PackageReference(index))
     },
     Element::ItemGroup if name == "FrameworkReference" => {
@@ -803,9 +929,25 @@ fn start_element(
       });
       Ok(Element::FrameworkReference(index))
     },
-    Element::PackageReference(index) if name == "Version" => {
+    Element::PackageReference(index) => {
       validate_attributes(path, reader, element, &[])?;
-      Ok(Element::PackageVersion(index))
+      let metadata = match name {
+        "Version" => PackageMetadata::Version,
+        "IncludeAssets" => PackageMetadata::IncludeAssets,
+        "ExcludeAssets" => PackageMetadata::ExcludeAssets,
+        "PrivateAssets" => PackageMetadata::PrivateAssets,
+        "NoWarn" => PackageMetadata::NoWarn,
+        "Aliases" => PackageMetadata::Aliases,
+        "GeneratePathProperty" => PackageMetadata::GeneratePathProperty,
+        _ => {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            format!("package-reference metadata element {name} is not supported here"),
+          ));
+        },
+      };
+      Ok(Element::PackageMetadata(index, metadata))
     },
     Element::FrameworkReference(index) => {
       validate_attributes(path, reader, element, &[])?;
@@ -823,12 +965,12 @@ fn start_element(
       };
       Ok(Element::FrameworkMetadata(index, metadata))
     },
-    Element::ProjectReference | Element::PackageReference(_) => Err(ProjectError::new(
+    Element::ProjectReference => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
       format!("metadata element {name} is not supported here"),
     )),
-    Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _) => Err(ProjectError::new(
+    Element::Property(_) | Element::PackageMetadata(_, _) | Element::FrameworkMetadata(_, _) => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
       format!("nested element {name} is not supported in a property value"),
@@ -868,16 +1010,25 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::NugetAuditMode => raw.nuget_audit_mode = Some(text.to_owned()),
       Property::NugetAuditLevel => raw.nuget_audit_level = Some(text.to_owned()),
     },
-    Element::PackageVersion(index) => {
+    Element::PackageMetadata(index, metadata) => {
       let package = &mut raw.package_references[index];
-      if package.version.is_some() {
+      let (slot, name) = match metadata {
+        PackageMetadata::Version => (&mut package.version, "Version"),
+        PackageMetadata::IncludeAssets => (&mut package.include_assets, "IncludeAssets"),
+        PackageMetadata::ExcludeAssets => (&mut package.exclude_assets, "ExcludeAssets"),
+        PackageMetadata::PrivateAssets => (&mut package.private_assets, "PrivateAssets"),
+        PackageMetadata::NoWarn => (&mut package.no_warn, "NoWarn"),
+        PackageMetadata::Aliases => (&mut package.aliases, "Aliases"),
+        PackageMetadata::GeneratePathProperty => (&mut package.generate_path_property, "GeneratePathProperty"),
+      };
+      if slot.is_some() {
         return Err(ProjectError::new(
           ProjectErrorKind::InvalidProperty,
           path,
-          format!("package {:?} declares Version more than once", package.id),
+          format!("package {:?} declares {name} more than once", package.id),
         ));
       }
-      package.version = Some(text.to_owned());
+      *slot = Some(text.to_owned());
     },
     Element::FrameworkMetadata(index, metadata) => {
       let reference = &mut raw.framework_references[index];
@@ -1038,7 +1189,12 @@ fn materialize_project(
     + raw
       .package_references
       .iter()
-      .map(|package| package.id.len() + package.version.as_ref().map_or(0, String::len))
+      .map(|package| {
+        package.id.len()
+          + package.version.as_ref().map_or(0, String::len)
+          + package.no_warn.as_ref().map_or(0, String::len)
+          + package.aliases.as_ref().map_or(0, String::len)
+      })
       .sum::<usize>()
     + raw.runtime_framework_version.as_ref().map_or(0, String::len)
     + raw
@@ -1080,9 +1236,37 @@ fn materialize_project(
         format!("package {:?} version {version:?} is not a literal version or range", package.id),
       ));
     }
+    let include_assets = parse_package_assets(&project_path, "IncludeAssets", package.include_assets.as_deref(), PackageAssetFlags::ALL)?;
+    let exclude_assets = parse_package_assets(&project_path, "ExcludeAssets", package.exclude_assets.as_deref(), PackageAssetFlags::NONE)?;
+    let private_assets = parse_package_assets(
+      &project_path,
+      "PrivateAssets",
+      package.private_assets.as_deref(),
+      PackageAssetFlags::DEFAULT_PRIVATE,
+    )?;
+    let no_warn = optional_literal_metadata(&project_path, "NoWarn", package.no_warn.as_deref())?
+      .map(|value| table.push(value, &project_path))
+      .transpose()?
+      .unwrap_or(NO_TEXT);
+    let aliases = optional_literal_metadata(&project_path, "Aliases", package.aliases.as_deref())?
+      .map(|value| table.push(value, &project_path))
+      .transpose()?
+      .unwrap_or(NO_TEXT);
+    let generate_path_property = parse_bool(
+      &project_path,
+      "GeneratePathProperty",
+      package.generate_path_property.as_deref().filter(|value| !value.trim().is_empty()),
+      false,
+    )?;
     package_references.push(PackageReference {
       id: table.push(&package.id, &project_path)?,
       version: table.push(&version, &project_path)?,
+      no_warn,
+      aliases,
+      include_assets,
+      exclude_assets,
+      private_assets,
+      generate_path_property,
     });
   }
   let runtime_framework_version_span = match raw.runtime_framework_version.as_deref() {
@@ -1422,6 +1606,75 @@ fn normalize_project_reference(path: &Path, value: &str) -> Result<String, Proje
   Ok(normalized)
 }
 
+fn parse_package_assets(path: &Path, name: &str, value: Option<&str>, default: PackageAssetFlags) -> Result<PackageAssetFlags, ProjectError> {
+  let Some(value) = value else {
+    return Ok(default);
+  };
+  if value.contains("$(") {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      format!("{name} must be a literal asset list"),
+    ));
+  }
+  let mut flags = PackageAssetFlags::NONE;
+  let mut token_count = 0usize;
+  let mut contains_all_or_none = false;
+  for asset in value.split([',', ';']).map(str::trim).filter(|asset| !asset.is_empty()) {
+    token_count += 1;
+    let selected = if asset.eq_ignore_ascii_case("none") {
+      contains_all_or_none = true;
+      PackageAssetFlags::NONE
+    } else if asset.eq_ignore_ascii_case("all") {
+      contains_all_or_none = true;
+      PackageAssetFlags::ALL
+    } else if asset.eq_ignore_ascii_case("runtime") {
+      PackageAssetFlags::RUNTIME
+    } else if asset.eq_ignore_ascii_case("compile") {
+      PackageAssetFlags::COMPILE
+    } else if asset.eq_ignore_ascii_case("build") {
+      PackageAssetFlags::BUILD
+    } else if asset.eq_ignore_ascii_case("buildmultitargeting") {
+      PackageAssetFlags::BUILD_MULTI_TARGETING
+    } else if asset.eq_ignore_ascii_case("buildtransitive") {
+      PackageAssetFlags::BUILD_TRANSITIVE.union(PackageAssetFlags::BUILD)
+    } else if asset.eq_ignore_ascii_case("native") {
+      PackageAssetFlags::NATIVE
+    } else if asset.eq_ignore_ascii_case("contentfiles") {
+      PackageAssetFlags::CONTENT_FILES
+    } else if asset.eq_ignore_ascii_case("analyzers") {
+      PackageAssetFlags::ANALYZERS
+    } else {
+      return Err(ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        path,
+        format!("{name} contains unsupported asset {asset:?}"),
+      ));
+    };
+    flags = flags.union(selected);
+  }
+  if token_count == 0 {
+    return Ok(default);
+  }
+  if token_count != 1 && contains_all_or_none {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      format!("{name} values all and none must appear by themselves"),
+    ));
+  }
+  Ok(flags)
+}
+
+fn optional_literal_metadata<'a>(path: &Path, name: &str, value: Option<&'a str>) -> Result<Option<&'a str>, ProjectError> {
+  match value {
+    Some(value) if value.contains("$(") => Err(ProjectError::new(ProjectErrorKind::InvalidProperty, path, format!("{name} must be literal"))),
+    Some(value) if value.trim().is_empty() => Ok(None),
+    Some(value) => Ok(Some(value.trim())),
+    None => Ok(None),
+  }
+}
+
 fn is_literal_package_version(value: &str) -> bool {
   !value.is_empty() && value.len() <= 256 && !value.contains("$(")
 }
@@ -1565,6 +1818,80 @@ mod tests {
   }
 
   #[test]
+  fn evaluates_package_reference_policy_into_typed_inline_fields() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Example.Package" Version="1.2.3"><IncludeAssets>compile;runtime;buildMultitargeting</IncludeAssets><ExcludeAssets>runtime</ExcludeAssets><PrivateAssets>all</PrivateAssets><NoWarn>NU1603;NU1701</NoWarn><Aliases>ExampleAlias</Aliases><GeneratePathProperty>true</GeneratePathProperty></PackageReference></ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let package = result.package_references()[0];
+
+    assert!(result.package_include_assets(package).contains(PackageAssetFlags::COMPILE));
+    assert!(result.package_include_assets(package).contains(PackageAssetFlags::RUNTIME));
+    assert!(result.package_include_assets(package).contains(PackageAssetFlags::BUILD_MULTI_TARGETING));
+    assert_eq!(result.package_exclude_assets(package), PackageAssetFlags::RUNTIME);
+    assert_eq!(
+      result.package_effective_assets(package),
+      PackageAssetFlags::COMPILE.union(PackageAssetFlags::BUILD_MULTI_TARGETING)
+    );
+    assert_eq!(result.package_private_assets(package), PackageAssetFlags::ALL);
+    assert_eq!(result.package_no_warn(package), Some("NU1603;NU1701"));
+    assert_eq!(result.package_aliases(package), Some("ExampleAlias"));
+    assert!(result.package_generate_path_property(package));
+  }
+
+  #[test]
+  fn defaults_package_reference_policy_to_nuget_values() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml("", r#"<ItemGroup><PackageReference Include="Example.Package" Version="1.2.3" /></ItemGroup>"#),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let package = result.package_references()[0];
+
+    assert_eq!(result.package_include_assets(package), PackageAssetFlags::ALL);
+    assert_eq!(result.package_exclude_assets(package), PackageAssetFlags::NONE);
+    assert_eq!(result.package_private_assets(package), PackageAssetFlags::DEFAULT_PRIVATE);
+    assert_eq!(result.package_no_warn(package), None);
+    assert_eq!(result.package_aliases(package), None);
+    assert!(!result.package_generate_path_property(package));
+  }
+
+  #[test]
+  fn rejects_ambiguous_or_unknown_package_asset_lists() {
+    let temp = TempDirectory::new();
+    let mixed = temp.write(
+      "Mixed.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Example.Package" Version="1.2.3" IncludeAssets="all;compile" /></ItemGroup>"#,
+      ),
+    );
+    let unknown = temp.write(
+      "Unknown.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Example.Package" Version="1.2.3" PrivateAssets="telepathy" /></ItemGroup>"#,
+      ),
+    );
+
+    let mixed = evaluate_project_path(&mixed, ProjectConfiguration::Debug).unwrap_err();
+    let unknown = evaluate_project_path(&unknown, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(mixed.kind(), ProjectErrorKind::InvalidProperty);
+    assert!(mixed.to_string().contains("must appear by themselves"));
+    assert_eq!(unknown.kind(), ProjectErrorKind::InvalidProperty);
+    assert!(unknown.to_string().contains("unsupported asset"));
+  }
+
+  #[test]
   fn materializes_runtime_targets_as_one_compact_dimension_batch() {
     let temp = TempDirectory::new();
     let project = temp.write(
@@ -1683,6 +2010,88 @@ mod tests {
     let package = result.package_references()[0];
     assert_eq!(result.package_id(package), "Example.Package");
     assert_eq!(result.package_version(package), "2.0.0-preview.1");
+  }
+
+  #[test]
+  fn materializes_package_reference_policy_from_attributes_and_children() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup>
+          <PackageReference Include="Attribute.Package" Version="1.2.3" IncludeAssets="compile;runtime;" ExcludeAssets="runtime" PrivateAssets="all" NoWarn="NU1603;NU1701" Aliases="AttributeAlias" GeneratePathProperty="true" />
+          <PackageReference Include="Child.Package">
+            <Version>2.0.0</Version>
+            <IncludeAssets>compile;buildTransitive</IncludeAssets>
+            <ExcludeAssets>native</ExcludeAssets>
+            <PrivateAssets>contentFiles;analyzers</PrivateAssets>
+            <NoWarn> NU1901,NU1902 </NoWarn>
+            <Aliases>ChildAlias</Aliases>
+            <GeneratePathProperty>true</GeneratePathProperty>
+          </PackageReference>
+          <PackageReference Include="Default.Package" Version="3.0.0" />
+        </ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let attribute = result.package_references()[0];
+    let child = result.package_references()[1];
+    let defaulted = result.package_references()[2];
+
+    assert_eq!(
+      result.package_include_assets(attribute),
+      PackageAssetFlags::COMPILE.union(PackageAssetFlags::RUNTIME)
+    );
+    assert_eq!(result.package_exclude_assets(attribute), PackageAssetFlags::RUNTIME);
+    assert_eq!(result.package_effective_assets(attribute), PackageAssetFlags::COMPILE);
+    assert_eq!(result.package_private_assets(attribute), PackageAssetFlags::ALL);
+    assert_eq!(result.package_no_warn(attribute), Some("NU1603;NU1701"));
+    assert_eq!(result.package_aliases(attribute), Some("AttributeAlias"));
+    assert!(result.package_generate_path_property(attribute));
+
+    assert_eq!(
+      result.package_include_assets(child),
+      PackageAssetFlags::COMPILE
+        .union(PackageAssetFlags::BUILD)
+        .union(PackageAssetFlags::BUILD_TRANSITIVE)
+    );
+    assert_eq!(result.package_exclude_assets(child), PackageAssetFlags::NATIVE);
+    assert_eq!(
+      result.package_private_assets(child),
+      PackageAssetFlags::CONTENT_FILES.union(PackageAssetFlags::ANALYZERS)
+    );
+    assert_eq!(result.package_no_warn(child), Some("NU1901,NU1902"));
+    assert_eq!(result.package_aliases(child), Some("ChildAlias"));
+    assert!(result.package_generate_path_property(child));
+
+    assert_eq!(result.package_include_assets(defaulted), PackageAssetFlags::ALL);
+    assert_eq!(result.package_exclude_assets(defaulted), PackageAssetFlags::NONE);
+    assert_eq!(result.package_private_assets(defaulted), PackageAssetFlags::DEFAULT_PRIVATE);
+    assert_eq!(result.package_no_warn(defaulted), None);
+    assert_eq!(result.package_aliases(defaulted), None);
+    assert!(!result.package_generate_path_property(defaulted));
+  }
+
+  #[test]
+  fn rejects_ambiguous_or_dynamic_package_reference_policy() {
+    let temp = TempDirectory::new();
+    for (index, item) in [
+      r#"<PackageReference Include="Example" Version="1.0.0" IncludeAssets="all;compile" />"#,
+      r#"<PackageReference Include="Example" Version="1.0.0" ExcludeAssets="unknown" />"#,
+      r#"<PackageReference Include="Example" Version="1.0.0" Aliases="$(Alias)" />"#,
+      r#"<PackageReference Include="Example" Version="1.0.0" GeneratePathProperty="sometimes" />"#,
+      r#"<PackageReference Include="Example" Version="1.0.0" PrivateAssets="all"><PrivateAssets>none</PrivateAssets></PackageReference>"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      let project = temp.write(&format!("Invalid{index}.csproj"), &project_xml("", &format!("<ItemGroup>{item}</ItemGroup>")));
+      let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+      assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty, "unexpected error for {item}");
+    }
   }
 
   #[test]

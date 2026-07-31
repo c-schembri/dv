@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 13;
+pub const EVENT_SCHEMA_VERSION: u16 = 14;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -172,6 +172,55 @@ pub struct ProjectPackageEvent {
   pub id: String,
   /// Exact package version.
   pub version: String,
+  /// Asset families made available to the project before exclusions.
+  pub include_assets: Vec<String>,
+  /// Asset families removed from the project.
+  pub exclude_assets: Vec<String>,
+  /// Asset families hidden from consuming projects.
+  pub private_assets: Vec<String>,
+  /// Package-scoped NuGet warning codes.
+  pub no_warn: Vec<String>,
+  /// Compiler aliases applied to direct package assemblies.
+  pub aliases: Option<String>,
+  /// Whether a `Pkg*` package-root property is generated.
+  pub generate_path_property: bool,
+}
+
+/// Sparse compiler alias attached to one materialized reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompilerReferenceAliasEvent {
+  /// Zero-based index in the compiler reference batch.
+  pub reference_index: u32,
+  /// Reference path at that index.
+  pub reference: String,
+  /// Alias text passed to Roslyn.
+  pub aliases: String,
+}
+
+/// One generated package-root property.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackagePathPropertyEvent {
+  /// MSBuild-compatible property name.
+  pub name: String,
+  /// Selected global-packages root for this package version.
+  pub value: String,
+}
+
+/// One direct dependency policy keyed into the resolved package batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectPackagePolicyEvent {
+  /// Zero-based index in the resolved package batch.
+  pub package_index: u32,
+  /// Effective asset families consumed through this direct reference.
+  pub include_assets: Vec<String>,
+  /// Asset families hidden from consuming projects.
+  pub private_assets: Vec<String>,
+  /// Package-scoped NuGet warning codes.
+  pub no_warn: Vec<String>,
+  /// Compiler aliases for this package's direct compile assets.
+  pub aliases: Option<String>,
+  /// Generated package-root property, when requested.
+  pub path_property: Option<PackagePathPropertyEvent>,
 }
 
 /// One explicit project framework reference at the reporter boundary.
@@ -433,6 +482,10 @@ pub enum EventPayload {
     generated_sources: Vec<String>,
     /// Ordered framework reference assemblies.
     references: Vec<String>,
+    /// Sparse aliases keyed into `references`.
+    reference_aliases: Vec<CompilerReferenceAliasEvent>,
+    /// Generated package-root properties.
+    package_path_properties: Vec<PackagePathPropertyEvent>,
     /// Ordered SDK and framework analyzers.
     analyzers: Vec<String>,
     /// Ordered analyzer configuration files.
@@ -486,6 +539,8 @@ pub enum EventPayload {
     source_work: Vec<PackageSourceWorkEvent>,
     /// Packages sorted by case-insensitive identity.
     packages: Vec<ResolvedPackageEvent>,
+    /// Direct-reference policy rows keyed into `packages`.
+    direct_policies: Vec<DirectPackagePolicyEvent>,
     /// Ordered compile assemblies selected for the evaluated target.
     compile_assets: Vec<String>,
     /// Ordered runtime assemblies selected for the evaluated target.

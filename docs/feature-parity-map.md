@@ -858,7 +858,8 @@ boundary, not final drop-in parity.
   and authentication retry paths, source bytes, and cumulative source-work
   microseconds are accumulated in 24-byte task-local records and merged once
   by configured source index. Package rows carry `hit` or `miss`; warm locked
-  restores publish zero source work. Event schema 13 identifies rows only by
+  restores publish zero source work. The source rows introduced in event schema
+  13 and retained by schema 14 identify entries only by
   redacted source keys and protocol generations. Source URLs are stripped of
   userinfo, query, and fragment data before inventory, lock, or package-metadata
   publication. No
@@ -879,8 +880,21 @@ boundary, not final drop-in parity.
   cold benchmark covers exact identity, version, hash, and assets. `P1`
 - [x] `RES-003` Parse `PackageReference` version and metadata from attributes
   or child elements. `P1`
-- [ ] `RES-004` Support `IncludeAssets`, `ExcludeAssets`, `PrivateAssets`,
-  `NoWarn`, `Aliases`, and `GeneratePathProperty`. `P2`
+- [x] `RES-004` `PackageReference` asset lists are normalized once into an
+  eight-bit family mask; effective includes propagate through the dependency
+  graph while private assets remain scoped to parent flow. Package-scoped
+  `NoWarn`, direct compile `Aliases`, and Microsoft-compatible generated
+  `Pkg*` package-root properties occupy a separate identity-ordered 32-byte
+  cold policy batch. Compiler aliases are sparse 12-byte reference-index rows,
+  so the common 168-reference framework batch is not widened. Lock schema 4
+  invalidates selected assets when the effective mask changes, and event schema
+  14 exposes the same structured policy to human/JSON consumers. Parser tests
+  cover attribute and child-element forms; the checked Microsoft oracle covers
+  compile-only selection, private-all flow, two warning codes, the direct
+  compiler alias, and the exact `PkgNewtonsoft_Json` root. Thirty warm Windows
+  samples measure `456.722 ms` for
+  Microsoft versus `6.611 ms` for `dv` (`69.1x`) with one cache hit and zero
+  timed network work. `P2`
 - [ ] `RES-005` Support conditional references per TFM/RID/configuration. `P2`
 - [ ] `RES-006` Read `Directory.Packages.props` and implement central package
   versions, version overrides, global references, and transitive pinning. `P2`
@@ -900,7 +914,7 @@ boundary, not final drop-in parity.
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by compatible TFM and NuGet include/exclude
-  propagation. Lock schema 3 and event schema 4 preserve every selected family
+  propagation. Lock schema 4 and event schema 14 preserve every selected family
   in compact per-package ranges. The 203-package massive acceptance graph now
   matches `project.assets.json` across portable asset paths and runtime-target
   RID/type metadata and is benchmarked end to end. Selecting one concrete RID
