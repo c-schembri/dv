@@ -39,6 +39,7 @@ enum CaseKind {
   NugetCliOverrides,
   NugetLocalSources,
   NugetServiceIndex,
+  NugetCredentials,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -66,6 +67,7 @@ struct Fixtures<'a> {
   nuget_cli_overrides: &'a Path,
   nuget_local_sources: &'a Path,
   nuget_service_index: &'a Path,
+  nuget_credentials: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -318,6 +320,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_credentials",
+    kind: CaseKind::NugetCredentials,
+    args: &["oracle/bin/Release/CredentialOracle.dll", "."],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -517,6 +525,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_credentials",
+    kind: CaseKind::NugetCredentials,
+    args: &["project", "package-sources", "CredentialProject.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -651,6 +665,7 @@ fn run() -> Result<()> {
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
   let nuget_service_index_fixture = repository.join("benchmarks/fixtures/nuget-service-index");
+  let nuget_credentials_fixture = repository.join("benchmarks/fixtures/nuget-credentials");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -668,6 +683,7 @@ fn run() -> Result<()> {
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
     nuget_local_sources: &nuget_local_sources_fixture,
     nuget_service_index: &nuget_service_index_fixture,
+    nuget_credentials: &nuget_credentials_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -730,6 +746,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_service_index") {
     verify_nuget_service_index(&repository, &dv_executable, &nuget_service_index_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_credentials") {
+    verify_nuget_credentials(&repository, &dv_executable, &nuget_credentials_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -749,7 +768,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 13,
+    schema_version: 14,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2424,6 +2443,78 @@ fn verify_nuget_service_index(repository: &Path, dv_executable: &Path, fixture: 
   Ok(())
 }
 
+fn verify_nuget_credentials(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let workspace = repository.join(format!("target/benchmark-nuget-credentials-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &workspace)?;
+  reset_fixture(fixture, &workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "oracle/CredentialOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &workspace,
+    "NuGet credential oracle build",
+  )?;
+  let oracle_text = credential_command_text(Path::new("dotnet"), &["oracle/bin/Release/CredentialOracle.dll", "."], &workspace)?;
+  reject_credential_output("Microsoft credential oracle", &oracle_text)?;
+  let oracle: Vec<serde_json::Value> = serde_json::from_str(&oracle_text)?;
+  let dv_text = credential_command_text(
+    dv_executable,
+    &["project", "package-sources", "CredentialProject.csproj", "--offline", "--json"],
+    &workspace,
+  )?;
+  reject_credential_output("dv credential inspection", &dv_text)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv credential verification omitted package_sources_inspected")?;
+  let actual = dv
+    .get("sources")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv credential verification omitted sources")?;
+  if oracle.len() != 2 || actual.len() != oracle.len() {
+    return Err(format!("credential source count differs: oracle={} dv={}", oracle.len(), actual.len()).into());
+  }
+  for (expected, actual) in oracle.iter().zip(actual) {
+    for field in ["name", "location", "protocol", "authentication"] {
+      if required_string(expected, field)? != required_string(actual, field)? {
+        return Err(format!("credential source field {field} differs: oracle={expected} dv={actual}").into());
+      }
+    }
+    if expected.get("credentialSelected").and_then(serde_json::Value::as_bool) != Some(true) {
+      return Err(format!("Microsoft credential oracle did not select the expected environment/config secret: {expected}").into());
+    }
+    if actual
+      .get("endpoints")
+      .and_then(serde_json::Value::as_array)
+      .is_none_or(|endpoints| !endpoints.is_empty())
+    {
+      return Err(format!("offline credential inspection unexpectedly discovered endpoints: {actual}").into());
+    }
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) || dv.get("downloaded_bytes").and_then(serde_json::Value::as_u64) != Some(0) {
+    return Err("offline credential inspection performed network work".into());
+  }
+  Ok(())
+}
+
+fn reject_credential_output(label: &str, output: &str) -> Result<()> {
+  for secret in [
+    "config-decoy-user",
+    "config-decoy-secret",
+    "environment-user",
+    "environment-pat",
+    "config-only-user",
+    "config-only-pat",
+  ] {
+    if output.contains(secret) {
+      return Err(format!("{label} exposed credential text {secret:?}").into());
+    }
+  }
+  Ok(())
+}
+
 fn package_service_endpoints(source: &serde_json::Value, kind: &str) -> Result<Vec<String>> {
   source
     .get("endpoints")
@@ -2723,6 +2814,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
       | CaseKind::NugetServiceIndex
+      | CaseKind::NugetCredentials
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -2737,6 +2829,14 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       &["build", "oracle/ServiceIndexOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
       workspace,
       "NuGet service-index oracle build",
+    )?;
+  }
+  if matches!(case.kind, CaseKind::NugetCredentials) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &["build", "oracle/CredentialOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+      workspace,
+      "NuGet credential oracle build",
     )?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
@@ -3157,6 +3257,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
+    CaseKind::NugetCredentials => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
@@ -3225,6 +3326,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
     CaseKind::NugetServiceIndex => fixtures.nuget_service_index,
+    CaseKind::NugetCredentials => fixtures.nuget_credentials,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -3247,6 +3349,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
     CaseKind::NugetServiceIndex => Some("nuget-service-index"),
+    CaseKind::NugetCredentials => Some("nuget-credentials"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -3266,6 +3369,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
       | CaseKind::NugetServiceIndex
+      | CaseKind::NugetCredentials
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd);
   }
@@ -3295,7 +3399,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetLocalSources
     ) {
     Some(parse_work_evidence(&output.stdout)?)
-  } else if !is_dotnet(executable) && matches!(case.kind, CaseKind::NugetServiceIndex) {
+  } else if !is_dotnet(executable) && matches!(case.kind, CaseKind::NugetServiceIndex | CaseKind::NugetCredentials) {
     Some(parse_source_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
     Some(reference_package_work(cwd)?)
@@ -3474,6 +3578,16 @@ fn apply_nuget_cli_environment(command: &mut Command, cwd: &Path) {
     .env_remove("no_proxy");
 }
 
+fn apply_nuget_credential_environment(command: &mut Command, cwd: &Path) {
+  apply_nuget_config_environment(command, cwd);
+  command
+    .env(
+      "NuGetPackageSourceCredentials_private",
+      "Username=environment-user;Password=environment-pat;ValidAuthenticationTypes=Basic",
+    )
+    .env("DV_BENCH_CONFIG_PAT", "config-only-pat");
+}
+
 fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) {
   if matches!(kind, CaseKind::NugetStoragePolicy) {
     apply_nuget_storage_environment(command, cwd);
@@ -3482,6 +3596,8 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
   } else if matches!(kind, CaseKind::NugetServiceIndex) {
     apply_nuget_config_environment(command, cwd);
     command.env("NUGET_HTTP_CACHE_PATH", cwd.join(".http-cache"));
+  } else if matches!(kind, CaseKind::NugetCredentials) {
+    apply_nuget_credential_environment(command, cwd);
   } else {
     apply_nuget_config_environment(command, cwd);
   }
@@ -3547,6 +3663,19 @@ fn service_index_command_text(executable: &Path, args: &[&str], cwd: &Path) -> R
   let output = command.output()?;
   check_output(output.clone(), executable, args, "NuGet service-index command")?;
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn credential_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_credential_environment(&mut command, cwd);
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, "NuGet credential command")?;
+  let stdout = String::from_utf8(output.stdout)?;
+  let stderr = String::from_utf8(output.stderr)?;
+  reject_credential_output("NuGet credential stdout", &stdout)?;
+  reject_credential_output("NuGet credential stderr", &stderr)?;
+  Ok(stdout.trim().to_owned())
 }
 
 fn nuget_storage_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
@@ -3699,6 +3828,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_cli_overrides"
           | "nuget_local_sources"
           | "nuget_service_index"
+          | "nuget_credentials"
       )
     })
     .collect::<Vec<_>>();
@@ -3832,6 +3962,7 @@ fn case_label(case: &str) -> &str {
     "nuget_cli_overrides" => "NuGet CLI overrides",
     "nuget_local_sources" => "NuGet local sources",
     "nuget_service_index" => "NuGet service index",
+    "nuget_credentials" => "NuGet credentials",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -3915,7 +4046,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 13,
+      schema_version: 14,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -3979,7 +4110,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 13,
+      schema_version: 14,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

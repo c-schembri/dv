@@ -24,12 +24,16 @@ NuGet sources are typed records containing URL and protocol generation:
   only for a `/v3/index.json` URL and otherwise infer v2;
 - HTTPS v2/v3 sources plus local flat or hierarchical folders are accepted;
   local paths may be configuration-relative, CLI-relative, absolute, or
-  `file://`, and remain usable in offline mode. Source authentication remains
-  outside the supported subset. Credential-free config
-  or lowercase environment HTTP proxies are applied by the native client;
-  separate encrypted config credentials fail explicitly on Windows and are
-  ignored elsewhere like NuGet. Proxy addresses and credentials are not
-  retained in results or events.
+  `file://`, and remain usable in offline mode;
+- Basic/PAT source credentials come from merged `packageSourceCredentials` or
+  exact `NuGetPackageSourceCredentials_{name}` environment values. Windows
+  encrypted passwords use current-user DPAPI with NuGet-compatible entropy;
+  cleartext and intermediate buffers are zeroed. One sensitive header is
+  reused only for the configured HTTPS origin;
+- credential-free config or lowercase environment HTTP proxies are applied by
+  the native client. Proxy addresses and source credentials are not retained
+  in locks, results, diagnostics, or events; source inventory reports only the
+  authentication kind.
 
 Configuration discovers machine fragments, additional-user fragments, the
 main .NET CLI user file, and one `NuGet.Config` from each drive-to-project

@@ -77,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":8"));
+  assert!(lines[0].contains("\"schema_version\":9"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -549,6 +549,46 @@ fn package_source_inspection_keeps_offline_discovery_network_free() {
     event.pointer("/sources/0/endpoints").and_then(serde_json::Value::as_array).map(Vec::len),
     Some(0)
   );
+}
+
+#[test]
+fn package_source_credentials_report_only_the_authentication_kind() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration>
+<packageSources><clear /><add key="private" value="https://packages.example.test/v3/index.json" protocolVersion="3" /></packageSources>
+<packageSourceCredentials><private>
+  <add key="Username" value="config-decoy-user" />
+  <add key="ClearTextPassword" value="config-decoy-secret" />
+  <add key="ValidAuthenticationTypes" value="negotiate" />
+</private></packageSourceCredentials>
+</configuration>"#,
+  );
+  let output = dv()
+    .args(["project", "package-sources", "App.csproj", "--offline", "--json"])
+    .env(
+      "NuGetPackageSourceCredentials_private",
+      "Username=environment-user;Password=environment-pat;ValidAuthenticationTypes=basic",
+    )
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stdout.contains("\"authentication\":\"basic\""));
+  for secret in ["environment-user", "environment-pat", "config-decoy-user", "config-decoy-secret"] {
+    assert!(!stdout.contains(secret));
+    assert!(!stderr.contains(secret));
+  }
+  assert!(!temp.0.join("dv.lock.json").exists());
 }
 
 #[test]

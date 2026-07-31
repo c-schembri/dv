@@ -62,6 +62,9 @@ dv restore (local sources)       64.522 ms median
 dotnet NuGet service index      344.113 ms median
 dv NuGet service index          277.336 ms median
 
+dotnet NuGet credentials         73.624 ms median
+dv NuGet credentials              4.615 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -109,6 +112,7 @@ The project is in the first implementation phase.
 | NuGet CLI source, config, and package-folder overrides | Implemented |
 | NuGet flat and hierarchical local sources | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
+| NuGet Basic/PAT source credentials | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -175,12 +179,18 @@ precedence matches NuGet.Client, while selected endpoint text is compacted
 into one allocation with five fixed ranges. Independent source indexes are
 requested concurrently through the bounded Tokio scheduler.
 
+Basic/PAT source credentials follow NuGet.Client's config and exact per-source
+environment precedence. Cleartext buffers are zeroed, Windows-encrypted
+passwords use NuGet-compatible user DPAPI, and one sensitive header is reused
+only for the configured HTTPS origin. Locks, diagnostics, events, and human
+output never contain usernames, passwords, tokens, or authorization headers;
+source inventory reports only `none` or `basic`.
+
 Storage policy follows NuGet precedence for the writable global cache,
 read-only fallback folders, HTTP metadata cache, and scratch directory.
 Restore also retains typed signature-validation and project audit policy and
 constructs proxy address and bypass policy only at the HTTP boundary, without
-reporting either. Separate Windows-encrypted config credentials fail explicitly
-until authenticated proxy support lands. Signature verification, advisory
+reporting either. Signature verification, advisory
 lookup, and conditional HTTP-cache semantics remain separately tracked parity
 work.
 
@@ -262,7 +272,7 @@ Initial machine:
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, storage policy, CLI overrides, local sources, service-index
-  capability discovery, the
+  capability discovery, source credentials, the
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; compiler planning uses 5 warm-ups; 10
@@ -290,6 +300,7 @@ Initial machine:
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
+| Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -340,7 +351,11 @@ all registration, flat-container, search, vulnerability, and package-publish
 URIs against NuGet.Client's official resource selection. The `dv` timing also
 includes project evaluation and `NuGet.Config` discovery. The live-network
 samples are comparable within the same run, not across unrelated network
-conditions. The massive case additionally compares runtime, resource,
+conditions. The credential case uses the official `NuGet.Configuration`
+implementation to prove one environment override and one config-only PAT,
+compares the same two redacted source rows, and rejects every fixture secret
+in stdout and stderr. Both commands perform zero timed network requests. The
+massive case additionally compares runtime, resource,
 content, analyzer, build, build-multitargeting, native, and RID runtime-target
 paths plus runtime-target metadata. The warm asset-plan case retains that
 exact parity gate, then measures locked planning over the populated
@@ -364,6 +379,7 @@ recorded in the curated
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
+[NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -416,6 +432,7 @@ cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
+cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
@@ -474,6 +491,7 @@ See:
 - [NuGet CLI override contract](docs/nuget-cli-overrides.md)
 - [NuGet local source contract](docs/nuget-local-sources.md)
 - [NuGet service-index capability contract](docs/nuget-service-index.md)
+- [NuGet source credential contract](docs/nuget-credentials.md)
 - [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)

@@ -777,8 +777,17 @@ boundary, not final drop-in parity.
   oracle measures `344.113 ms` for Microsoft versus `277.336 ms` for `dv`
   (`1.24x`) across 30 retained samples; `dv` also evaluates the project and
   configuration hierarchy inside its timed command. `P2`
-- [ ] `NUGET-008` Support Basic/PAT credentials from config and environment
-  without persisting or reporting plaintext. `P2`
+- [x] `NUGET-008` Support Basic/PAT credentials from config and environment
+  without persisting or reporting plaintext. Exact
+  `NuGetPackageSourceCredentials_{name}` values override decoded
+  `packageSourceCredentials` groups; malformed environment values fall back
+  to configuration like NuGet.Client. Cleartext buffers are zeroed, Windows
+  `Password` values use NuGet-compatible user DPAPI entropy, and one sensitive
+  Basic header is materialized per effective HTTPS source. Authentication is
+  limited to the configured source origin; events and human output expose only
+  `none` or `basic` through schema 9. The offline NuGet.Configuration oracle
+  measures `73.624 ms` for Microsoft versus `4.615 ms` for `dv` (`16.0x`)
+  across 30 retained samples with two sources and zero network requests. `P2`
 - [ ] `NUGET-009` Define a credential-provider protocol for private feeds,
   interactive login, cancellation, timeout, and noninteractive CI. `P2`
 - [ ] `NUGET-010` Support client certificates and platform certificate stores

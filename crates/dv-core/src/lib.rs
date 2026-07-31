@@ -26,8 +26,8 @@ pub use framework_reference::{
 };
 pub use pack_requirement::{PackAcquisition, PackKind, PackRequirement};
 pub use package::{
-  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, PackageServiceKind, PackageSourceInventory, ResolvedPackage,
-  RuntimeTargetKind, SignatureValidationMode, inspect_package_sources, resolve_package_inputs,
+  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, PackageServiceKind, PackageSourceAuthentication,
+  PackageSourceInventory, ResolvedPackage, RuntimeTargetKind, SignatureValidationMode, inspect_package_sources, resolve_package_inputs,
 };
 pub use project::{
   FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec,

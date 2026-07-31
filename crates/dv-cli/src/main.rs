@@ -891,6 +891,7 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
       name: inventory.source_name(source).to_owned(),
       location: inventory.source_location(source).to_owned(),
       protocol: inventory.source_protocol(source).to_owned(),
+      authentication: inventory.source_authentication(source).as_str().to_owned(),
       endpoints: inventory
         .source_endpoints(source)
         .map(|endpoint| PackageServiceEndpointEvent {
@@ -917,7 +918,14 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   let mut output = String::with_capacity(1024);
   use std::fmt::Write as _;
   for source in inventory.sources() {
-    writeln!(output, "{} ({})", inventory.source_name(source), inventory.source_protocol(source)).expect("writing a String succeeds");
+    writeln!(
+      output,
+      "{} ({}, {})",
+      inventory.source_name(source),
+      inventory.source_protocol(source),
+      inventory.source_authentication(source).as_str()
+    )
+    .expect("writing a String succeeds");
     for endpoint in inventory.source_endpoints(source) {
       writeln!(
         output,

@@ -15,9 +15,11 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{Reader, XmlVersion, events::Event};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
+use zeroize::Zeroizing;
 use zip::ZipArchive;
 
 use crate::{FrameworkFamily, NugetAuditLevel, NugetAuditMode, ProjectSpec, TargetFramework, discover_sdks};
@@ -286,6 +288,26 @@ pub enum PackageServiceKind {
   PackagePublish,
 }
 
+/// Authentication attached to one effective package source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PackageSourceAuthentication {
+  /// The source has no static credential.
+  None,
+  /// The source uses HTTP Basic authentication, including PAT-as-password feeds.
+  Basic,
+}
+
+impl PackageSourceAuthentication {
+  /// Returns the stable event and human-output spelling.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::None => "none",
+      Self::Basic => "basic",
+    }
+  }
+}
+
 impl PackageServiceKind {
   /// Returns the stable event and human-output spelling.
   pub const fn as_str(self) -> &'static str {
@@ -305,6 +327,7 @@ struct PackageSourceRecord {
   location: TextSpan,
   endpoints: ItemRange,
   protocol: NugetProtocol,
+  authentication: PackageSourceAuthentication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,6 +377,11 @@ impl PackageSourceInventory {
   /// Returns `local`, `v2`, or `v3`.
   pub fn source_protocol(&self, source: usize) -> &'static str {
     self.sources[source].protocol.as_str()
+  }
+
+  /// Returns the selected source authentication policy without exposing credentials.
+  pub fn source_authentication(&self, source: usize) -> PackageSourceAuthentication {
+    self.sources[source].authentication
   }
 
   /// Returns selected endpoint indices for one source.
@@ -1230,7 +1258,7 @@ impl PackageSource {
       if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(config_error(
           context,
-          "package-source URLs must not embed credentials; credential support is tracked by NUGET-008",
+          "package-source URLs must not embed credentials; use packageSourceCredentials or NuGetPackageSourceCredentials_{name}",
         ));
       }
       return Ok(Self {
@@ -1282,6 +1310,71 @@ impl PackageSource {
   }
 }
 
+enum StoredCredentialPassword {
+  Clear(Zeroizing<String>),
+  Encrypted(String),
+}
+
+struct MergedSourceCredential {
+  source: String,
+  username: Zeroizing<String>,
+  password: StoredCredentialPassword,
+  valid_authentication_types: Option<String>,
+}
+
+struct PendingSourceCredential {
+  source: String,
+  username: Option<Zeroizing<String>>,
+  password: Option<StoredCredentialPassword>,
+  valid_authentication_types: Option<String>,
+}
+
+struct SourceCredential {
+  authorization: HeaderValue,
+  origin: HttpsOrigin,
+}
+
+#[derive(Eq, PartialEq)]
+struct HttpsOrigin {
+  host: Box<str>,
+  port: u16,
+}
+
+impl HttpsOrigin {
+  fn parse(url: &str, context: &Path) -> Result<Self, PackageError> {
+    let url = reqwest::Url::parse(url).map_err(|error| config_error(context, format!("invalid HTTPS package source {url:?}: {error}")))?;
+    let host = url
+      .host_str()
+      .ok_or_else(|| config_error(context, format!("HTTPS package source {url:?} must include a host")))?;
+    Ok(Self {
+      host: host.to_ascii_lowercase().into_boxed_str(),
+      port: url.port_or_known_default().expect("HTTPS has a known default port"),
+    })
+  }
+
+  fn matches(&self, url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+      return false;
+    };
+    url.scheme() == "https" && url.host_str().is_some_and(|host| host.eq_ignore_ascii_case(&self.host)) && url.port_or_known_default() == Some(self.port)
+  }
+}
+
+#[derive(Default)]
+struct SourceCredentialBatch {
+  entries: Box<[Option<Arc<SourceCredential>>]>,
+}
+
+impl SourceCredentialBatch {
+  fn get(&self, source: usize) -> Option<&Arc<SourceCredential>> {
+    self.entries.get(source).and_then(Option::as_ref)
+  }
+
+  fn is_configured(&self, source: usize) -> bool {
+    self.get(source).is_some()
+  }
+}
+
 #[derive(Clone)]
 enum ServiceEndpoint {
   Local {
@@ -1293,11 +1386,13 @@ enum ServiceEndpoint {
   V2 {
     source: String,
     base: String,
+    credential: Option<Arc<SourceCredential>>,
     source_index: u32,
   },
   V3 {
     source: String,
     services: Arc<NugetServiceEndpoints>,
+    credential: Option<Arc<SourceCredential>>,
     source_index: u32,
   },
 }
@@ -1331,6 +1426,13 @@ impl ServiceEndpoint {
       Self::V3 { .. } => NugetProtocol::V3,
     }
   }
+
+  fn credential(&self) -> Option<&SourceCredential> {
+    match self {
+      Self::Local { .. } => None,
+      Self::V2 { credential, .. } | Self::V3 { credential, .. } => credential.as_deref(),
+    }
+  }
 }
 
 struct NugetConfiguration {
@@ -1339,6 +1441,7 @@ struct NugetConfiguration {
   temp_root: PathBuf,
   fallback_roots: Arc<[PathBuf]>,
   sources: Vec<(String, PackageSource)>,
+  credentials: SourceCredentialBatch,
   // Audit resolution consumes this batch without reopening configuration
   // files once vulnerability endpoints are wired into restore.
   #[allow(dead_code)]
@@ -1351,6 +1454,7 @@ struct NugetConfiguration {
 #[derive(Default)]
 struct NugetConfigMerge {
   sources: Vec<(String, PackageSource)>,
+  credentials: Vec<MergedSourceCredential>,
   disabled: Vec<String>,
   audit_sources: Vec<(String, PackageSource)>,
   source_mapping: MergedSourceMapping,
@@ -1512,7 +1616,7 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
       &options.sources,
     )?;
     let client = http_client(config.proxy.as_ref())?;
-    inventories.push(runtime.block_on(inspect_source_batch(&client, &config.sources, !options.offline))?);
+    inventories.push(runtime.block_on(inspect_source_batch(&client, &config.sources, &config.credentials, !options.offline))?);
   }
   Ok(inventories)
 }
@@ -1520,6 +1624,7 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
 async fn inspect_source_batch(
   client: &reqwest::Client,
   sources: &[(String, PackageSource)],
+  credentials: &SourceCredentialBatch,
   allow_network: bool,
 ) -> Result<PackageSourceInventory, PackageError> {
   let mut discovered = std::iter::repeat_with(|| None)
@@ -1530,15 +1635,15 @@ async fn inspect_source_batch(
       .iter()
       .enumerate()
       .filter(|(_, (_, source))| source.protocol == NugetProtocol::V3)
-      .map(|(index, (_, source))| (index, source.url.clone()))
+      .map(|(index, (_, source))| (index, source.url.clone(), credentials.get(index).cloned()))
       .collect::<Vec<_>>();
     let mut tasks = JoinSet::new();
     let mut next = 0usize;
     while next < jobs.len() || !tasks.is_empty() {
       while next < jobs.len() && tasks.len() < MAX_DOWNLOAD_WORKERS {
-        let (index, source) = jobs[next].clone();
+        let (index, source, credential) = jobs[next].clone();
         let client = client.clone();
-        tasks.spawn(async move { (index, fetch_v3_service_index(&client, &source).await) });
+        tasks.spawn(async move { (index, fetch_v3_service_index(&client, credential.as_deref(), &source).await) });
         next += 1;
       }
       let (index, result) = tasks
@@ -1592,6 +1697,11 @@ async fn inspect_source_batch(
         len: u32_len(endpoint_rows.len() - start as usize, "package-source endpoint range")?,
       },
       protocol: source.protocol,
+      authentication: if credentials.is_configured(index) {
+        PackageSourceAuthentication::Basic
+      } else {
+        PackageSourceAuthentication::None
+      },
     });
   }
   Ok(PackageSourceInventory {
@@ -1928,6 +2038,7 @@ fn discover_configuration(
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
   let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
+  let credentials = resolve_source_credentials(&sources, merged.credentials, project_directory)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -1966,6 +2077,7 @@ fn discover_configuration(
     temp_root,
     fallback_roots: fallback_roots.into(),
     sources,
+    credentials,
     audit_sources: merged.audit_sources,
     source_mapping,
     signature_validation,
@@ -1997,6 +2109,188 @@ fn command_line_sources(
     }
   }
   Ok(sources)
+}
+
+fn resolve_source_credentials(
+  sources: &[(String, PackageSource)],
+  configured: Vec<MergedSourceCredential>,
+  context: &Path,
+) -> Result<SourceCredentialBatch, PackageError> {
+  resolve_source_credentials_with(sources, configured, context, |name| env::var(name).ok())
+}
+
+fn resolve_source_credentials_with(
+  sources: &[(String, PackageSource)],
+  configured: Vec<MergedSourceCredential>,
+  context: &Path,
+  mut environment: impl FnMut(&str) -> Option<String>,
+) -> Result<SourceCredentialBatch, PackageError> {
+  let mut configured = configured;
+  let mut entries = None::<Vec<Option<Arc<SourceCredential>>>>;
+  for (source_index, (name, source)) in sources.iter().enumerate() {
+    if source.protocol == NugetProtocol::Local {
+      if let Some(entries) = &mut entries {
+        entries.push(None);
+      }
+      continue;
+    }
+    let selected = environment_source_credential(name, &mut environment).or_else(|| {
+      configured
+        .iter()
+        .position(|credential| credential.source == *name)
+        .map(EnvironmentOrConfigCredential::Config)
+    });
+    let credential = match selected {
+      Some(EnvironmentOrConfigCredential::Environment(credential)) => Some(materialize_source_credential(credential, source, context)?),
+      Some(EnvironmentOrConfigCredential::Config(index)) => {
+        let credential = configured.swap_remove(index);
+        Some(materialize_source_credential(credential, source, context)?)
+      },
+      None => None,
+    };
+    if credential.is_some() && entries.is_none() {
+      let mut initialized = Vec::with_capacity(sources.len());
+      initialized.resize_with(source_index, || None);
+      entries = Some(initialized);
+    }
+    if let Some(entries) = &mut entries {
+      entries.push(credential.map(Arc::new));
+    }
+  }
+  Ok(match entries {
+    Some(entries) => SourceCredentialBatch {
+      entries: entries.into_boxed_slice(),
+    },
+    None => SourceCredentialBatch::default(),
+  })
+}
+
+enum EnvironmentOrConfigCredential {
+  Environment(MergedSourceCredential),
+  Config(usize),
+}
+
+fn environment_source_credential(source: &str, environment: &mut impl FnMut(&str) -> Option<String>) -> Option<EnvironmentOrConfigCredential> {
+  let variable = format!("NuGetPackageSourceCredentials_{source}");
+  let raw = environment(&variable)?;
+  let raw = Zeroizing::new(raw);
+  let (username, password, valid_authentication_types) = parse_environment_credential(&raw)?;
+  if username.is_empty() || password.is_empty() {
+    return None;
+  }
+  Some(EnvironmentOrConfigCredential::Environment(MergedSourceCredential {
+    source: source.to_owned(),
+    username: Zeroizing::new(username.to_owned()),
+    password: StoredCredentialPassword::Clear(Zeroizing::new(password.to_owned())),
+    valid_authentication_types: valid_authentication_types.map(str::to_owned),
+  }))
+}
+
+fn parse_environment_credential(value: &str) -> Option<(&str, &str, Option<&str>)> {
+  let value = value.trim();
+  value.get(..9).filter(|prefix| prefix.eq_ignore_ascii_case("Username="))?;
+  let rest = &value[9..];
+  let (username, password_and_types) = rest.match_indices(';').find_map(|(separator, _)| {
+    let after_separator = rest[separator + 1..].trim_start_matches(char::is_whitespace);
+    let prefix = after_separator.get(..9)?;
+    prefix.eq_ignore_ascii_case("Password=").then_some((&rest[..separator], &after_separator[9..]))
+  })?;
+  let auth_marker = ";ValidAuthenticationTypes=";
+  if let Some(index) = find_ascii_case_insensitive(password_and_types, auth_marker) {
+    Some((username, &password_and_types[..index], Some(&password_and_types[index + auth_marker.len()..])))
+  } else {
+    Some((username, password_and_types, None))
+  }
+}
+
+fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
+  value
+    .as_bytes()
+    .windows(needle.len())
+    .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn materialize_source_credential(credential: MergedSourceCredential, source: &PackageSource, context: &Path) -> Result<SourceCredential, PackageError> {
+  if credential.username.is_empty() {
+    return Err(config_error(
+      context,
+      format!("package source {:?} has an empty credential username", credential.source),
+    ));
+  }
+  let password = decrypt_source_password(&credential.source, credential.password, context)?;
+  if password.is_empty() {
+    return Err(config_error(
+      context,
+      format!("package source {:?} has an empty credential password", credential.source),
+    ));
+  }
+  if let Some(types) = credential.valid_authentication_types.as_deref()
+    && !types.trim().is_empty()
+    && !types.split(',').any(|kind| kind.trim().eq_ignore_ascii_case("basic"))
+  {
+    return Err(config_error(
+      context,
+      format!(
+        "package source {:?} does not allow Basic authentication; other mechanisms remain tracked by NUGET-009",
+        credential.source
+      ),
+    ));
+  }
+  let authorization = basic_authorization(&credential.username, &password, &credential.source, context)?;
+  Ok(SourceCredential {
+    authorization,
+    origin: HttpsOrigin::parse(&source.url, context)?,
+  })
+}
+
+fn basic_authorization(username: &str, password: &str, source: &str, context: &Path) -> Result<HeaderValue, PackageError> {
+  let mut plaintext = Zeroizing::new(Vec::with_capacity(username.len().saturating_add(password.len()).saturating_add(1)));
+  plaintext.extend_from_slice(username.as_bytes());
+  plaintext.push(b':');
+  plaintext.extend_from_slice(password.as_bytes());
+  let encoded = Zeroizing::new(BASE64.encode(&*plaintext));
+  let mut header_bytes = Zeroizing::new(Vec::with_capacity(encoded.len().saturating_add(6)));
+  header_bytes.extend_from_slice(b"Basic ");
+  header_bytes.extend_from_slice(encoded.as_bytes());
+  let mut authorization = HeaderValue::from_bytes(&header_bytes).map_err(|_| {
+    config_error(
+      context,
+      format!("package source {source:?} has a credential which cannot form an HTTP Basic header"),
+    )
+  })?;
+  authorization.set_sensitive(true);
+  Ok(authorization)
+}
+
+fn decrypt_source_password(source: &str, password: StoredCredentialPassword, context: &Path) -> Result<Zeroizing<String>, PackageError> {
+  match password {
+    StoredCredentialPassword::Clear(password) => Ok(password),
+    StoredCredentialPassword::Encrypted(password) => decrypt_nuget_password(source, &password, context),
+  }
+}
+
+#[cfg(windows)]
+fn decrypt_nuget_password(source: &str, password: &str, context: &Path) -> Result<Zeroizing<String>, PackageError> {
+  let encrypted = BASE64
+    .decode(password)
+    .map_err(|error| config_error(context, format!("package source {source:?} has an invalid encrypted password: {error}")))?;
+  let decrypted = windows_dpapi::decrypt_data(&encrypted, windows_dpapi::Scope::User, Some(b"NuGet")).map_err(|_| {
+    config_error(
+      context,
+      format!("package source {source:?} password could not be decrypted for the current Windows user"),
+    )
+  })?;
+  let decrypted = Zeroizing::new(decrypted);
+  let password = std::str::from_utf8(&decrypted).map_err(|_| config_error(context, format!("package source {source:?} decrypted password is not UTF-8")))?;
+  Ok(Zeroizing::new(password.to_owned()))
+}
+
+#[cfg(not(windows))]
+fn decrypt_nuget_password(source: &str, _password: &str, context: &Path) -> Result<Zeroizing<String>, PackageError> {
+  Err(config_error(
+    context,
+    format!("package source {source:?} uses a Windows-encrypted password; use ClearTextPassword with an environment expansion on this platform"),
+  ))
 }
 
 struct NugetConfigRoots {
@@ -2226,17 +2520,22 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
 }
 
 fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
-  let bytes = fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?;
+  let bytes = Zeroizing::new(fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?);
   let config_priority = merged.config_priority;
   let mut reader = Reader::from_reader(bytes.as_slice());
   reader.config_mut().trim_text(true);
   let mut section = ConfigSection::Other;
   let mut pending_mapping = None::<PendingSourceMapping>;
+  let mut pending_credential = None::<PendingSourceCredential>;
   let mut mapping_sources_in_file = Vec::<String>::new();
   loop {
     match reader.read_event() {
       Ok(Event::Start(element)) => match local_name(element.name().as_ref()) {
+        _ if matches!(section, ConfigSection::Credentials) => {
+          begin_source_credential(&reader, &element, path, &mut pending_credential)?;
+        },
         b"packageSources" => section = ConfigSection::Sources,
+        b"packageSourceCredentials" => section = ConfigSection::Credentials,
         b"disabledPackageSources" => section = ConfigSection::Disabled,
         b"auditSources" => section = ConfigSection::AuditSources,
         b"packageSourceMapping" => section = ConfigSection::SourceMapping,
@@ -2259,6 +2558,8 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"clear" => match section {
         ConfigSection::Sources => merged.sources.clear(),
+        ConfigSection::Credentials if pending_credential.is_none() => merged.credentials.clear(),
+        ConfigSection::Credentials => return Err(config_error(path, "NuGet source credential groups do not support clear")),
         ConfigSection::Disabled => merged.disabled.clear(),
         ConfigSection::AuditSources => merged.audit_sources.clear(),
         ConfigSection::SourceMapping => merged.source_mapping.clear(),
@@ -2280,6 +2581,9 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
               &mut merged.audit_sources
             };
             add_or_replace_source(sources, key, source);
+          },
+          ConfigSection::Credentials => {
+            append_source_credential(&key, value, path, pending_credential.as_mut())?;
           },
           ConfigSection::Disabled => {
             if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
@@ -2327,6 +2631,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         let key = config_attribute(&reader, &element, b"key", path)?.ok_or_else(|| config_error(path, "NuGet remove element requires key"))?;
         match section {
           ConfigSection::Sources => merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::Credentials => return Err(config_error(path, "NuGet source credential groups do not support remove")),
           ConfigSection::Disabled => merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::AuditSources => merged.audit_sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::SourceMapping => merged.source_mapping.remove(&key),
@@ -2335,12 +2640,25 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
           ConfigSection::Other => {},
         }
       },
+      Ok(Event::Empty(element)) if matches!(section, ConfigSection::Credentials) => {
+        begin_source_credential(&reader, &element, path, &mut pending_credential)?;
+        finish_source_credential(path, &mut merged.credentials, &mut pending_credential)?;
+      },
       Ok(Event::End(element)) => match local_name(element.name().as_ref()) {
+        _ if matches!(section, ConfigSection::Credentials) && pending_credential.is_some() => {
+          finish_source_credential(path, &mut merged.credentials, &mut pending_credential)?;
+        },
         b"packageSource" if matches!(section, ConfigSection::SourceMapping) => {
           let pending = pending_mapping
             .take()
             .ok_or_else(|| config_error(path, "NuGet package-source mapping ended without a source"))?;
           merged.source_mapping.finish_source(pending, path)?;
+        },
+        b"packageSourceCredentials" if matches!(section, ConfigSection::Credentials) => {
+          if pending_credential.is_some() {
+            return Err(config_error(path, "NuGet package-source credential group did not close"));
+          }
+          section = ConfigSection::Other;
         },
         b"packageSources" | b"disabledPackageSources" | b"auditSources" | b"packageSourceMapping" | b"fallbackPackageFolders" | b"config" => {
           if pending_mapping.is_some() {
@@ -2355,6 +2673,9 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
       Err(error) => return Err(config_error(path, format!("invalid NuGet configuration XML: {error}"))),
     }
   }
+  if pending_credential.is_some() {
+    return Err(config_error(path, "NuGet package-source credential group did not close"));
+  }
   merged.config_priority = config_priority
     .checked_add(1)
     .ok_or_else(|| config_error(path, "NuGet configuration file count exceeds u32"))?;
@@ -2368,6 +2689,120 @@ fn add_or_replace_source(sources: &mut Vec<(String, PackageSource)>, key: String
   } else {
     sources.push((key, source));
   }
+}
+
+fn begin_source_credential(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  pending: &mut Option<PendingSourceCredential>,
+) -> Result<(), PackageError> {
+  if pending.is_some() {
+    return Err(config_error(path, "NuGet package-source credential groups cannot be nested"));
+  }
+  let name = element.name();
+  let encoded = reader
+    .decoder()
+    .decode(name.as_ref())
+    .map_err(|error| config_error(path, format!("invalid NuGet credential source name: {error}")))?;
+  let source = decode_xml_name(&encoded).map_err(|error| config_error(path, error))?;
+  if source.is_empty() {
+    return Err(config_error(path, "NuGet package-source credential name cannot be empty"));
+  }
+  *pending = Some(PendingSourceCredential {
+    source,
+    username: None,
+    password: None,
+    valid_authentication_types: None,
+  });
+  Ok(())
+}
+
+fn append_source_credential(key: &str, value: String, path: &Path, pending: Option<&mut PendingSourceCredential>) -> Result<(), PackageError> {
+  let credential = pending.ok_or_else(|| config_error(path, "NuGet credential add must be inside a package-source group"))?;
+  if key.eq_ignore_ascii_case("Username") {
+    if credential.username.replace(Zeroizing::new(value)).is_some() {
+      return Err(config_error(
+        path,
+        format!("NuGet package source {:?} has more than one Username", credential.source),
+      ));
+    }
+  } else if key.eq_ignore_ascii_case("Password") {
+    if credential.password.replace(StoredCredentialPassword::Encrypted(value)).is_some() {
+      return Err(config_error(
+        path,
+        format!("NuGet package source {:?} has more than one password", credential.source),
+      ));
+    }
+  } else if key.eq_ignore_ascii_case("ClearTextPassword") {
+    if credential.password.replace(StoredCredentialPassword::Clear(Zeroizing::new(value))).is_some() {
+      return Err(config_error(
+        path,
+        format!("NuGet package source {:?} has more than one password", credential.source),
+      ));
+    }
+  } else if key.eq_ignore_ascii_case("ValidAuthenticationTypes") && credential.valid_authentication_types.replace(value).is_some() {
+    return Err(config_error(
+      path,
+      format!("NuGet package source {:?} has more than one ValidAuthenticationTypes value", credential.source),
+    ));
+  }
+  Ok(())
+}
+
+fn finish_source_credential(
+  path: &Path,
+  credentials: &mut Vec<MergedSourceCredential>,
+  pending: &mut Option<PendingSourceCredential>,
+) -> Result<(), PackageError> {
+  let credential = pending
+    .take()
+    .ok_or_else(|| config_error(path, "NuGet package-source credential group ended without a start"))?;
+  let username = credential
+    .username
+    .ok_or_else(|| config_error(path, format!("NuGet package source {:?} credential requires Username", credential.source)))?;
+  let password = credential.password.ok_or_else(|| {
+    config_error(
+      path,
+      format!("NuGet package source {:?} credential requires Password or ClearTextPassword", credential.source),
+    )
+  })?;
+  let merged = MergedSourceCredential {
+    source: credential.source,
+    username,
+    password,
+    valid_authentication_types: credential.valid_authentication_types,
+  };
+  if let Some(existing) = credentials.iter_mut().find(|existing| existing.source == merged.source) {
+    *existing = merged;
+  } else {
+    credentials.push(merged);
+  }
+  Ok(())
+}
+
+fn decode_xml_name(value: &str) -> Result<String, String> {
+  let bytes = value.as_bytes();
+  let mut units = Vec::with_capacity(value.encode_utf16().count());
+  let mut offset = 0usize;
+  while offset < bytes.len() {
+    if offset + 7 <= bytes.len()
+      && bytes[offset] == b'_'
+      && matches!(bytes[offset + 1], b'x' | b'X')
+      && bytes[offset + 6] == b'_'
+      && let Ok(hex) = std::str::from_utf8(&bytes[offset + 2..offset + 6])
+      && let Ok(unit) = u16::from_str_radix(hex, 16)
+    {
+      units.push(unit);
+      offset += 7;
+      continue;
+    }
+    let character = value[offset..].chars().next().expect("offset is inside the source name");
+    let mut encoded = [0u16; 2];
+    units.extend_from_slice(character.encode_utf16(&mut encoded));
+    offset += character.len_utf8();
+  }
+  String::from_utf16(&units).map_err(|_| format!("NuGet credential source name {value:?} contains an invalid UTF-16 escape"))
 }
 
 fn add_or_replace_path(paths: &mut Vec<FallbackFolder>, key: String, path: PathBuf, config_priority: u32) {
@@ -2597,6 +3032,7 @@ impl PackageSourceMapping {
 enum ConfigSection {
   Other,
   Sources,
+  Credentials,
   Disabled,
   AuditSources,
   SourceMapping,
@@ -2678,6 +3114,7 @@ fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, Package
 async fn discover_service_endpoints(
   client: &reqwest::Client,
   sources: &[(String, PackageSource)],
+  credentials: &SourceCredentialBatch,
   allow_network: bool,
 ) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
   let mut local = Vec::with_capacity(sources.len());
@@ -2698,10 +3135,12 @@ async fn discover_service_endpoints(
       NugetProtocol::V2 if allow_network => remote.push(ServiceEndpoint::V2 {
         source: source.url.clone(),
         base: with_trailing_slash(source.url.clone()),
+        credential: credentials.get(index).cloned(),
         source_index,
       }),
       NugetProtocol::V3 if allow_network => {
-        let (services, _) = fetch_v3_service_index(client, &source.url).await?;
+        let credential = credentials.get(index).cloned();
+        let (services, _) = fetch_v3_service_index(client, credential.as_deref(), &source.url).await?;
         requests += 1;
         let services = Arc::new(services);
         if services.package_base_address().is_none() {
@@ -2710,6 +3149,7 @@ async fn discover_service_endpoints(
         remote.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
           services,
+          credential,
           source_index,
         });
       },
@@ -2800,8 +3240,12 @@ fn service_types(capability: ServiceCapability) -> &'static [&'static str] {
   }
 }
 
-async fn fetch_v3_service_index(client: &reqwest::Client, source: &str) -> Result<(NugetServiceEndpoints, u64), PackageError> {
-  let bytes = get_bytes(client, source, MAX_JSON_BYTES, "NuGet service index").await?;
+async fn fetch_v3_service_index(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  source: &str,
+) -> Result<(NugetServiceEndpoints, u64), PackageError> {
+  let bytes = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index").await?;
   let document: serde_json::Value =
     serde_json::from_slice(&bytes).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
   let endpoints = parse_v3_service_index(source, &document)?;
@@ -3018,7 +3462,7 @@ async fn resolve_streaming_graph(
         if !config.cache_root.is_dir() {
           fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
         }
-        let (discovered, requests) = discover_service_endpoints(client, &config.sources, !options.offline).await?;
+        let (discovered, requests) = discover_service_endpoints(client, &config.sources, &config.credentials, !options.offline).await?;
         network_requests += requests;
         endpoints = Some(discovered.into());
       }
@@ -3503,7 +3947,7 @@ async fn load_node_metadata(
         let package_base = services.package_base_address().expect("v3 endpoint discovery requires package content");
         let separator = if package_base.ends_with('/') { "" } else { "/" };
         let url = format!("{package_base}{separator}{lower_id}/index.json");
-        let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
+        let Some(body) = get_optional_bytes(client, endpoint.credential(), &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
           requests += 1;
           continue;
         };
@@ -3519,7 +3963,7 @@ async fn load_node_metadata(
         }
       },
       ServiceEndpoint::V2 { base, .. } => {
-        let batch = enumerate_v2_versions(client, base, lower_id).await?;
+        let batch = enumerate_v2_versions(client, endpoint.credential(), base, lower_id).await?;
         versions.extend(batch.versions);
         requests = requests
           .checked_add(batch.requests)
@@ -3553,7 +3997,12 @@ struct VersionBatch {
   bytes: u64,
 }
 
-async fn enumerate_v2_versions(client: &reqwest::Client, base: &str, lower_id: &str) -> Result<VersionBatch, PackageError> {
+async fn enumerate_v2_versions(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  base: &str,
+  lower_id: &str,
+) -> Result<VersionBatch, PackageError> {
   let mut url = format!("{base}FindPackagesById()?id='{lower_id}'&semVerLevel=2.0.0");
   let mut visited = HashSet::new();
   let mut versions = Vec::new();
@@ -3566,7 +4015,7 @@ async fn enumerate_v2_versions(client: &reqwest::Client, base: &str, lower_id: &
     if visited.len() > MAX_ARCHIVE_ENTRIES {
       return Err(network_error(&url, "NuGet v2 version enumeration exceeds the page count limit"));
     }
-    let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet v2 version page").await? else {
+    let Some(body) = get_optional_bytes(client, credential, &url, MAX_JSON_BYTES, "NuGet v2 version page").await? else {
       requests = requests.checked_add(1).ok_or_else(|| network_error(&url, "NuGet v2 request count overflow"))?;
       break;
     };
@@ -3871,9 +4320,14 @@ fn parse_local_nuspec_identity(path: &Path, bytes: &[u8]) -> Result<(String, Pac
   Ok((id, PackageVersion::parse(&version)?))
 }
 
-async fn get_optional_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Option<Vec<u8>>, PackageError> {
-  let mut response = client
-    .get(url)
+async fn get_optional_bytes(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  url: &str,
+  limit: u64,
+  kind: &str,
+) -> Result<Option<Vec<u8>>, PackageError> {
+  let mut response = authenticated_get(client, credential, url)
     .send()
     .await
     .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
@@ -4012,7 +4466,7 @@ async fn download_and_publish(
   }
   let metadata = match endpoint {
     ServiceEndpoint::Local { .. } => unreachable!("local package acquisition returned above"),
-    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, request, base).await?,
+    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, endpoint.credential(), request, base).await?,
     ServiceEndpoint::V3 { services, .. } => v3_package_metadata(
       request,
       services.package_base_address().expect("v3 endpoint discovery requires package content"),
@@ -4035,7 +4489,7 @@ async fn download_and_publish(
   let scratch_guard = TempGuard(Some(scratch_root.clone()));
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
   let scratch_nupkg = scratch_root.join(&nupkg_name);
-  let (hash, bytes) = download_package(client, &metadata.content_url, &scratch_nupkg).await?;
+  let (hash, bytes) = download_package(client, endpoint.credential(), &metadata.content_url, &scratch_nupkg).await?;
   if let Some(expected) = metadata.expected_size
     && bytes != expected
   {
@@ -4242,9 +4696,14 @@ fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageM
   }
 }
 
-async fn v2_package_metadata(client: &reqwest::Client, request: &PackageRequest, base: &str) -> Result<PackageMetadata, PackageError> {
+async fn v2_package_metadata(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  request: &PackageRequest,
+  base: &str,
+) -> Result<PackageMetadata, PackageError> {
   let metadata_url = format!("{base}Packages(Id='{}',Version='{}')", request.id, request.version);
-  let bytes = get_bytes(client, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
+  let bytes = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
   parse_v2_package_metadata(request, &metadata_url, &bytes)
 }
 
@@ -4342,9 +4801,13 @@ enum V2MetadataText {
   Size,
 }
 
-async fn download_package(client: &reqwest::Client, url: &str, destination: &Path) -> Result<(String, u64), PackageError> {
-  let mut response = client
-    .get(url)
+async fn download_package(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  url: &str,
+  destination: &Path,
+) -> Result<(String, u64), PackageError> {
+  let mut response = authenticated_get(client, credential, url)
     .send()
     .await
     .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
@@ -4393,9 +4856,8 @@ async fn download_package(client: &reqwest::Client, url: &str, destination: &Pat
   Ok((BASE64.encode(hasher.finalize()), total))
 }
 
-async fn get_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
-  let mut response = client
-    .get(url)
+async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
+  let mut response = authenticated_get(client, credential, url)
     .send()
     .await
     .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
@@ -4421,6 +4883,14 @@ async fn get_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) 
     debug_assert_eq!(bytes.len(), next);
   }
   Ok(bytes)
+}
+
+fn authenticated_get(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str) -> reqwest::RequestBuilder {
+  let request = client.get(url);
+  match credential.filter(|credential| credential.origin.matches(url)) {
+    Some(credential) => request.header(AUTHORIZATION, credential.authorization.clone()),
+    None => request,
+  }
 }
 
 fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
@@ -6110,6 +6580,7 @@ mod tests {
           protocol: NugetProtocol::V3,
         },
       )],
+      credentials: SourceCredentialBatch::default(),
       audit_sources: Vec::new(),
       source_mapping: None,
       signature_validation: SignatureValidationMode::Accept,
@@ -6343,6 +6814,153 @@ mod tests {
 
     assert_eq!(error.kind(), PackageErrorKind::Configuration);
     assert!(error.message.contains("must not embed credentials"));
+  }
+
+  #[test]
+  fn source_credentials_follow_config_name_decoding_and_environment_precedence() {
+    let temp = TempDirectory::new();
+    let lower = temp.write(
+      "lower.config",
+      r#"<configuration>
+<packageSources><clear /><add key="Private Feed" value="https://packages.example.test/v3/index.json" protocolVersion="3" /></packageSources>
+<packageSourceCredentials><Private_x0020_Feed>
+  <add key="Username" value="config-user" />
+  <add key="ClearTextPassword" value="config-secret" />
+  <add key="ValidAuthenticationTypes" value="negotiate" />
+</Private_x0020_Feed></packageSourceCredentials>
+</configuration>"#,
+    );
+    let higher = temp.write(
+      "higher.config",
+      r#"<configuration><packageSourceCredentials><Private_x0020_Feed>
+  <add key="Username" value="higher-user" />
+  <add key="ClearTextPassword" value="higher-secret" />
+  <add key="ValidAuthenticationTypes" value="basic" />
+</Private_x0020_Feed></packageSourceCredentials></configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+    merge_config(&lower, &mut merged).unwrap();
+    merge_config(&higher, &mut merged).unwrap();
+    assert_eq!(merged.credentials.len(), 1);
+    assert_eq!(merged.credentials[0].source, "Private Feed");
+
+    let sources = merged.sources.clone();
+    let credentials = resolve_source_credentials_with(&sources, merged.credentials, &temp.0, |name| {
+      assert_eq!(name, "NuGetPackageSourceCredentials_Private Feed");
+      Some("Username=environment-user; Password=environment-pat;ValidAuthenticationTypes=basic".into())
+    })
+    .unwrap();
+    let credential = credentials.get(0).unwrap();
+    let request = authenticated_get(&reqwest::Client::new(), Some(credential), "https://packages.example.test/v3/index.json")
+      .build()
+      .unwrap();
+    let authorization = request.headers().get(AUTHORIZATION).unwrap();
+    assert_eq!(authorization, "Basic ZW52aXJvbm1lbnQtdXNlcjplbnZpcm9ubWVudC1wYXQ=");
+    assert!(authorization.is_sensitive());
+
+    let foreign = authenticated_get(&reqwest::Client::new(), Some(credential), "https://other.example.test/v3/index.json")
+      .build()
+      .unwrap();
+    assert!(!foreign.headers().contains_key(AUTHORIZATION));
+
+    let client = reqwest::Client::new();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let inventory = runtime.block_on(inspect_source_batch(&client, &sources, &credentials, false)).unwrap();
+    assert_eq!(inventory.source_authentication(0), PackageSourceAuthentication::Basic);
+    assert!(!inventory.text.contains("config-secret"));
+    assert!(!inventory.text.contains("higher-secret"));
+    assert!(!inventory.text.contains("environment-user"));
+    assert!(!inventory.text.contains("environment-pat"));
+  }
+
+  #[test]
+  fn malformed_environment_credential_falls_back_without_exposing_config_secret() {
+    let sources = vec![(
+      "private".into(),
+      PackageSource {
+        url: "https://packages.example.test/v3/index.json".into(),
+        protocol: NugetProtocol::V3,
+      },
+    )];
+    let configured = vec![MergedSourceCredential {
+      source: "private".into(),
+      username: Zeroizing::new("config-user".into()),
+      password: StoredCredentialPassword::Clear(Zeroizing::new("config-secret".into())),
+      valid_authentication_types: Some("negotiate".into()),
+    }];
+    let error = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), |_| Some("malformed-secret-value".into()))
+      .err()
+      .unwrap();
+    let rendered = error.to_string();
+    assert!(rendered.contains("does not allow Basic authentication"));
+    assert!(!rendered.contains("config-user"));
+    assert!(!rendered.contains("config-secret"));
+    assert!(!rendered.contains("malformed-secret-value"));
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn windows_encrypted_source_password_uses_nuget_dpapi_entropy() {
+    let plaintext = b"encrypted-pat";
+    let encrypted = windows_dpapi::encrypt_data(plaintext, windows_dpapi::Scope::User, Some(b"NuGet")).unwrap();
+    let encoded = BASE64.encode(encrypted);
+
+    let decrypted = decrypt_nuget_password("private", &encoded, Path::new("NuGet.Config")).unwrap();
+
+    assert_eq!(decrypted.as_bytes(), plaintext);
+  }
+
+  #[test]
+  fn malformed_environment_credentials_fall_back_to_config() {
+    let source = PackageSource {
+      url: "https://packages.example.test/v3/index.json".into(),
+      protocol: NugetProtocol::V3,
+    };
+    let sources = vec![("private".to_owned(), source.clone())];
+    let configured = vec![MergedSourceCredential {
+      source: "private".into(),
+      username: Zeroizing::new("config-user".into()),
+      password: StoredCredentialPassword::Clear(Zeroizing::new("config-secret".into())),
+      valid_authentication_types: Some("basic".into()),
+    }];
+    let credentials = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), |_| {
+      Some("Password=wrong-order;Username=ignored".into())
+    })
+    .unwrap();
+    let request = authenticated_get(
+      &reqwest::Client::new(),
+      credentials.get(0).map(Arc::as_ref),
+      "https://packages.example.test/v3/index.json",
+    )
+    .build()
+    .unwrap();
+    assert_eq!(
+      request.headers()[AUTHORIZATION],
+      format!("Basic {}", BASE64.encode("config-user:config-secret"))
+    );
+  }
+
+  #[test]
+  fn empty_source_credential_groups_fail_explicitly() {
+    let temp = TempDirectory::new();
+    let config = temp.write(
+      "NuGet.Config",
+      r#"<configuration><packageSourceCredentials><private /></packageSourceCredentials></configuration>"#,
+    );
+
+    let error = merge_config(&config, &mut NugetConfigMerge::default()).unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert!(error.to_string().contains("requires Username"));
+  }
+
+  #[test]
+  fn environment_credential_grammar_preserves_semicolons_in_passwords() {
+    assert_eq!(
+      parse_environment_credential(" Username=user; Password=pat;with;semicolons;ValidAuthenticationTypes=Basic "),
+      Some(("user", "pat;with;semicolons", Some("Basic")))
+    );
+    assert_eq!(parse_environment_credential("Password=secret;Username=user"), None);
   }
 
   #[test]

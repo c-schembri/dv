@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 8;
+pub const EVENT_SCHEMA_VERSION: u16 = 9;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -65,6 +65,8 @@ pub struct PackageSourceCapabilityEvent {
   pub location: String,
   /// `local`, `v2`, or `v3`.
   pub protocol: String,
+  /// `none` or `basic`; never contains a username, password, or token.
+  pub authentication: String,
   /// Capability-ordered endpoint batch.
   pub endpoints: Vec<PackageServiceEndpointEvent>,
 }
