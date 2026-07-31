@@ -1,8 +1,10 @@
 use std::{
+  cmp::Ordering,
   collections::{BTreeMap, BTreeSet, HashSet},
   env,
   error::Error,
-  fmt, fs,
+  fmt::{self, Write as _},
+  fs,
   io::{self, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
@@ -30,6 +32,7 @@ const MAX_DOWNLOAD_WORKERS: usize = 24;
 const ASYNC_RUNTIME_WORKERS: usize = 2;
 const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
+const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
 const LOCK_SCHEMA_VERSION: u16 = 1;
 
@@ -306,6 +309,287 @@ struct PackageRequest {
   direct: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackageRequirement {
+  id: String,
+  lower_id: String,
+  range: VersionRange,
+  direct: bool,
+}
+
+/// Parsed NuGet version used only while converging cold dependency metadata.
+/// The normalized text is retained for URLs and output; fixed numeric fields
+/// keep the dominant precedence comparison branch allocation-free.
+#[derive(Clone, Debug)]
+struct PackageVersion {
+  normalized: String,
+  numbers: [u32; 4],
+  prerelease_start: Option<u32>,
+}
+
+impl PackageVersion {
+  fn parse(value: &str) -> Result<Self, PackageError> {
+    if value.is_empty() || value.len() > 256 {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        value,
+        format!("package version {value:?} must contain between 1 and 256 bytes"),
+      ));
+    }
+    let (precedence, metadata) = value
+      .split_once('+')
+      .map_or((value, None), |(precedence, metadata)| (precedence, Some(metadata)));
+    if metadata.is_some_and(|value| {
+      value.is_empty()
+        || value
+          .split('.')
+          .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    }) {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        value,
+        format!("package version {value:?} has invalid build metadata"),
+      ));
+    }
+    let (numbers_text, prerelease) = precedence
+      .split_once('-')
+      .map_or((precedence, None), |(numbers, prerelease)| (numbers, Some(prerelease)));
+    if prerelease.is_some_and(|value| {
+      value.is_empty()
+        || value
+          .split('.')
+          .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    }) {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        value,
+        format!("package version {value:?} has an invalid prerelease"),
+      ));
+    }
+    let mut numbers = [0u32; 4];
+    let mut part_count = 0;
+    for (index, part) in numbers_text.split('.').enumerate() {
+      if index >= numbers.len() {
+        return Err(PackageError::new(
+          PackageErrorKind::Resolution,
+          value,
+          format!("package version {value:?} must contain one to four numeric parts"),
+        ));
+      }
+      numbers[index] = part.parse().map_err(|_| {
+        PackageError::new(
+          PackageErrorKind::Resolution,
+          value,
+          format!("package version {value:?} contains a non-numeric version part"),
+        )
+      })?;
+      part_count += 1;
+    }
+    if part_count == 0 {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        value,
+        format!("package version {value:?} must contain one to four numeric parts"),
+      ));
+    }
+    let mut normalized = format!("{}.{}.{}", numbers[0], numbers[1], numbers[2]);
+    if numbers[3] != 0 {
+      write!(normalized, ".{}", numbers[3]).expect("writing a String succeeds");
+    }
+    let prerelease_start = prerelease.map(|value| {
+      normalized.push('-');
+      let start = normalized.len();
+      normalized.push_str(&value.to_ascii_lowercase());
+      start as u32
+    });
+    Ok(Self {
+      normalized,
+      numbers,
+      prerelease_start,
+    })
+  }
+
+  fn prerelease(&self) -> Option<&str> {
+    self.prerelease_start.map(|start| &self.normalized[start as usize..])
+  }
+}
+
+impl Ord for PackageVersion {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self
+      .numbers
+      .cmp(&other.numbers)
+      .then_with(|| compare_prerelease(self.prerelease(), other.prerelease()))
+  }
+}
+
+impl PartialEq for PackageVersion {
+  fn eq(&self, other: &Self) -> bool {
+    self.cmp(other) == Ordering::Equal
+  }
+}
+
+impl Eq for PackageVersion {}
+
+impl PartialOrd for PackageVersion {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+fn compare_prerelease(left: Option<&str>, right: Option<&str>) -> Ordering {
+  match (left, right) {
+    (None, None) => Ordering::Equal,
+    (None, Some(_)) => Ordering::Greater,
+    (Some(_), None) => Ordering::Less,
+    (Some(left), Some(right)) => {
+      let mut left = left.split('.');
+      let mut right = right.split('.');
+      loop {
+        match (left.next(), right.next()) {
+          (Some(left), Some(right)) => {
+            let ordering = compare_prerelease_part(left, right);
+            if ordering != Ordering::Equal {
+              return ordering;
+            }
+          },
+          (Some(_), None) => return Ordering::Greater,
+          (None, Some(_)) => return Ordering::Less,
+          (None, None) => return Ordering::Equal,
+        }
+      }
+    },
+  }
+}
+
+fn compare_prerelease_part(left: &str, right: &str) -> Ordering {
+  match (left.bytes().all(|byte| byte.is_ascii_digit()), right.bytes().all(|byte| byte.is_ascii_digit())) {
+    (true, true) => {
+      let left = left.trim_start_matches('0');
+      let right = right.trim_start_matches('0');
+      left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    },
+    (true, false) => Ordering::Less,
+    (false, true) => Ordering::Greater,
+    (false, false) => left.cmp(right),
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VersionBound {
+  version: PackageVersion,
+  inclusive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VersionRange {
+  lower: Option<VersionBound>,
+  upper: Option<VersionBound>,
+}
+
+impl VersionRange {
+  #[cfg(test)]
+  fn exact(version: PackageVersion) -> Self {
+    Self {
+      lower: Some(VersionBound {
+        version: version.clone(),
+        inclusive: true,
+      }),
+      upper: Some(VersionBound { version, inclusive: true }),
+    }
+  }
+
+  fn parse(value: &str) -> Result<Self, PackageError> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('*') {
+      return Err(unsupported_version_range(value));
+    }
+    if !value.starts_with(['[', '(']) {
+      return Ok(Self {
+        lower: Some(VersionBound {
+          version: PackageVersion::parse(value)?,
+          inclusive: true,
+        }),
+        upper: None,
+      });
+    }
+    let lower_inclusive = value.starts_with('[');
+    let upper_inclusive = value.ends_with(']');
+    if !value.ends_with([']', ')']) || value.len() < 3 {
+      return Err(unsupported_version_range(value));
+    }
+    let body = &value[1..value.len() - 1];
+    if !body.contains(',') {
+      if !lower_inclusive || !upper_inclusive {
+        return Err(unsupported_version_range(value));
+      }
+      let version = PackageVersion::parse(body.trim())?;
+      return Ok(Self {
+        lower: Some(VersionBound {
+          version: version.clone(),
+          inclusive: true,
+        }),
+        upper: Some(VersionBound { version, inclusive: true }),
+      });
+    }
+    let (lower, upper) = body.split_once(',').expect("a checked range contains a comma");
+    let lower = (!lower.trim().is_empty())
+      .then(|| {
+        Ok(VersionBound {
+          version: PackageVersion::parse(lower.trim())?,
+          inclusive: lower_inclusive,
+        })
+      })
+      .transpose()?;
+    let upper = (!upper.trim().is_empty())
+      .then(|| {
+        Ok(VersionBound {
+          version: PackageVersion::parse(upper.trim())?,
+          inclusive: upper_inclusive,
+        })
+      })
+      .transpose()?;
+    if lower.is_none() && upper.is_none() {
+      return Err(unsupported_version_range(value));
+    }
+    let range = Self { lower, upper };
+    if let (Some(lower), Some(upper)) = (&range.lower, &range.upper)
+      && (lower.version > upper.version || (lower.version == upper.version && (!lower.inclusive || !upper.inclusive)))
+    {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        value,
+        format!("dependency range {value:?} contains no versions"),
+      ));
+    }
+    Ok(range)
+  }
+
+  fn contains(&self, version: &PackageVersion) -> bool {
+    self
+      .lower
+      .as_ref()
+      .is_none_or(|lower| version > &lower.version || (lower.inclusive && version == &lower.version))
+      && self
+        .upper
+        .as_ref()
+        .is_none_or(|upper| version < &upper.version || (upper.inclusive && version == &upper.version))
+  }
+
+  fn allows_prerelease(&self) -> bool {
+    self.lower.as_ref().is_some_and(|bound| bound.version.prerelease().is_some())
+      || self.upper.as_ref().is_some_and(|bound| bound.version.prerelease().is_some())
+  }
+}
+
+fn unsupported_version_range(value: &str) -> PackageError {
+  PackageError::new(
+    PackageErrorKind::Resolution,
+    value,
+    format!("dependency range {value:?} is outside the supported NuGet interval syntax"),
+  )
+}
+
 struct WorkPackage {
   request: PackageRequest,
   hash: String,
@@ -328,7 +612,7 @@ struct ResolutionContext<'a> {
 struct CachedPackage {
   root: PathBuf,
   hash: String,
-  dependencies: Option<Vec<PackageRequest>>,
+  dependencies: Option<Vec<PackageRequirement>>,
   cache_hit: bool,
   requests: u32,
   bytes: u64,
@@ -339,6 +623,39 @@ struct ResolvedGraph {
   packages: BTreeMap<String, WorkPackage>,
   network_requests: u32,
   downloaded_bytes: u64,
+}
+
+/// Cold graph state is identity-ordered and owned by the resolver task. Parent
+/// identities key constraints so replacing a package version can retract its
+/// previous edges without retaining an object graph.
+struct ConstraintNode {
+  id: String,
+  direct: Option<VersionRange>,
+  constraints: BTreeMap<String, VersionRange>,
+  selected: Option<PackageVersion>,
+  metadata_version: Option<PackageVersion>,
+  dependencies: Vec<PackageRequirement>,
+  available_versions: Option<Vec<PackageVersion>>,
+  generation: u32,
+}
+
+enum NodeSelection {
+  Version(PackageVersion),
+  Enumerate,
+}
+
+enum MetadataTaskResult {
+  Requirements {
+    dependencies: Vec<PackageRequirement>,
+    requests: u32,
+    bytes: u64,
+    package: Option<CachedPackage>,
+  },
+  Versions {
+    versions: Vec<PackageVersion>,
+    requests: u32,
+    bytes: u64,
+  },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -494,26 +811,27 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   Ok(resolution)
 }
 
-fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequest>, PackageError> {
+fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, PackageError> {
   let mut direct = Vec::with_capacity(project.package_references().len());
-  let mut seen = BTreeMap::<String, String>::new();
+  let mut seen = BTreeMap::<String, (VersionRange, String)>::new();
   for package in project.package_references() {
     let id = project.package_id(*package);
     let lower_id = normalize_id(id)?;
-    let version = normalize_version(project.package_version(*package))?;
-    if let Some(existing) = seen.insert(lower_id.clone(), version.clone())
-      && existing != version
+    let version_text = project.package_version(*package).trim();
+    let range = VersionRange::parse(version_text)?;
+    if let Some((existing_range, existing_text)) = seen.insert(lower_id.clone(), (range.clone(), version_text.to_owned()))
+      && existing_range != range
     {
       return Err(PackageError::new(
         PackageErrorKind::Resolution,
         id,
-        format!("package {id} is directly referenced with conflicting versions {existing} and {version}"),
+        format!("package {id} is directly referenced with conflicting versions {existing_text} and {version_text}"),
       ));
     }
-    direct.push(PackageRequest {
+    direct.push(PackageRequirement {
       id: id.into(),
       lower_id,
-      version,
+      range,
       direct: true,
     });
   }
@@ -772,38 +1090,59 @@ fn with_trailing_slash(mut value: String) -> String {
 
 async fn resolve_streaming_graph(
   client: &reqwest::Client,
-  direct: &[PackageRequest],
+  direct: &[PackageRequirement],
   config: &NugetConfiguration,
   options: &PackageResolveOptions,
   target: TargetFramework,
   target_text: &str,
 ) -> Result<ResolvedGraph, PackageError> {
-  let mut known: BTreeMap<String, PackageRequest> = direct.iter().cloned().map(|request| (request.lower_id.clone(), request)).collect();
-  let mut ready = known.clone();
-  let mut resolved = BTreeMap::<String, WorkPackage>::new();
+  let mut nodes = BTreeMap::<String, ConstraintNode>::new();
+  let mut dirty = BTreeSet::new();
+  for request in direct {
+    nodes.insert(
+      request.lower_id.clone(),
+      ConstraintNode {
+        id: request.id.clone(),
+        direct: Some(request.range.clone()),
+        constraints: BTreeMap::new(),
+        selected: None,
+        metadata_version: None,
+        dependencies: Vec::new(),
+        available_versions: None,
+        generation: 0,
+      },
+    );
+    dirty.insert(request.lower_id.clone());
+  }
+  let mut ready = BTreeSet::new();
+  stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready)?;
   let mut endpoints: Option<Arc<[ServiceEndpoint]>> = None;
   let mut network_requests = 0;
   let mut downloaded_bytes = 0;
+  let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
   let mut tasks = JoinSet::new();
-  let mut cache_root_ready = config.cache_root.is_dir();
+  let mut in_flight = BTreeSet::new();
 
   while !ready.is_empty() || !tasks.is_empty() {
-    while tasks.len() < MAX_DOWNLOAD_WORKERS
-      && let Some((_, request)) = ready.pop_first()
-    {
-      let cache_miss = !package_root(&config.cache_root, &request).exists();
-      if cache_miss && options.offline {
-        return Err(PackageError::new(
-          PackageErrorKind::OfflineMiss,
-          format!("{} {}", request.id, request.version),
-          format!("package {} {} is not available in the global package cache", request.id, request.version),
-        ));
-      }
-      if cache_miss && !cache_root_ready {
-        fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
-        cache_root_ready = true;
-      }
-      if cache_miss && endpoints.is_none() {
+    while tasks.len() < MAX_DOWNLOAD_WORKERS {
+      let Some(lower_id) = ready.iter().find(|id| !in_flight.contains(*id)).cloned() else {
+        break;
+      };
+      ready.remove(&lower_id);
+      let Some(node) = nodes.get(&lower_id) else {
+        continue;
+      };
+      let request = node.selected.as_ref().map(|version| PackageRequest {
+        id: node.id.clone(),
+        lower_id: lower_id.clone(),
+        version: version.normalized.clone(),
+        direct: node.direct.is_some(),
+      });
+      let cache_miss = request.as_ref().is_none_or(|request| !package_root(&config.cache_root, request).exists());
+      if cache_miss && !options.offline && endpoints.is_none() {
+        if !config.cache_root.is_dir() {
+          fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
+        }
         let (discovered, requests) = discover_service_endpoints(client, &config.sources).await?;
         network_requests += requests;
         endpoints = Some(discovered.into());
@@ -812,46 +1151,124 @@ async fn resolve_streaming_graph(
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
       let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
-      let parallel_extract = tasks.is_empty() && ready.is_empty();
+      let generation = node.generation;
+      let task_version = request.as_ref().map(|request| request.version.clone());
+      let task_target = target;
+      in_flight.insert(lower_id.clone());
       tasks.spawn(async move {
+        let result = load_node_metadata(&task_client, request.as_ref(), &lower_id, &task_cache_root, &task_endpoints, task_target).await;
+        (lower_id, generation, task_version, result)
+      });
+    }
+
+    let (lower_id, generation, task_version, result) = tasks.join_next().await.ok_or_else(package_worker_stopped)?.map_err(|error| {
+      PackageError::new(
+        PackageErrorKind::Io,
+        "package scheduler",
+        format!("package metadata task stopped before the graph completed: {error}"),
+      )
+    })?;
+    in_flight.remove(&lower_id);
+    let stale = nodes.get(&lower_id).is_none_or(|node| node.generation != generation);
+    let result = match result {
+      Ok(result) => result,
+      Err(_) if stale => {
+        ready.insert(lower_id);
+        continue;
+      },
+      Err(error) => return Err(error),
+    };
+    match result {
+      MetadataTaskResult::Versions { versions, requests, bytes } => {
+        network_requests += requests;
+        downloaded_bytes += bytes;
+        if let Some(node) = nodes.get_mut(&lower_id) {
+          node.available_versions = Some(versions);
+          dirty.insert(lower_id);
+        }
+      },
+      MetadataTaskResult::Requirements {
+        dependencies,
+        requests,
+        bytes,
+        package,
+      } => {
+        network_requests += requests;
+        downloaded_bytes += bytes;
+        if let Some(package) = package
+          && let Some(version) = task_version
+        {
+          metadata_packages.insert((lower_id.clone(), version), package);
+        }
+        if stale {
+          ready.insert(lower_id.clone());
+        } else {
+          install_node_dependencies(&lower_id, generation, dependencies, &mut nodes, &mut dirty)?;
+        }
+      },
+    }
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready)?;
+  }
+
+  let mut exact = BTreeMap::new();
+  for (lower_id, node) in &nodes {
+    let version = node
+      .selected
+      .as_ref()
+      .ok_or_else(|| resolution_error(&node.id, "package graph did not select a version"))?;
+    exact.insert(
+      lower_id.clone(),
+      PackageRequest {
+        id: node.id.clone(),
+        lower_id: lower_id.clone(),
+        version: version.normalized.clone(),
+        direct: node.direct.is_some(),
+      },
+    );
+  }
+
+  let mut acquisition = BTreeMap::new();
+  let mut acquired = BTreeMap::<String, (PackageRequest, CachedPackage)>::new();
+  for (lower_id, request) in exact {
+    match metadata_packages.remove(&(lower_id.clone(), request.version.clone())) {
+      Some(cached) => {
+        acquired.insert(lower_id, (request, cached));
+      },
+      _ => {
+        acquisition.insert(lower_id, request);
+      },
+    }
+  }
+  let mut acquisition_tasks = JoinSet::new();
+  while !acquisition.is_empty() || !acquisition_tasks.is_empty() {
+    while acquisition_tasks.len() < MAX_DOWNLOAD_WORKERS
+      && let Some((_, request)) = acquisition.pop_first()
+    {
+      let task_client = client.clone();
+      let task_cache_root = config.cache_root.clone();
+      let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
+      acquisition_tasks.spawn(async move {
         let result = ensure_package(&task_client, &request, &task_cache_root, &task_endpoints, target, parallel_extract).await;
         (request, result)
       });
     }
-
-    let (request, cached) = tasks.join_next().await.ok_or_else(package_worker_stopped)?.map_err(|error| {
-      PackageError::new(
-        PackageErrorKind::Io,
-        "package scheduler",
-        format!("package task stopped before the graph completed: {error}"),
-      )
-    })?;
+    let (request, cached) = acquisition_tasks
+      .join_next()
+      .await
+      .ok_or_else(package_worker_stopped)?
+      .map_err(package_blocking_task_error)?;
     let cached = cached?;
     network_requests += cached.requests;
     downloaded_bytes += cached.bytes;
-    let parsed = parse_cached_package(request.clone(), cached, target, target_text)?;
-    for dependency in &parsed.dependencies {
-      match known.get_mut(&dependency.lower_id) {
-        Some(existing) if existing.version != dependency.version => {
-          let (lower, upper) = if existing.version <= dependency.version {
-            (&existing.version, &dependency.version)
-          } else {
-            (&dependency.version, &existing.version)
-          };
-          return Err(PackageError::new(
-            PackageErrorKind::Resolution,
-            &dependency.id,
-            format!("package {} requires conflicting exact versions {lower} and {upper}", dependency.id),
-          ));
-        },
-        Some(existing) => existing.direct |= dependency.direct,
-        None => {
-          known.insert(dependency.lower_id.clone(), dependency.clone());
-          ready.insert(dependency.lower_id.clone(), dependency.clone());
-        },
-      }
-    }
-    resolved.insert(request.lower_id, parsed);
+    acquired.insert(request.lower_id.clone(), (request, cached));
+  }
+
+  let mut resolved = BTreeMap::<String, WorkPackage>::new();
+  for (lower_id, (request, cached)) in acquired {
+    let dependencies = concrete_dependencies(&nodes, &request.lower_id)?;
+    let parsed = parse_cached_package(request.clone(), cached, target, target_text, dependencies)?;
+    resolved.insert(lower_id, parsed);
   }
 
   Ok(ResolvedGraph {
@@ -859,6 +1276,336 @@ async fn resolve_streaming_graph(
     network_requests,
     downloaded_bytes,
   })
+}
+
+fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageError> {
+  fn consider_lower<'a>(candidate: &mut Option<&'a PackageVersion>, range: &'a VersionRange) {
+    if let Some(lower) = &range.lower
+      && lower.inclusive
+      && candidate.is_none_or(|candidate| lower.version > *candidate)
+    {
+      *candidate = Some(&lower.version);
+    }
+  }
+
+  let allows_prerelease = node.direct.as_ref().map_or_else(
+    || node.constraints.values().any(VersionRange::allows_prerelease),
+    VersionRange::allows_prerelease,
+  );
+  let accepts = |version: &PackageVersion| {
+    (version.prerelease().is_none() || allows_prerelease)
+      && node.direct.as_ref().map_or_else(
+        || node.constraints.values().all(|range| range.contains(version)),
+        |direct| direct.contains(version),
+      )
+  };
+  if let Some(versions) = &node.available_versions {
+    return versions
+      .iter()
+      .find(|version| accepts(version))
+      .cloned()
+      .map(NodeSelection::Version)
+      .ok_or_else(|| resolution_error(&node.id, "no available package version satisfies the dependency constraints"));
+  }
+  let mut candidate = None::<&PackageVersion>;
+  if let Some(direct) = &node.direct {
+    consider_lower(&mut candidate, direct);
+  } else {
+    for range in node.constraints.values() {
+      consider_lower(&mut candidate, range);
+    }
+  }
+  match candidate {
+    Some(candidate) if accepts(candidate) => Ok(NodeSelection::Version(candidate.clone())),
+    Some(_) if node.direct.is_none() => Err(resolution_error(&node.id, "dependency version ranges have no common version")),
+    _ => Ok(NodeSelection::Enumerate),
+  }
+}
+
+fn stabilize_constraint_nodes(
+  nodes: &mut BTreeMap<String, ConstraintNode>,
+  dirty: &mut BTreeSet<String>,
+  ready: &mut BTreeSet<String>,
+) -> Result<(), PackageError> {
+  while let Some(lower_id) = dirty.pop_first() {
+    let Some(node) = nodes.get(&lower_id) else {
+      continue;
+    };
+    if node.direct.is_none() && node.constraints.is_empty() {
+      let removed = nodes.remove(&lower_id).expect("a checked node exists");
+      ready.remove(&lower_id);
+      for dependency in removed.dependencies {
+        if let Some(child) = nodes.get_mut(&dependency.lower_id) {
+          child.constraints.remove(&lower_id);
+          dirty.insert(dependency.lower_id);
+        }
+      }
+      continue;
+    }
+    let selection = select_node_version(node)?;
+    let next = match selection {
+      NodeSelection::Version(version) => Some(version),
+      NodeSelection::Enumerate => None,
+    };
+    if next.is_some() && nodes.get(&lower_id).is_some_and(|node| node.selected == next) {
+      continue;
+    }
+    let node = nodes.get_mut(&lower_id).expect("a checked node exists");
+    let previous_dependencies = std::mem::take(&mut node.dependencies);
+    node.selected = next;
+    node.metadata_version = None;
+    node.generation = node
+      .generation
+      .checked_add(1)
+      .filter(|generation| *generation <= MAX_GRAPH_REVISIONS)
+      .ok_or_else(|| resolution_error(&node.id, "package dependency graph did not converge"))?;
+    ready.insert(lower_id.clone());
+    for dependency in previous_dependencies {
+      if let Some(child) = nodes.get_mut(&dependency.lower_id) {
+        child.constraints.remove(&lower_id);
+        dirty.insert(dependency.lower_id);
+      }
+    }
+  }
+  Ok(())
+}
+
+fn install_node_dependencies(
+  lower_id: &str,
+  generation: u32,
+  dependencies: Vec<PackageRequirement>,
+  nodes: &mut BTreeMap<String, ConstraintNode>,
+  dirty: &mut BTreeSet<String>,
+) -> Result<(), PackageError> {
+  let mut unique = BTreeMap::<String, PackageRequirement>::new();
+  for dependency in dependencies {
+    if let Some(existing) = unique.insert(dependency.lower_id.clone(), dependency.clone())
+      && existing.range != dependency.range
+    {
+      return Err(resolution_error(
+        &dependency.id,
+        "a package dependency group contains duplicate identities with different ranges",
+      ));
+    }
+  }
+  let dependencies: Vec<_> = unique.into_values().collect();
+  {
+    let node = nodes
+      .get_mut(lower_id)
+      .ok_or_else(|| resolution_error(lower_id, "package graph node disappeared"))?;
+    if node.generation != generation {
+      return Ok(());
+    }
+    node.metadata_version = node.selected.clone();
+    node.dependencies = dependencies.clone();
+  }
+  for dependency in dependencies {
+    let child = nodes.entry(dependency.lower_id.clone()).or_insert_with(|| ConstraintNode {
+      id: dependency.id.clone(),
+      direct: None,
+      constraints: BTreeMap::new(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: None,
+      generation: 0,
+    });
+    child.constraints.insert(lower_id.to_owned(), dependency.range);
+    dirty.insert(dependency.lower_id);
+  }
+  Ok(())
+}
+
+fn concrete_dependencies(nodes: &BTreeMap<String, ConstraintNode>, lower_id: &str) -> Result<Vec<PackageRequest>, PackageError> {
+  nodes[lower_id]
+    .dependencies
+    .iter()
+    .map(|dependency| {
+      let selected = nodes
+        .get(&dependency.lower_id)
+        .and_then(|node| node.selected.as_ref())
+        .ok_or_else(|| resolution_error(&dependency.id, "dependency graph has no selected package"))?;
+      Ok(PackageRequest {
+        id: dependency.id.clone(),
+        lower_id: dependency.lower_id.clone(),
+        version: selected.normalized.clone(),
+        direct: false,
+      })
+    })
+    .collect()
+}
+
+fn resolution_error(context: impl Into<String>, message: impl Into<String>) -> PackageError {
+  PackageError::new(PackageErrorKind::Resolution, context, message)
+}
+
+async fn load_node_metadata(
+  client: &reqwest::Client,
+  request: Option<&PackageRequest>,
+  lower_id: &str,
+  cache_root: &Path,
+  endpoints: &[ServiceEndpoint],
+  target: TargetFramework,
+) -> Result<MetadataTaskResult, PackageError> {
+  if request.is_none() && endpoints.is_empty() {
+    let cached_versions = enumerate_cached_versions(cache_root, lower_id)?;
+    if !cached_versions.is_empty() {
+      return Ok(MetadataTaskResult::Versions {
+        versions: cached_versions,
+        requests: 0,
+        bytes: 0,
+      });
+    }
+  }
+  if let Some(request) = request {
+    let root = package_root(cache_root, request);
+    if root.exists() {
+      let request = request.clone();
+      let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
+        .await
+        .map_err(package_blocking_task_error)??;
+      return Ok(MetadataTaskResult::Requirements {
+        dependencies,
+        requests: 0,
+        bytes: 0,
+        package: None,
+      });
+    }
+
+    if endpoints.is_empty() {
+      let cached_versions = enumerate_cached_versions(cache_root, lower_id)?;
+      if !cached_versions.is_empty() {
+        return Ok(MetadataTaskResult::Versions {
+          versions: cached_versions,
+          requests: 0,
+          bytes: 0,
+        });
+      }
+    }
+
+    match ensure_package(client, request, cache_root, endpoints, target, false).await {
+      Ok(cached) => {
+        let dependencies = match &cached.dependencies {
+          Some(dependencies) => dependencies.clone(),
+          None => read_cached_requirements(&cached.root, request, target)?,
+        };
+        return Ok(MetadataTaskResult::Requirements {
+          dependencies,
+          requests: cached.requests,
+          bytes: cached.bytes,
+          package: Some(cached),
+        });
+      },
+      Err(error) if error.kind() == PackageErrorKind::Network => {},
+      Err(error) => return Err(error),
+    }
+  }
+
+  if endpoints.is_empty() {
+    return Err(PackageError::new(
+      PackageErrorKind::OfflineMiss,
+      lower_id,
+      format!("package {lower_id} has no compatible version in the global package cache"),
+    ));
+  }
+
+  let mut versions = Vec::new();
+  let mut requests = 0;
+  let mut bytes = 0;
+  for endpoint in endpoints {
+    if let ServiceEndpoint::V3 { package_base, .. } = endpoint {
+      let url = format!("{package_base}{lower_id}/index.json");
+      let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
+        requests += 1;
+        continue;
+      };
+      requests += 1;
+      bytes += body.len() as u64;
+      let document: V3VersionIndex =
+        serde_json::from_slice(&body).map_err(|error| network_error(&url, format!("invalid NuGet package version index: {error}")))?;
+      if document.versions.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(network_error(&url, "NuGet package version index exceeds the version count limit"));
+      }
+      for version in document.versions {
+        versions.push(PackageVersion::parse(&version)?);
+      }
+    }
+  }
+  versions.sort_unstable();
+  versions.dedup();
+  if versions.is_empty() {
+    return Err(PackageError::new(
+      PackageErrorKind::Network,
+      lower_id,
+      format!("no enabled source could enumerate package {lower_id}"),
+    ));
+  }
+  Ok(MetadataTaskResult::Versions { versions, requests, bytes })
+}
+
+#[derive(Deserialize)]
+struct V3VersionIndex {
+  versions: Vec<String>,
+}
+
+fn read_cached_requirements(root: &Path, request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequirement>, PackageError> {
+  let nuspec_path = find_nuspec(root)?;
+  let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
+  parse_nuspec_requirements(&nuspec_path, &nuspec, request, target)
+}
+
+fn enumerate_cached_versions(cache_root: &Path, lower_id: &str) -> Result<Vec<PackageVersion>, PackageError> {
+  let identity_root = cache_root.join(lower_id);
+  let entries = match fs::read_dir(&identity_root) {
+    Ok(entries) => entries,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+    Err(error) => return Err(package_io("enumerate cached package versions", &identity_root, error)),
+  };
+  let mut versions = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|error| package_io("enumerate cached package versions", &identity_root, error))?;
+    if entry
+      .file_type()
+      .map_err(|error| package_io("inspect cached package version", &entry.path(), error))?
+      .is_dir()
+      && let Some(version) = entry.file_name().to_str()
+      && let Ok(version) = PackageVersion::parse(version)
+    {
+      versions.push(version);
+    }
+  }
+  versions.sort_unstable();
+  versions.dedup();
+  Ok(versions)
+}
+
+async fn get_optional_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Option<Vec<u8>>, PackageError> {
+  let mut response = client
+    .get(url)
+    .send()
+    .await
+    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  if response.status() == reqwest::StatusCode::NOT_FOUND {
+    return Ok(None);
+  }
+  response
+    .error_for_status_ref()
+    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  if response.content_length().is_some_and(|length| length > limit) {
+    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+  }
+  let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit) as usize);
+  while let Some(chunk) = response
+    .chunk()
+    .await
+    .map_err(|error| network_error(url, format!("read {kind} response: {error}")))?
+  {
+    if bytes.len().checked_add(chunk.len()).is_none_or(|length| length as u64 > limit) {
+      return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+    }
+    bytes.extend_from_slice(&chunk);
+  }
+  Ok(Some(bytes))
 }
 
 fn package_worker_stopped() -> PackageError {
@@ -998,7 +1745,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut guard: TempGua
   normalize_nuspec_name(&downloaded.temp_root, &downloaded.request)?;
   let nuspec_path = downloaded.temp_root.join(format!("{}.nuspec", downloaded.request.lower_id));
   let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-  let dependencies = parse_nuspec(&nuspec_path, &nuspec, &downloaded.request, downloaded.target)?;
+  let dependencies = parse_nuspec_requirements(&nuspec_path, &nuspec, &downloaded.request, downloaded.target)?;
   fs::write(
     downloaded.temp_root.join(format!("{}.sha512", downloaded.nupkg_name)),
     downloaded.hash.as_bytes(),
@@ -1515,15 +2262,13 @@ fn validate_staged_nuspec_identity(root: &Path, request: &PackageRequest) -> Res
   Ok(())
 }
 
-fn parse_cached_package(request: PackageRequest, cached: CachedPackage, target: TargetFramework, target_text: &str) -> Result<WorkPackage, PackageError> {
-  let dependencies = match cached.dependencies {
-    Some(dependencies) => dependencies,
-    None => {
-      let nuspec_path = find_nuspec(&cached.root)?;
-      let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-      parse_nuspec(&nuspec_path, &nuspec, &request, target)?
-    },
-  };
+fn parse_cached_package(
+  request: PackageRequest,
+  cached: CachedPackage,
+  target: TargetFramework,
+  target_text: &str,
+  dependencies: Vec<PackageRequest>,
+) -> Result<WorkPackage, PackageError> {
   reject_unsupported_package_assets(&cached.root)?;
   let compile_assets = select_compile_assets(&cached.root, target)?;
   let runtime_assets = select_runtime_assets(&cached.root, target)?;
@@ -1555,7 +2300,22 @@ struct DependencyGroup {
   dependencies: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequest>, PackageError> {
+  parse_nuspec_requirements(path, bytes, request, target)?
+    .into_iter()
+    .map(|requirement| {
+      Ok(PackageRequest {
+        id: requirement.id,
+        lower_id: requirement.lower_id,
+        version: minimum_version_from_range(&requirement.range)?.normalized,
+        direct: requirement.direct,
+      })
+    })
+    .collect()
+}
+
+fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequirement>, PackageError> {
   let mut reader = Reader::from_reader(bytes);
   reader.config_mut().trim_text(true);
   let mut current_text = NuspecText::None;
@@ -1563,12 +2323,14 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
   let mut version = None;
   let mut groups = Vec::<DependencyGroup>::new();
   let mut ungrouped = Vec::new();
+  let mut in_dependencies = false;
   loop {
     match reader.read_event() {
       Ok(Event::Start(element)) => match local_name(element.name().as_ref()) {
         b"id" if id.is_none() => current_text = NuspecText::Id,
         b"version" if version.is_none() => current_text = NuspecText::Version,
-        b"group" => {
+        b"dependencies" => in_dependencies = true,
+        b"group" if in_dependencies => {
           groups.push(DependencyGroup {
             framework: nuspec_attribute(&reader, &element, b"targetFramework", path)?,
             dependencies: Vec::new(),
@@ -1576,13 +2338,13 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
         },
         _ => {},
       },
-      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"group" => {
+      Ok(Event::Empty(element)) if in_dependencies && local_name(element.name().as_ref()) == b"group" => {
         groups.push(DependencyGroup {
           framework: nuspec_attribute(&reader, &element, b"targetFramework", path)?,
           dependencies: Vec::new(),
         });
       },
-      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"dependency" => {
+      Ok(Event::Empty(element)) if in_dependencies && local_name(element.name().as_ref()) == b"dependency" => {
         let dependency_id = nuspec_attribute(&reader, &element, b"id", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires id"))?;
         let dependency_version =
           nuspec_attribute(&reader, &element, b"version", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires version"))?;
@@ -1603,10 +2365,10 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
           NuspecText::None => {},
         }
       },
-      Ok(Event::End(element)) => {
-        if matches!(local_name(element.name().as_ref()), b"id" | b"version") {
-          current_text = NuspecText::None;
-        }
+      Ok(Event::End(element)) => match local_name(element.name().as_ref()) {
+        b"id" | b"version" => current_text = NuspecText::None,
+        b"dependencies" => in_dependencies = false,
+        _ => {},
       },
       Ok(Event::Eof) => break,
       Ok(_) => {},
@@ -1652,10 +2414,10 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
   selected
     .iter()
     .map(|(id, range)| {
-      Ok(PackageRequest {
+      Ok(PackageRequirement {
         id: id.clone(),
         lower_id: normalize_id(id)?,
-        version: minimum_version(range)?,
+        range: VersionRange::parse(range)?,
         direct: false,
       })
     })
@@ -1792,32 +2554,16 @@ fn collect_analyzers(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
   Ok(analyzers)
 }
 
-fn minimum_version(range: &str) -> Result<String, PackageError> {
-  let trimmed = range.trim();
-  let version = if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(',') {
-    &trimmed[1..trimmed.len() - 1]
-  } else if let Some(remainder) = trimmed.strip_prefix('[') {
-    remainder
-      .split_once(',')
-      .filter(|(_, upper)| upper.trim().is_empty() || upper.trim() == ")")
-      .map(|(lower, _)| lower.trim())
-      .ok_or_else(|| {
-        PackageError::new(
-          PackageErrorKind::Resolution,
-          range,
-          format!("dependency range {range:?} is outside the initial lowest-inclusive subset"),
-        )
-      })?
-  } else if !trimmed.contains(['(', ')', '[', ']', ',', '*']) {
-    trimmed
-  } else {
-    return Err(PackageError::new(
+#[cfg(test)]
+fn minimum_version_from_range(range: &VersionRange) -> Result<PackageVersion, PackageError> {
+  match &range.lower {
+    Some(lower) if lower.inclusive => Ok(lower.version.clone()),
+    _ => Err(PackageError::new(
       PackageErrorKind::Resolution,
-      range,
-      format!("dependency range {range:?} is outside the initial lowest-inclusive subset"),
-    ));
-  };
-  normalize_version(version)
+      "dependency range",
+      "dependency range requires package source version enumeration",
+    )),
+  }
 }
 
 fn normalize_id(value: &str) -> Result<String, PackageError> {
@@ -1832,49 +2578,7 @@ fn normalize_id(value: &str) -> Result<String, PackageError> {
 }
 
 fn normalize_version(value: &str) -> Result<String, PackageError> {
-  let precedence = value.split_once('+').map_or(value, |(precedence, _)| precedence);
-  let (numbers, prerelease) = precedence
-    .split_once('-')
-    .map_or((precedence, None), |(numbers, prerelease)| (numbers, Some(prerelease)));
-  if prerelease.is_some_and(|value| {
-    value.is_empty()
-      || value
-        .split('.')
-        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
-  }) {
-    return Err(PackageError::new(
-      PackageErrorKind::Resolution,
-      value,
-      format!("package version {value:?} has an invalid prerelease"),
-    ));
-  }
-  let parts: Vec<&str> = numbers.split('.').collect();
-  if parts.is_empty() || parts.len() > 4 {
-    return Err(PackageError::new(
-      PackageErrorKind::Resolution,
-      value,
-      format!("package version {value:?} must contain one to four numeric parts"),
-    ));
-  }
-  let mut numeric = [0u32; 4];
-  for (index, part) in parts.iter().enumerate() {
-    numeric[index] = part.parse().map_err(|_| {
-      PackageError::new(
-        PackageErrorKind::Resolution,
-        value,
-        format!("package version {value:?} contains a non-numeric version part"),
-      )
-    })?;
-  }
-  let mut normalized = format!("{}.{}.{}", numeric[0], numeric[1], numeric[2]);
-  if numeric[3] != 0 {
-    normalized.push_str(&format!(".{}", numeric[3]));
-  }
-  if let Some(prerelease) = prerelease {
-    normalized.push('-');
-    normalized.push_str(&prerelease.to_ascii_lowercase());
-  }
-  Ok(normalized)
+  Ok(PackageVersion::parse(value)?.normalized)
 }
 
 fn validate_acyclic(packages: &BTreeMap<String, WorkPackage>) -> Result<(), PackageError> {
@@ -2035,7 +2739,12 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
   })
 }
 
-fn read_warm_lock(path: &Path, config: &NugetConfiguration, direct: &[PackageRequest], target_text: &str) -> Result<Option<PackageResolution>, PackageError> {
+fn read_warm_lock(
+  path: &Path,
+  config: &NugetConfiguration,
+  direct: &[PackageRequirement],
+  target_text: &str,
+) -> Result<Option<PackageResolution>, PackageError> {
   let bytes = match fs::read(path) {
     Ok(bytes) => bytes,
     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2048,16 +2757,18 @@ fn read_warm_lock(path: &Path, config: &NugetConfiguration, direct: &[PackageReq
       format!("invalid dv package lock: {error}"),
     )
   })?;
-  let expected_direct: Vec<LockDirect> = direct
-    .iter()
-    .map(|request| LockDirect {
-      id: request.id.clone(),
-      version: request.version.clone(),
-    })
-    .collect();
+  let direct_matches = lock.direct.len() == direct.len()
+    && direct.iter().all(|request| {
+      lock
+        .direct
+        .iter()
+        .find(|locked| locked.id.eq_ignore_ascii_case(&request.id))
+        .and_then(|locked| PackageVersion::parse(&locked.version).ok())
+        .is_some_and(|version| request.range.contains(&version))
+    });
   if lock.schema_version != LOCK_SCHEMA_VERSION
     || lock.target_framework != target_text
-    || lock.direct != expected_direct
+    || !direct_matches
     || !config
       .sources
       .iter()
@@ -2124,12 +2835,12 @@ fn read_warm_lock(path: &Path, config: &NugetConfiguration, direct: &[PackageReq
   for request in direct {
     if !work
       .get(&request.lower_id)
-      .is_some_and(|package| package.request.direct && package.request.version == request.version)
+      .is_some_and(|package| package.request.direct && PackageVersion::parse(&package.request.version).is_ok_and(|version| request.range.contains(&version)))
     {
       return Err(PackageError::new(
         PackageErrorKind::Integrity,
         path.display().to_string(),
-        format!("dv package lock omits direct package {} {}", request.id, request.version),
+        format!("dv package lock omits a compatible direct package {}", request.id),
       ));
     }
   }
@@ -2389,6 +3100,139 @@ mod tests {
   }
 
   #[test]
+  fn package_versions_follow_nuget_semver_precedence_and_normalization() {
+    let alpha_two = PackageVersion::parse("1.0-alpha.2+BUILD").unwrap();
+    let alpha_ten = PackageVersion::parse("1.0.0-alpha.10").unwrap();
+    let stable = PackageVersion::parse("1.0.0.0").unwrap();
+
+    assert_eq!(alpha_two.normalized, "1.0.0-alpha.2");
+    assert!(alpha_two < alpha_ten);
+    assert!(alpha_ten < stable);
+    assert_eq!(stable.normalized, "1.0.0");
+  }
+
+  #[test]
+  fn typed_ranges_preserve_inclusive_and_exclusive_bounds() {
+    let minimum = VersionRange::parse("1.2").unwrap();
+    let bounded = VersionRange::parse("(1.2,2.0]").unwrap();
+    let one_two = PackageVersion::parse("1.2.0").unwrap();
+    let one_three = PackageVersion::parse("1.3.0").unwrap();
+    let two = PackageVersion::parse("2.0.0").unwrap();
+
+    assert!(minimum.contains(&one_two));
+    assert!(minimum.contains(&two));
+    assert!(!bounded.contains(&one_two));
+    assert!(bounded.contains(&one_three));
+    assert!(bounded.contains(&two));
+  }
+
+  #[test]
+  fn cousin_constraints_choose_the_lowest_common_version() {
+    let node = ConstraintNode {
+      id: "Common.Package".into(),
+      direct: None,
+      constraints: BTreeMap::from([
+        ("a".into(), VersionRange::parse("1.0").unwrap()),
+        ("b".into(), VersionRange::parse("[2.0,3.0)").unwrap()),
+      ]),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: None,
+      generation: 0,
+    };
+
+    let NodeSelection::Version(selected) = select_node_version(&node).unwrap() else {
+      panic!("inclusive lower bounds select without enumeration");
+    };
+    assert_eq!(selected.normalized, "2.0.0");
+  }
+
+  #[test]
+  fn direct_dependency_wins_over_a_transitive_minimum() {
+    let node = ConstraintNode {
+      id: "Direct.Package".into(),
+      direct: Some(VersionRange::exact(PackageVersion::parse("1.0.0").unwrap())),
+      constraints: BTreeMap::from([("parent".into(), VersionRange::parse("2.0").unwrap())]),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: None,
+      generation: 0,
+    };
+
+    let NodeSelection::Version(selected) = select_node_version(&node).unwrap() else {
+      panic!("an exact direct dependency selects without enumeration");
+    };
+    assert_eq!(selected.normalized, "1.0.0");
+  }
+
+  #[test]
+  fn stable_ranges_do_not_select_prerelease_versions_during_enumeration() {
+    let node = ConstraintNode {
+      id: "Stable.Package".into(),
+      direct: Some(VersionRange::parse("[1.0,2.0)").unwrap()),
+      constraints: BTreeMap::new(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: Some(vec![PackageVersion::parse("1.1.0-beta.1").unwrap(), PackageVersion::parse("1.1.0").unwrap()]),
+      generation: 0,
+    };
+
+    let NodeSelection::Version(selected) = select_node_version(&node).unwrap() else {
+      panic!("an enumerated stable version is available");
+    };
+    assert_eq!(selected.normalized, "1.1.0");
+  }
+
+  #[test]
+  fn changing_a_selection_retracts_its_stale_dependency_edges() {
+    let child_requirement = PackageRequirement {
+      id: "Child.Package".into(),
+      lower_id: "child.package".into(),
+      range: VersionRange::parse("1.0").unwrap(),
+      direct: false,
+    };
+    let mut nodes = BTreeMap::from([
+      (
+        "parent.package".into(),
+        ConstraintNode {
+          id: "Parent.Package".into(),
+          direct: Some(VersionRange::exact(PackageVersion::parse("2.0.0").unwrap())),
+          constraints: BTreeMap::new(),
+          selected: Some(PackageVersion::parse("1.0.0").unwrap()),
+          metadata_version: Some(PackageVersion::parse("1.0.0").unwrap()),
+          dependencies: vec![child_requirement],
+          available_versions: None,
+          generation: 1,
+        },
+      ),
+      (
+        "child.package".into(),
+        ConstraintNode {
+          id: "Child.Package".into(),
+          direct: None,
+          constraints: BTreeMap::from([("parent.package".into(), VersionRange::parse("1.0").unwrap())]),
+          selected: Some(PackageVersion::parse("1.0.0").unwrap()),
+          metadata_version: None,
+          dependencies: Vec::new(),
+          available_versions: None,
+          generation: 1,
+        },
+      ),
+    ]);
+    let mut dirty = BTreeSet::from(["parent.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready).unwrap();
+
+    assert_eq!(nodes["parent.package"].selected.as_ref().unwrap().normalized, "2.0.0");
+    assert!(!nodes.contains_key("child.package"));
+    assert!(ready.contains("parent.package"));
+  }
+
+  #[test]
   fn nuget_config_keeps_v2_and_v3_as_typed_sources() {
     let temp = TempDirectory::new();
     let path = temp.write(
@@ -2498,7 +3342,19 @@ mod tests {
       origin: None,
     };
 
-    let package = parse_cached_package(request(), cached, TargetFramework::parse("net10.0").unwrap(), "net10.0").unwrap();
+    let package = parse_cached_package(
+      request(),
+      cached,
+      TargetFramework::parse("net10.0").unwrap(),
+      "net10.0",
+      vec![PackageRequest {
+        id: "Base.Dependency".into(),
+        lower_id: "base.dependency".into(),
+        version: "1.0.0".into(),
+        direct: false,
+      }],
+    )
+    .unwrap();
 
     assert_eq!(package.dependencies.len(), 1);
     assert!(package.compile_assets.is_empty());
@@ -2552,6 +3408,40 @@ mod tests {
 
     assert_eq!(identities, ["Child.Package", "Meta.Package"]);
     assert_eq!(resolution.cache_hits(), 2);
+    assert_eq!(resolution.network_requests(), 0);
+  }
+
+  #[test]
+  fn direct_project_ranges_select_the_lowest_available_version_offline() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+<ItemGroup><PackageReference Include="Range.Package" Version="(1.0,3.0)" /></ItemGroup></Project>"#,
+    );
+    for version in ["1.0.0", "2.0.0"] {
+      let root = format!("packages/range.package/{version}");
+      temp.write(
+        &format!("{root}/range.package.nuspec"),
+        format!(r#"<package><metadata><id>Range.Package</id><version>{version}</version></metadata></package>"#),
+      );
+      temp.write(&format!("{root}/range.package.{version}.nupkg"), []);
+      temp.write(&format!("{root}/range.package.{version}.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+      temp.write(&format!("{root}/lib/net10.0/Range.Package.dll"), []);
+    }
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      offline: true,
+      write_lock: false,
+    };
+
+    let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+
+    assert_eq!(resolution.packages().len(), 1);
+    assert_eq!(resolution.package_version(resolution.packages()[0]), "2.0.0");
     assert_eq!(resolution.network_requests(), 0);
   }
 

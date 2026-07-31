@@ -186,7 +186,7 @@ impl ProjectSpec {
     self.text(package.id)
   }
 
-  /// Returns an exact package version.
+  /// Returns a literal package version or range.
   pub fn package_version(&self, package: PackageReference) -> &str {
     self.text(package.version)
   }
@@ -666,14 +666,14 @@ fn materialize_project(
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
         &project_path,
-        format!("package {:?} requires an exact Version", package.id),
+        format!("package {:?} requires a Version", package.id),
       )
     })?;
-    if !is_exact_package_version(&version) {
+    if !is_literal_package_version(&version) {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
         &project_path,
-        format!("package {:?} version {version:?} is not an exact literal version", package.id),
+        format!("package {:?} version {version:?} is not a literal version or range", package.id),
       ));
     }
     package_references.push(PackageReference {
@@ -906,8 +906,8 @@ fn normalize_project_reference(path: &Path, value: &str) -> Result<String, Proje
   Ok(normalized)
 }
 
-fn is_exact_package_version(value: &str) -> bool {
-  !value.is_empty() && !value.contains("$(") && !value.bytes().any(|byte| matches!(byte, b'*' | b'[' | b']' | b'(' | b')' | b','))
+fn is_literal_package_version(value: &str) -> bool {
+  !value.is_empty() && value.len() <= 256 && !value.contains("$(")
 }
 
 fn is_csproj(path: &Path) -> bool {

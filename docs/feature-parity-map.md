@@ -10,7 +10,7 @@ repository at the snapshot below. An unchecked item is required unless it is
 explicitly identified as a native `dv` addition. `REJECT` describes safe
 intermediate behavior for an unfinished compatibility row, not optional work.
 
-Snapshot: working tree on 2026-07-31, based on commit `95a02db`.
+Snapshot: working tree on 2026-07-31, based on commit `b1b1b57`.
 
 ## Scope Contract
 
@@ -131,8 +131,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 7,720 nonblank source
-lines, and 45 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 12 Rust source files, 9,021 nonblank source
+lines, and 57 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -711,8 +711,9 @@ boundary, not final drop-in parity.
 
 - [x] `RES-001` Parse NuGet package identities case-insensitively while
   preserving display casing. `P1`
-- [~] `RES-002` Implement NuGet SemVer 2 precedence, normalized versions,
-  prerelease identifiers, build metadata, ranges, and floating versions. `P1`
+- [~] `RES-002` NuGet SemVer 2 precedence, normalized numeric versions,
+  prerelease identifiers, ignored build metadata, and inclusive/exclusive
+  interval ranges are typed and tested. Floating versions remain. `P1`
 - [x] `RES-003` Parse `PackageReference` version and metadata from attributes
   or child elements. `P1`
 - [ ] `RES-004` Support `IncludeAssets`, `ExcludeAssets`, `PrivateAssets`,
@@ -720,16 +721,19 @@ boundary, not final drop-in parity.
 - [ ] `RES-005` Support conditional references per TFM/RID/configuration. `P2`
 - [ ] `RES-006` Read `Directory.Packages.props` and implement central package
   versions, version overrides, global references, and transitive pinning. `P2`
-- [~] `RES-007` Implement lowest-applicable-version, floating-version,
-  direct-dependency-wins, and cousin-dependency rules. The 203-package
-  eShop-derived acceptance graph currently exposes minimum-range convergence
-  as the next blocking case. `P1`
+- [~] `RES-007` Lowest-applicable-version, direct-dependency-wins, and cousin
+  convergence use an identity-ordered constraint table with stale-edge
+  retraction and bounded non-convergence failure. The eShop-derived acceptance
+  graph selects every one of the reference graph's 203 identities at the same
+  exact version; five additional framework-provided packages now expose
+  `RES-012` SDK pruning, and floating versions remain. `P1`
 - [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
   downloads are deduplicated. `P2`
-- [~] `RES-010` Parse `.nuspec` dependency groups and framework assemblies.
-  `P1`
+- [~] `RES-010` Parse `.nuspec` dependency groups without confusing later
+  `frameworkReferences` groups with dependency groups. Framework assemblies
+  remain incomplete. `P1`
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by TFM/RID and metadata. The massive acceptance

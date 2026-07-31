@@ -20,14 +20,14 @@ dv project inspect              3.846 ms median
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
-dotnet restore (cold deps)     994.180 ms median
-dv restore (cold deps)         400.814 ms median
+dotnet restore (cold deps)     966.711 ms median
+dv restore (cold deps)         411.275 ms median
 
-dotnet restore (50 packages)  1350.559 ms median
-dv restore (50 packages)       581.450 ms median
+dotnet restore (50 packages)  1364.792 ms median
+dv restore (50 packages)       598.220 ms median
 
-dotnet restore (warm locked)   498.177 ms median
-dv restore (warm locked)         5.881 ms median
+dotnet restore (warm locked)   552.265 ms median
+dv restore (warm locked)         7.019 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK and the same evaluated
@@ -85,10 +85,12 @@ as the default target.
 
 `dv restore` (also available as `dv sync`) merges the supported
 `NuGet.Config` subset, speaks HTTPS NuGet v2 or v3 according to each source,
-streams package payloads through SHA-512, validates v2 source hashes and ZIP
-boundaries, publishes a NuGet-compatible cache entry atomically, and writes a
-deterministic `dv.lock.json`. A matching warm lock performs zero network
-requests.
+converges typed NuGet version ranges with lowest-applicable, direct-wins, and
+cousin rules, then streams package payloads through SHA-512. It validates v2
+source hashes and ZIP boundaries, retracts stale dependency edges when a
+selection changes, publishes NuGet-compatible cache entries atomically, and
+writes a deterministic `dv.lock.json`. A matching warm lock performs zero
+network requests.
 
 `dv build --plan` selects the newest installed reference pack matching the
 project target, parses its manifest, selects Roslyn plus built-in and package
@@ -164,9 +166,9 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
-| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 994.180 ms | 400.814 ms | 2.5x | 1048.203 ms | 634.719 ms |
-| Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1350.559 ms | 581.450 ms | 2.3x | 1401.944 ms | 641.654 ms |
-| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 498.177 ms | 5.881 ms | 84.7x | 508.203 ms | 7.601 ms |
+| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 966.711 ms | 411.275 ms | 2.4x | 1018.389 ms | 586.613 ms |
+| Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1364.792 ms | 598.220 ms | 2.3x | 1558.358 ms | 638.761 ms |
+| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 552.265 ms | 7.019 ms | 78.7x | 680.915 ms | 7.770 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
@@ -188,18 +190,19 @@ and 3,241,550 payload bytes per retained sample. This case emphasizes graph
 expansion and scheduling across many small archives rather than bandwidth.
 Streaming dependency discovery, a measured sixteen-worker crossover, and
 removal of redundant staging I/O reduced the scoped-worker `dv` median from
-904.097 ms to 562.799 ms. The current bounded Tokio scheduler measures
-581.450 ms under the latest low-latency run and has separate congested-network
-A/B evidence in the package baseline.
+904.097 ms to 562.799 ms. The current bounded Tokio scheduler with typed graph
+convergence measures 598.220 ms in the latest network-sensitive run and has
+separate congested-network A/B evidence in the package baseline.
 
 The massive acceptance fixture unions 51 direct package references from
 Microsoft's eShop application into one `net10.0` restore workload. The .NET
 SDK selected 203 packages and populated 272 package archives totaling
 197,860,237 bytes. A five-sample cold reference run measured 10,079.053 ms
-median and 11,241.686 ms p95. `dv` is intentionally reported as `TBI`: its
-current minimum-range convergence and `build`/`runtimes` asset contracts do
-not yet cover this graph, so this result is not promoted into the
-like-for-like table.
+median and 11,241.686 ms p95. `dv` now converges every reference-selected
+identity to the same exact version; five additional `System.*` nodes await
+.NET 10 SDK package-pruning data. It then reaches the explicit
+`buildTransitive` asset-family rejection. The end-to-end case therefore stays
+`TBI` and is not promoted into the like-for-like table.
 
 The warm one-shot target for lightweight commands on this machine is `5 ms`
 end to end. It is a local engineering budget, not a universal Windows
