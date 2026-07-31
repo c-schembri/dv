@@ -27,6 +27,7 @@ enum CaseKind {
   PackageSyncCold,
   PackageGraphCold,
   PackageGraphMassive,
+  PackageAssetPlan,
   PackageSyncWarm,
   BuildClean,
   BuildNoOp,
@@ -196,6 +197,22 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_asset_plan",
+    kind: CaseKind::PackageAssetPlan,
+    args: &[
+      "restore",
+      "MassivePackageGraph.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build", "--no-restore", "--nologo", "--verbosity", "quiet"],
@@ -292,6 +309,12 @@ const DV_CASES: &[Case] = &[
     name: "package_graph_massive",
     kind: CaseKind::PackageGraphMassive,
     args: &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "package_asset_plan",
+    kind: CaseKind::PackageAssetPlan,
+    args: &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--offline", "--json"],
     implemented: true,
   },
   Case {
@@ -449,7 +472,11 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
-  if options.case.as_deref().is_none_or(|case| case == "package_graph_massive") {
+  if options
+    .case
+    .as_deref()
+    .is_none_or(|case| matches!(case, "package_graph_massive" | "package_asset_plan"))
+  {
     verify_package_sync(&repository, &dv_executable, &massive_package_graph_fixture, "MassivePackageGraph.csproj", 203)?;
   }
 
@@ -1481,6 +1508,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::RuntimePackPlan
       | CaseKind::FrameworkReferencePlan
       | CaseKind::CompilerPlan
+      | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
@@ -1554,6 +1582,34 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       )?;
     }
   }
+  if matches!(case.kind, CaseKind::PackageAssetPlan) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "MassivePackageGraph.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "-p:NuGetAudit=false",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "package asset plan setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "package asset plan setup",
+      )?;
+    }
+  }
   if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
   }
@@ -1576,7 +1632,8 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::RuntimeEvaluate
     | CaseKind::RuntimePackPlan
     | CaseKind::FrameworkReferencePlan
-    | CaseKind::CompilerPlan => Ok(()),
+    | CaseKind::CompilerPlan
+    | CaseKind::PackageAssetPlan => Ok(()),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -1621,7 +1678,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
-    CaseKind::PackageGraphMassive => fixtures.package_graph_massive,
+    CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
   }
 }
@@ -1635,7 +1692,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
-    CaseKind::PackageGraphMassive => Some("massive-package-graph"),
+    CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
   }
 }
@@ -1648,7 +1705,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let work = if !is_dotnet(executable)
     && matches!(
       case.kind,
-      CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackageSyncWarm
+      CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan | CaseKind::PackageSyncWarm
     ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
@@ -1894,7 +1951,7 @@ fn render_summary(report: &Report, color: bool) -> String {
     .filter(|run| {
       matches!(
         run.case.as_str(),
-        "package_sync_cold" | "package_graph_cold" | "package_graph_massive" | "package_sync_warm"
+        "package_sync_cold" | "package_graph_cold" | "package_graph_massive" | "package_asset_plan" | "package_sync_warm"
       )
     })
     .collect::<Vec<_>>();
@@ -2013,6 +2070,7 @@ fn case_label(case: &str) -> &str {
     "package_sync_cold" => "Cold dependency readiness",
     "package_graph_cold" => "Cold large dependency graph",
     "package_graph_massive" => "Cold massive solution graph",
+    "package_asset_plan" => "Warm package asset plan",
     "package_sync_warm" => "Warm locked restore",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",

@@ -40,6 +40,9 @@ dv restore (50 packages)       598.220 ms median
 
 dotnet restore (warm locked)   552.265 ms median
 dv restore (warm locked)         7.019 ms median
+
+dotnet locked asset plan       702.904 ms median
+dv locked asset plan           107.385 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK, evaluated project
@@ -76,6 +79,7 @@ The project is in the first implementation phase.
 | Target-aware framework and compiler input planning | Implemented |
 | Framework references and shared-runtime roll-forward | Implemented |
 | Runtime, host, native asset, and apphost planning | Implemented |
+| Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
 | Exact package resolution, v2/v3 sources, verified cache, and lock | Initial implementation |
@@ -126,7 +130,9 @@ cousin rules, then streams package payloads through SHA-512. It validates v2
 source hashes and ZIP boundaries, retracts stale dependency edges when a
 selection changes, publishes NuGet-compatible cache entries atomically, and
 writes a deterministic `dv.lock.json`. A matching warm lock performs zero
-network requests.
+network requests. Selected compile, runtime, analyzer, resource, content,
+build, build-multitargeting, build-transitive, and native paths occupy
+consecutive ranges in one immutable span batch.
 
 `dv build --plan` selects the newest installed reference pack matching the
 project target, parses its manifest, selects Roslyn plus built-in and package
@@ -201,7 +207,8 @@ Initial machine:
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, runtime-pack planning, and the
-  framework-reference plan and one-package cold case; compiler planning uses
+  framework-reference plan, 203-package asset plan, and one-package cold case;
+  compiler planning uses
   5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; 10 retained
   samples after 3 warm-ups for warm locked restore; the massive graph uses 5
@@ -221,6 +228,7 @@ Initial machine:
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
+| Plan assets for a warm 203-package graph | `dotnet restore MassivePackageGraph.csproj --locked-mode --packages .packages -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --offline --json` | 702.904 ms | 107.385 ms | 6.5x | 1301.984 ms | 132.369 ms |
 | Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 521.346 ms | 7.362 ms | 70.8x | 560.223 ms | 8.206 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
@@ -236,7 +244,9 @@ apphost template. For package sync it also compares the complete package
 identity, exact-version, archive-SHA-512, and selected asset batches. The
 massive case additionally compares runtime, resource, content, analyzer,
 build, build-multitargeting, native, and RID runtime-target paths plus
-runtime-target metadata. The framework-reference case compares both resolved
+runtime-target metadata. The warm asset-plan case retains that exact parity
+gate, then measures locked planning over the populated 203-package caches. The
+framework-reference case compares both resolved
 framework rows, requested runtime versions, profiles, targeting-pack
 identities/versions/roots, and the installed Core/ASP.NET versions observed by
 an actual Microsoft host launch. Exact commands are printed in benchmark output and
@@ -246,7 +256,8 @@ recorded in the curated
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
 [runtime pack baseline](docs/performance-baselines/2026-08-01-runtime-pack-windows.md),
 [framework reference baseline](docs/performance-baselines/2026-08-01-framework-reference-windows.md), and
-[package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md).
+[package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
+[warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
 The cold dependency result starts each timed process with a fresh project copy
 and empty isolated package directory. The reference command also bypasses
@@ -291,6 +302,7 @@ cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
+cargo bench-all --case package_asset_plan --samples 30 --warmups 3
 cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 

@@ -22,7 +22,9 @@ pub use framework::{FrameworkFamily, TargetFramework, TargetFrameworkError};
 pub use framework_reference::{
   FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, ResolvedFrameworkReference, plan_framework_references,
 };
-pub use package::{PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, resolve_package_inputs};
+pub use package::{
+  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, resolve_package_inputs,
+};
 pub use project::{
   FrameworkReference, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward,
   evaluate_project, evaluate_project_path,

@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 15 Rust source files, 13,943 nonblank source
-lines, and 84 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 15 Rust source files, 14,175 nonblank source
+lines, and 85 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -686,8 +686,15 @@ boundary, not final drop-in parity.
   .NET 10 Core + ASP.NET fixture matches MSBuild items and an actual host
   launch. A 30-sample MSBuild oracle measures `352.715 ms` versus `5.585 ms`
   for `dv` (`63.2x`). `P2`
-- [~] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and
-  build assets in the plan. `P1`
+- [x] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and
+  build assets in the plan. Nine semantic families occupy consecutive ranges
+  in one immutable span batch; per-package ranges index that same allocation.
+  The 248-byte plan header is 56 bytes smaller than the prior layout and keeps
+  compile, runtime, analyzer, resource, content, three build-import families,
+  and native assets independently iterable. The 203-package parity fixture
+  matches every portable `project.assets.json` family. A 30-sample locked
+  restore oracle measures `702.904 ms` versus `107.385 ms` for `dv` (`6.5x`).
+  `P1`
 - [~] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the
   required pack identity and acquisition action. `P1`
 - [ ] `PACKS-010` Cache immutable SDK pack inventories by selected SDK

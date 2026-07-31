@@ -80,16 +80,26 @@ references remain explicit; only transitive nodes and their outgoing edges
 are pruned.
 
 The warm locked path reads configuration, selected SDK pruning data, one lock,
-package markers and hashes, and selected asset metadata. It performs zero HTTP
-requests and never launches `dotnet`, MSBuild, or NuGet.
+and one immutable-cache completion marker per package. The lock carries the
+already verified archive hash and every selected relative asset path. Producing
+the plan deliberately does not stat every asset: concrete compiler, copy, and
+runtime consumers diagnose a missing file when they open it. This removes
+thousands of redundant Windows metadata requests from large warm graphs while
+retaining traversal-path validation. The path performs zero HTTP requests and
+never launches `dotnet`, MSBuild, or NuGet.
 
 Network and archive data are externally sized, so staging paths, XML/JSON
 documents, graph work maps, and extraction buffers allocate dynamically.
 Final package records are contiguous. `ResolvedPackage` is 28 bytes with
-4-byte alignment; its asset record is 32 bytes with 4-byte alignment. Text and
-paths cross the subsystem boundary as 8-byte offset/length spans into one
-owned UTF-8 buffer. Reporters and compiler planning traverse final records and
-asset ranges linearly.
+4-byte alignment; its hot asset record is 32 bytes with 4-byte alignment. The
+compile, runtime, analyzer, resource, content, inner-build, outer-build,
+transitive-build, and native families occupy nine consecutive ranges in one
+span allocation. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
+path is an 8-byte offset/length span into one owned UTF-8 buffer. The 248-byte,
+pointer-aligned `PackageResolution` header is 56 bytes smaller than the former
+nine-allocation layout. Assuming the benchmark machine's observed 64-byte
+cache line, eight spans fit per line. Reporters and compiler planning scan only
+the ranges they consume.
 
 The cold scheduler uses a two-thread Tokio runtime and one `JoinSet` capped at
 twenty-four active package tasks. The runtime exists only after the warm-lock
@@ -130,7 +140,8 @@ Each `PackageResolution` owns:
 
 - target framework, cache root, lock path, selected source, and protocol;
 - package records sorted by case-insensitive identity;
-- dependency indices and compile, runtime, and analyzer asset spans;
+- dependency indices and one contiguous, explicitly partitioned package-asset
+  span batch;
 - computed archive hashes, with source-advertised v2 hashes verified;
 - cache-hit, download, request, and payload-byte counters.
 
@@ -153,8 +164,8 @@ them. `dv.lock.json` is project-owned persistent state.
 | Non-Unicode retained path | `DV0408` |
 | Compact range or text overflow | `DV0409` |
 
-Unsupported build targets, runtime-specific assets, signatures, floating
-versions, and advanced conflict rules fail instead of being approximated.
+Unsupported package build-target execution, signatures, floating versions,
+and advanced conflict rules fail instead of being approximated.
 
 ## Verification
 
@@ -166,12 +177,15 @@ NuGet v2 and v3 and compares identity, archive SHA-512, size, and selected
 compile asset.
 
 The benchmark preflight compares `dotnet restore` and `dv restore` complete
-package identity, exact-version, archive-SHA-512, target-framework, and
-compile-asset batches before retaining samples. Cold dependency readiness uses
+package identity, exact-version, archive-SHA-512, target-framework, compile,
+runtime, native, resource, analyzer, content, build, build-multitargeting,
+build-transitive, and RID-specific runtime-target batches before retaining
+samples. Cold dependency readiness uses
 a fresh isolated package directory per iteration and disables the reference
 tool's HTTP cache. The 50-package case applies the same boundary to streaming
 dependency discovery and many small archives. Warm locked restore is reported
-separately.
+separately for both the single-package startup boundary and the 203-package
+asset-plan boundary.
 `dv` package, request, and payload counts are recorded as typed benchmark
 evidence.
 

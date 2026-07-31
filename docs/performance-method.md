@@ -62,6 +62,7 @@ Invalid input behavior:
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
 | `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload with package and portable-asset oracle comparison |
+| `package_asset_plan` | unchanged `massive-package-graph`, populated isolated packages, matching tool-native lock | process launch, 203-package locked validation, family-partitioned asset-plan materialization, and output |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
@@ -192,4 +193,11 @@ Measure the massive eShop-derived acceptance graph:
 
 ```text
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
+```
+
+Measure family-partitioned planning over that graph from matching locks and
+populated isolated caches:
+
+```text
+cargo bench-all --case package_asset_plan --samples 30 --warmups 3
 ```

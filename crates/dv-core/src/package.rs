@@ -55,6 +55,48 @@ const _: () = assert!(align_of::<TextSpan>() == 4);
 const _: () = assert!(size_of::<ItemRange>() == 8);
 const _: () = assert!(align_of::<ItemRange>() == 4);
 
+/// Stable semantic partition for selected package assets.
+///
+/// Families are stored as consecutive ranges in this order. The enum is a
+/// query key, not a persisted representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageAssetFamily {
+  /// Assemblies passed to the compiler as references.
+  Compile,
+  /// Managed assemblies available to the application at runtime.
+  Runtime,
+  /// Roslyn analyzers and source generators.
+  Analyzer,
+  /// Satellite resource assemblies.
+  Resource,
+  /// Package content files.
+  Content,
+  /// Inner-build props and targets.
+  Build,
+  /// Outer-build props and targets.
+  BuildMultiTargeting,
+  /// Transitive props and targets.
+  BuildTransitive,
+  /// Legacy native runtime assets.
+  Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageAssetRanges {
+  compile: ItemRange,
+  runtime: ItemRange,
+  analyzers: ItemRange,
+  resources: ItemRange,
+  content: ItemRange,
+  build: ItemRange,
+  build_multi_targeting: ItemRange,
+  build_transitive: ItemRange,
+  native: ItemRange,
+}
+
+const _: () = assert!(size_of::<PackageAssetRanges>() == 72);
+const _: () = assert!(align_of::<PackageAssetRanges>() == 4);
+
 /// One compact package graph record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedPackage {
@@ -173,21 +215,17 @@ pub struct PackageResolution {
   package_assets: Box<[PackageAssets]>,
   package_extended_assets: Box<[PackageExtendedAssets]>,
   dependencies: Box<[u32]>,
-  compile_assets: Box<[TextSpan]>,
-  runtime_assets: Box<[TextSpan]>,
-  analyzers: Box<[TextSpan]>,
-  resource_assets: Box<[TextSpan]>,
-  content_files: Box<[TextSpan]>,
-  build_assets: Box<[TextSpan]>,
-  build_multi_targeting_assets: Box<[TextSpan]>,
-  build_transitive_assets: Box<[TextSpan]>,
-  native_assets: Box<[TextSpan]>,
+  assets: Box<[TextSpan]>,
+  asset_ranges: PackageAssetRanges,
   runtime_targets: Box<[RuntimeTargetAsset]>,
   cache_hits: u32,
   downloaded_packages: u32,
   network_requests: u32,
   downloaded_bytes: u64,
 }
+
+const _: () = assert!(size_of::<PackageResolution>() == 248);
+const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
   /// Returns the global-packages directory used by this graph.
@@ -248,47 +286,63 @@ impl PackageResolution {
 
   /// Iterates selected compile assemblies across the graph.
   pub fn compile_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.compile_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Compile)
   }
 
   /// Iterates selected runtime assemblies across the graph.
   pub fn runtime_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.runtime_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Runtime)
   }
 
   /// Iterates package analyzers across the graph.
   pub fn analyzers(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.analyzers.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Analyzer)
   }
 
   /// Iterates selected satellite resource assemblies across the graph.
   pub fn resource_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.resource_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Resource)
   }
 
   /// Iterates selected package content files across the graph.
   pub fn content_files(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.content_files.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Content)
   }
 
   /// Iterates selected inner-build MSBuild imports across the graph.
   pub fn build_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.build_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Build)
   }
 
   /// Iterates selected outer-build MSBuild imports across the graph.
   pub fn build_multi_targeting_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.build_multi_targeting_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::BuildMultiTargeting)
   }
 
   /// Iterates selected transitive MSBuild imports across the graph.
   pub fn build_transitive_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.build_transitive_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::BuildTransitive)
   }
 
   /// Iterates selected legacy native assets across the graph.
   pub fn native_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
-    self.native_assets.iter().map(|span| Path::new(self.get(*span)))
+    self.assets(PackageAssetFamily::Native)
+  }
+
+  /// Iterates one selected asset family as a contiguous read-only range.
+  pub fn assets(&self, family: PackageAssetFamily) -> impl ExactSizeIterator<Item = &Path> {
+    let range = range(match family {
+      PackageAssetFamily::Compile => self.asset_ranges.compile,
+      PackageAssetFamily::Runtime => self.asset_ranges.runtime,
+      PackageAssetFamily::Analyzer => self.asset_ranges.analyzers,
+      PackageAssetFamily::Resource => self.asset_ranges.resources,
+      PackageAssetFamily::Content => self.asset_ranges.content,
+      PackageAssetFamily::Build => self.asset_ranges.build,
+      PackageAssetFamily::BuildMultiTargeting => self.asset_ranges.build_multi_targeting,
+      PackageAssetFamily::BuildTransitive => self.asset_ranges.build_transitive,
+      PackageAssetFamily::Native => self.asset_ranges.native,
+    });
+    self.assets[range].iter().map(|span| Path::new(self.get(*span)))
   }
 
   /// Iterates RID-specific runtime targets across the graph.
@@ -321,47 +375,47 @@ impl PackageResolution {
 
   fn package_compile_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_assets[index].compile);
-    self.compile_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_runtime_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_assets[index].runtime);
-    self.runtime_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_analyzers(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_assets[index].analyzers);
-    self.analyzers[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_resource_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].resources);
-    self.resource_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_content_files(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].content_files);
-    self.content_files[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_build_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].build);
-    self.build_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_build_multi_targeting_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].build_multi_targeting);
-    self.build_multi_targeting_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_build_transitive_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].build_transitive);
-    self.build_transitive_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_native_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_extended_assets[index].native);
-    self.native_assets[range].iter().map(|span| self.get(*span))
+    self.assets[range].iter().map(|span| self.get(*span))
   }
 
   fn package_runtime_targets(&self, index: usize) -> impl ExactSizeIterator<Item = RuntimeTargetAsset> + '_ {
@@ -3396,15 +3450,19 @@ fn materialize_resolution(
   let mut package_assets = Vec::with_capacity(work.len());
   let mut package_extended_assets = Vec::with_capacity(work.len());
   let mut dependencies = Vec::new();
-  let mut compile_assets = Vec::new();
-  let mut runtime_assets = Vec::new();
-  let mut analyzers = Vec::new();
-  let mut resource_assets = Vec::new();
-  let mut content_files = Vec::new();
-  let mut build_assets = Vec::new();
-  let mut build_multi_targeting_assets = Vec::new();
-  let mut build_transitive_assets = Vec::new();
-  let mut native_assets = Vec::new();
+  let (asset_ranges, asset_count) = plan_asset_ranges(work)?;
+  let mut assets = vec![TextSpan { start: 0, len: 0 }; asset_count];
+  let mut asset_cursors = [
+    asset_ranges.compile.start,
+    asset_ranges.runtime.start,
+    asset_ranges.analyzers.start,
+    asset_ranges.resources.start,
+    asset_ranges.content.start,
+    asset_ranges.build.start,
+    asset_ranges.build_multi_targeting.start,
+    asset_ranges.build_transitive.start,
+    asset_ranges.native.start,
+  ];
   let mut runtime_targets = Vec::new();
   let mut cache_hits = 0u32;
 
@@ -3420,15 +3478,15 @@ fn materialize_resolution(
       })?);
     }
     let dependency_len = u32_len(package.dependencies.len(), "package dependency range")?;
-    let compile = push_asset_range(&mut table, &mut compile_assets, &package.compile_assets)?;
-    let runtime = push_asset_range(&mut table, &mut runtime_assets, &package.runtime_assets)?;
-    let analyzer_range = push_asset_range(&mut table, &mut analyzers, &package.analyzers)?;
-    let resources = push_asset_range(&mut table, &mut resource_assets, &package.resource_assets)?;
-    let content = push_asset_range(&mut table, &mut content_files, &package.content_files)?;
-    let build = push_asset_range(&mut table, &mut build_assets, &package.build_assets)?;
-    let build_multi_targeting = push_asset_range(&mut table, &mut build_multi_targeting_assets, &package.build_multi_targeting_assets)?;
-    let build_transitive = push_asset_range(&mut table, &mut build_transitive_assets, &package.build_transitive_assets)?;
-    let native = push_asset_range(&mut table, &mut native_assets, &package.native_assets)?;
+    let compile = push_asset_range(&mut table, &mut assets, &mut asset_cursors[0], &package.compile_assets)?;
+    let runtime = push_asset_range(&mut table, &mut assets, &mut asset_cursors[1], &package.runtime_assets)?;
+    let analyzer_range = push_asset_range(&mut table, &mut assets, &mut asset_cursors[2], &package.analyzers)?;
+    let resources = push_asset_range(&mut table, &mut assets, &mut asset_cursors[3], &package.resource_assets)?;
+    let content = push_asset_range(&mut table, &mut assets, &mut asset_cursors[4], &package.content_files)?;
+    let build = push_asset_range(&mut table, &mut assets, &mut asset_cursors[5], &package.build_assets)?;
+    let build_multi_targeting = push_asset_range(&mut table, &mut assets, &mut asset_cursors[6], &package.build_multi_targeting_assets)?;
+    let build_transitive = push_asset_range(&mut table, &mut assets, &mut asset_cursors[7], &package.build_transitive_assets)?;
+    let native = push_asset_range(&mut table, &mut assets, &mut asset_cursors[8], &package.native_assets)?;
     let runtime_target_start = u32_len(runtime_targets.len(), "package runtime target range")?;
     for asset in &package.runtime_targets {
       runtime_targets.push(RuntimeTargetAsset {
@@ -3468,6 +3526,19 @@ fn materialize_resolution(
     cache_hits += u32::from(package.cache_hit);
   }
 
+  debug_assert_eq!(asset_cursors[0], asset_ranges.compile.start + asset_ranges.compile.len);
+  debug_assert_eq!(asset_cursors[1], asset_ranges.runtime.start + asset_ranges.runtime.len);
+  debug_assert_eq!(asset_cursors[2], asset_ranges.analyzers.start + asset_ranges.analyzers.len);
+  debug_assert_eq!(asset_cursors[3], asset_ranges.resources.start + asset_ranges.resources.len);
+  debug_assert_eq!(asset_cursors[4], asset_ranges.content.start + asset_ranges.content.len);
+  debug_assert_eq!(asset_cursors[5], asset_ranges.build.start + asset_ranges.build.len);
+  debug_assert_eq!(
+    asset_cursors[6],
+    asset_ranges.build_multi_targeting.start + asset_ranges.build_multi_targeting.len
+  );
+  debug_assert_eq!(asset_cursors[7], asset_ranges.build_transitive.start + asset_ranges.build_transitive.len);
+  debug_assert_eq!(asset_cursors[8], asset_ranges.native.start + asset_ranges.native.len);
+
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
     cache_root: cache_root_span,
@@ -3480,15 +3551,8 @@ fn materialize_resolution(
     package_assets: package_assets.into_boxed_slice(),
     package_extended_assets: package_extended_assets.into_boxed_slice(),
     dependencies: dependencies.into_boxed_slice(),
-    compile_assets: compile_assets.into_boxed_slice(),
-    runtime_assets: runtime_assets.into_boxed_slice(),
-    analyzers: analyzers.into_boxed_slice(),
-    resource_assets: resource_assets.into_boxed_slice(),
-    content_files: content_files.into_boxed_slice(),
-    build_assets: build_assets.into_boxed_slice(),
-    build_multi_targeting_assets: build_multi_targeting_assets.into_boxed_slice(),
-    build_transitive_assets: build_transitive_assets.into_boxed_slice(),
-    native_assets: native_assets.into_boxed_slice(),
+    assets: assets.into_boxed_slice(),
+    asset_ranges,
     runtime_targets: runtime_targets.into_boxed_slice(),
     cache_hits,
     downloaded_packages: work.len() as u32 - cache_hits,
@@ -3497,15 +3561,64 @@ fn materialize_resolution(
   })
 }
 
-fn push_asset_range(table: &mut TextTable, target: &mut Vec<TextSpan>, paths: &[PathBuf]) -> Result<ItemRange, PackageError> {
-  let start = u32_len(target.len(), "package asset range")?;
-  for path in paths {
-    target.push(table.push_path(path)?);
+fn plan_asset_ranges(work: &BTreeMap<String, WorkPackage>) -> Result<(PackageAssetRanges, usize), PackageError> {
+  let mut counts = [0usize; 9];
+  for package in work.values() {
+    for (count, additional) in counts.iter_mut().zip([
+      package.compile_assets.len(),
+      package.runtime_assets.len(),
+      package.analyzers.len(),
+      package.resource_assets.len(),
+      package.content_files.len(),
+      package.build_assets.len(),
+      package.build_multi_targeting_assets.len(),
+      package.build_transitive_assets.len(),
+      package.native_assets.len(),
+    ]) {
+      *count = count
+        .checked_add(additional)
+        .ok_or_else(|| PackageError::new(PackageErrorKind::TextOverflow, "package assets", "package asset count overflowed usize"))?;
+    }
   }
-  Ok(ItemRange {
-    start,
-    len: u32_len(paths.len(), "package asset range")?,
-  })
+  let mut start = 0usize;
+  let mut next = |length: usize| {
+    let range = ItemRange {
+      start: u32_len(start, "package asset family range")?,
+      len: u32_len(length, "package asset family range")?,
+    };
+    start = start
+      .checked_add(length)
+      .ok_or_else(|| PackageError::new(PackageErrorKind::TextOverflow, "package assets", "package asset count overflowed usize"))?;
+    Ok(range)
+  };
+  let ranges = PackageAssetRanges {
+    compile: next(counts[0])?,
+    runtime: next(counts[1])?,
+    analyzers: next(counts[2])?,
+    resources: next(counts[3])?,
+    content: next(counts[4])?,
+    build: next(counts[5])?,
+    build_multi_targeting: next(counts[6])?,
+    build_transitive: next(counts[7])?,
+    native: next(counts[8])?,
+  };
+  Ok((ranges, start))
+}
+
+fn push_asset_range(table: &mut TextTable, target: &mut [TextSpan], cursor: &mut u32, paths: &[PathBuf]) -> Result<ItemRange, PackageError> {
+  let start = *cursor;
+  let len = u32_len(paths.len(), "package asset range")?;
+  let end = start
+    .checked_add(len)
+    .ok_or_else(|| PackageError::new(PackageErrorKind::TextOverflow, "package assets", "package asset range overflowed u32"))?;
+  let slots = target
+    .get_mut(start as usize..end as usize)
+    .ok_or_else(|| PackageError::new(PackageErrorKind::TextOverflow, "package assets", "package asset range exceeds its family"))?;
+  for (slot, path) in slots.iter_mut().zip(paths) {
+    *slot = table.push_path(path)?;
+  }
+  *cursor = end;
+  Ok(ItemRange { start, len })
 }
 
 fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageError> {
@@ -3525,15 +3638,18 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     package_assets: Box::new([]),
     package_extended_assets: Box::new([]),
     dependencies: Box::new([]),
-    compile_assets: Box::new([]),
-    runtime_assets: Box::new([]),
-    analyzers: Box::new([]),
-    resource_assets: Box::new([]),
-    content_files: Box::new([]),
-    build_assets: Box::new([]),
-    build_multi_targeting_assets: Box::new([]),
-    build_transitive_assets: Box::new([]),
-    native_assets: Box::new([]),
+    assets: Box::new([]),
+    asset_ranges: PackageAssetRanges {
+      compile: ItemRange { start: 0, len: 0 },
+      runtime: ItemRange { start: 0, len: 0 },
+      analyzers: ItemRange { start: 0, len: 0 },
+      resources: ItemRange { start: 0, len: 0 },
+      content: ItemRange { start: 0, len: 0 },
+      build: ItemRange { start: 0, len: 0 },
+      build_multi_targeting: ItemRange { start: 0, len: 0 },
+      build_transitive: ItemRange { start: 0, len: 0 },
+      native: ItemRange { start: 0, len: 0 },
+    },
     runtime_targets: Box::new([]),
     cache_hits: 0,
     downloaded_packages: 0,
@@ -3591,14 +3707,7 @@ fn read_warm_lock(
       direct: package.direct,
     };
     let root = package_root(&config.cache_root, &request);
-    let cached = validate_cached_package(&root, &request, true, 0, 0)?;
-    if cached.hash != package.sha512 {
-      return Err(PackageError::new(
-        PackageErrorKind::Integrity,
-        root.display().to_string(),
-        format!("cached package hash for {} {} does not match dv.lock.json", request.id, request.version),
-      ));
-    }
+    validate_locked_package(&root, &request, &package.sha512)?;
     let compile_assets = lock_asset_paths(&root, &package.compile_assets)?;
     let runtime_assets = lock_asset_paths(&root, &package.runtime_assets)?;
     let analyzers = lock_asset_paths(&root, &package.analyzers)?;
@@ -3718,16 +3827,39 @@ fn lock_asset_path(root: &Path, value: &str) -> Result<PathBuf, PackageError> {
       format!("lock asset path {value:?} escapes its package"),
     ));
   }
-  let path = root.join(relative);
-  let virtual_marker = relative.file_name().is_some_and(|name| name == "_._");
-  if !path.is_file() && !virtual_marker {
+  // The completion marker and locked archive hash prove the immutable entry.
+  // Per-asset stats add thousands of syscalls to a large warm plan; consumers
+  // validate concrete files when they open or copy them.
+  Ok(root.join(relative))
+}
+
+fn validate_locked_package(root: &Path, request: &PackageRequest, expected_hash: &str) -> Result<(), PackageError> {
+  // A completion marker is published only after the immutable package root is
+  // fully extracted. Check the common dv-owned marker first so the warm path
+  // performs one metadata request per package rather than two.
+  if !root.join(".dv.metadata.json").is_file() && !root.join(".nupkg.metadata").is_file() {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
-      path.display().to_string(),
-      "locked package asset is missing",
+      root.display().to_string(),
+      format!("locked package cache entry for {} {} has no completion marker", request.id, request.version),
     ));
   }
-  Ok(path)
+  let hash_path = root.join(format!("{}.{}.nupkg.sha512", request.lower_id, request.version));
+  let decoded = BASE64.decode(expected_hash).map_err(|error| {
+    PackageError::new(
+      PackageErrorKind::Integrity,
+      hash_path.display().to_string(),
+      format!("invalid locked package SHA-512: {error}"),
+    )
+  })?;
+  if decoded.len() != 64 {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      hash_path.display().to_string(),
+      "locked package SHA-512 must decode to 64 bytes",
+    ));
+  }
+  Ok(())
 }
 
 fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
@@ -4286,6 +4418,21 @@ mod tests {
   }
 
   #[test]
+  fn locked_package_validation_uses_the_completion_marker_and_lock_hash() {
+    let temp = TempDirectory::new();
+    temp.write(".dv.metadata.json", "{}");
+    let hash = BASE64.encode([0u8; 64]);
+
+    validate_locked_package(&temp.0, &request(), &hash).unwrap();
+
+    let error = validate_locked_package(&temp.0, &request(), "not-base64").unwrap_err();
+    assert_eq!(error.kind(), PackageErrorKind::Integrity);
+    fs::remove_file(temp.0.join(".dv.metadata.json")).unwrap();
+    let error = validate_locked_package(&temp.0, &request(), &hash).unwrap_err();
+    assert_eq!(error.kind(), PackageErrorKind::Integrity);
+  }
+
+  #[test]
   fn nuspec_dependency_groups_follow_the_evaluated_target() {
     let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version><dependencies>
 <group targetFramework="netstandard2.0"><dependency id="Base.Dependency" version="1.0" /></group>
@@ -4533,7 +4680,12 @@ mod tests {
     temp.write("packages/sample.package/1.2.3/lib/net6.0/Sample.Package.dll", []);
     temp.write("packages/sample.package/1.2.3/lib/net6.0/de/Sample.Package.resources.dll", []);
     temp.write("packages/sample.package/1.2.3/lib/net10.0/Sample.Package.dll", []);
+    temp.write("packages/sample.package/1.2.3/contentFiles/any/any/readme.txt", []);
     temp.write("packages/sample.package/1.2.3/build/net6.0/Sample.Package.props", []);
+    temp.write("packages/sample.package/1.2.3/buildMultiTargeting/Sample.Package.props", []);
+    temp.write("packages/sample.package/1.2.3/buildTransitive/net6.0/Sample.Package.targets", []);
+    temp.write("packages/sample.package/1.2.3/analyzers/dotnet/cs/Sample.Analyzer.dll", []);
+    temp.write("packages/sample.package/1.2.3/native/sample.native", []);
     temp.write("packages/sample.package/1.2.3/runtimes/win/lib/net6.0/Sample.Package.dll", []);
     let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let options = PackageResolveOptions {
@@ -4552,10 +4704,41 @@ mod tests {
     assert_eq!(second.cache_hits(), 1);
     assert_eq!(second.compile_assets().collect::<Vec<_>>(), [root.join("lib/net6.0/Sample.Package.dll")]);
     assert_eq!(
+      second.assets(PackageAssetFamily::Compile).collect::<Vec<_>>(),
+      second.compile_assets().collect::<Vec<_>>()
+    );
+    assert_eq!(second.runtime_assets().collect::<Vec<_>>(), [root.join("lib/net6.0/Sample.Package.dll")]);
+    assert_eq!(second.analyzers().collect::<Vec<_>>(), [root.join("analyzers/dotnet/cs/Sample.Analyzer.dll")]);
+    assert_eq!(
       second.resource_assets().collect::<Vec<_>>(),
       [root.join("lib/net6.0/de/Sample.Package.resources.dll")]
     );
+    assert_eq!(second.content_files().collect::<Vec<_>>(), [root.join("contentFiles/any/any/readme.txt")]);
     assert_eq!(second.build_assets().collect::<Vec<_>>(), [root.join("build/net6.0/Sample.Package.props")]);
+    assert_eq!(
+      second.build_multi_targeting_assets().collect::<Vec<_>>(),
+      [root.join("buildMultiTargeting/Sample.Package.props")]
+    );
+    assert_eq!(
+      second.build_transitive_assets().collect::<Vec<_>>(),
+      [root.join("buildTransitive/net6.0/Sample.Package.targets")]
+    );
+    assert_eq!(second.native_assets().collect::<Vec<_>>(), [root.join("native/sample.native")]);
+    let ranges = second.asset_ranges;
+    assert_eq!(ranges.compile.start, 0);
+    for (left, right) in [
+      (ranges.compile, ranges.runtime),
+      (ranges.runtime, ranges.analyzers),
+      (ranges.analyzers, ranges.resources),
+      (ranges.resources, ranges.content),
+      (ranges.content, ranges.build),
+      (ranges.build, ranges.build_multi_targeting),
+      (ranges.build_multi_targeting, ranges.build_transitive),
+      (ranges.build_transitive, ranges.native),
+    ] {
+      assert_eq!(left.start + left.len, right.start);
+    }
+    assert_eq!(ranges.native.start + ranges.native.len, u32::try_from(second.assets.len()).unwrap());
     let runtime_target = root.join("runtimes/win/lib/net6.0/Sample.Package.dll");
     assert_eq!(
       second.runtime_targets().collect::<Vec<_>>(),
