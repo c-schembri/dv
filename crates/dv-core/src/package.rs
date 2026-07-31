@@ -29,6 +29,8 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_DOWNLOAD_WORKERS: usize = 4;
+const MAX_EXTRACTION_WORKERS: usize = 4;
+const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const LOCK_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,7 +150,7 @@ impl PackageResolution {
     self.get(package.version)
   }
 
-  /// Returns the verified package SHA-512.
+  /// Returns the computed package SHA-512, verified against v2 metadata when available.
   pub fn package_hash(&self, index: usize) -> &str {
     self.get(self.package_assets[index].hash)
   }
@@ -369,15 +371,8 @@ struct PackageSource {
 
 #[derive(Clone)]
 enum ServiceEndpoint {
-  V2 {
-    source: String,
-    base: String,
-  },
-  V3 {
-    source: String,
-    package_base: String,
-    registration_base: String,
-  },
+  V2 { source: String, base: String },
+  V3 { source: String, package_base: String },
 }
 
 impl ServiceEndpoint {
@@ -548,14 +543,14 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequest>, Package
     let id = project.package_id(*package);
     let lower_id = normalize_id(id)?;
     let version = normalize_version(project.package_version(*package))?;
-    if let Some(existing) = seen.insert(lower_id.clone(), version.clone()) {
-      if existing != version {
-        return Err(PackageError::new(
-          PackageErrorKind::Resolution,
-          id,
-          format!("package {id} is directly referenced with conflicting versions {existing} and {version}"),
-        ));
-      }
+    if let Some(existing) = seen.insert(lower_id.clone(), version.clone())
+      && existing != version
+    {
+      return Err(PackageError::new(
+        PackageErrorKind::Resolution,
+        id,
+        format!("package {id} is directly referenced with conflicting versions {existing} and {version}"),
+      ));
     }
     direct.push(PackageRequest {
       id: id.into(),
@@ -571,10 +566,10 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequest>, Package
 
 fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
   let mut config_paths = Vec::new();
-  if let Some(user) = user_config_path() {
-    if user.is_file() {
-      config_paths.push(user);
-    }
+  if let Some(user) = user_config_path()
+    && user.is_file()
+  {
+    config_paths.push(user);
   }
   let mut ancestors: Vec<&Path> = project_directory.ancestors().collect();
   ancestors.reverse();
@@ -769,33 +764,33 @@ fn discover_service_endpoints(agent: &ureq::Agent, sources: &[PackageSource]) ->
       NugetProtocol::V3 => {
         let document: serde_json::Value = get_json(agent, &source.url)?;
         requests += 1;
-        let resources = document
-          .get("resources")
-          .and_then(serde_json::Value::as_array)
-          .ok_or_else(|| network_error(&source.url, "NuGet service index has no resources array"))?;
-        let mut package_base = None;
-        let mut registration_base = None;
-        for resource in resources {
-          let id = resource.get("@id").and_then(serde_json::Value::as_str);
-          let resource_type = resource.get("@type");
-          if resource_type_matches(resource_type, "PackageBaseAddress/3.0.0") {
-            package_base = id.map(str::to_owned);
-          }
-          if resource_type_matches(resource_type, "RegistrationsBaseUrl/3.6.0") {
-            registration_base = id.map(str::to_owned);
-          }
-        }
-        let package_base = package_base.ok_or_else(|| network_error(&source.url, "NuGet source has no PackageBaseAddress/3.0.0 resource"))?;
-        let registration_base = registration_base.ok_or_else(|| network_error(&source.url, "NuGet source has no RegistrationsBaseUrl/3.6.0 resource"))?;
         endpoints.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
-          package_base: with_trailing_slash(package_base),
-          registration_base: with_trailing_slash(registration_base),
+          package_base: package_base_from_service_index(&source.url, &document)?,
         });
       },
     }
   }
   Ok((endpoints, requests))
+}
+
+fn package_base_from_service_index(source: &str, document: &serde_json::Value) -> Result<String, PackageError> {
+  let resources = document
+    .get("resources")
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| network_error(source, "NuGet service index has no resources array"))?;
+  let base = resources
+    .iter()
+    .find_map(|resource| {
+      resource_type_matches(resource.get("@type"), "PackageBaseAddress/3.0.0")
+        .then(|| resource.get("@id").and_then(serde_json::Value::as_str))
+        .flatten()
+    })
+    .ok_or_else(|| network_error(source, "NuGet source has no PackageBaseAddress/3.0.0 resource"))?;
+  if !base.starts_with("https://") {
+    return Err(network_error(base, "NuGet PackageBaseAddress must use HTTPS"));
+  }
+  Ok(with_trailing_slash(base.to_owned()))
 }
 
 fn resource_type_matches(value: Option<&serde_json::Value>, expected: &str) -> bool {
@@ -815,7 +810,10 @@ fn with_trailing_slash(mut value: String) -> String {
 
 fn ensure_wave(agent: &ureq::Agent, requests: &[PackageRequest], cache_root: &Path, endpoints: &[ServiceEndpoint]) -> Result<Vec<CachedPackage>, PackageError> {
   if requests.len() <= 1 || requests.iter().all(|request| package_root(cache_root, request).exists()) {
-    return requests.iter().map(|request| ensure_package(agent, request, cache_root, endpoints)).collect();
+    return requests
+      .iter()
+      .map(|request| ensure_package(agent, request, cache_root, endpoints, true))
+      .collect();
   }
 
   let cursor = AtomicUsize::new(0);
@@ -832,7 +830,7 @@ fn ensure_wave(agent: &ureq::Agent, requests: &[PackageRequest], cache_root: &Pa
           if index >= requests.len() {
             break;
           }
-          let result = ensure_package(&worker_agent, &requests[index], cache_root, endpoints);
+          let result = ensure_package(&worker_agent, &requests[index], cache_root, endpoints, false);
           results.lock().expect("package worker result lock is not poisoned").push((index, result));
         }
       });
@@ -843,14 +841,20 @@ fn ensure_wave(agent: &ureq::Agent, requests: &[PackageRequest], cache_root: &Pa
   results.into_iter().map(|(_, result)| result).collect()
 }
 
-fn ensure_package(agent: &ureq::Agent, request: &PackageRequest, cache_root: &Path, endpoints: &[ServiceEndpoint]) -> Result<CachedPackage, PackageError> {
+fn ensure_package(
+  agent: &ureq::Agent,
+  request: &PackageRequest,
+  cache_root: &Path,
+  endpoints: &[ServiceEndpoint],
+  parallel_extract: bool,
+) -> Result<CachedPackage, PackageError> {
   let root = package_root(cache_root, request);
   if root.exists() {
     return validate_cached_package(&root, request, true, 0, 0);
   }
   let mut last_error = None;
   for endpoint in endpoints {
-    match download_and_publish(agent, request, cache_root, endpoint) {
+    match download_and_publish(agent, request, cache_root, endpoint, parallel_extract) {
       Ok(package) => return Ok(package),
       Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
       Err(error) => return Err(error),
@@ -869,47 +873,31 @@ fn package_root(cache_root: &Path, request: &PackageRequest) -> PathBuf {
   cache_root.join(&request.lower_id).join(&request.version)
 }
 
-#[derive(Deserialize)]
-struct RegistrationLeaf {
-  #[serde(rename = "catalogEntry")]
-  catalog_entry: String,
-  #[serde(rename = "packageContent")]
-  package_content: String,
-}
-
-#[derive(Deserialize)]
-struct CatalogEntry {
-  id: String,
-  version: String,
-  #[serde(rename = "packageHash")]
-  package_hash: String,
-  #[serde(rename = "packageHashAlgorithm")]
-  package_hash_algorithm: String,
-  #[serde(rename = "packageSize")]
-  package_size: u64,
-}
-
 struct PackageMetadata {
   content_url: String,
-  hash: String,
-  size: u64,
+  expected_hash: Option<String>,
+  expected_size: Option<u64>,
   requests: u32,
 }
 
-fn download_and_publish(agent: &ureq::Agent, request: &PackageRequest, cache_root: &Path, endpoint: &ServiceEndpoint) -> Result<CachedPackage, PackageError> {
+fn download_and_publish(
+  agent: &ureq::Agent,
+  request: &PackageRequest,
+  cache_root: &Path,
+  endpoint: &ServiceEndpoint,
+  parallel_extract: bool,
+) -> Result<CachedPackage, PackageError> {
   let metadata = match endpoint {
     ServiceEndpoint::V2 { base, .. } => v2_package_metadata(agent, request, base)?,
-    ServiceEndpoint::V3 {
-      package_base,
-      registration_base,
-      ..
-    } => v3_package_metadata(agent, request, package_base, registration_base)?,
+    ServiceEndpoint::V3 { package_base, .. } => v3_package_metadata(request, package_base),
   };
-  if metadata.size > MAX_PACKAGE_BYTES {
+  if let Some(size) = metadata.expected_size
+    && size > MAX_PACKAGE_BYTES
+  {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
       &metadata.content_url,
-      format!("package size {} exceeds the {} byte limit", metadata.size, MAX_PACKAGE_BYTES),
+      format!("package size {size} exceeds the {MAX_PACKAGE_BYTES} byte limit"),
     ));
   }
 
@@ -920,22 +908,27 @@ fn download_and_publish(agent: &ureq::Agent, request: &PackageRequest, cache_roo
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
   let nupkg_path = temp_root.join(&nupkg_name);
   let (hash, bytes) = download_package(agent, &metadata.content_url, &nupkg_path)?;
-  if bytes != metadata.size {
+  if let Some(expected) = metadata.expected_size
+    && bytes != expected
+  {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
       &metadata.content_url,
-      format!("downloaded package size {bytes} does not match source metadata size {}", metadata.size),
+      format!("downloaded package size {bytes} does not match source metadata size {expected}"),
     ));
   }
-  if hash != metadata.hash {
+  if let Some(expected) = &metadata.expected_hash
+    && hash != *expected
+  {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
       &metadata.content_url,
       "downloaded package SHA-512 does not match source metadata",
     ));
   }
-  validate_and_extract_archive(&nupkg_path, &temp_root)?;
+  validate_and_extract_archive(&nupkg_path, &temp_root, parallel_extract)?;
   normalize_nuspec_name(&temp_root, request)?;
+  validate_staged_nuspec_identity(&temp_root, request)?;
   fs::write(temp_root.join(format!("{nupkg_name}.sha512")), hash.as_bytes()).map_err(|error| package_io("write package hash", &temp_root, error))?;
   let package_metadata = serde_json::json!({
     "schemaVersion": 1,
@@ -965,44 +958,16 @@ fn download_and_publish(agent: &ureq::Agent, request: &PackageRequest, cache_roo
   Ok(cached)
 }
 
-fn v3_package_metadata(agent: &ureq::Agent, request: &PackageRequest, package_base: &str, registration_base: &str) -> Result<PackageMetadata, PackageError> {
-  let leaf_url = format!("{registration_base}{}/{}.json", request.lower_id, request.version);
-  let leaf: RegistrationLeaf = get_json(agent, &leaf_url)?;
-  let catalog: CatalogEntry = get_json(agent, &leaf.catalog_entry)?;
-  if !catalog.id.eq_ignore_ascii_case(&request.id) || normalize_version(&catalog.version)? != request.version {
-    return Err(PackageError::new(
-      PackageErrorKind::Integrity,
-      &leaf.catalog_entry,
-      format!(
-        "registration metadata identity {} {} does not match requested {} {}",
-        catalog.id, catalog.version, request.id, request.version
-      ),
-    ));
+fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageMetadata {
+  PackageMetadata {
+    content_url: format!(
+      "{package_base}{}/{}/{}.{}.nupkg",
+      request.lower_id, request.version, request.lower_id, request.version
+    ),
+    expected_hash: None,
+    expected_size: None,
+    requests: 0,
   }
-  if !catalog.package_hash_algorithm.eq_ignore_ascii_case("SHA512") {
-    return Err(PackageError::new(
-      PackageErrorKind::Integrity,
-      &leaf.catalog_entry,
-      format!("unsupported package hash algorithm {:?}", catalog.package_hash_algorithm),
-    ));
-  }
-  let expected_url = format!(
-    "{package_base}{}/{}/{}.{}.nupkg",
-    request.lower_id, request.version, request.lower_id, request.version
-  );
-  if leaf.package_content != expected_url {
-    return Err(PackageError::new(
-      PackageErrorKind::Integrity,
-      &leaf.package_content,
-      "registration package URL does not match the selected source package base address",
-    ));
-  }
-  Ok(PackageMetadata {
-    content_url: leaf.package_content,
-    hash: catalog.package_hash,
-    size: catalog.package_size,
-    requests: 2,
-  })
 }
 
 fn v2_package_metadata(agent: &ureq::Agent, request: &PackageRequest, base: &str) -> Result<PackageMetadata, PackageError> {
@@ -1089,8 +1054,8 @@ fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes
   }
   Ok(PackageMetadata {
     content_url,
-    hash: hash.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no package hash"))?,
-    size: size.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no valid package size"))?,
+    expected_hash: Some(hash.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no package hash"))?),
+    expected_size: Some(size.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no valid package size"))?),
     requests: 1,
   })
 }
@@ -1164,7 +1129,13 @@ fn network_error(context: impl Into<String>, message: impl Into<String>) -> Pack
   PackageError::new(PackageErrorKind::Network, context, message)
 }
 
-fn validate_and_extract_archive(nupkg_path: &Path, destination: &Path) -> Result<(), PackageError> {
+struct ArchiveEntryPlan {
+  index: usize,
+  path: PathBuf,
+  is_directory: bool,
+}
+
+fn validate_and_extract_archive(nupkg_path: &Path, destination: &Path, parallel: bool) -> Result<(), PackageError> {
   let file = fs::File::open(nupkg_path).map_err(|error| package_io("open package archive", nupkg_path, error))?;
   let mut archive = ZipArchive::new(file).map_err(|error| archive_error(nupkg_path, format!("invalid ZIP archive: {error}")))?;
   if archive.len() > MAX_ARCHIVE_ENTRIES {
@@ -1174,6 +1145,7 @@ fn validate_and_extract_archive(nupkg_path: &Path, destination: &Path) -> Result
     ));
   }
   let mut names = HashSet::with_capacity(archive.len());
+  let mut plans = Vec::with_capacity(archive.len());
   let mut total = 0u64;
   for index in 0..archive.len() {
     let entry = archive
@@ -1205,23 +1177,59 @@ fn validate_and_extract_archive(nupkg_path: &Path, destination: &Path) -> Result
     if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
       return Err(archive_error(nupkg_path, format!("archive contains symbolic link {:?}", entry.name())));
     }
+    plans.push(ArchiveEntryPlan {
+      index,
+      path: enclosed.to_owned(),
+      is_directory: entry.is_dir(),
+    });
   }
 
-  for index in 0..archive.len() {
-    let mut entry = archive
-      .by_index(index)
-      .map_err(|error| archive_error(nupkg_path, format!("failed to read ZIP entry {index}: {error}")))?;
-    let enclosed = entry.enclosed_name().expect("validated archive path").to_owned();
-    let target = destination.join(enclosed);
-    if entry.is_dir() {
+  for plan in &plans {
+    let target = destination.join(&plan.path);
+    if plan.is_directory {
       fs::create_dir_all(&target).map_err(|error| package_io("create package directory", &target, error))?;
-    } else {
-      if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| package_io("create package directory", parent, error))?;
-      }
-      let mut output = fs::File::create(&target).map_err(|error| package_io("extract package file", &target, error))?;
-      io::copy(&mut entry, &mut output).map_err(|error| package_io("extract package file", &target, error))?;
+    } else if let Some(parent) = target.parent() {
+      fs::create_dir_all(parent).map_err(|error| package_io("create package directory", parent, error))?;
     }
+  }
+
+  let file_count = plans.iter().filter(|plan| !plan.is_directory).count();
+  if !parallel || file_count < MIN_PARALLEL_EXTRACTION_ENTRIES {
+    return extract_archive_range(&mut archive, &plans, nupkg_path, destination);
+  }
+
+  let worker_count = file_count.min(MAX_EXTRACTION_WORKERS);
+  let mut archives = Vec::with_capacity(worker_count);
+  for _ in 0..worker_count {
+    let file = fs::File::open(nupkg_path).map_err(|error| package_io("open package archive", nupkg_path, error))?;
+    archives.push(ZipArchive::new(file).map_err(|error| archive_error(nupkg_path, format!("invalid ZIP archive: {error}")))?);
+  }
+  thread::scope(|scope| {
+    let plans = plans.as_slice();
+    let mut workers = Vec::with_capacity(worker_count);
+    for (worker, mut archive) in archives.into_iter().enumerate() {
+      let start = plans.len() * worker / worker_count;
+      let end = plans.len() * (worker + 1) / worker_count;
+      workers.push(scope.spawn(move || extract_archive_range(&mut archive, &plans[start..end], nupkg_path, destination)));
+    }
+    for worker in workers {
+      worker.join().map_err(|_| archive_error(nupkg_path, "package extraction worker panicked"))??;
+    }
+    Ok(())
+  })
+}
+
+fn extract_archive_range(archive: &mut ZipArchive<fs::File>, plans: &[ArchiveEntryPlan], archive_path: &Path, destination: &Path) -> Result<(), PackageError> {
+  for plan in plans {
+    if plan.is_directory {
+      continue;
+    }
+    let mut entry = archive
+      .by_index(plan.index)
+      .map_err(|error| archive_error(archive_path, format!("failed to read ZIP entry {}: {error}", plan.index)))?;
+    let target = destination.join(&plan.path);
+    let mut output = fs::File::create(&target).map_err(|error| package_io("extract package file", &target, error))?;
+    io::copy(&mut entry, &mut output).map_err(|error| package_io("extract package file", &target, error))?;
   }
   Ok(())
 }
@@ -1317,6 +1325,54 @@ fn find_nuspec(root: &Path) -> Result<PathBuf, PackageError> {
     }
   }
   found.ok_or_else(|| PackageError::new(PackageErrorKind::Integrity, root.display().to_string(), "package contains no root nuspec"))
+}
+
+fn validate_staged_nuspec_identity(root: &Path, request: &PackageRequest) -> Result<(), PackageError> {
+  let path = find_nuspec(root)?;
+  let bytes = fs::read(&path).map_err(|error| package_io("read package manifest", &path, error))?;
+  let mut reader = Reader::from_reader(bytes.as_slice());
+  reader.config_mut().trim_text(true);
+  let mut current = NuspecText::None;
+  let mut id = None;
+  let mut version = None;
+  loop {
+    match reader.read_event() {
+      Ok(Event::Start(element)) => {
+        current = match local_name(element.name().as_ref()) {
+          b"id" if id.is_none() => NuspecText::Id,
+          b"version" if version.is_none() => NuspecText::Version,
+          _ => NuspecText::None,
+        };
+      },
+      Ok(Event::Text(text)) => {
+        let value = text
+          .xml_content(XmlVersion::Implicit1_0)
+          .map_err(|error| package_manifest_error(&path, format!("invalid nuspec text: {error}")))?
+          .into_owned();
+        match current {
+          NuspecText::Id => id = Some(value),
+          NuspecText::Version => version = Some(value),
+          NuspecText::None => {},
+        }
+      },
+      Ok(Event::End(_)) => current = NuspecText::None,
+      Ok(Event::Eof) => break,
+      Ok(_) => {},
+      Err(error) => return Err(package_manifest_error(&path, format!("invalid nuspec XML: {error}"))),
+    }
+  }
+  let found_id = id.ok_or_else(|| package_manifest_error(&path, "nuspec has no package id"))?;
+  let found_version = version.ok_or_else(|| package_manifest_error(&path, "nuspec has no package version"))?;
+  if !found_id.eq_ignore_ascii_case(&request.id) || normalize_version(&found_version)? != request.version {
+    return Err(package_manifest_error(
+      &path,
+      format!(
+        "nuspec identity {found_id} {found_version} does not match requested {} {}",
+        request.id, request.version
+      ),
+    ));
+  }
+  Ok(())
 }
 
 fn parse_cached_package(request: PackageRequest, cached: CachedPackage, target: TargetFramework, target_text: &str) -> Result<WorkPackage, PackageError> {
@@ -2219,8 +2275,43 @@ mod tests {
     let parsed = parse_v2_package_metadata(&request(), "https://packages.example.test/api/v2/Packages(...)", metadata).unwrap();
 
     assert_eq!(parsed.content_url, "https://packages.example.test/api/v2/package/Sample.Package/1.2.3");
-    assert_eq!(parsed.size, 42);
+    assert_eq!(parsed.expected_size, Some(42));
     assert_eq!(parsed.requests, 1);
+  }
+
+  #[test]
+  fn exact_v3_package_uses_only_the_discovered_flat_container() {
+    let service_index = serde_json::json!({
+      "resources": [{
+        "@id": "https://content.example.test/arbitrary/root",
+        "@type": ["PackageBaseAddress/3.0.0", "Other/1.0.0"]
+      }]
+    });
+    let package_base = package_base_from_service_index("https://feed.example.test/custom-index", &service_index).unwrap();
+
+    let metadata = v3_package_metadata(&request(), &package_base);
+
+    assert_eq!(package_base, "https://content.example.test/arbitrary/root/");
+    assert_eq!(
+      metadata.content_url,
+      "https://content.example.test/arbitrary/root/sample.package/1.2.3/sample.package.1.2.3.nupkg"
+    );
+    assert_eq!(metadata.expected_hash, None);
+    assert_eq!(metadata.expected_size, None);
+    assert_eq!(metadata.requests, 0);
+  }
+
+  #[test]
+  fn staged_package_identity_must_match_before_publication() {
+    let temp = TempDirectory::new();
+    temp.write(
+      "sample.package.nuspec",
+      r#"<package><metadata><id>Different.Package</id><version>1.2.3</version></metadata></package>"#,
+    );
+
+    let error = validate_staged_nuspec_identity(&temp.0, &request()).unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Integrity);
   }
 
   #[test]
@@ -2292,9 +2383,34 @@ mod tests {
     archive.write_all(b"not allowed").unwrap();
     archive.finish().unwrap();
 
-    let error = validate_and_extract_archive(&archive_path, &temp.0.join("staging")).unwrap_err();
+    let error = validate_and_extract_archive(&archive_path, &temp.0.join("staging"), false).unwrap_err();
 
     assert_eq!(error.kind(), PackageErrorKind::Archive);
     assert!(!temp.0.join("escape.dll").exists());
+  }
+
+  #[test]
+  fn parallel_archive_extraction_preserves_every_entry() {
+    let temp = TempDirectory::new();
+    let archive_path = temp.0.join("parallel.nupkg");
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = ZipWriter::new(file);
+    for index in 0..MIN_PARALLEL_EXTRACTION_ENTRIES {
+      archive
+        .start_file(format!("lib/net10.0/asset-{index}.dll"), SimpleFileOptions::default())
+        .unwrap();
+      archive.write_all(format!("asset {index}").as_bytes()).unwrap();
+    }
+    archive.finish().unwrap();
+    let destination = temp.0.join("staging");
+
+    validate_and_extract_archive(&archive_path, &destination, true).unwrap();
+
+    for index in 0..MIN_PARALLEL_EXTRACTION_ENTRIES {
+      assert_eq!(
+        fs::read_to_string(destination.join(format!("lib/net10.0/asset-{index}.dll"))).unwrap(),
+        format!("asset {index}")
+      );
+    }
   }
 }

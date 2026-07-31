@@ -20,11 +20,11 @@ dv project inspect              3.846 ms median
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
-dotnet restore (cold deps)     910.292 ms median
-dv restore (cold deps)         803.122 ms median
+dotnet restore (cold deps)     910.720 ms median
+dv restore (cold deps)         366.890 ms median
 
-dotnet restore (warm locked)   454.249 ms median
-dv restore (warm locked)         4.469 ms median
+dotnet restore (warm locked)   518.249 ms median
+dv restore (warm locked)         5.190 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK and the same evaluated
@@ -82,9 +82,10 @@ as the default target.
 
 `dv restore` (also available as `dv sync`) merges the supported
 `NuGet.Config` subset, speaks HTTPS NuGet v2 or v3 according to each source,
-streams and verifies package SHA-512 data, validates ZIP boundaries, publishes
-a NuGet-compatible cache entry atomically, and writes a deterministic
-`dv.lock.json`. A matching warm lock performs zero network requests.
+streams package payloads through SHA-512, validates v2 source hashes and ZIP
+boundaries, publishes a NuGet-compatible cache entry atomically, and writes a
+deterministic `dv.lock.json`. A matching warm lock performs zero network
+requests.
 
 `dv build --plan` selects the newest installed reference pack matching the
 project target, parses its manifest, selects Roslyn plus built-in and package
@@ -148,8 +149,8 @@ Initial machine:
 - Windows 11 `10.0.22631`, x86-64
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
-- 30 retained samples after 3 warm-ups (5 for compiler planning); 5 retained
-  samples after 1 warm-up for cold dependencies; 10 retained samples after 3
+- 30 retained samples after 3 warm-ups (5 for compiler planning); 10 retained
+  samples after 2 warm-ups for cold dependencies; 10 retained samples after 3
   warm-ups for warm locked restore
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
@@ -159,8 +160,8 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
-| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 910.292 ms | 803.122 ms | 1.1x | 952.869 ms | 1,926.573 ms |
-| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 454.249 ms | 4.469 ms | 101.6x | 456.167 ms | 4.954 ms |
+| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 910.720 ms | 366.890 ms | 2.5x | 963.904 ms | 482.027 ms |
+| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 518.249 ms | 5.190 ms | 99.9x | 547.722 ms | 5.903 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
@@ -186,7 +187,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
-cargo bench-all --case package_sync_cold --samples 5 --warmups 1
+cargo bench-all --case package_sync_cold --samples 10 --warmups 2
 cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 

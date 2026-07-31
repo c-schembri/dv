@@ -7,30 +7,88 @@ fallbacks.
 
 It is a capability map, not a schedule. A checked item is present in the
 repository at the snapshot below. An unchecked item is required unless it is
-explicitly marked `DEFER` or `REJECT`.
+explicitly identified as a native `dv` addition. `REJECT` describes safe
+intermediate behavior for an unfinished compatibility row, not optional work.
 
-Snapshot: working tree on 2026-07-31, based on commit `e171e92`.
+Snapshot: working tree on 2026-07-31, based on commit `95a02db`.
 
 ## Scope Contract
 
-Feature parity has three rings:
+Feature parity has three simultaneous layers:
 
-1. **Required product parity:** the workflows named in `PLAN.md`: create,
-   restore/sync, build, run, test, package management, pack, publish, and
-   SDK/runtime management for existing SDK-style projects and solutions.
-2. **Practical adjacent parity:** clean, solution/reference editing, package
-   search and source management, watch, shell integration, and CI-facing
-   behavior that real repositories need around the required workflows.
-3. **Explicit non-goals:** arbitrary MSBuild execution, identical console
-   prose, Visual Studio UI behavior, reimplementing Roslyn or CoreCLR, and
-   silently approximating unsupported project behavior.
+1. **Drop-in invocation parity:** replacing only the executable token in a
+   supported `dotnet`, direct MSBuild, NuGet, or VSTest command must preserve
+   the existing command, option, argument, environment, exit, side-effect, and
+   machine-consumed output contract.
+2. **Workflow and artifact parity:** the workflows named in `PLAN.md` must
+   evaluate the same meaningful inputs and produce the same meaningful
+   dependency decisions, compiler inputs, artifacts, test results, packages,
+   publish trees, and runtime behavior.
+3. **Native `dv` experience:** `dv` may additionally organize commands and
+   parameters into a smaller or clearer vocabulary, such as `dv sync`, but
+   that vocabulary is an alias over the same typed transforms. It never
+   replaces or weakens the compatibility spellings.
 
-This is therefore not literal parity with every command shipped under the
-`dotnet` driver. Literal parity would include global tools, workloads,
-`dotnet msbuild`, build-server control, runtime stores, `dev-certs`,
-`user-secrets`, and product-specific tools such as Entity Framework. Those
-surfaces are recorded separately at the end so the scope cannot drift
-silently.
+Drop-in means these substitutions are product contracts:
+
+| Existing invocation | Required `dv` invocation | Contract |
+|---|---|---|
+| `dotnet build App.sln -c Release` | `dv build App.sln -c Release` | Same accepted arguments and meaningful build result |
+| `dotnet restore App.sln --locked-mode` | `dv restore App.sln --locked-mode` | Same restore and locked-mode behavior |
+| `dotnet msbuild App.sln -t:Build -p:X=Y` | `dv msbuild App.sln -t:Build -p:X=Y` | Same MSBuild command-line shape |
+| `msbuild App.sln /t:Build /p:X=Y` | `dv App.sln /t:Build /p:X=Y` | Direct-MSBuild shape inferred without rewriting arguments |
+| `nuget restore App.sln -NonInteractive` | `dv restore App.sln -NonInteractive` | NuGet spelling and behavior accepted |
+| `vstest.console Tests.dll /TestCaseFilter:X` | `dv Tests.dll /TestCaseFilter:X` | Direct VSTest container/options shape inferred |
+| `dotnet Tests.dll arg` | `dv Tests.dll arg` | Same managed-application host behavior |
+
+The canonical `dv` syntax may differ only as an additional entry point. For
+example, both `dv sync` and `dv restore` may reach the same restore transform,
+but removing `dv restore` or changing the meaning of a reference option would
+break the drop-in contract.
+
+The drop-in target includes the command-line surfaces shipped by the selected
+.NET SDK/tool versions. Compatibility is versioned because those surfaces
+change. Every release must publish a machine-readable compatibility manifest
+that lists the reference tool/version, commands, option spellings, defaults,
+environment inputs, exit behavior, output formats, and known unsupported rows.
+
+Explicit non-goals are limited to:
+
+- invoking `dotnet`, the Microsoft MSBuild engine, NuGet, or VSTest as a hidden
+  production fallback;
+- reproducing Microsoft internal architecture rather than behavior;
+- byte-identical incidental prose, timing, nondeterministic identifiers, or
+  terminal decoration that no documented or observed automation consumes;
+- Visual Studio UI behavior, except for files and design-time command results
+  required for repository/tool interoperability;
+- reimplementing Roslyn or the Microsoft runtime;
+- silently approximating unsupported behavior.
+
+MSBuild project, target, and task semantics required by the compatibility
+corpus are in scope. Rust still owns evaluation, target planning, scheduling,
+incremental state, and reporting. Managed built-in or custom task assemblies
+may eventually run through a versioned typed task-host boundary; invoking the
+Microsoft MSBuild engine is not an acceptable implementation.
+
+### Drop-In Definition Of Done
+
+A compatibility row is complete only when:
+
+1. the reference command is copied unchanged except for replacing its
+   executable token with `dv`;
+2. `dv` accepts the same paths, commands, options, aliases, ordering, quoting,
+   response files, environment, stdin, and working directory;
+3. it performs the same meaningful restore/build/test/run/package/publish
+   decisions and side effects without launching a forbidden fallback;
+4. it returns compatible exit behavior and every documented or observed
+   machine-consumed output format;
+5. its artifacts or observable runtime behavior match the reference oracle;
+6. canonical `dv` syntax, when offered, normalizes to the same typed request;
+7. unsupported input fails explicitly and keeps that row marked incomplete.
+
+Incidental interactive prose may be clearer in native `dv` mode. Compatibility
+mode must retain text layouts that real scripts parse, even when those layouts
+are not formally documented.
 
 ## Status And Delivery Labels
 
@@ -42,9 +100,11 @@ silently.
 - `P3` testing.
 - `P4` distribution and SDK/runtime acquisition.
 - `P5` broad compatibility.
-- `ADJ` practical adjacent parity.
-- `DEFER` not required by the current product contract.
 - `REJECT` must produce a stable diagnostic rather than approximate behavior.
+
+`REJECT` is an honest intermediate state, not drop-in completion. A command or
+project can be called drop-in compatible only when every exercised row in its
+versioned compatibility manifest is implemented.
 
 No percentage-complete value is assigned. The items differ radically in cost
 and risk, so a count-based percentage would be misleading.
@@ -55,6 +115,8 @@ and risk, so a count-based percentage would be misleading.
 
 Repository-owned representative input currently consists of:
 
+- raw OS argument vectors shaped like `dotnet`, MSBuild, NuGet, and VSTest
+  invocations, although a checked-in compatibility corpus does not yet exist;
 - five SDK-style C# projects;
 - five C# source files;
 - three project-reference edges;
@@ -69,14 +131,16 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 7,617 nonblank source
-lines, and 42 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 12 Rust source files, 7,720 nonblank source
+lines, and 45 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
 Current output is command-local human text or a schema-v1 JSON-lines event
-batch. Future workflows must additionally own:
+batch. Drop-in modes must also reproduce documented or observed
+machine-consumed text/JSON/XML/binary-log formats and tool-specific exit
+behavior. Future workflows must additionally own:
 
 - a command-lifetime workspace inventory;
 - evaluated project and target records;
@@ -92,8 +156,9 @@ producer only until the reporter call completes.
 
 ### Observed Distribution And Missing Facts
 
-The observed common case is currently tiny, package-free, SDK-style C# on
-Windows. It cannot justify large-repository layouts or concurrency thresholds.
+The observed common case is currently tiny, mostly package-free, SDK-style C#
+on Windows. It cannot justify large-repository layouts or concurrency
+thresholds.
 
 `ASSUMPTION: SDK-style C# projects using PackageReference are the dominant
 initial customer input - affects language, evaluator, and resolver sequencing.`
@@ -101,9 +166,10 @@ initial customer input - affects language, evaluator, and resolver sequencing.`
 `ASSUMPTION: repeated no-op build and test commands are the highest-value
 latency paths - affects fingerprint and daemon prioritization.`
 
-`ASSUMPTION: a useful first compatibility boundary can reject arbitrary custom
-tasks while accepting declarative properties, items, and imports that only
-affect known transforms - affects the evaluator and extension model.`
+`ASSUMPTION: a useful first compatibility boundary can initially reject
+arbitrary custom tasks while accepting declarative properties, items, and
+imports that only affect known transforms - affects sequencing, but every
+observed rejected task remains drop-in parity work.`
 
 Representative large, test-heavy, and authenticated multi-source data remains
 missing and is already tracked under `issues/`.
@@ -128,7 +194,8 @@ Frequently changing:
 
 The eventual inner-loop transform performs:
 
-1. argument and environment reads;
+1. one raw argument/environment read and compatibility-mode classification
+   with no filesystem or network work;
 2. ancestor walks and batched directory enumeration;
 3. XML, JSON, editor-config, solution, NuGet, and package-manifest reads;
 4. package cache lookups, HTTP requests, downloads, verification, extraction,
@@ -149,6 +216,7 @@ prove that nothing changed.
 |---|---|---|
 | Native process startup, help, and version | Implemented | `crates/dv-cli/src/main.rs` |
 | Stable unknown/unsupported command failures | Implemented | CLI tests and `DV0001`-`DV0003` |
+| Drop-in command parsing | Initial subset | several `dotnet` command names overlap; no complete tool/version grammar |
 | Installed SDK discovery | Implemented | `crates/dv-core/src/sdk.rs` |
 | `global.json` SDK selection | Implemented | policy and fixture tests |
 | SDK current/list human output | Implemented | CLI integration tests |
@@ -160,28 +228,31 @@ prove that nothing changed.
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
 | Package resolution and cache | Initial subset | exact versions, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
 | Solution discovery and evaluation | Missing | no production types or commands |
-| Restore, build, run, test | Missing | commands return `DV0003` |
+| Restore | Initial subset | exact package restore is implemented; most reference flags and graph cases remain |
+| Build execution, run, and test | Missing | build only plans inputs; run/test remain unsupported |
 | Pack, publish, SDK/runtime install | Missing | commands return `DV0003` |
 
 ## Dependency Spine
 
 The shortest dependency-respecting route to useful parity is:
 
-1. compatibility evidence and fixture expansion;
-2. command model and workspace selection;
-3. project/solution parsing;
-4. bounded declarative evaluation;
-5. framework, targeting-pack, and runtime-pack resolution;
-6. NuGet configuration, source access, package graph, cache, and lock state;
-7. target-expanded build graph;
-8. generated sources and compiler input batches;
-9. native Roslyn hosting and post-compile artifacts;
-10. incremental proof and deterministic scheduling;
-11. runtime launch;
-12. test protocol and adapters;
-13. pack and publish;
-14. SDK/runtime acquisition;
-15. broader SDK, language, framework, and extension compatibility.
+1. versioned invocation compatibility manifests and captured script corpus;
+2. compatibility parsers normalized into one typed command model;
+3. compatibility evidence and fixture expansion;
+4. workspace selection;
+5. project/solution parsing;
+6. bounded declarative evaluation;
+7. framework, targeting-pack, and runtime-pack resolution;
+8. NuGet configuration, source access, package graph, cache, and lock state;
+9. target-expanded build graph;
+10. generated sources and compiler input batches;
+11. native Roslyn hosting and post-compile artifacts;
+12. incremental proof and deterministic scheduling;
+13. runtime launch;
+14. test protocol and adapters;
+15. pack and publish;
+16. SDK/runtime acquisition;
+17. broader SDK, language, framework, and extension compatibility.
 
 A later stage may be prototyped against captured compatibility data, but it
 cannot be declared complete before its prerequisites have stable typed
@@ -197,8 +268,9 @@ contracts.
   request that retains lossless OS arguments where paths require it. `P1`
 - [ ] `CLI-006` Define global `--help`, `--version`, `--json`, `--verbose`,
   `--quiet`, `--color`, `--no-color`, and diagnostic verbosity behavior. `P1`
-- [ ] `CLI-007` Define stable exit-code classes for usage, compatibility,
-  restore, build, test failure, cancellation, and internal failure. `P1`
+- [ ] `CLI-007` Preserve the reference tool's documented and observed exit
+  behavior in compatibility mode, then map it to stable native `dv` outcome
+  classes internally. `P1`
 - [ ] `CLI-008` Support `--project`, explicit project/solution paths, and
   unambiguous current-directory defaults. `P1`
 - [ ] `CLI-009` Support repeated CLI property overrides without reparsing
@@ -206,7 +278,8 @@ contracts.
 - [ ] `CLI-010` Support configuration, framework, runtime, architecture,
   operating-system, output, artifacts-path, and no-restore selectors
   consistently across applicable commands. `P2`
-- [ ] `CLI-011` Reject unknown options before filesystem or network work. `P1`
+- [ ] `CLI-011` Reject unknown options at the same command boundary as the
+  reference tool, before unrelated filesystem or network work. `P1`
 - [ ] `CLI-012` Preserve arguments after `--` byte-for-byte for child
   application and test processes. `P1`
 - [ ] `CLI-013` Define environment-variable precedence and redact secrets from
@@ -215,12 +288,199 @@ contracts.
   propagate a bounded cancellation deadline to children. `P1`
 - [ ] `CLI-015` Preserve child exit codes where the command contract requires
   it and distinguish launch failure from child failure. `P1`
-- [ ] `CLI-016` Add response-file support only if representative repositories
-  require it; otherwise reject `@file` explicitly. `P5`
+- [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,
+  quoting, comments, default response-file discovery, opt-out, cycles, and
+  size/depth bounds. `P2`
 - [ ] `CLI-017` Version command syntax and JSON compatibility independently so
   a CLI alias does not mutate the event protocol. `P1`
 - [x] `CLI-018` Expose the initial evaluator through human and JSON
   `project inspect` output.
+
+## 1A. Drop-In Invocation Routing
+
+- [ ] `DROP-001` Generate a versioned compatibility manifest from the selected
+  reference SDK/tool set, covering every command, option alias, argument
+  position, default, environment input, exit case, and output format. `P1`
+- [ ] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
+  all accepted tool spellings into one typed command batch. `P1`
+- [ ] `DROP-003` Classify invocation mode deterministically before project,
+  SDK, filesystem, process, or network work. `P1`
+- [ ] `DROP-004` Treat a first token matching a `.csproj`, `.fsproj`, `.vbproj`,
+  `.sln`, `.slnx`, `.proj`, `.targets`, or `.props` input plus MSBuild switches
+  as direct-MSBuild replacement syntax. `P2`
+- [ ] `DROP-005` Treat one or more test-container inputs plus VSTest `/`
+  switches as direct `vstest.console` replacement syntax. `P3`
+- [ ] `DROP-006` Accept both `dv msbuild ...` from `dotnet -> dv` replacement
+  and `dv PROJECT ...` from `msbuild -> dv` replacement. `P2`
+- [ ] `DROP-007` Accept both `dv nuget COMMAND ...` from `dotnet -> dv`
+  replacement and `dv COMMAND ...` where the direct NuGet grammar is
+  unambiguous. `P2/P4`
+- [ ] `DROP-008` Accept `dv vstest ...` and direct test-container syntax for
+  `dotnet vstest` and `vstest.console` replacement. `P3`
+- [ ] `DROP-009` Accept `dv APP.dll ...`, `dv exec APP.dll ...`, and runtime
+  host options for direct `dotnet` application-host replacement. `P2`
+- [ ] `DROP-010` Resolve ambiguous command words such as `restore`, `pack`,
+  `push`, `list`, `add`, and `update` using an explicit precedence table that
+  matches the input shape and never guesses after side effects begin. `P1`
+- [ ] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
+  diagnostics and ambiguous automation without requiring it for ordinary
+  executable-token replacement. `P1`
+- [ ] `DROP-012` Detect optional executable aliases or shims named `dotnet`,
+  `msbuild`, `nuget`, and `vstest.console` through `argv[0]`, while keeping the
+  same parser and execution transforms. `P5`
+- [ ] `DROP-013` Preserve case sensitivity, option-prefix rules, combined
+  values, repeated options, separators, quoting, empty arguments, and end-of-
+  options behavior for the selected reference tool/platform. `P1-P3`
+- [ ] `DROP-014` Preserve precedence among command options, response files,
+  environment variables, config files, project properties, and defaults. `P2`
+- [ ] `DROP-015` Preserve script-consumed stdout/stderr placement, encodings,
+  line endings, quiet/verbosity behavior, JSON/XML schemas, result files, and
+  binary formats. `P1-P4`
+- [ ] `DROP-016` Preserve success, usage, build, restore, test-failure,
+  no-tests, cancellation, and child-process exit behavior per reference tool.
+  `P1-P3`
+- [ ] `DROP-017` Make help/version/info output expose both accepted
+  compatibility syntax and canonical `dv` syntax without changing the result
+  of reference `--help`, `/?`, or `help` forms. `P1`
+- [ ] `DROP-018` Accept deprecated aliases for as long as the pinned reference
+  tool does, emit equivalent deprecation diagnostics, and record removals in
+  the compatibility manifest. `P5`
+- [ ] `DROP-019` Prove that each canonical `dv` command and its compatibility
+  aliases create identical typed transform batches after parsing. `P1-P4`
+- [ ] `DROP-020` Maintain golden argv, environment, stdin, stdout, stderr, exit,
+  filesystem, process, and network traces for real CI/build-script
+  substitutions. `P1-P5`
+- [ ] `DROP-021` Add a `dv compat check` command that scans scripts and project
+  inputs, reports unsupported invocation rows without executing them, and
+  identifies the exact compatibility manifest version. `P2`
+- [ ] `DROP-022` Never claim a command is drop-in compatible while any accepted
+  option is ignored; every option must affect the typed request or fail
+  explicitly. `P1-P5`
+
+## 1B. `dotnet` Driver Command-Line Surface
+
+- [ ] `DNCLI-001` Support global `--info`, `--version`, `--list-sdks`,
+  `--list-runtimes`, architecture selection, diagnostics, help, and verbosity
+  with compatible text layouts where scripts consume them. `P1/P4`
+- [ ] `DNCLI-002` Support `build`, `clean`, `new`, `pack`, `publish`,
+  `restore`, `run`, `test`, `vstest`, `msbuild`, `sdk check`, `sln`, and
+  managed-application execution entry points. `P1-P5`
+- [ ] `DNCLI-003` Support `package add/list/remove/search` and both current and
+  older `add/list/remove package` orderings for SDK versions that expose them.
+  `P2`
+- [ ] `DNCLI-004` Support `reference add/list/remove` and older
+  `add/list/remove reference` orderings. `P2`
+- [ ] `DNCLI-005` Support `nuget delete/push/locals` and source
+  add/disable/enable/list/remove/update command trees. `P2/P4`
+- [ ] `DNCLI-006` Support workload and tool command trees rather than treating
+  them as unknown top-level commands. `P5`
+- [ ] `DNCLI-007` Dispatch SDK-bundled and installed extension commands such as
+  `dev-certs`, `user-secrets`, `watch`, and `ef` through selected-runtime
+  hosting without invoking `dotnet`. `P5`
+- [ ] `DNCLI-008` Preserve command-specific short/long aliases, option
+  availability by SDK version, implicit restore, default configuration, and
+  terminal-logger defaults. `P1-P5`
+- [ ] `DNCLI-009` Preserve `--` forwarding and the command-specific boundary
+  between `dotnet` options, command options, MSBuild properties, test-runner
+  options, and application arguments. `P1-P3`
+- [ ] `DNCLI-010` Support `dotnet help` command lookup behavior using bundled
+  or local documentation with explicit offline behavior. `P5`
+- [ ] `DNCLI-011` Support `build-server shutdown` for every server type `dv`
+  actually implements and return compatible success for absent servers. `P5`
+- [ ] `DNCLI-012` Support runtime-store commands and outputs for SDK versions
+  that still expose `dotnet store`. `P5`
+
+## 1C. Direct MSBuild Command-Line Surface
+
+- [ ] `MSCLI-001` Accept `MSBuild.exe [Switches] [ProjectFile]` with the project
+  before, after, or among switches as the reference parser permits. `P2`
+- [ ] `MSCLI-002` Accept case-insensitive `-switch`, `/switch`, documented
+  `--switch`, full names, short names, `:value`, and separate-value forms per
+  platform and reference version. `P2`
+- [ ] `MSCLI-003` Support target selection with `-target`/`-t`, ordered target
+  lists, default targets, initial targets, and target result semantics. `P2`
+- [ ] `MSCLI-004` Support global properties with `-property`/`-p`, multiple
+  assignments, escaping, quoting, and immutable global-property precedence.
+  `P2`
+- [ ] `MSCLI-005` Support `-restore`, `-restoreProperty`, and the distinct
+  restore/build property sets in one invocation. `P2`
+- [ ] `MSCLI-006` Support `-graphBuild`, `-isolateProjects`,
+  `-inputResultsCaches`, and `-outputResultsCache` with deterministic graph
+  and cache protocols. `P5`
+- [ ] `MSCLI-007` Support `-maxCpuCount`/`-m`, `-nodeReuse`, low-priority,
+  interactive, and worker-count behavior through the native scheduler. `P2`
+- [ ] `MSCLI-008` Support `-toolsVersion`, `-ignoreProjectExtensions`,
+  `-validate`, and schema selection where the selected reference version
+  exposes them. `P5`
+- [ ] `MSCLI-009` Support `-verbosity`, `-noLogo`, `-noConsoleLogger`,
+  `-consoleLoggerParameters`, and detailed summary with compatible routing and
+  formatting. `P2`
+- [ ] `MSCLI-010` Support repeated file loggers, logger parameters,
+  distributed loggers, and forwarding loggers through a versioned `dv` logger
+  protocol or a compatible managed logger host. `P5`
+- [ ] `MSCLI-011` Produce compatible `.binlog` records for `-binaryLogger`
+  consumers, including project evaluation, target/task, message, diagnostic,
+  file-embed, and result events. `P5`
+- [ ] `MSCLI-012` Support `-preprocess`/`-pp` expanded-project output with import
+  provenance and selected global properties. `P2`
+- [ ] `MSCLI-013` Support `-getProperty`, `-getItem`, `-getTargetResult`, and
+  result JSON/text formats without running unrelated targets. `P2`
+- [ ] `MSCLI-014` Support `-targets` target-list output and
+  `-profileEvaluation` timing output. `P5`
+- [ ] `MSCLI-015` Support automatic `MSBuild.rsp`/`Directory.Build.rsp`
+  discovery and `-noAutoResponse`. `P2`
+- [ ] `MSCLI-016` Match parse-error, unknown-switch, missing-project,
+  ambiguous-project, invalid-property, target-failure, and cancellation exit
+  behavior. `P2`
+- [ ] `MSCLI-017` Capture the exact supported switch matrix from each reference
+  MSBuild version instead of treating a current documentation page as a stable
+  protocol. `P2-P5`
+- [ ] `MSCLI-018` Interpret MSBuild target/task graphs natively and host
+  required managed task assemblies through typed inputs/outputs; never call
+  the Microsoft MSBuild engine. `P2-P5`
+
+## 1D. Direct NuGet And VSTest Command-Line Surfaces
+
+- [ ] `NGCLI-001` Accept NuGet option names case-insensitively with compatible
+  `-Option`, repeated-option, value, quoting, and `-NonInteractive` behavior.
+  `P2`
+- [ ] `NGCLI-002` Support consumption commands `config`, `help`, `install`,
+  `list`, `locals`, `restore`, `search`, `setapikey`, `sources`, and `update`.
+  `P2/P5`
+- [ ] `NGCLI-003` Support creation commands `init`, `pack`, and `spec`. `P4/P5`
+- [ ] `NGCLI-004` Support publishing commands `add`, `delete`, `push`, and
+  source/API-key administration. `P4/P5`
+- [ ] `NGCLI-005` Preserve NuGet.Config/environment precedence, culture,
+  force-English output, verbosity, prompt, consent, and authentication
+  behavior. `P2`
+- [ ] `NGCLI-006` Preserve package/source query text formats used by scripts
+  and provide native JSON only as an additional mode. `P2`
+- [ ] `NGCLI-007` Handle NuGet command/version availability, deprecated
+  aliases, `update -self`, and Windows/Mono-only behaviors through the
+  versioned manifest. `P5`
+- [ ] `NGCLI-008` Keep `dv add/remove/list` canonical package UX equivalent to
+  the matching direct NuGet or `dotnet package` typed transforms where their
+  contracts overlap. `P2`
+- [ ] `VSTCLI-001` Accept one or more positional test containers followed or
+  preceded by VSTest options in any reference-supported order. `P3`
+- [ ] `VSTCLI-002` Accept case-insensitive `/Settings`, `/Tests`, `/Parallel`,
+  `/EnableCodeCoverage`, `/InIsolation`, `/TestAdapterPath`, `/Platform`,
+  `/Framework`, and `/TestCaseFilter` forms and mutual exclusions. `P3`
+- [ ] `VSTCLI-003` Accept repeated `/Logger`, `/Collect`, logger/data-collector
+  parameters, `/ResultsDirectory`, and compatible attachment/result paths.
+  `P3`
+- [ ] `VSTCLI-004` Support `/ListTests`, `/ListDiscoverers`,
+  `/ListExecutors`, `/ListLoggers`, and `/ListSettingsProviders` output. `P3`
+- [ ] `VSTCLI-005` Support `/Blame`, `/Diag`, blame crash/hang options, dumps,
+  sequence files, and platform availability behavior. `P3`
+- [ ] `VSTCLI-006` Support `/ParentProcessId`, `/Port`, design-mode protocol,
+  and test-host communication only through a bounded versioned host protocol.
+  `P5`
+- [ ] `VSTCLI-007` Preserve VSTest no-tests, test-failure, host-crash,
+  cancelled, usage, and success exit behavior. `P3`
+- [ ] `VSTCLI-008` Keep direct VSTest, `dotnet vstest`, `dotnet test`, and
+  canonical `dv test` parser paths distinct while sharing discovery/execution
+  batches. `P3`
 
 ## 2. Workspace And Input Discovery
 
@@ -269,17 +529,20 @@ contracts.
 - [ ] `SLN-008` Diagnose solution/project target-framework incompatibility with
   the exact edge and target pair. `P2`
 - [ ] `SLN-009` Implement `dv solution list/add/remove` with loss-minimizing
-  edits for `.sln` and structured edits for `.slnx`. `ADJ`
+  edits for `.sln` and structured edits for `.slnx`. `P2`
 - [ ] `SLN-010` Support solution-folder placement, root placement, globbed
-  adds, duplicate suppression, and `.sln` to `.slnx` migration. `ADJ`
+  adds, duplicate suppression, and `.sln` to `.slnx` migration. `P2`
 - [ ] `SLN-011` Compare parsed membership and configuration selection with the
   reference tool on representative solutions. `P2`
 
 ## 4. Declarative Project Evaluation
 
-The evaluator is not a general MSBuild engine. It must implement the subset
-needed to produce known typed transforms, and reject any construct that can
-change a supported output but is not understood.
+The evaluator is a native MSBuild-compatible evaluator, not a wrapper around
+the Microsoft MSBuild engine. It must expand from the initial known-transform
+subset toward the properties, items, imports, targets, and tasks exercised by
+the compatibility corpus. Any construct that can change an output but is not
+yet understood fails explicitly; that failure is an honest intermediate
+boundary, not final drop-in parity.
 
 - [~] `EVAL-001` Parse XML securely: BOM/encoding, namespaces, comments, CDATA,
   and entities without DTD or external-entity expansion. `P1`
@@ -318,11 +581,12 @@ change a supported output but is not understood.
 - [ ] `EVAL-017` Retain unknown XML as source evidence and classify it as
   irrelevant, supported extension input, or blocking unsupported behavior.
   `P1`
-- [ ] `EVAL-018` Never execute `Target`, `Task`, `UsingTask`, or `Exec` while
-  evaluating a build plan. `REJECT`
-- [ ] `EVAL-019` Translate a finite allowlist of SDK targets/tasks into native
-  transforms only after compatibility fixtures establish their data contract.
-  `P2`
+- [ ] `EVAL-018` Parse `Target`, task elements, `UsingTask`, and `Exec` into an
+  immutable target/task plan without executing them during evaluation. Execute
+  them only in the scheduled build stage. `P2`
+- [ ] `EVAL-019` Implement built-in SDK/MSBuild task semantics as typed native
+  transforms and required managed/custom tasks through a versioned task-host
+  protocol after compatibility fixtures establish their contracts. `P2-P5`
 - [ ] `EVAL-020` Report unsupported custom targets/imports with file, line,
   condition, affected output, and supported alternative when known. `P1`
 - [ ] `EVAL-021` Evaluate outer and inner builds for `TargetFrameworks`,
@@ -331,8 +595,9 @@ change a supported output but is not understood.
   target expansion dimensions rather than repeated project objects. `P2`
 - [ ] `EVAL-023` Support `Debug` and `Release` defaults plus arbitrary named
   configurations whose values are fully declarative. `P1`
-- [ ] `EVAL-024` Parse and apply `Directory.Build.rsp` or reject it explicitly
-  based on the selected compatibility boundary. `P5`
+- [ ] `EVAL-024` Parse and apply `MSBuild.rsp` and `Directory.Build.rsp` with
+  reference discovery, precedence, encoding, quoting, and opt-out behavior.
+  `P2`
 - [ ] `EVAL-025` Emit an evaluated-input manifest suitable for oracle
   comparison without exposing secrets. `P1`
 
@@ -380,8 +645,9 @@ change a supported output but is not understood.
 - [ ] `PROJ-019` Support content copy metadata for build and publish:
   `CopyToOutputDirectory`, `CopyToPublishDirectory`, target path, and
   preserve-newest semantics. `P2`
-- [ ] `PROJ-020` Reject legacy non-SDK projects until a separate compatibility
-  contract and fixtures exist. `REJECT`
+- [ ] `PROJ-020` Support legacy non-SDK projects under a separately versioned
+  MSBuild compatibility contract; reject them explicitly only until that P5
+  row is implemented. `P5`
 
 ## 6. Framework, Runtime, And Pack Resolution
 
@@ -466,16 +732,17 @@ change a supported output but is not understood.
   `buildTransitive` assets by TFM/RID and metadata. `P2`
 - [~] `RES-012` Implement compatible-framework reduction and framework
   fallback rules using SDK-owned framework data. `P2`
-- [x] `RES-013` Download `.nupkg` and hash metadata concurrently into bounded
+- [x] `RES-013` Stream exact `.nupkg` content through SHA-512 into bounded
   temporary storage. `P1`
-- [x] `RES-014` Verify package identity, version, SHA-512, ZIP structure,
-  duplicate paths, traversal paths, entry sizes, and total expansion limits
-  before cache commit. `P1`
+- [x] `RES-014` Verify package identity, version, v2 source hash/size, ZIP
+  structure, duplicate paths, traversal paths, entry sizes, and total
+  expansion limits before cache commit. `P1`
 - [ ] `RES-015` Verify author/repository signatures and trusted-signers policy
   with platform-correct certificate roots. `P2`
 - [~] `RES-016` Extract atomically into a NuGet-compatible global-packages
   layout with per-package concurrency coordination. `P1`
-- [~] `RES-017` Reuse the existing global package and HTTP caches when valid;
+- [~] `RES-017` Reuse the existing global package and HTTP caches when valid,
+  including conditionally revalidated service-index entries keyed by source;
   never rewrite a valid immutable entry. `P1`
 - [ ] `RES-018` Implement conditional HTTP caching, negative-result policy, and
   corruption quarantine. `P2`
@@ -494,11 +761,12 @@ change a supported output but is not understood.
 - [ ] `RES-024` Audit direct and transitive dependencies for known
   vulnerabilities with configurable severity and source policy. `P2`
 - [ ] `RES-025` Produce deterministic dependency trees for direct, transitive,
-  outdated, deprecated, and vulnerable package listing. `ADJ`
+  outdated, deprecated, and vulnerable package listing. `P2`
 - [ ] `RES-026` Add cache list/path/clear/prune operations with safe ownership
-  checks and concurrent-reader behavior. `ADJ`
-- [ ] `RES-027` Reject `packages.config` until a separate legacy restore
-  contract exists. `REJECT`
+  checks and concurrent-reader behavior. `P2`
+- [ ] `RES-027` Support `packages.config` restore/install/update semantics,
+  repository layout, project mutations, and NuGet version-specific resolution
+  under the direct NuGet compatibility contract. `P5`
 
 ## 9. Package And Reference Editing
 
@@ -519,9 +787,9 @@ change a supported output but is not understood.
 - [ ] `EDIT-008` `dv list` reports direct/transitive packages in human and JSON
   forms with stable ordering. `P2`
 - [ ] `EDIT-009` Add package search with source, prerelease, skip, take, exact,
-  and machine-readable result support. `ADJ`
+  and machine-readable result support. `P2`
 - [ ] `EDIT-010` Add/list/remove project references with relative path,
-  framework condition, duplicate, cycle, and compatibility checks. `ADJ`
+  framework condition, duplicate, cycle, and compatibility checks. `P2`
 - [ ] `EDIT-011` Use temp-file plus atomic replacement and preserve the
   original on parse, resolution, or write failure. `P2`
 
@@ -548,9 +816,63 @@ change a supported output but is not understood.
   already-running independent work to reach a defined cancellation boundary.
   `P2`
 - [ ] `GRAPH-011` Support clean, rebuild, no-incremental, and disable-build-
-  servers semantics without delegating. `ADJ`
+  servers semantics without delegating. `P2`
 - [ ] `GRAPH-012` Record per-stage input/output byte counts, process count,
   allocations, CPU work, and elapsed time at batch granularity. `P1`
+
+## 10A. MSBuild Target And Task Compatibility
+
+- [ ] `MSTASK-001` Parse project `InitialTargets`, `DefaultTargets`, and named
+  command-line targets into the native target graph. `P2`
+- [ ] `MSTASK-002` Implement `DependsOnTargets`, `BeforeTargets`,
+  `AfterTargets`, declaration-order tie breaking, duplicate suppression, and
+  the rule that a target executes at most once per build context. `P2`
+- [ ] `MSTASK-003` Implement target `Condition`, `Inputs`, `Outputs`,
+  `Returns`, `KeepDuplicateOutputs`, and partial/full incremental skipping.
+  `P2`
+- [ ] `MSTASK-004` Implement property groups, item groups, item definitions,
+  metadata, include/remove/update operations, and output capture inside
+  targets at execution time. `P2`
+- [ ] `MSTASK-005` Implement MSBuild batching by item lists and metadata,
+  including bucket construction, scoped property/item views, and deterministic
+  merge. `P5`
+- [ ] `MSTASK-006` Implement task parameter conversion, required/output
+  parameters, scalar/item arrays, escaped values, conditions, and output
+  property/item bindings. `P2`
+- [ ] `MSTASK-007` Implement `ContinueOnError`, `OnError`, warning/error
+  conversion, cancellation, yielded work, and target result propagation. `P2`
+- [ ] `MSTASK-008` Implement native equivalents for common data/filesystem
+  tasks such as `Message`, `Warning`, `Error`, `Copy`, `Delete`, `MakeDir`,
+  `RemoveDir`, `Touch`, `ReadLinesFromFile`, and `WriteLinesToFile`. `P2`
+- [ ] `MSTASK-009` Implement native graph/control tasks such as `CallTarget`
+  and `MSBuild` without recursive Microsoft MSBuild process launches. `P2`
+- [ ] `MSTASK-010` Implement compile/resource/reference/apphost/package tasks
+  as the typed transforms defined elsewhere in this map rather than generic
+  reflection calls. `P1-P5`
+- [ ] `MSTASK-011` Implement `Exec` with reference-compatible command,
+  working-directory, environment, encoding, timeout, exit-code, console-line,
+  logging, and cancellation behavior. `P2`
+- [ ] `MSTASK-012` Parse `UsingTask` assembly/task-factory declarations,
+  conditions, runtime/architecture requirements, parameter groups, and inline
+  task bodies. `P5`
+- [ ] `MSTASK-013` Define a length-bounded task-host protocol that loads
+  compatible managed task assemblies under the selected Microsoft runtime and
+  returns typed outputs/events without console scraping. `P5`
+- [ ] `MSTASK-014` Provide compatible task build-engine services for logging,
+  project builds, task objects, cancellation, yield/reacquire, and node
+  affinity without exposing `dv` hot-state pointers. `P5`
+- [ ] `MSTASK-015` Isolate task assembly load contexts, crashes, hangs, static
+  state, architecture, and runtime conflicts; recycle hosts at deterministic
+  boundaries. `P5`
+- [ ] `MSTASK-016` Require explicit trust policy for repository/package custom
+  tasks and make every external process, filesystem write, and network request
+  observable in compatibility evidence. `P5`
+- [ ] `MSTASK-017` Preserve target/task events and results sufficiently for
+  loggers, binary logs, `-getTargetResult`, IDE/design-time consumers, and
+  failure diagnostics. `P2-P5`
+- [ ] `MSTASK-018` Build a compatibility corpus of Microsoft.Common, .NET SDK,
+  NuGet, Web/Razor, desktop, test, and representative custom targets/tasks,
+  recording every unsupported task by frequency and affected workflow. `P2-P5`
 
 ## 11. Generated Inputs And Roslyn Compilation
 
@@ -681,7 +1003,7 @@ change a supported output but is not understood.
 - [ ] `RUN-011` Add file-based C# app run/build/publish only after the project
   vertical slice is complete. `P5`
 - [ ] `RUN-012` Add `dv watch` with debounced filesystem batches, rebuild
-  invalidation, restart, and hot-reload protocol as adjacent parity. `ADJ`
+  invalidation, restart, and hot-reload protocol. `P5`
 
 ## 15. Test Discovery And Execution
 
@@ -828,12 +1150,12 @@ change a supported output but is not understood.
 - [ ] `PUB-015` Add Web/Razor static web assets, web.config transforms, and
   related publish behavior only with Web SDK compatibility. `P5`
 - [ ] `PUB-016` Add container-image publishing as a later distribution target,
-  with registry auth, deterministic layers, and signed metadata. `DEFER`
+  with registry auth, deterministic layers, and signed metadata. `P5`
 - [ ] `PUB-017` Add NuGet package push with API key/credential provider,
   duplicate policy, timeout, retries, symbols source, and secret redaction.
   `P4`
 - [ ] `PUB-018` Add package delete/unlist only as an explicit destructive
-  command with source capability checks. `ADJ`
+  command with source capability checks. `P4`
 
 ## 19. SDK And Runtime Management
 
@@ -905,7 +1227,7 @@ change a supported output but is not understood.
 - [ ] `EVT-014` Add optional trace/evidence files containing evaluation,
   resolution, cache, process, and timing data with an explicit schema. `P2`
 - [ ] `EVT-015` Generate shell completions and command documentation from the
-  typed command model. `ADJ`
+  typed command model. `P5`
 - [ ] `EVT-016` Define a stable IDE/editor integration protocol only after
   CLI/JSON consumers prove which data is needed. `P5`
 
@@ -975,7 +1297,7 @@ vertical slice is correct and measured.
   `P5`
 - [ ] `BROAD-011` Platform TFMs and workloads for Android, iOS, Mac Catalyst,
   tvOS, browser, and WASI only as individually measured compatibility
-  programs. `DEFER`
+  programs. `P5`
 - [ ] `BROAD-012` Native AOT and workload-specific custom tasks remain explicit
   failures until their Microsoft tool inputs can be invoked through typed
   protocols without MSBuild fallback. `REJECT until P5`
@@ -1023,12 +1345,37 @@ vertical slice is correct and measured.
   even if `dv` is faster. `P1-P5`
 - [ ] `GATE-014` Label every unmeasured performance hypothesis
   **unverified** and name its deciding benchmark. `P1-P5`
+- [ ] `GATE-015` Enumerate commands/options from pinned `dotnet`, MSBuild,
+  NuGet, and VSTest help/version output and fail when the published
+  compatibility manifest omits a row. `P1-P5`
+- [ ] `GATE-016` Run paired executable-token tests that keep the complete argv,
+  environment, stdin, working directory, and input filesystem identical while
+  changing only the reference executable to `dv`. `P1-P5`
+- [ ] `GATE-017` Compare exit code, stdout/stderr roles, documented
+  machine-readable output, created/changed/deleted files, processes, network
+  requests, and meaningful artifacts for every paired invocation. `P1-P5`
+- [ ] `GATE-018` Verify canonical `dv` syntax and every compatibility alias
+  normalize to an identical typed command batch before execution. `P1-P5`
+- [ ] `GATE-019` Maintain real CI-script fixtures from GitHub Actions, Azure
+  Pipelines, build scripts, Dockerfiles, and local shell workflows with only
+  the executable token substituted. `P2-P5`
+- [ ] `GATE-020` Test output consumers, not only snapshots: parse generated
+  JSON, XML, TRX, lock files, assets files, binary logs, and list/info text
+  using representative downstream tools. `P2-P5`
+- [ ] `GATE-021` Record compatibility separately for each supported SDK,
+  MSBuild, NuGet, VSTest, OS, architecture, and shell combination. `P1-P5`
+- [ ] `GATE-022` Block unqualified drop-in release claims when any required
+  manifest row is missing, rejected, ignored, or only tested through canonical
+  `dv` syntax. `P1-P5`
 
 ## Simplification Pass
 
 This mapping deliberately removes the following machinery:
 
-- no general MSBuild interpreter or arbitrary task runner;
+- no invocation of the Microsoft MSBuild engine and no separate evaluator or
+  scheduler per compatibility syntax;
+- no duplicated execution paths for `dotnet`, direct MSBuild, NuGet, VSTest,
+  and canonical `dv` commands after they become typed requests;
 - no plugin framework before a real extension protocol consumer exists;
 - no daemon before isolated compiler-host and whole-process benchmarks prove
   persistence is required;
@@ -1042,8 +1389,10 @@ This mapping deliberately removes the following machinery:
 - no broad language/workload implementation before the minimal C# vertical
   slice is artifact-compatible.
 
-The primary fallback is explicit rejection with a stable diagnostic, captured
-unsupported evidence, and a supported alternative when one exists.
+The temporary implementation boundary is explicit rejection with a stable
+diagnostic, captured unsupported evidence, and a supported alternative when
+one exists. Rejection prevents incorrect artifacts, but the rejected row
+remains missing drop-in parity work.
 
 ## Phase Completion Gates
 
@@ -1053,40 +1402,54 @@ Complete only when the package-free and package-bearing console/library
 fixtures can sync, build, no-op build, incrementally rebuild, and run without a
 production `dotnet`, MSBuild, NuGet, or VSTest process. Evaluated inputs,
 compiler batches, artifacts, and observable execution must match the oracle
-contract.
+contract. The supported vertical slice must work through both canonical `dv`
+syntax and direct executable-token replacements such as replacing
+`dotnet restore` with `dv restore`, `dotnet build` with `dv build`, and
+`dotnet run` with `dv run`.
 
 ### P2: Real Repositories
 
 Complete only when `.sln`/`.slnx`, multi-target projects, package sources,
 central package management, private authentication, package editing, concurrent
 cache use, and cross-platform output pass representative fixtures and failure
-injection.
+injection. Replacing direct `msbuild` with `dv`, `dotnet msbuild` with
+`dv msbuild`, and direct `nuget` with `dv` must also pass the versioned
+invocation manifests for the supported project/restore surface.
 
 ### P3: Testing
 
 Complete only when supported VSTest-adapter and MTP repositories have equivalent
 discovery, filtering, execution, result, attachment, cancellation, and exit
-behavior, with bounded memory and measured scheduling.
+behavior, with bounded memory and measured scheduling. The same test batches
+must be reachable through `dotnet test`, `dotnet vstest`,
+`vstest.console`, and canonical `dv test` replacement shapes.
 
 ### P4: Distribution
 
 Complete only when pack, app publish, package push, and SDK/runtime acquisition
 produce verified contents, survive interruption, redact secrets, and have
-cold/warm resource evidence.
+cold/warm resource evidence. Reference `dotnet` and NuGet command names,
+options, defaults, outputs, and exits must pass executable-token replacement
+tests.
 
 ### P5: Broad Compatibility
 
-Complete per SDK/language/workload row, never as a blanket claim. Each row needs
-its own input contract, rejection boundary, oracle corpus, artifacts, failures,
-and benchmark evidence.
+Complete per SDK/language/workload/tool row. A scoped compatibility claim may
+name completed rows, but an unqualified "drop-in replacement for dotnet,
+MSBuild, NuGet, and VSTest" claim is allowed only when every required row in
+the published compatibility manifests passes. Each row needs its own input
+contract, oracle corpus, artifacts, failures, output/exit evidence, and
+benchmarks.
 
 ## Evidence That Would Disprove This Map
 
 - Real target repositories depend predominantly on an omitted workflow.
-- Common projects require arbitrary target/task execution that cannot be
-  represented as typed native transforms.
-- IDE/tool interoperability requires NuGet/MSBuild intermediate files that the
-  current boundaries treat as optional.
+- Real scripts contain invocation ambiguities that cannot be classified from
+  executable-token replacement plus argument shape.
+- Required MSBuild task assemblies cannot be hosted compatibly without using
+  the Microsoft MSBuild engine.
+- IDE/tool interoperability requires undocumented binary or design-time
+  behavior that cannot be captured as a versioned compatibility protocol.
 - Direct Roslyn/runtime hosting cannot preserve compiler/runtime compatibility
   without unacceptable process or protocol cost.
 - The isolated compiler host, content-addressed cache, or fingerprint layers
@@ -1095,32 +1458,53 @@ and benchmark evidence.
 Any of these requires revising the scope or transform, not silently adding a
 fallback.
 
-## Adjacent `dotnet` Surface Not Required By The Current Goal
+## Full Drop-In Surface Ledger
 
-The official .NET CLI also exposes these command families. They are not
-required for the scope defined at the top, but must be reconsidered if
-"feature parity" is later changed to mean literal `dotnet` driver parity:
+The official command families below are required eventual compatibility work,
+even when sequenced after the inner loop. They cannot be omitted from an
+unqualified drop-in claim.
 
-- `dotnet build-server`;
-- `dotnet msbuild`;
-- `dotnet store`;
-- global/local/tool-path tool install, update, uninstall, list, and search;
-- workload clean, config, history, install, list, repair, restore, search,
-  uninstall, and update;
-- SDK-bundled `dev-certs`, `user-secrets`, `watch`, and product-specific tools
-  such as `dotnet ef`;
-- generic execution options for arbitrary managed applications;
-- NuGet signing, verification, trusted-signer editing, and server
-  administration beyond package push/delete;
-- Visual Studio project-system/design-time build and IDE UI behavior.
-
-`dv watch` is already retained as practical adjacent parity because it directly
-serves the inner loop. The others need explicit product value, representative
-data, and a separate subsystem contract before entering required scope.
+- [ ] `SURF-001` `dotnet build-server` server discovery/shutdown and compatible
+  absent-server behavior. `P5`
+- [ ] `SURF-002` `dotnet msbuild` plus direct `msbuild` command-line,
+  evaluation, target, task, logger, and result behavior. `P2-P5`
+- [ ] `SURF-003` `dotnet store` runtime package-store generation and manifests
+  for SDK versions that expose it. `P5`
+- [ ] `SURF-004` global, local, and tool-path `dotnet tool`
+  install/update/uninstall/list/search plus manifest and restore behavior. `P5`
+- [ ] `SURF-005` `dotnet workload` clean/config/history/install/list/repair/
+  restore/search/uninstall/update, workload sets, manifests, rollback, and
+  advertising behavior. `P5`
+- [ ] `SURF-006` SDK command dispatch for `dev-certs`, `user-secrets`, `watch`,
+  Entity Framework, and installed extension commands without a `dotnet`
+  process. `P5`
+- [ ] `SURF-007` generic managed application execution with additional probing
+  paths/deps, runtime config, deps file, framework version, roll-forward,
+  architecture, arguments, environment, signals, and exit behavior. `P2`
+- [ ] `SURF-008` NuGet sign/verify, trusted-signer editing, API-key/source
+  administration, install/update/spec/init, and server operations exposed by
+  supported NuGet versions. `P5`
+- [ ] `SURF-009` project/reference/package/solution command orderings from old
+  and current SDK versions, including renamed noun-first forms. `P2-P5`
+- [ ] `SURF-010` `dotnet new` template search/list/details/install/update/
+  uninstall and every selected built-in template parameter. `P5`
+- [ ] `SURF-011` `dotnet sdk check`, runtime inventory, architecture-specific
+  list commands, and script-compatible output. `P4`
+- [ ] `SURF-012` design-time/evaluation targets and intermediate files consumed
+  by editors, IDEs, language servers, and CI integrations. Visual Studio UI
+  rendering itself remains outside the command-line drop-in contract. `P5`
+- [ ] `SURF-013` compatibility aliases that have been removed from current
+  documentation but remain in supported LTS SDK/tool versions. `P5`
+- [ ] `SURF-014` a release gate that compares the published manifest against
+  the complete command inventories reported by the selected `dotnet`,
+  MSBuild, NuGet, and VSTest reference executables. `P1-P5`
 
 ## Primary Compatibility References
 
 - [The `dotnet` command and command families](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet)
+- [MSBuild command-line reference](https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-command-line-reference)
+- [NuGet CLI reference](https://learn.microsoft.com/en-us/nuget/reference/nuget-exe-cli-reference)
+- [VSTest.Console command-line options](https://learn.microsoft.com/en-us/visualstudio/test/vstest-console-options)
 - [.NET project SDK overview](https://learn.microsoft.com/en-us/dotnet/core/project-sdk/overview)
 - [.NET SDK MSBuild properties and items](https://learn.microsoft.com/en-us/dotnet/core/project-sdk/msbuild-props)
 - [MSBuild conditions](https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-conditions)

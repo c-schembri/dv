@@ -143,5 +143,5 @@ Measure first dependency readiness with a fresh package cache and no NuGet HTTP
 cache reuse:
 
 ```text
-cargo bench-all --case package_sync_cold --samples 5 --warmups 1
+cargo bench-all --case package_sync_cold --samples 10 --warmups 2
 ```

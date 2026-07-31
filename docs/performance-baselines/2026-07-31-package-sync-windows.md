@@ -6,7 +6,7 @@
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - `Newtonsoft.Json` `13.0.3`, 2,441,966-byte package
-- release `dv` binary from the working tree based on `c23f2b3`
+- release `dv` binary from the working tree based on `95a02db`
 
 ## Like-For-Like Warm Locked Result
 
@@ -17,10 +17,10 @@ package identity, exact version, archive SHA-512, and compile assets.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 454.249 ms | 456.167 ms | 451.008 ms | 456.167 ms |
-| `dv` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 4.469 ms | 4.954 ms | 4.300 ms | 4.954 ms |
+| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 518.249 ms | 547.722 ms | 472.478 ms | 547.722 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 5.190 ms | 5.903 ms | 4.929 ms | 5.903 ms |
 
-Ten samples were retained after three warm-ups. The median ratio is `101.6x`.
+Ten samples were retained after three warm-ups. The median ratio is `99.9x`.
 The `dv` timing includes process startup and JSON event reporting.
 
 Reproduce:
@@ -38,23 +38,28 @@ established the same exact dependency graph and selected compile assets.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 910.292 ms | 952.869 ms | 885.639 ms | 952.869 ms |
-| `dv` | `dv restore PackageConsole.csproj --packages .packages --json` | 803.122 ms | 1,926.573 ms | 793.164 ms | 1,926.573 ms |
+| `dotnet` | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 910.720 ms | 963.904 ms | 892.961 ms | 963.904 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --json` | 366.890 ms | 482.027 ms | 353.201 ms | 482.027 ms |
 
-Five samples were retained after one warm-up. The median ratio is `1.1x`.
-`dv` reported four HTTP requests and 2,441,966 downloaded payload bytes for
+Ten samples were retained after two warm-ups. The median ratio is `2.5x`.
+`dv` reported two HTTP requests and 2,441,966 downloaded payload bytes for
 every retained sample. The reference command does not expose typed request or
 byte counters.
 
-The result covers v3 discovery, metadata, a streamed download, SHA-512
-verification, bounded ZIP validation/extraction, and atomic publish. It is
-deliberately retained despite a 1,926.573 ms `dv` outlier: first-restore
-latency is network-sensitive, and hiding its tail would make the record less
-useful. The benchmark does not claim to reset Windows page cache, DNS, TLS, or
-CDN state.
+The result covers v3 service-index discovery, direct exact-version package
+download, SHA-512 calculation, embedded nuspec identity validation, bounded
+ZIP validation/extraction, and atomic publish. First-restore latency remains
+network-sensitive. The benchmark does not claim to reset Windows page cache,
+DNS, TLS, or CDN state.
+
+Local stage profiling used ten fresh package directories. Bounded extraction
+reduced ZIP validation/extraction from 36.3 ms to 26.5 ms median. Service-index
+fetching remained the dominant stage at roughly 250 ms; a persistent,
+conditionally revalidated service-index cache is the next recommendation for
+the package-cold/metadata-warm state, not for this HTTP-cold result.
 
 Reproduce:
 
 ```powershell
-cargo bench-all --case package_sync_cold --samples 5 --warmups 1
+cargo bench-all --case package_sync_cold --samples 10 --warmups 2
 ```

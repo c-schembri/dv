@@ -11,8 +11,8 @@ explicitly unsupported until their pack and compiler policies are captured.
 
 NuGet sources are typed records containing URL and protocol generation:
 
-- v3 sources discover registration and flat-container resources from the
-  service index;
+- v3 sources discover `PackageBaseAddress` from the service index and derive
+  exact normalized package-content URLs from that advertised base;
 - v2 sources read the exact OData package entry and its advertised content
   URL, SHA-512, and size;
 - `protocolVersion="2"` and `"3"` are authoritative; absent values infer v3
@@ -34,8 +34,8 @@ the caller.
 
 Exact `Newtonsoft.Json` `13.0.3` is the representative package. Its 2,441,966
 byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`
-fixture. A v3 miss performs four requests: service index, registration leaf,
-catalog entry, and package. A v2 miss performs metadata and package requests.
+fixture. A v3 miss performs two requests: service index and package content.
+A v2 miss performs metadata and package requests.
 
 ## Transform
 
@@ -48,6 +48,7 @@ ProjectSpec batch + resolve options
   -> fetch up to four independent misses concurrently
   -> stream each package through SHA-512 into a bounded staging directory
   -> validate ZIP paths, duplicates, links, sizes, and expansion bounds
+  -> verify embedded nuspec identity and version before publication
   -> extract and atomically publish the NuGet-compatible cache entry
   -> select dependency and asset groups using the parsed target framework
   -> compact graph indices, asset spans, and text into PackageResolution
@@ -72,6 +73,13 @@ and merge results by original index, so completion order cannot affect the
 graph. Downloads use a reused 64 KiB buffer. Package size, entry size, expanded
 size, entry count, and worker count are bounded constants.
 
+A single package with at least eight archive entries uses up to four
+contiguous-range extraction workers. When a package wave is already parallel,
+each package extracts sequentially, keeping total extraction concurrency
+bounded at four instead of nesting worker pools. On the representative
+24-entry archive this reduced ZIP validation/extraction from 36.3 ms to
+26.5 ms median.
+
 ## Output And Lifetime
 
 Each `PackageResolution` owns:
@@ -79,7 +87,7 @@ Each `PackageResolution` owns:
 - target framework, cache root, lock path, selected source, and protocol;
 - package records sorted by case-insensitive identity;
 - dependency indices and compile, runtime, and analyzer asset spans;
-- verified archive hashes;
+- computed archive hashes, with source-advertised v2 hashes verified;
 - cache-hit, download, request, and payload-byte counters.
 
 The graph is immutable through compiler planning and reporting. Published
@@ -95,7 +103,7 @@ them. `dv.lock.json` is project-owned persistent state.
 | No compatible supported assets | `DV0402` |
 | Offline cache miss | `DV0403` |
 | HTTP or source metadata failure | `DV0404` |
-| Identity, size, or SHA-512 mismatch | `DV0405` |
+| Identity, v2 source size/SHA-512 mismatch, or invalid hash | `DV0405` |
 | Malformed or unsafe ZIP archive | `DV0406` |
 | Cache or lock I/O failure | `DV0407` |
 | Non-Unicode retained path | `DV0408` |
@@ -118,3 +126,9 @@ before retaining samples. Cold dependency readiness uses a fresh isolated
 package directory per iteration and disables the reference tool's HTTP cache.
 Warm locked restore is reported separately. `dv` request and payload counts are
 recorded as typed benchmark evidence.
+
+The next cold-path optimization is a persistent conditional service-index
+cache keyed by normalized source URL and validators such as ETag or
+Last-Modified. A dedicated package-cold/metadata-warm benchmark must measure
+that real repeated-project state; the existing HTTP-cold benchmark must keep
+the cache disabled so it remains an honest first-machine boundary.

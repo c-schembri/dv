@@ -1276,7 +1276,7 @@ mod tests {
           p95: 1,
           max: 1,
         }),
-        network_requests: Some(4),
+        network_requests: Some(2),
         downloaded_bytes: Some(2_441_966),
       }],
     };
@@ -1284,7 +1284,7 @@ mod tests {
     let output = render_summary(&report, false);
 
     assert!(output.contains("Cold dependency readiness"));
-    assert!(output.contains("4 HTTP requests · 2,441,966 payload bytes"));
+    assert!(output.contains("2 HTTP requests · 2,441,966 payload bytes"));
     assert!(output.find("Observed work").unwrap() < output.find("Commands").unwrap());
   }
 

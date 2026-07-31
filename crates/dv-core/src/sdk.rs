@@ -312,12 +312,12 @@ fn discover_host_roots() -> Vec<PathBuf> {
     }
   }
 
-  if let Some(architecture) = dotnet_architecture() {
-    if let Some(root) = env::var_os(format!("DOTNET_ROOT_{architecture}")) {
-      push_existing_root(&mut roots, PathBuf::from(root));
-      if !roots.is_empty() {
-        return roots;
-      }
+  if let Some(architecture) = dotnet_architecture()
+    && let Some(root) = env::var_os(format!("DOTNET_ROOT_{architecture}"))
+  {
+    push_existing_root(&mut roots, PathBuf::from(root));
+    if !roots.is_empty() {
+      return roots;
     }
   }
   if let Some(root) = env::var_os("DOTNET_ROOT") {
