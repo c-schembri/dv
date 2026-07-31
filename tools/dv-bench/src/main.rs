@@ -21,6 +21,7 @@ enum CaseKind {
   CompilerPlan,
   RestoreCold,
   PackageSyncCold,
+  PackageGraphCold,
   PackageSyncWarm,
   BuildClean,
   BuildNoOp,
@@ -32,6 +33,12 @@ struct Case {
   kind: CaseKind,
   args: &'static [&'static str],
   implemented: bool,
+}
+
+struct Fixtures<'a> {
+  small: &'a Path,
+  package: &'a Path,
+  package_graph: &'a Path,
 }
 
 const DOTNET_CASES: &[Case] = &[
@@ -103,6 +110,21 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_graph_cold",
+    kind: CaseKind::PackageGraphCold,
+    args: &[
+      "restore",
+      "LargePackageGraph.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build", "--no-restore", "--nologo", "--verbosity", "quiet"],
@@ -166,6 +188,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_graph_cold",
+    kind: CaseKind::PackageGraphCold,
+    args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build"],
@@ -224,6 +252,8 @@ struct Run {
   network_requests: Option<u64>,
   #[serde(skip_serializing_if = "Option::is_none")]
   downloaded_bytes: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  downloaded_packages: Option<u64>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -245,6 +275,7 @@ struct Statistics {
 struct WorkEvidence {
   network_requests: u64,
   downloaded_bytes: u64,
+  downloaded_packages: u64,
 }
 
 struct Measurement {
@@ -264,6 +295,12 @@ fn run() -> Result<()> {
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
+  let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
+  let fixtures = Fixtures {
+    small: &fixture,
+    package: &package_fixture,
+    package_graph: &package_graph_fixture,
+  };
   let workspace = repository.join("target/benchmark-work");
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
@@ -281,34 +318,21 @@ fn run() -> Result<()> {
     .as_deref()
     .is_none_or(|case| matches!(case, "package_sync_cold" | "package_sync_warm"))
   {
-    verify_package_sync(&repository, &dv_executable, &package_fixture)?;
+    verify_package_sync(&repository, &dv_executable, &package_fixture, "PackageConsole.csproj", 1)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
+    verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
 
-  let mut runs = run_tool(
-    "dotnet",
-    Path::new("dotnet"),
-    DOTNET_CASES,
-    &options,
-    &fixture,
-    &package_fixture,
-    &workspace.join("dotnet"),
-  )?;
-  runs.extend(run_tool(
-    "dv",
-    &dv_executable,
-    DV_CASES,
-    &options,
-    &fixture,
-    &package_fixture,
-    &workspace.join("dv"),
-  )?);
+  let mut runs = run_tool("dotnet", Path::new("dotnet"), DOTNET_CASES, &options, &fixtures, &workspace.join("dotnet"))?;
+  runs.extend(run_tool("dv", &dv_executable, DV_CASES, &options, &fixtures, &workspace.join("dv"))?);
   if runs.is_empty() {
     return Err(format!("no benchmark case named {:?}", options.case.as_deref().unwrap_or_default()).into());
   }
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 3,
+    schema_version: 4,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -470,8 +494,9 @@ fn verify_compiler_plan(repository: &Path, dv_executable: &Path, fixture: &Path)
   Ok(())
 }
 
-fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
-  let root = repository.join("target/benchmark-package-sync-verification");
+fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, project_file: &str, expected_packages: usize) -> Result<()> {
+  let verification_name = project_file.trim_end_matches(".csproj").to_ascii_lowercase();
+  let root = repository.join(format!("target/benchmark-{verification_name}-verification"));
   ensure_workspace_is_safe(repository, &root)?;
   let dotnet_workspace = root.join("dotnet");
   let dv_workspace = root.join("dv");
@@ -481,7 +506,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
     Path::new("dotnet"),
     &[
       "restore",
-      "PackageConsole.csproj",
+      project_file,
       "--packages",
       ".packages",
       "--no-http-cache",
@@ -492,11 +517,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
     &dotnet_workspace,
     "package-sync verification restore",
   )?;
-  let dv_text = command_text(
-    dv_executable,
-    &["restore", "PackageConsole.csproj", "--packages", ".packages", "--json"],
-    &dv_workspace,
-  )?;
+  let dv_text = command_text(dv_executable, &["restore", project_file, "--packages", ".packages", "--json"], &dv_workspace)?;
   let dv = dv_text
     .lines()
     .map(serde_json::from_str::<serde_json::Value>)
@@ -514,17 +535,72 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
     return Err("package-sync target framework does not match dotnet restore".into());
   }
 
-  let package_key = "Newtonsoft.Json/13.0.3";
-  let reference_hash = fs::read_to_string(dotnet_workspace.join(".packages/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512"))?;
-  let reference_hash = reference_hash.trim();
-  let packages = dv.get("packages").and_then(serde_json::Value::as_array).ok_or("dv sync omitted packages")?;
-  let package = packages.first().ok_or("dv sync resolved no package")?;
-  if packages.len() != 1
-    || package.get("id").and_then(serde_json::Value::as_str) != Some("Newtonsoft.Json")
-    || package.get("version").and_then(serde_json::Value::as_str) != Some("13.0.3")
-    || package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash)
-  {
-    return Err("dv package identity, version, or hash does not match dotnet restore".into());
+  let reference_libraries = assets
+    .get("libraries")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("dotnet assets omitted libraries")?;
+  let mut reference_packages = Vec::with_capacity(expected_packages);
+  for (identity, library) in reference_libraries {
+    if library.get("type").and_then(serde_json::Value::as_str) != Some("package") {
+      continue;
+    }
+    let (id, version) = identity
+      .split_once('/')
+      .ok_or_else(|| format!("dotnet package identity {identity:?} omitted its version"))?;
+    let lower_id = id.to_ascii_lowercase();
+    let lower_version = version.to_ascii_lowercase();
+    let hash_path = dotnet_workspace
+      .join(".packages")
+      .join(&lower_id)
+      .join(&lower_version)
+      .join(format!("{lower_id}.{lower_version}.nupkg.sha512"));
+    let hash = fs::read_to_string(&hash_path)?;
+    reference_packages.push((lower_id, lower_version, hash.trim().to_owned()));
+  }
+  reference_packages.sort_unstable();
+  if reference_packages.len() != expected_packages {
+    return Err(
+      format!(
+        "{project_file} resolved {} reference packages; expected {expected_packages}",
+        reference_packages.len()
+      )
+      .into(),
+    );
+  }
+  let mut actual_packages = dv
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv sync omitted packages")?
+    .iter()
+    .map(|package| {
+      let id = package
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("dv package omitted id")?
+        .to_ascii_lowercase();
+      let version = package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("dv package omitted version")?
+        .to_ascii_lowercase();
+      let hash = package
+        .get("sha512")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("dv package omitted sha512")?
+        .to_owned();
+      Ok((id, version, hash))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  actual_packages.sort_unstable();
+  if reference_packages != actual_packages {
+    return Err(
+      format!(
+        "dv package identity, version, or hash batch differs from dotnet restore: dotnet={} dv={}",
+        reference_packages.len(),
+        actual_packages.len()
+      )
+      .into(),
+    );
   }
 
   let target = assets
@@ -532,24 +608,54 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) 
     .and_then(serde_json::Value::as_object)
     .and_then(|targets| targets.get(framework))
     .and_then(serde_json::Value::as_object)
-    .and_then(|target| target.get(package_key))
     .ok_or("dotnet assets omitted the package target")?;
-  let reference_compile = target
-    .get("compile")
-    .and_then(serde_json::Value::as_object)
-    .map(|assets| assets.keys().cloned().collect::<Vec<_>>())
-    .ok_or("dotnet assets omitted package compile assets")?;
-  let actual_compile = string_array(&dv, "compile_assets")?
+  let mut reference_compile = Vec::new();
+  for (identity, package) in target {
+    let Some(compile) = package.get("compile").and_then(serde_json::Value::as_object) else {
+      continue;
+    };
+    let (id, version) = identity
+      .split_once('/')
+      .ok_or_else(|| format!("dotnet target identity {identity:?} omitted its version"))?;
+    for asset in compile.keys().filter(|asset| !asset.ends_with("/_._")) {
+      reference_compile.push(format!("{}/{}/{}", id.to_ascii_lowercase(), version.to_ascii_lowercase(), asset));
+    }
+  }
+  reference_compile.sort_unstable();
+  let mut actual_compile = string_array(&dv, "compile_assets")?
     .into_iter()
-    .map(|path| {
-      let path = path.replace('\\', "/");
-      path.find("/lib/").map_or(path.clone(), |index| path[index + 1..].to_owned())
-    })
-    .collect::<Vec<_>>();
+    .map(|path| package_relative_path(&path))
+    .collect::<Result<Vec<_>>>()?;
+  actual_compile.sort_unstable();
   if reference_compile != actual_compile {
-    return Err(format!("package compile assets differ: dotnet={reference_compile:?}, dv={actual_compile:?}").into());
+    return Err(
+      format!(
+        "package compile asset batch differs: dotnet={} dv={}",
+        reference_compile.len(),
+        actual_compile.len()
+      )
+      .into(),
+    );
   }
   Ok(())
+}
+
+fn package_relative_path(path: &str) -> Result<String> {
+  let path = path.replace('\\', "/");
+  let marker = "/.packages/";
+  let relative = if let Some(path) = path.strip_prefix(".packages/") {
+    path
+  } else {
+    path
+      .find(marker)
+      .map(|index| &path[index + marker.len()..])
+      .ok_or_else(|| format!("dv package asset is outside the isolated package cache: {path}"))?
+  };
+  let mut parts = relative.splitn(3, '/');
+  let id = parts.next().ok_or("dv package asset omitted package id")?;
+  let version = parts.next().ok_or("dv package asset omitted package version")?;
+  let asset = parts.next().ok_or("dv package asset omitted its package-relative path")?;
+  Ok(format!("{}/{}/{}", id.to_ascii_lowercase(), version.to_ascii_lowercase(), asset))
 }
 
 fn compare_canonical_item_paths(dotnet: &serde_json::Value, dotnet_item: &str, dv: &serde_json::Value, dv_field: &str) -> Result<()> {
@@ -671,21 +777,13 @@ fn parse_count(option: &str, value: Option<std::ffi::OsString>) -> Result<usize>
     .map_err(|_| format!("{option} requires a non-negative integer").into())
 }
 
-fn run_tool(
-  tool_name: &str,
-  executable: &Path,
-  cases: &[Case],
-  options: &Options,
-  fixture: &Path,
-  package_fixture: &Path,
-  workspace: &Path,
-) -> Result<Vec<Run>> {
-  let version = command_text(executable, &["--version"], fixture)?;
+fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Options, fixtures: &Fixtures<'_>, workspace: &Path) -> Result<Vec<Run>> {
+  let version = command_text(executable, &["--version"], fixtures.small)?;
   let mut runs = Vec::with_capacity(cases.len());
 
   for case in cases.iter().filter(|case| options.case.as_deref().is_none_or(|name| name == case.name)) {
     let case_workspace = workspace.join(case.name);
-    let case_fixture = case_fixture(case, fixture, package_fixture);
+    let case_fixture = case_fixture(case, fixtures);
     let command: Vec<String> = std::iter::once(executable.display().to_string())
       .chain(case.args.iter().map(|value| (*value).into()))
       .collect();
@@ -703,6 +801,7 @@ fn run_tool(
         statistics_ns: None,
         network_requests: None,
         downloaded_bytes: None,
+        downloaded_packages: None,
       });
       continue;
     }
@@ -734,6 +833,7 @@ fn run_tool(
       statistics_ns: Some(statistics_ns),
       network_requests: work.map(|evidence| evidence.network_requests),
       downloaded_bytes: work.map(|evidence| evidence.downloaded_bytes),
+      downloaded_packages: work.map(|evidence| evidence.downloaded_packages),
     });
   }
 
@@ -786,7 +886,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::ProjectEvaluate | CaseKind::CompilerPlan => Ok(()),
-    CaseKind::RestoreCold | CaseKind::PackageSyncCold => reset_fixture(fixture, workspace),
+    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
       run_checked(executable, restore_args(executable), workspace, "clean build restore")
@@ -822,11 +922,11 @@ fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path
   if matches!(case.kind, CaseKind::Startup) { fixture } else { workspace }
 }
 
-fn case_fixture<'a>(case: &Case, fixture: &'a Path, package_fixture: &'a Path) -> &'a Path {
-  if matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm) {
-    package_fixture
-  } else {
-    fixture
+fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
+  match case.kind {
+    CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
+    CaseKind::PackageGraphCold => fixtures.package_graph,
+    _ => fixtures.small,
   }
 }
 
@@ -834,6 +934,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
   match case.kind {
     CaseKind::Startup => None,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
+    CaseKind::PackageGraphCold => Some("large-package-graph"),
     _ => Some("small-console"),
   }
 }
@@ -843,7 +944,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let output = Command::new(executable).args(case.args).current_dir(cwd).output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
   check_output(output.clone(), executable, case.args, "measured command")?;
-  let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm) {
+  let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageSyncWarm) {
     Some(parse_work_evidence(&output.stdout)?)
   } else {
     None
@@ -869,6 +970,10 @@ fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
       .get("downloaded_bytes")
       .and_then(serde_json::Value::as_u64)
       .ok_or("dv package event omitted downloaded_bytes")?,
+    downloaded_packages: event
+      .get("downloaded_packages")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv package event omitted downloaded_packages")?,
   })
 }
 
@@ -877,7 +982,7 @@ fn merge_work_evidence(current: &mut Option<WorkEvidence>, observed: Option<Work
     return Ok(());
   };
   if current.is_some_and(|current| current != observed) {
-    return Err(format!("{tool} {case} reported inconsistent request or byte counts across retained samples").into());
+    return Err(format!("{tool} {case} reported inconsistent package, request, or byte counts across retained samples").into());
   }
   *current = Some(observed);
   Ok(())
@@ -1018,7 +1123,7 @@ fn render_summary(report: &Report, color: bool) -> String {
   let package_runs = report
     .runs
     .iter()
-    .filter(|run| matches!(run.case.as_str(), "package_sync_cold" | "package_sync_warm"))
+    .filter(|run| matches!(run.case.as_str(), "package_sync_cold" | "package_graph_cold" | "package_sync_warm"))
     .collect::<Vec<_>>();
   if !package_runs.is_empty() {
     output.push('\n');
@@ -1037,9 +1142,14 @@ fn render_summary(report: &Report, color: bool) -> String {
       .unwrap_or(0);
     for run in package_runs {
       let label = format!("{} · {}", run.tool, case_label(&run.case));
-      let evidence = match (run.network_requests, run.downloaded_bytes) {
-        (Some(requests), Some(bytes)) => {
-          format!("{requests} HTTP requests · {} payload bytes", format_integer(bytes))
+      let evidence = match (run.downloaded_packages, run.network_requests, run.downloaded_bytes) {
+        (Some(packages), Some(requests), Some(bytes)) => {
+          let package_label = if packages == 1 { "package" } else { "packages" };
+          format!(
+            "{} {package_label} · {requests} HTTP requests · {} payload bytes",
+            format_integer(packages),
+            format_integer(bytes)
+          )
         },
         _ => "not exposed by command".to_owned(),
       };
@@ -1109,6 +1219,7 @@ fn case_label(case: &str) -> &str {
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
     "package_sync_cold" => "Cold dependency readiness",
+    "package_graph_cold" => "Cold large dependency graph",
     "package_sync_warm" => "Warm locked restore",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
@@ -1193,7 +1304,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 3,
+      schema_version: 4,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1219,6 +1330,7 @@ mod tests {
           }),
           network_requests: None,
           downloaded_bytes: None,
+          downloaded_packages: None,
         },
         Run {
           tool: "dv".into(),
@@ -1232,6 +1344,7 @@ mod tests {
           statistics_ns: None,
           network_requests: None,
           downloaded_bytes: None,
+          downloaded_packages: None,
         },
       ],
     };
@@ -1253,7 +1366,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 3,
+      schema_version: 4,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1278,13 +1391,14 @@ mod tests {
         }),
         network_requests: Some(2),
         downloaded_bytes: Some(2_441_966),
+        downloaded_packages: Some(1),
       }],
     };
 
     let output = render_summary(&report, false);
 
     assert!(output.contains("Cold dependency readiness"));
-    assert!(output.contains("2 HTTP requests · 2,441,966 payload bytes"));
+    assert!(output.contains("1 package · 2 HTTP requests · 2,441,966 payload bytes"));
     assert!(output.find("Observed work").unwrap() < output.find("Commands").unwrap());
   }
 
@@ -1294,5 +1408,19 @@ mod tests {
     assert_eq!(format_integer(999), "999");
     assert_eq!(format_integer(1_000), "1,000");
     assert_eq!(format_integer(2_441_966), "2,441,966");
+  }
+
+  #[test]
+  fn package_asset_paths_normalize_relative_and_absolute_cache_roots() {
+    let expected = "humanizer.core/2.14.1/lib/net6.0/Humanizer.dll";
+
+    assert_eq!(
+      package_relative_path(".packages/humanizer.core/2.14.1/lib/net6.0/Humanizer.dll").unwrap(),
+      expected
+    );
+    assert_eq!(
+      package_relative_path("C:\\work\\.packages\\humanizer.core\\2.14.1\\lib\\net6.0\\Humanizer.dll").unwrap(),
+      expected
+    );
   }
 }

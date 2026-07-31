@@ -6,10 +6,7 @@ use std::{
   io::{self, Read, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
-  sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-  },
+  sync::{Mutex, OnceLock, mpsc::sync_channel},
   thread,
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,9 +25,10 @@ const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
-const MAX_DOWNLOAD_WORKERS: usize = 4;
+const MAX_DOWNLOAD_WORKERS: usize = 16;
 const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
+const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
 const LOCK_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,10 +326,17 @@ struct ResolutionContext<'a> {
 struct CachedPackage {
   root: PathBuf,
   hash: String,
+  dependencies: Option<Vec<PackageRequest>>,
   cache_hit: bool,
   requests: u32,
   bytes: u64,
   origin: Option<PackageSource>,
+}
+
+struct ResolvedGraph {
+  packages: BTreeMap<String, WorkPackage>,
+  network_requests: u32,
+  downloaded_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -449,63 +454,9 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     return Ok(resolution);
   }
 
-  let mut pending: BTreeMap<String, PackageRequest> = direct.iter().cloned().map(|request| (request.lower_id.clone(), request)).collect();
-  let mut resolved = BTreeMap::<String, WorkPackage>::new();
   let agent = http_agent();
-  let mut endpoints = None;
-  let mut network_requests = 0;
-  let mut downloaded_bytes = 0;
-
-  while resolved.len() < pending.len() {
-    let wave: Vec<PackageRequest> = pending.values().filter(|request| !resolved.contains_key(&request.lower_id)).cloned().collect();
-    if wave.is_empty() {
-      break;
-    }
-
-    let misses = wave.iter().filter(|request| !package_root(&config.cache_root, request).exists()).count();
-    if misses > 0 && options.offline {
-      let request = wave
-        .iter()
-        .find(|request| !package_root(&config.cache_root, request).exists())
-        .expect("one miss exists");
-      return Err(PackageError::new(
-        PackageErrorKind::OfflineMiss,
-        format!("{} {}", request.id, request.version),
-        format!("package {} {} is not available in the global package cache", request.id, request.version),
-      ));
-    }
-    if misses > 0 && endpoints.is_none() {
-      let (discovered, requests) = discover_service_endpoints(&agent, &config.sources)?;
-      endpoints = Some(discovered);
-      network_requests += requests;
-    }
-
-    let cached = ensure_wave(&agent, &wave, &config.cache_root, endpoints.as_deref().unwrap_or(&[]))?;
-    for (request, cached) in wave.into_iter().zip(cached) {
-      network_requests += cached.requests;
-      downloaded_bytes += cached.bytes;
-      let parsed = parse_cached_package(request.clone(), cached, target, target_text)?;
-      for dependency in &parsed.dependencies {
-        match pending.get_mut(&dependency.lower_id) {
-          Some(existing) if existing.version != dependency.version => {
-            return Err(PackageError::new(
-              PackageErrorKind::Resolution,
-              &dependency.id,
-              format!(
-                "package {} requires conflicting exact versions {} and {}",
-                dependency.id, existing.version, dependency.version
-              ),
-            ));
-          },
-          Some(existing) => existing.direct |= dependency.direct,
-          None => {
-            pending.insert(dependency.lower_id.clone(), dependency.clone());
-          },
-        }
-      }
-      resolved.insert(request.lower_id, parsed);
-    }
-  }
+  let graph = resolve_streaming_graph(&agent, &direct, &config, options, target, target_text)?;
+  let resolved = graph.packages;
 
   validate_acyclic(&resolved)?;
   let origin = resolved.values().find_map(|package| package.origin.as_ref());
@@ -527,8 +478,8 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       source_protocol,
     },
     &resolved,
-    network_requests,
-    downloaded_bytes,
+    graph.network_requests,
+    graph.downloaded_bytes,
   )?;
   if options.write_lock {
     write_lock(&resolution)?;
@@ -808,37 +759,130 @@ fn with_trailing_slash(mut value: String) -> String {
   value
 }
 
-fn ensure_wave(agent: &ureq::Agent, requests: &[PackageRequest], cache_root: &Path, endpoints: &[ServiceEndpoint]) -> Result<Vec<CachedPackage>, PackageError> {
-  if requests.len() <= 1 || requests.iter().all(|request| package_root(cache_root, request).exists()) {
-    return requests
-      .iter()
-      .map(|request| ensure_package(agent, request, cache_root, endpoints, true))
-      .collect();
-  }
+fn resolve_streaming_graph(
+  agent: &ureq::Agent,
+  direct: &[PackageRequest],
+  config: &NugetConfiguration,
+  options: &PackageResolveOptions,
+  target: TargetFramework,
+  target_text: &str,
+) -> Result<ResolvedGraph, PackageError> {
+  let mut known: BTreeMap<String, PackageRequest> = direct.iter().cloned().map(|request| (request.lower_id.clone(), request)).collect();
+  let mut ready = known.clone();
+  let mut resolved = BTreeMap::<String, WorkPackage>::new();
+  let endpoints = OnceLock::<Vec<ServiceEndpoint>>::new();
+  let mut network_requests = 0;
+  let mut downloaded_bytes = 0;
+  let (task_sender, task_receiver) = sync_channel::<(PackageRequest, bool)>(MAX_DOWNLOAD_WORKERS);
+  let (result_sender, result_receiver) = sync_channel::<(PackageRequest, Result<CachedPackage, PackageError>)>(MAX_DOWNLOAD_WORKERS);
+  let task_receiver = Mutex::new(task_receiver);
+  let mut cache_root_ready = config.cache_root.is_dir();
 
-  let cursor = AtomicUsize::new(0);
-  let results = Mutex::new(Vec::with_capacity(requests.len()));
-  let worker_count = requests.len().min(MAX_DOWNLOAD_WORKERS);
   thread::scope(|scope| {
-    for _ in 0..worker_count {
+    for _ in 0..MAX_DOWNLOAD_WORKERS {
       let worker_agent = agent.clone();
-      let results = &results;
-      let cursor = &cursor;
+      let task_receiver = &task_receiver;
+      let result_sender = result_sender.clone();
+      let endpoints = &endpoints;
+      let cache_root = &config.cache_root;
       scope.spawn(move || {
         loop {
-          let index = cursor.fetch_add(1, Ordering::Relaxed);
-          if index >= requests.len() {
+          let task = {
+            let receiver = task_receiver.lock().expect("package task queue is not poisoned");
+            receiver.recv()
+          };
+          let Ok((request, parallel_extract)) = task else {
+            break;
+          };
+          let discovered = endpoints.get().map(Vec::as_slice).unwrap_or(&[]);
+          let result = ensure_package(&worker_agent, &request, cache_root, discovered, target, parallel_extract);
+          if result_sender.send((request, result)).is_err() {
             break;
           }
-          let result = ensure_package(&worker_agent, &requests[index], cache_root, endpoints, false);
-          results.lock().expect("package worker result lock is not poisoned").push((index, result));
         }
       });
     }
-  });
-  let mut results = results.into_inner().expect("package worker result lock is not poisoned");
-  results.sort_unstable_by_key(|(index, _)| *index);
-  results.into_iter().map(|(_, result)| result).collect()
+    drop(result_sender);
+
+    let mut active = 0;
+    while !ready.is_empty() || active > 0 {
+      while active < MAX_DOWNLOAD_WORKERS
+        && let Some((_, request)) = ready.pop_first()
+      {
+        let cache_miss = !package_root(&config.cache_root, &request).exists();
+        if cache_miss && options.offline {
+          return Err(PackageError::new(
+            PackageErrorKind::OfflineMiss,
+            format!("{} {}", request.id, request.version),
+            format!("package {} {} is not available in the global package cache", request.id, request.version),
+          ));
+        }
+        if cache_miss && !cache_root_ready {
+          fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
+          cache_root_ready = true;
+        }
+        if cache_miss && endpoints.get().is_none() {
+          let (discovered, requests) = discover_service_endpoints(agent, &config.sources)?;
+          network_requests += requests;
+          if endpoints.set(discovered).is_err() {
+            return Err(PackageError::new(
+              PackageErrorKind::Resolution,
+              "package scheduler",
+              "NuGet service endpoints were initialized more than once",
+            ));
+          }
+        }
+
+        let parallel_extract = active == 0 && ready.is_empty();
+        task_sender.send((request, parallel_extract)).map_err(|_| package_worker_stopped())?;
+        active += 1;
+      }
+
+      let (request, cached) = result_receiver.recv().map_err(|_| package_worker_stopped())?;
+      active -= 1;
+      let cached = cached?;
+      network_requests += cached.requests;
+      downloaded_bytes += cached.bytes;
+      let parsed = parse_cached_package(request.clone(), cached, target, target_text)?;
+      for dependency in &parsed.dependencies {
+        match known.get_mut(&dependency.lower_id) {
+          Some(existing) if existing.version != dependency.version => {
+            let (lower, upper) = if existing.version <= dependency.version {
+              (&existing.version, &dependency.version)
+            } else {
+              (&dependency.version, &existing.version)
+            };
+            return Err(PackageError::new(
+              PackageErrorKind::Resolution,
+              &dependency.id,
+              format!("package {} requires conflicting exact versions {lower} and {upper}", dependency.id),
+            ));
+          },
+          Some(existing) => existing.direct |= dependency.direct,
+          None => {
+            known.insert(dependency.lower_id.clone(), dependency.clone());
+            ready.insert(dependency.lower_id.clone(), dependency.clone());
+          },
+        }
+      }
+      resolved.insert(request.lower_id, parsed);
+    }
+
+    drop(task_sender);
+    Ok(ResolvedGraph {
+      packages: resolved,
+      network_requests,
+      downloaded_bytes,
+    })
+  })
+}
+
+fn package_worker_stopped() -> PackageError {
+  PackageError::new(
+    PackageErrorKind::Io,
+    "package scheduler",
+    "package fetch worker stopped before the graph completed",
+  )
 }
 
 fn ensure_package(
@@ -846,6 +890,7 @@ fn ensure_package(
   request: &PackageRequest,
   cache_root: &Path,
   endpoints: &[ServiceEndpoint],
+  target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
   let root = package_root(cache_root, request);
@@ -854,7 +899,7 @@ fn ensure_package(
   }
   let mut last_error = None;
   for endpoint in endpoints {
-    match download_and_publish(agent, request, cache_root, endpoint, parallel_extract) {
+    match download_and_publish(agent, request, cache_root, endpoint, target, parallel_extract) {
       Ok(package) => return Ok(package),
       Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
       Err(error) => return Err(error),
@@ -885,6 +930,7 @@ fn download_and_publish(
   request: &PackageRequest,
   cache_root: &Path,
   endpoint: &ServiceEndpoint,
+  target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
   let metadata = match endpoint {
@@ -901,7 +947,6 @@ fn download_and_publish(
     ));
   }
 
-  fs::create_dir_all(cache_root).map_err(|error| package_io("create package cache", cache_root, error))?;
   let temp_root = unique_temp_root(cache_root, request);
   fs::create_dir(&temp_root).map_err(|error| package_io("create package staging directory", &temp_root, error))?;
   let mut guard = TempGuard(Some(temp_root.clone()));
@@ -928,11 +973,13 @@ fn download_and_publish(
   }
   validate_and_extract_archive(&nupkg_path, &temp_root, parallel_extract)?;
   normalize_nuspec_name(&temp_root, request)?;
-  validate_staged_nuspec_identity(&temp_root, request)?;
+  let nuspec_path = temp_root.join(format!("{}.nuspec", request.lower_id));
+  let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
+  let dependencies = parse_nuspec(&nuspec_path, &nuspec, request, target)?;
   fs::write(temp_root.join(format!("{nupkg_name}.sha512")), hash.as_bytes()).map_err(|error| package_io("write package hash", &temp_root, error))?;
   let package_metadata = serde_json::json!({
     "schemaVersion": 1,
-    "sha512": hash,
+    "sha512": &hash,
     "source": endpoint.source(),
     "protocol": endpoint.protocol().as_str(),
   });
@@ -945,17 +992,42 @@ fn download_and_publish(
   let final_root = package_root(cache_root, request);
   fs::create_dir_all(final_root.parent().expect("package version has an identity parent"))
     .map_err(|error| package_io("create package identity directory", &final_root, error))?;
-  match fs::rename(&temp_root, &final_root) {
-    Ok(()) => guard.0 = None,
-    Err(_) if final_root.exists() => {},
-    Err(error) => return Err(package_io("publish package atomically", &final_root, error)),
+  let published = publish_package_directory(&temp_root, &final_root)?;
+  if published {
+    guard.0 = None;
   }
-  let mut cached = validate_cached_package(&final_root, request, false, metadata.requests + 1, bytes)?;
+  let mut cached = if published {
+    CachedPackage {
+      root: final_root,
+      hash,
+      dependencies: Some(dependencies),
+      cache_hit: false,
+      requests: metadata.requests + 1,
+      bytes,
+      origin: None,
+    }
+  } else {
+    validate_cached_package(&final_root, request, false, metadata.requests + 1, bytes)?
+  };
   cached.origin = Some(PackageSource {
     url: endpoint.source().to_owned(),
     protocol: endpoint.protocol(),
   });
   Ok(cached)
+}
+
+fn publish_package_directory(staged: &Path, destination: &Path) -> Result<bool, PackageError> {
+  for delay in PUBLISH_RETRY_DELAYS.into_iter().map(Some).chain([None]) {
+    match fs::rename(staged, destination) {
+      Ok(()) => return Ok(true),
+      Err(_) if destination.exists() => return Ok(false),
+      Err(error) if error.kind() == io::ErrorKind::PermissionDenied && delay.is_some() => {
+        thread::sleep(delay.expect("permission retry has a delay"));
+      },
+      Err(error) => return Err(package_io("publish package atomically", destination, error)),
+    }
+  }
+  unreachable!("the final publish attempt returns")
 }
 
 fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageMetadata {
@@ -1103,7 +1175,6 @@ fn download_package(agent: &ureq::Agent, url: &str, destination: &Path) -> Resul
       .write_all(&buffer[..read])
       .map_err(|error| package_io("write package archive", destination, error))?;
   }
-  output.sync_all().map_err(|error| package_io("flush package archive", destination, error))?;
   Ok((BASE64.encode(hasher.finalize()), total))
 }
 
@@ -1299,6 +1370,7 @@ fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: boo
   Ok(CachedPackage {
     root: root.to_owned(),
     hash,
+    dependencies: None,
     cache_hit,
     requests,
     bytes,
@@ -1327,6 +1399,7 @@ fn find_nuspec(root: &Path) -> Result<PathBuf, PackageError> {
   found.ok_or_else(|| PackageError::new(PackageErrorKind::Integrity, root.display().to_string(), "package contains no root nuspec"))
 }
 
+#[cfg(test)]
 fn validate_staged_nuspec_identity(root: &Path, request: &PackageRequest) -> Result<(), PackageError> {
   let path = find_nuspec(root)?;
   let bytes = fs::read(&path).map_err(|error| package_io("read package manifest", &path, error))?;
@@ -1376,18 +1449,26 @@ fn validate_staged_nuspec_identity(root: &Path, request: &PackageRequest) -> Res
 }
 
 fn parse_cached_package(request: PackageRequest, cached: CachedPackage, target: TargetFramework, target_text: &str) -> Result<WorkPackage, PackageError> {
-  let nuspec_path = find_nuspec(&cached.root)?;
-  let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-  let dependencies = parse_nuspec(&nuspec_path, &nuspec, &request, target)?;
+  let dependencies = match cached.dependencies {
+    Some(dependencies) => dependencies,
+    None => {
+      let nuspec_path = find_nuspec(&cached.root)?;
+      let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
+      parse_nuspec(&nuspec_path, &nuspec, &request, target)?
+    },
+  };
   reject_unsupported_package_assets(&cached.root)?;
   let compile_assets = select_compile_assets(&cached.root, target)?;
   let runtime_assets = select_runtime_assets(&cached.root, target)?;
   let analyzers = collect_analyzers(&cached.root)?;
-  if compile_assets.is_empty() {
+  if dependencies.is_empty() && compile_assets.is_empty() && runtime_assets.is_empty() && analyzers.is_empty() {
     return Err(PackageError::new(
       PackageErrorKind::Incompatible,
       format!("{} {}", request.id, request.version),
-      format!("package {} {} has no compatible compile assets for {target_text}", request.id, request.version,),
+      format!(
+        "package {} {} has no compatible assets or dependencies for {target_text}",
+        request.id, request.version,
+      ),
     ));
   }
   Ok(WorkPackage {
@@ -2332,6 +2413,82 @@ mod tests {
   }
 
   #[test]
+  fn dependency_only_meta_package_is_a_valid_graph_node() {
+    let temp = TempDirectory::new();
+    temp.write(
+      "sample.package.nuspec",
+      r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version><dependencies>
+<group targetFramework="netstandard2.0"><dependency id="Base.Dependency" version="[1.0]" /></group>
+</dependencies></metadata></package>"#,
+    );
+    let cached = CachedPackage {
+      root: temp.0.clone(),
+      hash: BASE64.encode([0u8; 64]),
+      dependencies: None,
+      cache_hit: true,
+      requests: 0,
+      bytes: 0,
+      origin: None,
+    };
+
+    let package = parse_cached_package(request(), cached, TargetFramework::parse("net10.0").unwrap(), "net10.0").unwrap();
+
+    assert_eq!(package.dependencies.len(), 1);
+    assert!(package.compile_assets.is_empty());
+    assert!(package.runtime_assets.is_empty());
+  }
+
+  #[test]
+  fn streaming_scheduler_enqueues_a_dependency_as_soon_as_its_parent_is_parsed() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+<ItemGroup><PackageReference Include="Meta.Package" Version="1.0.0" /></ItemGroup></Project>"#,
+    );
+    for (id, version, nuspec) in [
+      (
+        "meta.package",
+        "1.0.0",
+        r#"<package><metadata><id>Meta.Package</id><version>1.0.0</version><dependencies>
+<group targetFramework="netstandard2.0"><dependency id="Child.Package" version="[2.0]" /></group>
+</dependencies></metadata></package>"#,
+      ),
+      (
+        "child.package",
+        "2.0.0",
+        r#"<package><metadata><id>Child.Package</id><version>2.0.0</version></metadata></package>"#,
+      ),
+    ] {
+      let root = format!("packages/{id}/{version}");
+      temp.write(&format!("{root}/{id}.nuspec"), nuspec);
+      temp.write(&format!("{root}/{id}.{version}.nupkg"), []);
+      temp.write(&format!("{root}/{id}.{version}.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+    }
+    temp.write("packages/child.package/2.0.0/lib/net6.0/Child.Package.dll", []);
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      offline: true,
+      write_lock: true,
+    };
+
+    let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    let identities = resolution
+      .packages()
+      .iter()
+      .copied()
+      .map(|package| resolution.package_id(package))
+      .collect::<Vec<_>>();
+
+    assert_eq!(identities, ["Child.Package", "Meta.Package"]);
+    assert_eq!(resolution.cache_hits(), 2);
+    assert_eq!(resolution.network_requests(), 0);
+  }
+
+  #[test]
   fn warm_cache_and_lock_select_assets_for_the_evaluated_target_without_http() {
     let temp = TempDirectory::new();
     temp.write(
@@ -2387,6 +2544,20 @@ mod tests {
 
     assert_eq!(error.kind(), PackageErrorKind::Archive);
     assert!(!temp.0.join("escape.dll").exists());
+  }
+
+  #[test]
+  fn package_publish_reuses_an_existing_atomic_winner() {
+    let temp = TempDirectory::new();
+    let staged = temp.0.join("staged");
+    let destination = temp.0.join("destination");
+    fs::create_dir(&staged).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("winner"), []).unwrap();
+
+    assert!(!publish_package_directory(&staged, &destination).unwrap());
+    assert!(staged.is_dir());
+    assert!(destination.is_dir());
   }
 
   #[test]

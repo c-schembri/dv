@@ -37,6 +37,12 @@ byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`
 fixture. A v3 miss performs two requests: service index and package content.
 A v2 miss performs metadata and package requests.
 
+The large-graph fixture references `Humanizer` `2.14.1`. Its dependency-only
+root is retained as a valid graph node and resolves to 50 packages totaling
+3,241,550 downloaded bytes. Dependency-only meta-packages need no compile,
+runtime, or analyzer asset of their own; packages with neither a compatible
+asset nor a dependency remain incompatible.
+
 ## Transform
 
 ```text
@@ -44,8 +50,10 @@ ProjectSpec batch + resolve options
   -> merge typed source and cache configuration
   -> validate a matching dv.lock.json and immutable cache entries
   -> otherwise normalize exact direct references
-  -> resolve dependency waves in stable identity order
-  -> fetch up to four independent misses concurrently
+  -> seed a bounded queue with exact direct references
+  -> fetch, verify, extract, and publish up to sixteen independent requests
+  -> parse each completed manifest and immediately enqueue unseen dependencies
+  -> merge dependency identities and conflicts through one deterministic owner
   -> stream each package through SHA-512 into a bounded staging directory
   -> validate ZIP paths, duplicates, links, sizes, and expansion bounds
   -> verify embedded nuspec identity and version before publication
@@ -67,18 +75,36 @@ paths cross the subsystem boundary as 8-byte offset/length spans into one
 owned UTF-8 buffer. Reporters and compiler planning traverse final records and
 asset ranges linearly.
 
-Independent misses use at most four scoped workers. Small waves remain
-sequential. Workers claim indices atomically, retain immutable shared input,
-and merge results by original index, so completion order cannot affect the
-graph. Downloads use a reused 64 KiB buffer. Package size, entry size, expanded
-size, entry count, and worker count are bounded constants.
+The cold scheduler uses sixteen scoped workers, a sixteen-entry task channel,
+and a sixteen-entry result channel. One main-thread owner merges completed
+manifests into identity-ordered maps and immediately submits newly discovered
+dependencies when capacity exists. Completion order affects which eligible
+transfer starts next but cannot affect final package order, version-conflict
+text, graph indices, or lock output. Queue traffic is bounded; there is no
+unbounded task creation or result retention.
 
-A single package with at least eight archive entries uses up to four
-contiguous-range extraction workers. When a package wave is already parallel,
-each package extracts sequentially, keeping total extraction concurrency
-bounded at four instead of nesting worker pools. On the representative
-24-entry archive this reduced ZIP validation/extraction from 36.3 ms to
-26.5 ms median.
+Scheduling maps contain cold variable-sized external identities. Final graph
+records remain contiguous and identity-sorted. Workers read immutable service
+endpoints and cache configuration, own one request and staging directory at a
+time, and touch the receiver mutex only while dequeuing. Network waits, hash
+updates, and archive writes are sequential within one request and concurrent
+across requests. Downloads use a reused 64 KiB buffer. Package size, entry
+size, expanded size, entry count, queue capacity, and worker count are bounded
+constants.
+
+A lone package with at least eight archive entries uses up to four
+contiguous-range extraction workers. When multiple package requests are
+already in flight, each package extracts sequentially instead of nesting
+worker pools. On the representative 24-entry archive this reduced ZIP
+validation/extraction from 36.3 ms to 26.5 ms median.
+
+The download archive is closed and immediately reopened from the operating
+system cache for validation and extraction; it is not forced to stable storage
+while still in a disposable staging directory. A successful atomic rename
+uses the already validated in-memory hash and identity rather than rescanning
+the entry. If another publisher wins the race, the winner is fully revalidated
+before use. Transient Windows permission failures during the atomic rename
+receive three bounded retries totaling at most 21 ms.
 
 ## Output And Lifetime
 
@@ -120,12 +146,15 @@ archive traversal rejection. Live verification downloads the same public
 package through both NuGet v2 and v3 and compares identity, archive SHA-512,
 size, and selected compile asset.
 
-The benchmark preflight compares `dotnet restore` and `dv restore` package
-identity, exact version, archive SHA-512, target framework, and compile assets
-before retaining samples. Cold dependency readiness uses a fresh isolated
-package directory per iteration and disables the reference tool's HTTP cache.
-Warm locked restore is reported separately. `dv` request and payload counts are
-recorded as typed benchmark evidence.
+The benchmark preflight compares `dotnet restore` and `dv restore` complete
+package identity, exact-version, archive-SHA-512, target-framework, and
+compile-asset batches before retaining samples. Cold dependency readiness uses
+a fresh isolated package directory per iteration and disables the reference
+tool's HTTP cache. The 50-package case applies the same boundary to streaming
+dependency discovery and many small archives. Warm locked restore is reported
+separately.
+`dv` package, request, and payload counts are recorded as typed benchmark
+evidence.
 
 The next cold-path optimization is a persistent conditional service-index
 cache keyed by normalized source URL and validators such as ETag or

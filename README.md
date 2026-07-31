@@ -20,11 +20,14 @@ dv project inspect              3.846 ms median
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
-dotnet restore (cold deps)     910.720 ms median
-dv restore (cold deps)         366.890 ms median
+dotnet restore (cold deps)     916.034 ms median
+dv restore (cold deps)         353.981 ms median
 
-dotnet restore (warm locked)   518.249 ms median
-dv restore (warm locked)         5.190 ms median
+dotnet restore (50 packages)  1243.644 ms median
+dv restore (50 packages)       562.799 ms median
+
+dotnet restore (warm locked)   456.544 ms median
+dv restore (warm locked)         5.155 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK and the same evaluated
@@ -149,9 +152,10 @@ Initial machine:
 - Windows 11 `10.0.22631`, x86-64
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
-- 30 retained samples after 3 warm-ups (5 for compiler planning); 10 retained
-  samples after 2 warm-ups for cold dependencies; 10 retained samples after 3
-  warm-ups for warm locked restore
+- 30 retained samples after 3 warm-ups for SDK selection, project evaluation,
+  and the one-package cold case; compiler planning uses 5 warm-ups; 10
+  retained samples after 2 warm-ups for the large cold graph; 10 retained
+  samples after 3 warm-ups for warm locked restore
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
@@ -160,14 +164,15 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
-| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 910.720 ms | 366.890 ms | 2.5x | 963.904 ms | 482.027 ms |
-| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 518.249 ms | 5.190 ms | 99.9x | 547.722 ms | 5.903 ms |
+| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 916.034 ms | 353.981 ms | 2.6x | 955.827 ms | 443.317 ms |
+| Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1243.644 ms | 562.799 ms | 2.2x | 1433.290 ms | 660.337 ms |
+| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 456.544 ms | 5.155 ms | 88.6x | 481.635 ms | 7.208 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
 project property plus the ordered compile-item identities. For package sync it
-also compares target framework, package identity, exact version, archive
-SHA-512, and selected compile assets. Exact commands are printed in benchmark
+also compares the complete package identity, exact-version, archive-SHA-512,
+and selected-compile-asset batches. Exact commands are printed in benchmark
 output and recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md) and
 [package baseline](docs/performance-baselines/2026-07-31-package-sync-windows.md).
@@ -176,6 +181,14 @@ The cold dependency result starts each timed process with a fresh project copy
 and empty isolated package directory. The reference command also bypasses
 NuGet's HTTP cache. It is a network-sensitive first-restore measurement, not a
 claim that Windows page cache, DNS, TLS, or CDN state was reset.
+
+The large-graph fixture has one direct `Humanizer` `2.14.1` reference and a
+real 50-package closure. `dv` reported 50 package downloads, 51 HTTP requests,
+and 3,241,550 payload bytes per retained sample. This case emphasizes graph
+expansion and scheduling across many small archives rather than bandwidth.
+Streaming dependency discovery, a measured sixteen-worker crossover, and
+removal of redundant staging I/O reduced the `dv` median from 904.097 ms to
+562.799 ms.
 
 The warm one-shot target for lightweight commands on this machine is `5 ms`
 end to end. It is a local engineering budget, not a universal Windows
@@ -187,7 +200,8 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
-cargo bench-all --case package_sync_cold --samples 10 --warmups 2
+cargo bench-all --case package_sync_cold --samples 30 --warmups 3
+cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 

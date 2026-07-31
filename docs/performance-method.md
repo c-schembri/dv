@@ -56,6 +56,7 @@ Invalid input behavior:
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `restore_cold` | fresh fixture copy | restore |
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
+| `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
@@ -79,6 +80,7 @@ directional decisions.`
 |---|---|---|---|
 | `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
+| `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | specification pending real sample |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
@@ -143,5 +145,11 @@ Measure first dependency readiness with a fresh package cache and no NuGet HTTP
 cache reuse:
 
 ```text
-cargo bench-all --case package_sync_cold --samples 10 --warmups 2
+cargo bench-all --case package_sync_cold --samples 30 --warmups 3
+```
+
+Measure the real 50-package graph under the same cold boundary:
+
+```text
+cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 ```

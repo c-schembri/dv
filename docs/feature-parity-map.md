@@ -226,7 +226,7 @@ prove that nothing changed.
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
 | Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
-| Package resolution and cache | Initial subset | exact versions, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
+| Package resolution and cache | Initial subset | exact versions, dependency-only meta-packages, bounded streaming resolution, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore | Initial subset | exact package restore is implemented; most reference flags and graph cases remain |
 | Build execution, run, and test | Missing | build only plans inputs; run/test remain unsupported |
@@ -701,8 +701,9 @@ boundary, not final drop-in parity.
   validation and surface the security consequence. `P2`
 - [ ] `NUGET-013` Apply package source mapping before network requests and
   diagnose unmapped identities. `P2`
-- [~] `NUGET-014` Bound concurrent requests per source and globally; implement
-  backpressure and deterministic result merge. `P2`
+- [~] `NUGET-014` Bound concurrent requests per source and globally; the
+  current sixteen-worker task/result queues provide global backpressure and
+  deterministic graph merge, while distinct per-source budgets remain. `P2`
 - [~] `NUGET-015` Record request count, bytes, cache outcome, and source timing
   without recording credentials. `P2`
 
@@ -1319,8 +1320,9 @@ vertical slice is correct and measured.
 - [~] `GATE-003` Add exact oracle comparisons for evaluated items/properties,
   resolved graph/assets, compiler batch, artifacts, program behavior, test
   results, package contents, and publish output. `P1-P4`
-- [ ] `GATE-004` Add package-bearing small fixture, conditional project,
-  analyzer/generator fixture, resources/content fixture, and failure corpus.
+- [~] `GATE-004` Add package-bearing small and real large-graph fixtures,
+  conditional project, analyzer/generator fixture, resources/content fixture,
+  and failure corpus.
   `P1/P2`
 - [ ] `GATE-005` Add sanitized or distribution-derived large solution,
   test-heavy repository, and authenticated multi-source fixture. `P2/P3`
