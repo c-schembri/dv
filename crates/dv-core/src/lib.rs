@@ -1,6 +1,7 @@
 //! Stable data contracts shared by dv commands and reporters.
 
 mod compiler;
+mod credential_provider;
 mod diagnostic;
 mod event;
 mod framework;
@@ -14,6 +15,7 @@ mod runtime_pack;
 mod sdk;
 
 pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_compiler_inputs, plan_compiler_inputs_with_packages};
+pub use credential_provider::{CredentialProviderLogSink, PackageCancellation};
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
   CacheOutcome, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,

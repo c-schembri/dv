@@ -9,9 +9,9 @@ use std::{
 
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
-  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions,
-  PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, ProjectConfiguration, ProjectError, ProjectErrorKind,
-  ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
+  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageCancellation, PackageError, PackageErrorKind, PackageResolution,
+  PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, ProjectConfiguration, ProjectError,
+  ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
   RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity,
   discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
   plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
@@ -57,7 +57,8 @@ Usage:
   dv project frameworks [PROJECT] [--packages PATH]
   dv project runtime-packs [PROJECT] [--packages PATH]
   dv project package-sources [PROJECT] [-s|--source SOURCE]...
-                             [--configfile PATH] [--offline]
+                             [--configfile PATH] [--offline] [--interactive]
+                             [--probe-credentials]
 ";
 
 const BUILD_HELP: &str = "\
@@ -68,9 +69,9 @@ Usage:
 const PACKAGE_HELP: &str = "\
 Usage:
   dv restore [PROJECT] [-s|--source SOURCE]... [--packages PATH]
-             [--configfile PATH] [--offline]
+             [--configfile PATH] [--offline] [--interactive]
   dv sync [PROJECT] [-s|--source SOURCE]... [--packages PATH]
-          [--configfile PATH] [--offline]
+          [--configfile PATH] [--offline] [--interactive]
 ";
 
 fn main() -> ExitCode {
@@ -205,7 +206,10 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Ok(project) => project,
     Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
-  let options = normalize_package_options(options, &current_directory, true);
+  let options = match normalize_package_options(options, &current_directory, true) {
+    Ok(options) => options,
+    Err(problem) => return fail(started, json, command, args, diagnostic("DV0002", problem, None, None)),
+  };
   let resolutions = match resolve_package_inputs(&[&project], &options) {
     Ok(resolutions) => resolutions,
     Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
@@ -217,8 +221,9 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
   succeed(started, command, args, package_resolution_payload(&project, resolution))
 }
 
-fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> PackageResolveOptions {
-  PackageResolveOptions {
+fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
+  let cancellation = install_credential_provider_cancellation()?;
+  Ok(PackageResolveOptions {
     packages_directory: options
       .packages_directory
       .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
@@ -232,7 +237,24 @@ fn normalize_package_options(options: PackageCommandOptions, current_directory: 
       .collect(),
     offline: options.offline,
     write_lock,
+    interactive: options.interactive,
+    probe_credentials: options.probe_credentials,
+    cancellation,
+    credential_provider_log_sink: options.interactive.then_some(write_credential_provider_log),
+  })
+}
+
+fn install_credential_provider_cancellation() -> Result<Option<PackageCancellation>, String> {
+  let configured = env::var_os("NUGET_NETCORE_PLUGIN_PATHS")
+    .or_else(|| env::var_os("NUGET_PLUGIN_PATHS"))
+    .is_some_and(|paths| !paths.is_empty());
+  if !configured {
+    return Ok(None);
   }
+  let cancellation = PackageCancellation::new();
+  let signal = cancellation.clone();
+  ctrlc::set_handler(move || signal.cancel()).map_err(|error| format!("failed to install credential-provider cancellation handler: {error}"))?;
+  Ok(Some(cancellation))
 }
 
 struct PackageCommandOptions {
@@ -241,6 +263,8 @@ struct PackageCommandOptions {
   config_file: Option<PathBuf>,
   sources: Vec<String>,
   offline: bool,
+  interactive: bool,
+  probe_credentials: bool,
 }
 
 fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageCommandOptions, String> {
@@ -250,6 +274,8 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
     config_file: None,
     sources: Vec::new(),
     offline: false,
+    interactive: false,
+    probe_credentials: false,
   };
   let mut index = 0;
   while index < arguments.len() {
@@ -310,6 +336,8 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         options.sources.push(source.to_owned());
       },
       "--offline" => options.offline = true,
+      "--interactive" => options.interactive = true,
+      "--probe-credentials" if command == "project package-sources" => options.probe_credentials = true,
       value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
       value if options.project.is_none() => options.project = Some(PathBuf::from(value)),
       value => return Err(format!("unexpected {command} argument {value:?}")),
@@ -339,6 +367,10 @@ fn normalize_command_source(source: String, current_directory: &Path) -> String 
   } else {
     current_directory.join(path).to_string_lossy().into_owned()
   }
+}
+
+fn write_credential_provider_log(message: &str) {
+  let _ = writeln!(io::stderr().lock(), "credential provider: {message}");
 }
 
 fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
@@ -399,6 +431,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
     sources: Vec::new(),
     offline: false,
     write_lock: true,
+    ..PackageResolveOptions::default()
   };
   let package_resolutions = match resolve_package_inputs(&[&project], &package_options) {
     Ok(resolutions) => resolutions,
@@ -876,7 +909,10 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
     Ok(project) => project,
     Err(error) => return fail(started, json, "project package-sources", args, project_diagnostic(error)),
   };
-  let options = normalize_package_options(parsed, &current_directory, false);
+  let options = match normalize_package_options(parsed, &current_directory, false) {
+    Ok(options) => options,
+    Err(problem) => return fail(started, json, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
+  };
   let inventories = match inspect_package_sources(&[&project], &options) {
     Ok(inventories) => inventories,
     Err(error) => return fail(started, json, "project package-sources", args, package_diagnostic(error)),
@@ -1380,12 +1416,16 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     PackageErrorKind::Io => "DV0407",
     PackageErrorKind::NonUnicodePath => "DV0408",
     PackageErrorKind::TextOverflow => "DV0409",
+    PackageErrorKind::CredentialProvider => "DV0410",
+    PackageErrorKind::Cancelled => "DV0411",
   };
   let help = match error.kind() {
     PackageErrorKind::OfflineMiss => Some("Populate the global package cache or rerun without --offline."),
     PackageErrorKind::Configuration => Some("Use an HTTPS NuGet v2/v3 source, a local folder source, and the supported NuGet.Config subset."),
     PackageErrorKind::Incompatible => Some("Use a package with compatible lib or ref assets and no unsupported build/runtime assets."),
     PackageErrorKind::Network => Some("Check source availability, proxy settings, and package identity/version."),
+    PackageErrorKind::CredentialProvider => Some("Install a self-contained NuGet V2 credential provider and check its timeout and login policy."),
+    PackageErrorKind::Cancelled => Some("Rerun the command when package authentication can complete."),
     PackageErrorKind::Integrity | PackageErrorKind::Archive => Some("Remove the corrupt cache entry and retry from a trusted source."),
     PackageErrorKind::Resolution | PackageErrorKind::Io | PackageErrorKind::NonUnicodePath | PackageErrorKind::TextOverflow => None,
   };

@@ -1,18 +1,11 @@
 [package]
-name = "dv-cli"
+name = "nuget-plugin-dv-fixture"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "dv"
-path = "src/main.rs"
-
 [dependencies]
-ctrlc.workspace = true
-dv-core = { path = "../dv-core" }
-
-[dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

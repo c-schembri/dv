@@ -788,8 +788,19 @@ boundary, not final drop-in parity.
   `none` or `basic` through schema 9. The offline NuGet.Configuration oracle
   measures `73.624 ms` for Microsoft versus `4.615 ms` for `dv` (`16.0x`)
   across 30 retained samples with two sources and zero network requests. `P2`
-- [ ] `NUGET-009` Define a credential-provider protocol for private feeds,
-  interactive login, cancellation, timeout, and noninteractive CI. `P2`
+- [x] `NUGET-009` Implement the NuGet cross-platform V2 credential-provider
+  protocol for private feeds. Self-contained providers use symmetric bounded
+  JSON-lines messaging, process monitoring, initialization, authentication
+  claims, noninteractive-by-default requests, opt-in interactive login output,
+  cancellation, and NuGet-compatible handshake/request timeouts. Provider
+  response storage is zeroed, the acquired Basic header is cached only for the
+  challenged HTTPS origin, rejected credentials receive one bounded
+  `IsRetry=true` refresh, concurrent challenges coalesce per source, and
+  DLL-only plugins fail rather than invoking `dotnet`. The official
+  `NuGet.Protocol` oracle measures `115.621 ms` for
+  Microsoft versus `22.519 ms` for `dv` (`5.1x`) across 30 retained samples
+  while both launch the same fixture provider and perform zero network work.
+  `P2`
 - [ ] `NUGET-010` Support client certificates and platform certificate stores
   only after authenticated-source fixtures exist. `P5`
 - [~] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,

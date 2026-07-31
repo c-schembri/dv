@@ -77,6 +77,7 @@ Invalid input behavior:
 | `nuget_local_sources` | mapped flat and hierarchical local feeds, empty global cache and restore outputs | process launch, local layout discovery, two-package graph resolution, 2,980,145 source bytes, hash/ZIP validation, extraction, atomic publication, and output |
 | `nuget_service_index` | one v3 source, prebuilt official NuGet.Protocol oracle, fresh isolated HTTP cache | process launch, project/config discovery, one live HTTPS request, bounded index parse, five capability selections, and output |
 | `nuget_credentials` | two v3 sources, one environment override and one config-only credential, prebuilt official NuGet.Configuration oracle | process launch, project/config discovery, credential precedence, sensitive-header materialization, redacted source output, and zero network work |
+| `nuget_credential_provider` | one private v3 source, one prebuilt self-contained provider, prebuilt official NuGet.Protocol oracle | process launch, provider launch, symmetric handshake, monitor/initialize/claims/authentication requests, secret-free result, provider close, and zero network work |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -112,6 +113,7 @@ directional decisions.`
 | `nuget-local-sources` | 1 project, 2 mapped local feeds, 1 flat package, 1 hierarchical package, 2,980,145 archive bytes | offline layout detection, local range/exact lookup, integrity validation, and cold cache publication | executable for both tools with source/package/hash parity preflight |
 | `nuget-service-index` | 1 project, 1 v3 source, 40 resource rows, 31 distinct types, 5 capability families, 9,272 response bytes | official resource preference, client-version compatibility, mirror retention, and live request latency | executable for both tools with exact SDK-shipped NuGet.Protocol endpoint parity preflight |
 | `nuget-credentials` | 1 project, 2 HTTPS v3 sources, 1 environment credential override, 1 config-only PAT, 6 secret/decoy strings | NuGet-compatible credential selection, Basic policy, redacted output, and offline setup latency | executable for both tools with official NuGet.Configuration selection and plaintext-containment preflight |
+| `nuget-credential-provider` | 1 project, 1 HTTPS v3 source, 1 self-contained provider, 1 Basic credential, 2 secret strings | NuGet V2 handshake/lifecycle, authentication claim, noninteractive flags, timeout cancellation, redacted output, and offline probe latency | executable for both tools with official NuGet.Protocol plugin manager, trace-policy, timeout, and plaintext-containment preflight |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | package workload captured; project-graph shape still pending |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
@@ -264,6 +266,13 @@ reporting without network variance:
 
 ```text
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
+```
+
+Measure the same self-contained V2 provider lifecycle through Microsoft's
+official plugin manager and `dv`, without network variance:
+
+```text
+cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

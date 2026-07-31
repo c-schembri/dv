@@ -51,8 +51,8 @@ boundary.
 
 ## Boundaries
 
-- Only Basic is implemented; challenge-driven mechanisms and credential
-  providers remain `NUGET-009`.
+- Basic/PAT is implemented for static credentials and cross-platform V2
+  credential providers. Other HTTP authentication schemes remain unsupported.
 - Static credentials apply only to HTTPS remote sources. Local sources never
   retain credentials.
 - Credentials are not sent to a different host or port advertised by a

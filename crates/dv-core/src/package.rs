@@ -8,7 +8,10 @@ use std::{
   io::{self, Read, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
-  sync::Arc,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+  },
   thread,
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,11 +21,15 @@ use quick_xml::{Reader, XmlVersion, events::Event};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 use zeroize::Zeroizing;
 use zip::ZipArchive;
 
-use crate::{FrameworkFamily, NugetAuditLevel, NugetAuditMode, ProjectSpec, TargetFramework, discover_sdks};
+use crate::{
+  CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageCancellation, ProjectSpec, TargetFramework,
+  credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
+  discover_sdks,
+};
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
@@ -270,6 +277,27 @@ pub struct PackageResolveOptions {
   pub offline: bool,
   /// Write or refresh `dv.lock.json` after successful resolution.
   pub write_lock: bool,
+  /// Permit a credential provider to show interactive login instructions.
+  /// The default is false so CI never blocks waiting for input.
+  pub interactive: bool,
+  /// Acquire provider credentials while inspecting sources without making an
+  /// HTTP request. Intended for diagnostics and like-for-like measurement.
+  pub probe_credentials: bool,
+  /// Cooperative cancellation observed by credential-provider subprocesses.
+  pub cancellation: Option<PackageCancellation>,
+  /// Receives provider log messages only in interactive mode.
+  pub credential_provider_log_sink: Option<CredentialProviderLogSink>,
+}
+
+impl PackageResolveOptions {
+  fn credential_provider_options(&self) -> CredentialProviderOptions {
+    CredentialProviderOptions {
+      configured: credential_provider::is_configured(),
+      interactive: self.interactive,
+      cancellation: self.cancellation.clone(),
+      log_sink: self.credential_provider_log_sink,
+    }
+  }
 }
 
 /// A NuGet v3 capability selected from a source service index.
@@ -743,6 +771,10 @@ pub enum PackageErrorKind {
   NonUnicodePath,
   /// Compact plan data exceeded its supported range.
   TextOverflow,
+  /// A credential provider could not be discovered or violated its protocol.
+  CredentialProvider,
+  /// Package work was cooperatively cancelled.
+  Cancelled,
 }
 
 /// A package failure with stable path or source context.
@@ -1330,8 +1362,74 @@ struct PendingSourceCredential {
 }
 
 struct SourceCredential {
-  authorization: HeaderValue,
+  authorization: Option<HeaderValue>,
   origin: HttpsOrigin,
+  provider: Option<Box<SourceProviderCredential>>,
+}
+
+struct SourceProviderCredential {
+  source: Box<str>,
+  provider_options: CredentialProviderOptions,
+  acquired: AtomicBool,
+  state: Mutex<ProviderCredentialState>,
+}
+
+#[derive(Default)]
+struct ProviderCredentialState {
+  authorization: Option<HeaderValue>,
+  provider_index: Option<usize>,
+  generation: u32,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+  assert!(size_of::<HttpsOrigin>() == 24);
+  assert!(align_of::<HttpsOrigin>() == 8);
+  assert!(size_of::<SourceCredential>() == 72);
+  assert!(align_of::<SourceCredential>() == 8);
+};
+
+impl SourceCredential {
+  #[cfg(test)]
+  fn authorization(&self) -> Option<&HeaderValue> {
+    self.authorization.as_ref()
+  }
+
+  fn is_configured(&self) -> bool {
+    self.authorization.is_some() || self.provider.as_deref().is_some_and(|provider| provider.acquired.load(AtomicOrdering::Acquire))
+  }
+
+  async fn authorization_snapshot(&self) -> (Option<HeaderValue>, u32, bool) {
+    let Some(provider) = &self.provider else {
+      return (self.authorization.clone(), 0, false);
+    };
+    let state = provider.state.lock().await;
+    match &state.authorization {
+      Some(authorization) => (Some(authorization.clone()), state.generation, true),
+      None => (self.authorization.clone(), state.generation, false),
+    }
+  }
+
+  async fn acquire_provider(&self, observed_generation: u32, is_retry: bool) -> Result<Option<HeaderValue>, PackageError> {
+    let Some(provider) = &self.provider else {
+      return Ok(None);
+    };
+    let mut state = provider.state.lock().await;
+    if state.generation != observed_generation {
+      return Ok(state.authorization.clone());
+    }
+    let acquired = credential_provider::acquire(&provider.source, &provider.provider_options, is_retry, state.provider_index)
+      .await
+      .map_err(package_credential_provider_error)?;
+    let Some(acquired) = acquired else {
+      return Ok(None);
+    };
+    state.authorization = Some(acquired.authorization.clone());
+    state.provider_index = Some(acquired.provider_index);
+    state.generation = state.generation.wrapping_add(1);
+    provider.acquired.store(true, AtomicOrdering::Release);
+    Ok(Some(acquired.authorization))
+  }
 }
 
 #[derive(Eq, PartialEq)]
@@ -1371,7 +1469,7 @@ impl SourceCredentialBatch {
   }
 
   fn is_configured(&self, source: usize) -> bool {
-    self.get(source).is_some()
+    self.get(source).is_some_and(|credential| credential.is_configured())
   }
 }
 
@@ -1614,9 +1712,16 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
       options.packages_directory.as_deref(),
       options.config_file.as_deref(),
       &options.sources,
+      options.credential_provider_options(),
     )?;
     let client = http_client(config.proxy.as_ref())?;
-    inventories.push(runtime.block_on(inspect_source_batch(&client, &config.sources, &config.credentials, !options.offline))?);
+    inventories.push(runtime.block_on(inspect_source_batch(
+      &client,
+      &config.sources,
+      &config.credentials,
+      !options.offline,
+      options.probe_credentials,
+    ))?);
   }
   Ok(inventories)
 }
@@ -1626,10 +1731,21 @@ async fn inspect_source_batch(
   sources: &[(String, PackageSource)],
   credentials: &SourceCredentialBatch,
   allow_network: bool,
+  probe_credentials: bool,
 ) -> Result<PackageSourceInventory, PackageError> {
   let mut discovered = std::iter::repeat_with(|| None)
     .take(sources.len())
     .collect::<Vec<Option<(NugetServiceEndpoints, u64)>>>();
+  if probe_credentials {
+    for (index, (_, source)) in sources.iter().enumerate() {
+      if source.protocol != NugetProtocol::Local
+        && let Some(credential) = credentials.get(index)
+      {
+        let (_, generation, _) = credential.authorization_snapshot().await;
+        credential.acquire_provider(generation, false).await?;
+      }
+    }
+  }
   if allow_network {
     let jobs = sources
       .iter()
@@ -1719,6 +1835,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     options.packages_directory.as_deref(),
     options.config_file.as_deref(),
     &options.sources,
+    options.credential_provider_options(),
   )?;
   validate_signature_policy(config.signature_validation)?;
   validate_audit_policy(project)?;
@@ -2016,6 +2133,7 @@ fn discover_configuration(
   explicit_cache: Option<&Path>,
   explicit_config: Option<&Path>,
   explicit_sources: &[String],
+  provider_options: CredentialProviderOptions,
 ) -> Result<NugetConfiguration, PackageError> {
   let config_paths = discover_config_paths(project_directory, explicit_config, &NugetConfigRoots::from_environment())?;
 
@@ -2038,7 +2156,7 @@ fn discover_configuration(
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
   let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
-  let credentials = resolve_source_credentials(&sources, merged.credentials, project_directory)?;
+  let credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -2115,17 +2233,20 @@ fn resolve_source_credentials(
   sources: &[(String, PackageSource)],
   configured: Vec<MergedSourceCredential>,
   context: &Path,
+  provider_options: CredentialProviderOptions,
 ) -> Result<SourceCredentialBatch, PackageError> {
-  resolve_source_credentials_with(sources, configured, context, |name| env::var(name).ok())
+  resolve_source_credentials_with(sources, configured, context, provider_options, |name| env::var(name).ok())
 }
 
 fn resolve_source_credentials_with(
   sources: &[(String, PackageSource)],
   configured: Vec<MergedSourceCredential>,
   context: &Path,
+  provider_options: CredentialProviderOptions,
   mut environment: impl FnMut(&str) -> Option<String>,
 ) -> Result<SourceCredentialBatch, PackageError> {
   let mut configured = configured;
+  let provider_configured = provider_options.configured;
   let mut entries = None::<Vec<Option<Arc<SourceCredential>>>>;
   for (source_index, (name, source)) in sources.iter().enumerate() {
     if source.protocol == NugetProtocol::Local {
@@ -2140,7 +2261,7 @@ fn resolve_source_credentials_with(
         .position(|credential| credential.source == *name)
         .map(EnvironmentOrConfigCredential::Config)
     });
-    let credential = match selected {
+    let authorization = match selected {
       Some(EnvironmentOrConfigCredential::Environment(credential)) => Some(materialize_source_credential(credential, source, context)?),
       Some(EnvironmentOrConfigCredential::Config(index)) => {
         let credential = configured.swap_remove(index);
@@ -2148,20 +2269,34 @@ fn resolve_source_credentials_with(
       },
       None => None,
     };
+    let provider = provider_configured.then(|| {
+      Box::new(SourceProviderCredential {
+        source: source.url.clone().into_boxed_str(),
+        provider_options: provider_options.clone(),
+        acquired: AtomicBool::new(false),
+        state: Mutex::new(ProviderCredentialState::default()),
+      })
+    });
+    let credential = if authorization.is_some() || provider.is_some() {
+      Some(Arc::new(SourceCredential {
+        authorization,
+        origin: HttpsOrigin::parse(&source.url, context)?,
+        provider,
+      }))
+    } else {
+      None
+    };
     if credential.is_some() && entries.is_none() {
       let mut initialized = Vec::with_capacity(sources.len());
       initialized.resize_with(source_index, || None);
       entries = Some(initialized);
     }
     if let Some(entries) = &mut entries {
-      entries.push(credential.map(Arc::new));
+      entries.push(credential);
     }
   }
-  Ok(match entries {
-    Some(entries) => SourceCredentialBatch {
-      entries: entries.into_boxed_slice(),
-    },
-    None => SourceCredentialBatch::default(),
+  Ok(SourceCredentialBatch {
+    entries: entries.map_or_else(Box::default, Vec::into_boxed_slice),
   })
 }
 
@@ -2210,7 +2345,7 @@ fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
     .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
-fn materialize_source_credential(credential: MergedSourceCredential, source: &PackageSource, context: &Path) -> Result<SourceCredential, PackageError> {
+fn materialize_source_credential(credential: MergedSourceCredential, _source: &PackageSource, context: &Path) -> Result<HeaderValue, PackageError> {
   if credential.username.is_empty() {
     return Err(config_error(
       context,
@@ -2237,10 +2372,7 @@ fn materialize_source_credential(credential: MergedSourceCredential, source: &Pa
     ));
   }
   let authorization = basic_authorization(&credential.username, &password, &credential.source, context)?;
-  Ok(SourceCredential {
-    authorization,
-    origin: HttpsOrigin::parse(&source.url, context)?,
-  })
+  Ok(authorization)
 }
 
 fn basic_authorization(username: &str, password: &str, source: &str, context: &Path) -> Result<HeaderValue, PackageError> {
@@ -2516,7 +2648,7 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
   if let Some(cache) = environment_path("NUGET_PACKAGES")? {
     return Ok(cache);
   }
-  discover_configuration(project_directory, None, None, &[]).map(|configuration| configuration.cache_root)
+  discover_configuration(project_directory, None, None, &[], CredentialProviderOptions::default()).map(|configuration| configuration.cache_root)
 }
 
 fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
@@ -4327,10 +4459,7 @@ async fn get_optional_bytes(
   limit: u64,
   kind: &str,
 ) -> Result<Option<Vec<u8>>, PackageError> {
-  let mut response = authenticated_get(client, credential, url)
-    .send()
-    .await
-    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
   if response.status() == reqwest::StatusCode::NOT_FOUND {
     return Ok(None);
   }
@@ -4807,10 +4936,7 @@ async fn download_package(
   url: &str,
   destination: &Path,
 ) -> Result<(String, u64), PackageError> {
-  let mut response = authenticated_get(client, credential, url)
-    .send()
-    .await
-    .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
+  let mut response = send_authenticated(client, credential, url, "package download").await?;
   response
     .error_for_status_ref()
     .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
@@ -4857,10 +4983,7 @@ async fn download_package(
 }
 
 async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
-  let mut response = authenticated_get(client, credential, url)
-    .send()
-    .await
-    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
   response
     .error_for_status_ref()
     .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
@@ -4885,12 +5008,50 @@ async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredentia
   Ok(bytes)
 }
 
+#[cfg(test)]
 fn authenticated_get(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str) -> reqwest::RequestBuilder {
   let request = client.get(url);
-  match credential.filter(|credential| credential.origin.matches(url)) {
-    Some(credential) => request.header(AUTHORIZATION, credential.authorization.clone()),
+  match credential
+    .filter(|credential| credential.origin.matches(url))
+    .and_then(SourceCredential::authorization)
+  {
+    Some(authorization) => request.header(AUTHORIZATION, authorization.clone()),
     None => request,
   }
+}
+
+async fn send_authenticated(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  url: &str,
+  operation: &str,
+) -> Result<reqwest::Response, PackageError> {
+  let credential = credential.filter(|credential| credential.origin.matches(url));
+  for attempt in 0..=2 {
+    let (authorization, generation, provider_was_used) = match credential {
+      Some(credential) => credential.authorization_snapshot().await,
+      None => (None, 0, false),
+    };
+    let mut request = client.get(url);
+    if let Some(authorization) = authorization {
+      request = request.header(AUTHORIZATION, authorization);
+    }
+    let response = request
+      .send()
+      .await
+      .map_err(|error| network_error(url, format!("{operation} failed: {error}")))?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 2 {
+      return Ok(response);
+    }
+    let Some(credential) = credential else {
+      return Ok(response);
+    };
+    if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
+      return Ok(response);
+    }
+    drop(response);
+  }
+  unreachable!("the bounded authentication loop always returns")
 }
 
 fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
@@ -4903,6 +5064,17 @@ fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
 
 fn network_error(context: impl Into<String>, message: impl Into<String>) -> PackageError {
   PackageError::new(PackageErrorKind::Network, context, message)
+}
+
+fn package_credential_provider_error(error: CredentialProviderError) -> PackageError {
+  let kind = match error.kind() {
+    CredentialProviderErrorKind::Cancelled => PackageErrorKind::Cancelled,
+    CredentialProviderErrorKind::Discovery
+    | CredentialProviderErrorKind::Protocol
+    | CredentialProviderErrorKind::Timeout
+    | CredentialProviderErrorKind::Process => PackageErrorKind::CredentialProvider,
+  };
+  PackageError::new(kind, error.context(), error.to_string())
 }
 
 struct ArchiveEntryPlan {
@@ -6845,7 +7017,7 @@ mod tests {
     assert_eq!(merged.credentials[0].source, "Private Feed");
 
     let sources = merged.sources.clone();
-    let credentials = resolve_source_credentials_with(&sources, merged.credentials, &temp.0, |name| {
+    let credentials = resolve_source_credentials_with(&sources, merged.credentials, &temp.0, CredentialProviderOptions::default(), |name| {
       assert_eq!(name, "NuGetPackageSourceCredentials_Private Feed");
       Some("Username=environment-user; Password=environment-pat;ValidAuthenticationTypes=basic".into())
     })
@@ -6865,12 +7037,27 @@ mod tests {
 
     let client = reqwest::Client::new();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let inventory = runtime.block_on(inspect_source_batch(&client, &sources, &credentials, false)).unwrap();
+    let inventory = runtime.block_on(inspect_source_batch(&client, &sources, &credentials, false, false)).unwrap();
     assert_eq!(inventory.source_authentication(0), PackageSourceAuthentication::Basic);
     assert!(!inventory.text.contains("config-secret"));
     assert!(!inventory.text.contains("higher-secret"));
     assert!(!inventory.text.contains("environment-user"));
     assert!(!inventory.text.contains("environment-pat"));
+  }
+
+  #[test]
+  fn public_sources_without_credentials_retain_no_provider_batch() {
+    let sources = vec![(
+      "nuget.org".to_owned(),
+      PackageSource {
+        url: DEFAULT_SOURCE.to_owned(),
+        protocol: NugetProtocol::V3,
+      },
+    )];
+
+    let credentials = resolve_source_credentials_with(&sources, Vec::new(), Path::new("NuGet.Config"), CredentialProviderOptions::default(), |_| None).unwrap();
+
+    assert!(credentials.entries.is_empty());
   }
 
   #[test]
@@ -6888,9 +7075,11 @@ mod tests {
       password: StoredCredentialPassword::Clear(Zeroizing::new("config-secret".into())),
       valid_authentication_types: Some("negotiate".into()),
     }];
-    let error = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), |_| Some("malformed-secret-value".into()))
-      .err()
-      .unwrap();
+    let error = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), CredentialProviderOptions::default(), |_| {
+      Some("malformed-secret-value".into())
+    })
+    .err()
+    .unwrap();
     let rendered = error.to_string();
     assert!(rendered.contains("does not allow Basic authentication"));
     assert!(!rendered.contains("config-user"));
@@ -6923,7 +7112,7 @@ mod tests {
       password: StoredCredentialPassword::Clear(Zeroizing::new("config-secret".into())),
       valid_authentication_types: Some("basic".into()),
     }];
-    let credentials = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), |_| {
+    let credentials = resolve_source_credentials_with(&sources, configured, Path::new("NuGet.Config"), CredentialProviderOptions::default(), |_| {
       Some("Password=wrong-order;Username=ignored".into())
     })
     .unwrap();
@@ -7221,7 +7410,14 @@ mod tests {
       "https://packages.example.test/v3/index.json".to_owned(),
     ];
 
-    let discovered = discover_configuration(&temp.0, Some(&temp.0.join("packages")), Some(&config), &overrides).unwrap();
+    let discovered = discover_configuration(
+      &temp.0,
+      Some(&temp.0.join("packages")),
+      Some(&config),
+      &overrides,
+      CredentialProviderOptions::default(),
+    )
+    .unwrap();
 
     assert_eq!(discovered.sources.len(), 2);
     assert_eq!(discovered.sources[0].0, "selected");
@@ -7378,9 +7574,15 @@ mod tests {
 
     let selected = discover_config_paths(&temp.0.join("repository"), Some(&explicit), &roots).unwrap();
     assert_eq!(selected.as_slice(), std::slice::from_ref(&explicit));
-    let no_sources = discover_configuration(&temp.0.join("repository"), Some(&temp.0.join("packages")), Some(&explicit), &[])
-      .err()
-      .unwrap();
+    let no_sources = discover_configuration(
+      &temp.0.join("repository"),
+      Some(&temp.0.join("packages")),
+      Some(&explicit),
+      &[],
+      CredentialProviderOptions::default(),
+    )
+    .err()
+    .unwrap();
     assert_eq!(no_sources.kind(), PackageErrorKind::Configuration);
     assert!(no_sources.to_string().contains("no enabled package source"));
     let missing = temp.0.join("missing.config");
@@ -7718,6 +7920,7 @@ mod tests {
       sources: Vec::new(),
       offline: true,
       write_lock: true,
+      ..PackageResolveOptions::default()
     };
 
     let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
@@ -7761,6 +7964,7 @@ mod tests {
       ],
       offline: true,
       write_lock: true,
+      ..PackageResolveOptions::default()
     };
 
     let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
@@ -7800,6 +8004,7 @@ mod tests {
       sources: vec![temp.0.join("feed").to_string_lossy().into_owned()],
       offline: true,
       write_lock: true,
+      ..PackageResolveOptions::default()
     };
 
     let error = resolve_package_inputs(&[&project], &options).unwrap_err();
@@ -7835,6 +8040,7 @@ mod tests {
       sources: Vec::new(),
       offline: true,
       write_lock: false,
+      ..PackageResolveOptions::default()
     };
 
     let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
@@ -7883,6 +8089,7 @@ mod tests {
       sources: Vec::new(),
       offline: true,
       write_lock: true,
+      ..PackageResolveOptions::default()
     };
 
     let first = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
