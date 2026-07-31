@@ -191,6 +191,9 @@ impl AssetFlags {
 pub struct PackageResolveOptions {
   /// Explicit global-packages directory, overriding environment and config.
   pub packages_directory: Option<PathBuf>,
+  /// Explicit NuGet configuration file. When present, no implicit hierarchy
+  /// is discovered.
+  pub config_file: Option<PathBuf>,
   /// Reject every operation that would require an HTTP request.
   pub offline: bool,
   /// Write or refresh `dv.lock.json` after successful resolution.
@@ -1054,7 +1057,11 @@ pub fn resolve_package_inputs(projects: &[&ProjectSpec], options: &PackageResolv
 }
 
 fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Result<PackageResolution, PackageError> {
-  let config = discover_configuration(project.project_directory(), options.packages_directory.as_deref())?;
+  let config = discover_configuration(
+    project.project_directory(),
+    options.packages_directory.as_deref(),
+    options.config_file.as_deref(),
+  )?;
   let lock_path = project.project_directory().join("dv.lock.json");
   let direct = direct_requests(project)?;
   let target = project.target();
@@ -1314,31 +1321,20 @@ fn invalid_prune_line(path: &Path, line: usize) -> PackageError {
   )
 }
 
-fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
-  let mut config_paths = Vec::new();
-  if let Some(user) = user_config_path()
-    && user.is_file()
-  {
-    config_paths.push(user);
-  }
-  let mut ancestors: Vec<&Path> = project_directory.ancestors().collect();
-  ancestors.reverse();
-  for directory in ancestors {
-    for name in ["NuGet.Config", "nuget.config"] {
-      let candidate = directory.join(name);
-      if candidate.is_file() && !config_paths.contains(&candidate) {
-        config_paths.push(candidate);
-      }
-    }
-  }
+fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>, explicit_config: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
+  let config_paths = discover_config_paths(project_directory, explicit_config, &NugetConfigRoots::from_environment())?;
 
-  let mut sources = vec![(
-    "nuget.org".to_owned(),
-    PackageSource {
-      url: DEFAULT_SOURCE.to_owned(),
-      protocol: NugetProtocol::V3,
-    },
-  )];
+  let mut sources = if config_paths.is_empty() {
+    vec![(
+      "nuget.org".to_owned(),
+      PackageSource {
+        url: DEFAULT_SOURCE.to_owned(),
+        protocol: NugetProtocol::V3,
+      },
+    )]
+  } else {
+    Vec::new()
+  };
   let mut disabled = BTreeSet::new();
   let mut configured_cache = None;
   for path in config_paths {
@@ -1355,16 +1351,6 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
       "NuGet configuration contains no enabled package source",
     ));
   }
-  for source in &sources {
-    if !source.url.starts_with("https://") {
-      return Err(PackageError::new(
-        PackageErrorKind::Configuration,
-        &source.url,
-        format!("package resolution supports HTTPS NuGet v2 and v3 sources; {:?} is unsupported", source.url),
-      ));
-    }
-  }
-
   let cache_root = explicit_cache
     .map(Path::to_owned)
     .or_else(|| env::var_os("NUGET_PACKAGES").map(PathBuf::from))
@@ -1380,12 +1366,121 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   Ok(NugetConfiguration { cache_root, sources })
 }
 
-fn user_config_path() -> Option<PathBuf> {
-  if cfg!(windows) {
-    env::var_os("APPDATA").map(PathBuf::from).map(|path| path.join("NuGet/NuGet.Config"))
-  } else {
-    env::var_os("HOME").map(PathBuf::from).map(|path| path.join(".config/NuGet/NuGet.Config"))
+struct NugetConfigRoots {
+  machine_config_directory: Option<PathBuf>,
+  user_settings_directory: Option<PathBuf>,
+}
+
+impl NugetConfigRoots {
+  fn from_environment() -> Self {
+    let machine_base = if cfg!(windows) {
+      nonempty_env("PROGRAMFILES(X86)").or_else(|| nonempty_env("PROGRAMFILES"))
+    } else {
+      nonempty_env("NUGET_COMMON_APPLICATION_DATA").or_else(|| {
+        Some(if cfg!(target_os = "macos") {
+          PathBuf::from("/Library/Application Support")
+        } else {
+          PathBuf::from("/etc/opt")
+        })
+      })
+    };
+    let user_settings_directory = if cfg!(windows) {
+      nonempty_env("APPDATA").map(|path| path.join("NuGet"))
+    } else {
+      nonempty_env("HOME").map(|path| path.join(".nuget/NuGet"))
+    };
+    Self {
+      machine_config_directory: machine_base.map(|path| path.join("NuGet/Config")),
+      user_settings_directory,
+    }
   }
+}
+
+fn nonempty_env(name: &str) -> Option<PathBuf> {
+  env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn discover_config_paths(project_directory: &Path, explicit_config: Option<&Path>, roots: &NugetConfigRoots) -> Result<Vec<PathBuf>, PackageError> {
+  if let Some(path) = explicit_config {
+    if !path.is_file() {
+      return Err(config_error(path, "explicit NuGet configuration file does not exist or is not a file"));
+    }
+    return Ok(vec![path.to_owned()]);
+  }
+
+  let ancestor_count = project_directory.ancestors().count();
+  let mut paths = Vec::with_capacity(ancestor_count + 4);
+  if let Some(directory) = roots.machine_config_directory.as_deref() {
+    append_config_fragments(directory, &mut paths, false)?;
+  }
+  if let Some(directory) = roots.user_settings_directory.as_deref() {
+    append_config_fragments(&directory.join("config"), &mut paths, true)?;
+    let user = directory.join("NuGet.Config");
+    if user.is_file() {
+      paths.push(user);
+    }
+  }
+
+  let mut ancestors: Vec<&Path> = project_directory.ancestors().collect();
+  ancestors.reverse();
+  for directory in ancestors {
+    if let Some(path) = config_path_in(directory) {
+      paths.push(path);
+    }
+  }
+  Ok(paths)
+}
+
+fn append_config_fragments(directory: &Path, paths: &mut Vec<PathBuf>, exclude_default: bool) -> Result<(), PackageError> {
+  let entries = match fs::read_dir(directory) {
+    Ok(entries) => entries,
+    Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => return Ok(()),
+    Err(error) => return Err(package_io("enumerate NuGet configuration directory", directory, error)),
+  };
+  let start = paths.len();
+  for entry in entries {
+    let entry = entry.map_err(|error| package_io("enumerate NuGet configuration directory", directory, error))?;
+    let file_type = entry
+      .file_type()
+      .map_err(|error| package_io("inspect NuGet configuration entry", &entry.path(), error))?;
+    let path = entry.path();
+    if (file_type.is_file() || (file_type.is_symlink() && path.is_file())) && is_config_fragment(&path) && !(exclude_default && is_default_config_name(&path)) {
+      paths.push(path);
+    }
+  }
+  paths[start..].sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
+  Ok(())
+}
+
+fn is_default_config_name(path: &Path) -> bool {
+  path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+    if cfg!(windows) {
+      name.eq_ignore_ascii_case("NuGet.Config")
+    } else {
+      name == "NuGet.Config"
+    }
+  })
+}
+
+fn is_config_fragment(path: &Path) -> bool {
+  let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+    return false;
+  };
+  if cfg!(windows) {
+    extension.eq_ignore_ascii_case("config")
+  } else {
+    matches!(extension, "Config" | "config")
+  }
+}
+
+fn config_path_in(directory: &Path) -> Option<PathBuf> {
+  const CASE_SENSITIVE_NAMES: [&str; 3] = ["nuget.config", "NuGet.config", "NuGet.Config"];
+  let names = if cfg!(windows) {
+    &CASE_SENSITIVE_NAMES[2..]
+  } else {
+    &CASE_SENSITIVE_NAMES[..]
+  };
+  names.iter().map(|name| directory.join(name)).find(|path| path.is_file())
 }
 
 fn default_global_packages() -> Option<PathBuf> {
@@ -1395,7 +1490,13 @@ fn default_global_packages() -> Option<PathBuf> {
 }
 
 pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache: Option<&Path>) -> Result<PathBuf, PackageError> {
-  discover_configuration(project_directory, explicit_cache).map(|configuration| configuration.cache_root)
+  if let Some(cache) = explicit_cache {
+    return Ok(cache.to_owned());
+  }
+  if let Some(cache) = nonempty_env("NUGET_PACKAGES") {
+    return Ok(cache);
+  }
+  discover_configuration(project_directory, None, None).map(|configuration| configuration.cache_root)
 }
 
 fn merge_config(
@@ -1514,6 +1615,13 @@ async fn discover_service_endpoints(client: &reqwest::Client, sources: &[Package
   let mut endpoints = Vec::with_capacity(sources.len());
   let mut requests = 0;
   for source in sources {
+    if !source.url.starts_with("https://") {
+      return Err(PackageError::new(
+        PackageErrorKind::Configuration,
+        &source.url,
+        format!("package resolution supports HTTPS NuGet v2 and v3 sources; {:?} is unsupported", source.url),
+      ));
+    }
     match source.protocol {
       NugetProtocol::V2 => endpoints.push(ServiceEndpoint::V2 {
         source: source.url.clone(),
@@ -4366,6 +4474,71 @@ mod tests {
   }
 
   #[test]
+  fn nuget_config_discovery_orders_machine_user_and_drive_scopes() {
+    let temp = TempDirectory::new();
+    for relative in [
+      "machine/10.config",
+      "machine/20.Config",
+      "user/config/10.config",
+      "user/config/20.Config",
+      "user/config/NuGet.Config",
+      "user/NuGet.Config",
+      "drive/NuGet.Config",
+      "drive/repository/NuGet.Config",
+      "drive/repository/src/NuGet.Config",
+    ] {
+      temp.write(relative, "<configuration />");
+    }
+    let project_directory = temp.0.join("drive/repository/src");
+    let roots = NugetConfigRoots {
+      machine_config_directory: Some(temp.0.join("machine")),
+      user_settings_directory: Some(temp.0.join("user")),
+    };
+
+    let paths = discover_config_paths(&project_directory, None, &roots).unwrap();
+    let relative = paths.iter().filter_map(|path| path.strip_prefix(&temp.0).ok()).collect::<Vec<_>>();
+
+    assert_eq!(
+      relative,
+      [
+        Path::new("machine/20.Config"),
+        Path::new("machine/10.config"),
+        Path::new("user/config/20.Config"),
+        Path::new("user/config/10.config"),
+        Path::new("user/NuGet.Config"),
+        Path::new("drive/NuGet.Config"),
+        Path::new("drive/repository/NuGet.Config"),
+        Path::new("drive/repository/src/NuGet.Config"),
+      ]
+    );
+  }
+
+  #[test]
+  fn explicit_nuget_config_is_the_only_discovered_file() {
+    let temp = TempDirectory::new();
+    temp.write("machine/machine.config", "<configuration />");
+    temp.write("user/NuGet.Config", "<configuration />");
+    temp.write("repository/NuGet.Config", "<configuration />");
+    let explicit = temp.write("selected/custom.xml", "<configuration />");
+    let roots = NugetConfigRoots {
+      machine_config_directory: Some(temp.0.join("machine")),
+      user_settings_directory: Some(temp.0.join("user")),
+    };
+
+    let selected = discover_config_paths(&temp.0.join("repository"), Some(&explicit), &roots).unwrap();
+    assert_eq!(selected.as_slice(), std::slice::from_ref(&explicit));
+    let no_sources = discover_configuration(&temp.0.join("repository"), Some(&temp.0.join("packages")), Some(&explicit))
+      .err()
+      .unwrap();
+    assert_eq!(no_sources.kind(), PackageErrorKind::Configuration);
+    assert!(no_sources.to_string().contains("no enabled package source"));
+    let missing = temp.0.join("missing.config");
+    let error = discover_config_paths(&temp.0.join("repository"), Some(&missing), &roots).unwrap_err();
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert_eq!(error.context(), missing.display().to_string());
+  }
+
+  #[test]
   fn parses_exact_v2_atom_metadata_without_console_scraping() {
     let metadata = br#"<entry xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
 <content type="application/zip" src="https://packages.example.test/api/v2/package/Sample.Package/1.2.3" />
@@ -4604,6 +4777,7 @@ mod tests {
     let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let options = PackageResolveOptions {
       packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
       offline: true,
       write_lock: true,
     };
@@ -4644,6 +4818,7 @@ mod tests {
     let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let options = PackageResolveOptions {
       packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
       offline: true,
       write_lock: false,
     };
@@ -4690,6 +4865,7 @@ mod tests {
     let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let options = PackageResolveOptions {
       packages_directory: Some(cache),
+      config_file: None,
       offline: true,
       write_lock: true,
     };

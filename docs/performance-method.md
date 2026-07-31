@@ -69,6 +69,7 @@ Invalid input behavior:
 | `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload with package and portable-asset oracle comparison |
 | `package_asset_plan` | unchanged `massive-package-graph`, populated isolated packages, matching tool-native lock | process launch, 203-package locked validation, family-partitioned asset-plan materialization, and output |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
+| `nuget_config_hierarchy` | six machine/user/repository configs, populated isolated package cache, matching native lock | process launch, platform config discovery/merge, project evaluation, one-package locked validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -193,6 +194,13 @@ Measure deterministic unavailable-pack diagnosis without network variance:
 
 ```text
 cargo bench-all --case pack_diagnostic --samples 30 --warmups 3
+```
+
+Measure platform NuGet configuration discovery and merge through a warm,
+one-package locked restore:
+
+```text
+cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

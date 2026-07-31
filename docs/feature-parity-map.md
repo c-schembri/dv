@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 16 Rust source files, 15,315 nonblank source
-lines, and 91 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 15,714 nonblank source
+lines, and 94 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -717,8 +717,13 @@ boundary, not final drop-in parity.
 
 ## 7. NuGet Configuration, Sources, And Authentication
 
-- [~] `NUGET-001` Discover machine, user, drive, repository, and explicit
-  `NuGet.Config` files with platform-correct precedence. `P1`
+- [x] `NUGET-001` Discover machine, user, drive, repository, and explicit
+  `NuGet.Config` files with platform-correct precedence. Machine and
+  additional-user fragments, the main .NET CLI user file, and one
+  casing-correct file per ancestor form a deterministic low-to-high batch;
+  `--configfile` validates and isolates one file. The six-file locked oracle
+  measures `532.948 ms` for Microsoft versus `5.651 ms` for `dv` (`94.3x`)
+  across 30 retained samples. `P1`
 - [~] `NUGET-002` Merge keyed sections with `<clear>`, add, remove, disabled
   sources, and environment-variable expansion. `P1`
 - [~] `NUGET-003` Support `packageSources`, `disabledPackageSources`,

@@ -277,6 +277,51 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 }
 
 #[test]
+fn explicit_nuget_config_replaces_the_implicit_hierarchy() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="insecure" value="http://invalid.example.test/v2" /></packageSources></configuration>"#,
+  );
+  temp.write(
+    "config/selected.config",
+    r#"<configuration>
+<config><add key="globalPackagesFolder" value="../packages" /></config>
+<packageSources><clear /><add key="selected" value="https://packages.example.test/api/v2/" protocolVersion="2" /></packageSources>
+</configuration>"#,
+  );
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+<ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "packages/sample.package/1.2.3/sample.package.nuspec",
+    r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+  );
+  temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg", "");
+  temp.write(
+    "packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  );
+  temp.write("packages/sample.package/1.2.3/.dv.metadata.json", "{}");
+  temp.write("packages/sample.package/1.2.3/lib/net6.0/Sample.Package.dll", "");
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--configfile", "config/selected.config", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"source\":\"https://packages.example.test/api/v2/\""));
+  assert!(stdout.contains("\"source_protocol\":\"v2\""));
+  assert!(stdout.contains("\"network_requests\":0"));
+}
+
+#[test]
 fn build_plan_json_reports_framework_and_compiler_inputs() {
   let temp = TempDirectory::new();
   temp.write("Program.cs", "Console.WriteLine(\"hello\");");

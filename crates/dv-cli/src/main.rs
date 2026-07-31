@@ -64,8 +64,8 @@ Usage:
 
 const PACKAGE_HELP: &str = "\
 Usage:
-  dv restore [PROJECT] [--packages PATH] [--offline]
-  dv sync [PROJECT] [--packages PATH] [--offline]
+  dv restore [PROJECT] [--packages PATH] [--configfile PATH] [--offline]
+  dv sync [PROJECT] [--packages PATH] [--configfile PATH] [--offline]
 ";
 
 fn main() -> ExitCode {
@@ -167,7 +167,7 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
   }
-  let (requested_path, packages_directory, offline) = match parse_package_args(command, command_args) {
+  let options = match parse_package_args(command, command_args) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -196,13 +196,16 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+  let project = match load_project(&current_directory, options.project.as_deref(), ProjectConfiguration::Debug) {
     Ok(project) => project,
     Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
   let options = PackageResolveOptions {
-    packages_directory,
-    offline,
+    packages_directory: options.packages_directory,
+    config_file: options
+      .config_file
+      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
+    offline: options.offline,
     write_lock: true,
   };
   let resolutions = match resolve_package_inputs(&[&project], &options) {
@@ -216,25 +219,39 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
   succeed(started, command, args, package_resolution_payload(&project, resolution))
 }
 
-fn parse_package_args(command: &str, arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>, bool), String> {
-  let mut project = None;
-  let mut packages = None;
-  let mut offline = false;
+struct PackageCommandOptions {
+  project: Option<PathBuf>,
+  packages_directory: Option<PathBuf>,
+  config_file: Option<PathBuf>,
+  offline: bool,
+}
+
+fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageCommandOptions, String> {
+  let mut options = PackageCommandOptions {
+    project: None,
+    packages_directory: None,
+    config_file: None,
+    offline: false,
+  };
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].as_str() {
       "--packages" => {
         index += 1;
-        packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
+        options.packages_directory = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
       },
-      "--offline" => offline = true,
+      "--configfile" => {
+        index += 1;
+        options.config_file = Some(PathBuf::from(arguments.get(index).ok_or("--configfile requires a path")?));
+      },
+      "--offline" => options.offline = true,
       value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
-      value if project.is_none() => project = Some(PathBuf::from(value)),
+      value if options.project.is_none() => options.project = Some(PathBuf::from(value)),
       value => return Err(format!("unexpected {command} argument {value:?}")),
     }
     index += 1;
   }
-  Ok((project, packages, offline))
+  Ok(options)
 }
 
 fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
@@ -291,6 +308,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
   };
   let package_options = PackageResolveOptions {
     packages_directory: None,
+    config_file: None,
     offline: false,
     write_lock: true,
   };

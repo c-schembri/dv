@@ -22,8 +22,10 @@ NuGet sources are typed records containing URL and protocol generation:
   authentication, source mapping, proxies, and environment expansion fail or
   remain outside the supported subset.
 
-Configuration currently merges the user file and ancestor `NuGet.Config`
-files in precedence order. `packageSources` supports add, remove, and clear;
+Configuration discovers machine fragments, additional-user fragments, the
+main .NET CLI user file, and one `NuGet.Config` from each drive-to-project
+ancestor in precedence order. `--configfile` selects only its validated file.
+`packageSources` supports add, remove, and clear;
 `disabledPackageSources` supports clear and Boolean add values. The explicit
 `--packages` path wins over `NUGET_PACKAGES`, which wins over
 `globalPackagesFolder`, which wins over the platform default.
