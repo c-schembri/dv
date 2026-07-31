@@ -18,6 +18,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 enum CaseKind {
   Startup,
   ProjectEvaluate,
+  CompilerPlan,
   RestoreCold,
   BuildClean,
   BuildNoOp,
@@ -47,6 +48,19 @@ const DOTNET_CASES: &[Case] = &[
       "--nologo",
       "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
       "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "compiler_plan",
+    kind: CaseKind::CompilerPlan,
+    args: &[
+      "msbuild",
+      "SmallConsole.csproj",
+      "--nologo",
+      "-t:ResolveReferences",
+      "-getProperty:LangVersion,DefineConstants",
+      "-getItem:ReferencePath,Analyzer,Compile",
     ],
     implemented: true,
   },
@@ -87,6 +101,12 @@ const DV_CASES: &[Case] = &[
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "compiler_plan",
+    kind: CaseKind::CompilerPlan,
+    args: &["build", "--plan", "SmallConsole.csproj", "--json"],
     implemented: true,
   },
   Case {
@@ -193,6 +213,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
+    verify_compiler_plan(&repository, &dv_executable, &fixture)?;
+  }
 
   let mut runs = run_tool("dotnet", Path::new("dotnet"), DOTNET_CASES, &options, &fixture, &workspace.join("dotnet"))?;
   runs.extend(run_tool("dv", &dv_executable, DV_CASES, &options, &fixture, &workspace.join("dv"))?);
@@ -290,6 +313,93 @@ fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()>
   }
   if !dv.get("package_references").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
     return Err("dv small-console evaluation unexpectedly contains package references".into());
+  }
+  Ok(())
+}
+
+fn verify_compiler_plan(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-compiler-plan-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  reset_fixture(fixture, &verification)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["restore", "--nologo", "--verbosity", "quiet"],
+    &verification,
+    "compiler-plan verification restore",
+  )?;
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "SmallConsole.csproj",
+      "--nologo",
+      "-t:ResolveReferences",
+      "-getProperty:LangVersion,DefineConstants",
+      "-getItem:ReferencePath,Analyzer,Compile",
+    ],
+    &verification,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(dv_executable, &["build", "--plan", "SmallConsole.csproj", "--json"], &verification)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("compiler_plan_created"))
+    .ok_or("dv build plan did not emit compiler_plan_created")?;
+
+  let reference_language = dotnet.pointer("/Properties/LangVersion").and_then(serde_json::Value::as_str);
+  let actual_language = dv.get("language_version").and_then(serde_json::Value::as_str);
+  if reference_language != actual_language {
+    return Err(format!("compiler language mismatch: dotnet={reference_language:?}, dv={actual_language:?}").into());
+  }
+  let reference_defines = dotnet
+    .pointer("/Properties/DefineConstants")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or_default()
+    .split(';')
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+  if reference_defines != string_array(&dv, "defines")? {
+    return Err("compiler define batch does not match MSBuild".into());
+  }
+  compare_canonical_item_paths(&dotnet, "ReferencePath", &dv, "references")?;
+  compare_canonical_item_paths(&dotnet, "Analyzer", &dv, "analyzers")?;
+
+  let reference_sources = item_identities(&dotnet, "Compile")?
+    .into_iter()
+    .filter(|path| !path.replace('\\', "/").starts_with("obj/"))
+    .collect::<Vec<_>>();
+  let actual_sources = string_array(&dv, "sources")?
+    .into_iter()
+    .map(|path| {
+      Path::new(&path)
+        .strip_prefix(&verification)
+        .unwrap_or(Path::new(&path))
+        .to_string_lossy()
+        .replace('\\', "/")
+    })
+    .collect::<Vec<_>>();
+  if reference_sources != actual_sources {
+    return Err(format!("compiler source batch mismatch: dotnet={reference_sources:?}, dv={actual_sources:?}").into());
+  }
+  Ok(())
+}
+
+fn compare_canonical_item_paths(dotnet: &serde_json::Value, dotnet_item: &str, dv: &serde_json::Value, dv_field: &str) -> Result<()> {
+  let mut reference = item_identities(dotnet, dotnet_item)?
+    .into_iter()
+    .map(|path| fs::canonicalize(path).map_err(Into::into))
+    .collect::<Result<Vec<_>>>()?;
+  let mut actual = string_array(dv, dv_field)?
+    .into_iter()
+    .map(|path| fs::canonicalize(path).map_err(Into::into))
+    .collect::<Result<Vec<_>>>()?;
+  reference.sort_unstable();
+  actual.sort_unstable();
+  if reference != actual {
+    return Err(format!("{dv_field} batch does not match MSBuild: dotnet={} dv={}", reference.len(), actual.len()).into());
   }
   Ok(())
 }
@@ -451,8 +561,16 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
 }
 
 fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
-  if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
+  if matches!(
+    case.kind,
+    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan | CaseKind::BuildNoOp | CaseKind::RunWarm
+  ) {
     reset_fixture(fixture, workspace)?;
+  }
+  if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
+    run_checked(executable, &["restore", "--nologo", "--verbosity", "quiet"], workspace, "compiler plan restore")?;
+  }
+  if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
   }
   Ok(())
@@ -460,7 +578,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::ProjectEvaluate => Ok(()),
+    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan => Ok(()),
     CaseKind::RestoreCold => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -494,11 +612,7 @@ fn is_dotnet(executable: &Path) -> bool {
 }
 
 fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path {
-  if matches!(case.kind, CaseKind::Startup | CaseKind::ProjectEvaluate) {
-    fixture
-  } else {
-    workspace
-  }
+  if matches!(case.kind, CaseKind::Startup) { fixture } else { workspace }
 }
 
 fn measure(executable: &Path, args: &[&str], cwd: &Path) -> Result<u64> {
@@ -698,6 +812,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
+    "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
     "build_clean" => "Clean build",

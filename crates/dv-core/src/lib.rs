@@ -1,11 +1,13 @@
 //! Stable data contracts shared by dv commands and reporters.
 
+mod compiler;
 mod diagnostic;
 mod event;
 mod project;
 mod reporter;
 mod sdk;
 
+pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_compiler_inputs};
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
   CacheOutcome, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome, ProjectPackageEvent, SdkInstallationEvent, validate_events,

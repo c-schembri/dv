@@ -8,8 +8,9 @@ use std::{
 };
 
 use dv_core::{
-  ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent,
-  ProjectSpec, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, write_json_lines,
+  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, ProjectConfiguration,
+  ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project,
+  evaluate_project_path, plan_compiler_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -46,6 +47,11 @@ Usage:
 const PROJECT_HELP: &str = "\
 Usage:
   dv project inspect [PROJECT] [--configuration Debug|Release]
+";
+
+const BUILD_HELP: &str = "\
+Usage:
+  dv build --plan [PROJECT] [--configuration Debug|Release]
 ";
 
 fn main() -> ExitCode {
@@ -107,6 +113,7 @@ fn main() -> ExitCode {
     },
     Some("sdk") => run_sdk(started, json, args, &semantic_args[1..]),
     Some("project") => run_project(started, json, args, &semantic_args[1..]),
+    Some("build") => run_build(started, json, args, &semantic_args[1..]),
     Some(command) if is_known_command(command) => fail(
       started,
       json,
@@ -138,6 +145,96 @@ fn main() -> ExitCode {
       ),
     ),
   }
+}
+
+fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
+  if matches!(build_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
+    print!("{BUILD_HELP}");
+    return ExitCode::SUCCESS;
+  }
+  if !build_args.iter().any(|argument| argument == "--plan") {
+    return fail(
+      started,
+      json,
+      "build",
+      args,
+      diagnostic(
+        "DV0003",
+        "build execution is not implemented yet; only input planning is available",
+        None,
+        Some("Use `dv build --plan [PROJECT]` to inspect compiler inputs."),
+      ),
+    );
+  }
+  let plan_arguments: Vec<String> = build_args.iter().filter(|argument| argument.as_str() != "--plan").cloned().collect();
+  let (requested_path, configuration) = match parse_project_args(&plan_arguments) {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "build --plan",
+        args,
+        diagnostic("DV0002", problem, None, Some("Use `dv build --help` to inspect the accepted arguments.")),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "build --plan",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "build --plan", args, project_diagnostic(error)),
+  };
+  let inventory = match discover_sdks(&current_directory) {
+    Ok(inventory) => inventory,
+    Err(error) => return fail(started, json, "build --plan", args, sdk_diagnostic(&current_directory, error)),
+  };
+  let plans = match plan_compiler_inputs(&[&project], &inventory) {
+    Ok(plans) => plans,
+    Err(error) => return fail(started, json, "build --plan", args, compiler_plan_diagnostic(error)),
+  };
+  let plan = &plans[0];
+  if !json {
+    return write_compiler_plan(plan);
+  }
+
+  succeed(
+    started,
+    "build --plan",
+    args,
+    EventPayload::CompilerPlanCreated {
+      project: plan.project().into(),
+      sdk_version: plan.sdk_version().into(),
+      compiler: plan.compiler().into(),
+      framework_pack_version: plan.framework_pack_version().into(),
+      framework_pack: plan.framework_pack().into(),
+      language_version: plan.language_version().into(),
+      warning_level: plan.warning_level(),
+      configuration: plan.configuration().as_str().into(),
+      output_type: plan.output_type().as_str().into(),
+      nullable: plan.nullable_enabled(),
+      deterministic: plan.deterministic(),
+      output_assembly: plan.output_assembly().into(),
+      output_pdb: plan.output_pdb().into(),
+      reference_output: plan.reference_output().into(),
+      sources: plan.sources().map(str::to_owned).collect(),
+      generated_sources: plan.generated_sources().map(str::to_owned).collect(),
+      references: plan.references().map(str::to_owned).collect(),
+      analyzers: plan.analyzers().map(str::to_owned).collect(),
+      analyzer_configs: plan.analyzer_configs().map(str::to_owned).collect(),
+      defines: plan.defines().map(str::to_owned).collect(),
+    },
+  )
 }
 
 fn decode_args(raw_args: &[OsString]) -> Result<Vec<String>, &OsString> {
@@ -280,7 +377,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     );
   }
 
-  let (requested_path, configuration) = match parse_project_inspect_args(&project_args[1..]) {
+  let (requested_path, configuration) = match parse_project_args(&project_args[1..]) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -344,7 +441,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   succeed(started, "project inspect", args, payload)
 }
 
-fn parse_project_inspect_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_project_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut configuration = ProjectConfiguration::Debug;
   let mut index = 0;
@@ -363,6 +460,40 @@ fn parse_project_inspect_args(arguments: &[String]) -> Result<(Option<PathBuf>, 
     index += 1;
   }
   Ok((project, configuration))
+}
+
+fn write_compiler_plan(plan: &CompilerPlan) -> ExitCode {
+  let mut output = String::with_capacity(2048);
+  use std::fmt::Write as _;
+  writeln!(output, "Compiler input plan").expect("writing a String succeeds");
+  writeln!(output, "  Project          {}", plan.project()).expect("writing a String succeeds");
+  writeln!(output, "  Configuration    {}", plan.configuration().as_str()).expect("writing a String succeeds");
+  writeln!(output, "  SDK              {}", plan.sdk_version()).expect("writing a String succeeds");
+  writeln!(output, "  Language         C# {}", plan.language_version()).expect("writing a String succeeds");
+  writeln!(output, "  Warnings         level {}", plan.warning_level()).expect("writing a String succeeds");
+  writeln!(output, "  Output kind      {}", plan.output_type().as_str()).expect("writing a String succeeds");
+  writeln!(output, "  Nullable         {}", toggle_text(plan.nullable_enabled())).expect("writing a String succeeds");
+  writeln!(output, "  Deterministic    {}", plan.deterministic()).expect("writing a String succeeds");
+  writeln!(output, "  Framework pack   {} ({})", plan.framework_pack_version(), plan.framework_pack()).expect("writing a String succeeds");
+  writeln!(output, "  Compiler         {}", plan.compiler()).expect("writing a String succeeds");
+  writeln!(output).expect("writing a String succeeds");
+  writeln!(output, "Inputs").expect("writing a String succeeds");
+  writeln!(output, "  Sources          {:>4}", plan.sources().len()).expect("writing a String succeeds");
+  writeln!(output, "  Generated        {:>4}", plan.generated_sources().len()).expect("writing a String succeeds");
+  writeln!(output, "  References       {:>4}", plan.references().len()).expect("writing a String succeeds");
+  writeln!(output, "  Analyzers        {:>4}", plan.analyzers().len()).expect("writing a String succeeds");
+  writeln!(output, "  Analyzer configs {:>4}", plan.analyzer_configs().len()).expect("writing a String succeeds");
+  writeln!(output, "  Defines          {:>4}", plan.defines().len()).expect("writing a String succeeds");
+  writeln!(output).expect("writing a String succeeds");
+  writeln!(output, "Outputs").expect("writing a String succeeds");
+  writeln!(output, "  Assembly         {}", plan.output_assembly()).expect("writing a String succeeds");
+  writeln!(output, "  Symbols          {}", plan.output_pdb()).expect("writing a String succeeds");
+  writeln!(output, "  Reference        {}", plan.reference_output()).expect("writing a String succeeds");
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing compiler plan to stdout succeeds");
+  ExitCode::SUCCESS
 }
 
 fn load_project(directory: &Path, requested: Option<&Path>, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
@@ -433,6 +564,33 @@ fn project_diagnostic(error: ProjectError) -> Diagnostic {
     ProjectErrorKind::Unsupported | ProjectErrorKind::InvalidProperty => Some("Use the supported single-target Microsoft.NET.Sdk project subset."),
     ProjectErrorKind::InvalidXml => Some("Correct the project XML and try again."),
     ProjectErrorKind::Io | ProjectErrorKind::NonUnicodePath => None,
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    help,
+  )
+}
+
+fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
+  let code = match error.kind() {
+    CompilerPlanErrorKind::PackNotFound => "DV0300",
+    CompilerPlanErrorKind::InvalidManifest => "DV0301",
+    CompilerPlanErrorKind::MissingAsset => "DV0302",
+    CompilerPlanErrorKind::UnsupportedSdk => "DV0303",
+    CompilerPlanErrorKind::Io => "DV0304",
+    CompilerPlanErrorKind::NonUnicodePath => "DV0305",
+    CompilerPlanErrorKind::TextOverflow => "DV0306",
+  };
+  let help = match error.kind() {
+    CompilerPlanErrorKind::PackNotFound => Some("Install the .NET 10 targeting pack."),
+    CompilerPlanErrorKind::InvalidManifest | CompilerPlanErrorKind::MissingAsset => Some("Repair or reinstall the selected .NET SDK."),
+    CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable .NET 10 SDK or newer."),
+    CompilerPlanErrorKind::Io | CompilerPlanErrorKind::NonUnicodePath | CompilerPlanErrorKind::TextOverflow => None,
   };
   diagnostic(
     code,

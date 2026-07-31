@@ -13,12 +13,12 @@ only.
 
 ## Minimal Compiler Input Batch
 
-For one `net9.0` console project, the compiler batch consists of:
+For one `net10.0` console project, the compiler batch consists of:
 
 - selected SDK and Roslyn version;
 - ordered source paths and generated source paths;
 - ordered reference-assembly paths from
-  `packs/Microsoft.NETCore.App.Ref/<version>/ref/net9.0`;
+  `packs/Microsoft.NETCore.App.Ref/<version>/ref/net10.0`;
 - analyzer and source-generator paths required by the SDK contract;
 - defines, language version, nullable mode, warning policy, optimization and
   debug settings;
@@ -83,27 +83,27 @@ must be regenerated when the selected SDK changes.
 
 ## Initial Observed Trace
 
-On 2026-07-31, SDK `10.0.100` building the `net9.0` fixture with shared
+On 2026-07-31, SDK `10.0.100` building the `net10.0` fixture with shared
 compilation disabled invoked:
 
 ```text
 C:\Program Files\dotnet\sdk\10.0.100\Roslyn\bincore\csc.exe
 ```
 
-Observed compiler version: `5.0.0-2.25523.111`. The 21,651-character command
+The 22,326-character command
 contained:
 
-- 164 reference-assembly arguments from
-  `Microsoft.NETCore.App.Ref\9.0.11`;
+- 167 reference-assembly arguments from
+  `Microsoft.NETCore.App.Ref\10.0.0`;
 - 8 analyzer/source-generator arguments;
 - 3 analyzer-config arguments;
 - `Program.cs` plus 3 generated C# inputs;
-- portable PDB, deterministic compilation, C# 13, nullable enabled, and the
+- portable PDB, deterministic compilation, C# 14, nullable enabled, and the
   SDK-defined target-framework constants.
 
-The compiler emitted a 4,608-byte managed assembly and 11,340-byte portable PDB
-into intermediate output. The SDK then produced/copied a 156,160-byte apphost,
-428-byte dependency manifest, and 268-byte runtime configuration.
+The compiler emitted a 4,608-byte managed assembly and 11,688-byte portable PDB
+into intermediate output. The SDK then produced/copied a 162,304-byte apphost,
+430-byte dependency manifest, and 270-byte runtime configuration.
 
 These counts are observed data for this SDK and fixture, not constants. Phase 1
 must discover them from selected SDK contents and evaluated inputs rather than

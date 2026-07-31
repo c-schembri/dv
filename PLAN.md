@@ -279,10 +279,9 @@ Completed foundations now include the compatibility matrix, Roslyn trace,
 benchmark fixtures, Rust workspace, structured events, native SDK selection,
 and strict evaluation of the initial SDK-style project subset.
 
-1. Discover the selected framework reference pack and build the compiler input
-   batch for the small console fixture.
-2. Resolve exact package references into a content-addressed cache and initial
+1. Resolve exact package references into a content-addressed cache and initial
    lockfile.
+2. Materialize the three planned SDK-generated C# inputs.
 3. Invoke Roslyn through the selected native runtime host.
 4. Build the smallest end-to-end path: resolve, compile, cache, and run one
    console application.

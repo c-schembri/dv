@@ -164,6 +164,49 @@ pub enum EventPayload {
     /// Ordered exact package references.
     package_references: Vec<ProjectPackageEvent>,
   },
+  /// A complete framework and Roslyn input plan was materialized.
+  CompilerPlanCreated {
+    /// Full project-file path.
+    project: String,
+    /// Selected SDK version.
+    sdk_version: String,
+    /// Selected Roslyn compiler assembly.
+    compiler: String,
+    /// Selected framework reference-pack version.
+    framework_pack_version: String,
+    /// Selected framework reference-pack directory.
+    framework_pack: String,
+    /// Fixed C# language version.
+    language_version: String,
+    /// Compiler warning level.
+    warning_level: u8,
+    /// Selected build configuration.
+    configuration: String,
+    /// Roslyn output kind.
+    output_type: String,
+    /// Whether nullable analysis is enabled.
+    nullable: bool,
+    /// Whether deterministic output is required.
+    deterministic: bool,
+    /// Planned output assembly.
+    output_assembly: String,
+    /// Planned portable PDB.
+    output_pdb: String,
+    /// Planned reference assembly.
+    reference_output: String,
+    /// Ordered user source paths.
+    sources: Vec<String>,
+    /// Ordered generated source paths.
+    generated_sources: Vec<String>,
+    /// Ordered framework reference assemblies.
+    references: Vec<String>,
+    /// Ordered SDK and framework analyzers.
+    analyzers: Vec<String>,
+    /// Ordered analyzer configuration files.
+    analyzer_configs: Vec<String>,
+    /// Ordered preprocessor symbols.
+    defines: Vec<String>,
+  },
   /// A structured diagnostic was produced.
   Diagnostic {
     /// Diagnostic data.

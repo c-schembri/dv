@@ -15,7 +15,7 @@ Observed fixture data:
 
 The supported property and item subset is:
 
-- one literal `TargetFramework` equal to `net9.0`;
+- one literal `TargetFramework` equal to `net10.0`;
 - `OutputType` equal to `Exe` or `Library`;
 - `Debug` or `Release` configuration;
 - literal `AssemblyName` and `RootNamespace`, with project-name defaults;

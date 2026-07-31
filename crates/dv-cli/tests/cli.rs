@@ -115,7 +115,7 @@ fn project_inspect_discovers_and_prints_one_project() {
     r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -128,7 +128,7 @@ fn project_inspect_discovers_and_prints_one_project() {
   assert!(output.stderr.is_empty());
   let stdout = String::from_utf8(output.stdout).unwrap();
   assert!(stdout.contains("Assembly            App"));
-  assert!(stdout.contains("Target              net9.0"));
+  assert!(stdout.contains("Target              net10.0"));
   assert!(stdout.contains("  Program.cs"));
 }
 
@@ -141,7 +141,7 @@ fn project_inspect_json_reports_the_evaluated_batch() {
     r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Example.Package" Version="1.2.3" />
@@ -167,7 +167,7 @@ fn project_inspect_json_reports_the_evaluated_batch() {
 #[test]
 fn project_inspect_rejects_ambiguous_selection() {
   let temp = TempDirectory::new();
-  let project = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>"#;
+  let project = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#;
   temp.write("A.csproj", project);
   temp.write("B.csproj", project);
 
@@ -177,4 +177,45 @@ fn project_inspect_rejects_ambiguous_selection() {
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert!(stderr.contains("error[DV0201]"));
   assert!(stderr.contains("pass one project path explicitly"));
+}
+
+#[test]
+fn build_plan_json_reports_framework_and_compiler_inputs() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "Console.WriteLine(\"hello\");");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>"#,
+  );
+  for relative in [
+    "sdk/10.0.100/Roslyn/bincore/csc.dll",
+    "sdk/10.0.100/Sdks/Microsoft.NET.Sdk/analyzers/Microsoft.CodeAnalysis.CSharp.NetAnalyzers.dll",
+    "sdk/10.0.100/Sdks/Microsoft.NET.Sdk/analyzers/Microsoft.CodeAnalysis.NetAnalyzers.dll",
+    "sdk/10.0.100/Sdks/Microsoft.NET.Sdk/analyzers/build/config/analysislevel_10_default.globalconfig",
+    "packs/Microsoft.NETCore.App.Ref/10.0.0/ref/net10.0/System.Runtime.dll",
+    "packs/Microsoft.NETCore.App.Ref/10.0.0/analyzers/dotnet/cs/Generator.dll",
+  ] {
+    temp.write(relative, "");
+  }
+  temp.write(
+    "packs/Microsoft.NETCore.App.Ref/10.0.0/data/FrameworkList.xml",
+    r#"<FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="10.0"><File Type="Managed" Path="ref/net10.0/System.Runtime.dll" /><File Type="Analyzer" Language="cs" Path="analyzers/dotnet/cs/Generator.dll" /></FileList>"#,
+  );
+  temp.write(&format!("dotnet{}", env::consts::EXE_SUFFIX), "not an executable");
+
+  let output = dv()
+    .args(["build", "--plan", "App.csproj", "--json"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"compiler_plan_created\""));
+  assert!(stdout.contains("\"sdk_version\":\"10.0.100\""));
+  assert!(stdout.contains("\"framework_pack_version\":\"10.0.0\""));
+  assert!(stdout.contains("\"language_version\":\"14.0\""));
+  assert!(stdout.contains("\"references\":["));
+  assert!(stdout.contains("\"outcome\":\"succeeded\""));
 }

@@ -9,7 +9,7 @@ diagnostic rather than approximate Microsoft behavior.
 | Project type | SDK-style C# `.csproj` | Implemented |
 | SDK discovery | Native root enumeration and `global.json` selection | Implemented |
 | SDK declaration | `Microsoft.NET.Sdk` | Implemented |
-| Target frameworks | one installed `net9.0` target | Evaluated; pack validation planned |
+| Target frameworks | one installed `net10.0` target | Evaluated and reference pack validated |
 | Output types | `Exe` and `Library` | Implemented |
 | Source items | default `**/*.cs`, excluding generated/output trees | Implemented |
 | Nullable | `enable` or omitted SDK default | Implemented |
@@ -17,7 +17,8 @@ diagnostic rather than approximate Microsoft behavior.
 | Project references | acyclic SDK-style references | Paths captured; graph validation planned |
 | Package references | one target, public source, exact versions first | Exact references captured; resolution planned |
 | Configuration | `Debug` and `Release` | Implemented |
-| Generated inputs | global usings, assembly attributes, editor config | Planned |
+| Generated inputs | global usings, assembly attributes, editor config | Paths planned; content generation planned |
+| Compiler inputs | framework references, SDK/pack analyzers, defines and core options | Initial immutable plan implemented |
 | Outputs | managed assembly, portable PDB, deps/runtime config as required | Planned |
 | Custom imports/targets/tasks | no execution | Rejected |
 | Legacy project format | unsupported | Rejected |

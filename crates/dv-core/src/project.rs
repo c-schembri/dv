@@ -10,7 +10,7 @@ use quick_xml::{
 };
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
-const SUPPORTED_TARGET_FRAMEWORK: &str = "net9.0";
+const SUPPORTED_TARGET_FRAMEWORK: &str = "net10.0";
 const MAX_XML_DEPTH: usize = 8;
 
 /// A supported build configuration.
@@ -994,7 +994,7 @@ mod tests {
     format!(
       r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     {properties}
   </PropertyGroup>
   {items}
@@ -1072,7 +1072,7 @@ mod tests {
     let temp = TempDirectory::new();
     let project = temp.write(
       "App.csproj",
-      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup Condition="'$(Configuration)' == 'Debug'"><TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>"#,
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup Condition="'$(Configuration)' == 'Debug'"><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
     );
 
     let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
@@ -1086,7 +1086,7 @@ mod tests {
     let temp = TempDirectory::new();
     let project = temp.write(
       "App.csproj",
-      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks>net9.0;net8.0</TargetFrameworks></PropertyGroup></Project>"#,
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks>net10.0;net9.0</TargetFrameworks></PropertyGroup></Project>"#,
     );
 
     let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();

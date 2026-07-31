@@ -156,7 +156,8 @@ prove that nothing changed.
 | Structured diagnostics | Foundation only | codes and ordered fields exist |
 | Benchmark process harness | Foundation only | startup, SDK, and project-evaluation cases measured |
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
-| Project evaluation | Initial subset | literal `net9.0` base-SDK properties/items and `project inspect` |
+| Project evaluation | Initial subset | literal `net10.0` base-SDK properties/items and `project inspect` |
+| Compiler input planning | Initial subset | .NET 10 reference pack, Roslyn/analyzers, options, and `build --plan` |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore, build, run, test | Missing | commands return `DV0003` |
 | Pack, publish, SDK/runtime install | Missing | commands return `DV0003` |
@@ -361,13 +362,13 @@ change a supported output but is not understood.
 - [ ] `PROJ-011` Implement configuration/platform defaults and
   `AppendTargetFrameworkToOutputPath`/`AppendRuntimeIdentifierToOutputPath`.
   `P2`
-- [ ] `PROJ-012` Support implicit framework references and targeting-pack
+- [~] `PROJ-012` Support implicit framework references and targeting-pack
   selection for the TFM. `P1`
 - [ ] `PROJ-013` Support implicit usings by SDK, language, TFM, and explicit
   `Using` additions/removals. `P1`
-- [ ] `PROJ-014` Generate framework and platform preprocessor symbols unless
+- [~] `PROJ-014` Generate framework and platform preprocessor symbols unless
   disabled. `P1`
-- [ ] `PROJ-015` Parse `.editorconfig`/`.globalconfig` hierarchy and construct
+- [~] `PROJ-015` Parse `.editorconfig`/`.globalconfig` hierarchy and construct
   ordered analyzer-config inputs. `P1`
 - [ ] `PROJ-016` Support `global.json` SDK analysis level where it changes
   diagnostics or supported SDK behavior. `P2`
@@ -383,13 +384,13 @@ change a supported output but is not understood.
 
 ## 6. Framework, Runtime, And Pack Resolution
 
-- [ ] `PACKS-001` Inventory installed targeting, runtime, host, apphost,
+- [~] `PACKS-001` Inventory installed targeting, runtime, host, apphost,
   analyzer, and workload packs from the selected SDK/root. `P1`
-- [ ] `PACKS-002` Parse pack manifests and versions rather than hard-code the
+- [~] `PACKS-002` Parse pack manifests and versions rather than hard-code the
   observed SDK layout. `P1`
-- [ ] `PACKS-003` Select the correct reference pack for a TFM and fail on
+- [~] `PACKS-003` Select the correct reference pack for a TFM and fail on
   missing or unsupported packs before compiler launch. `P1`
-- [ ] `PACKS-004` Produce an ordered reference-assembly range from the selected
+- [x] `PACKS-004` Produce an ordered reference-assembly range from the selected
   pack with stable path indices. `P1`
 - [ ] `PACKS-005` Load the SDK's portable RID graph as data; never infer RID
   compatibility by splitting the RID string. `P2`
@@ -397,9 +398,9 @@ change a supported output but is not understood.
   templates for requested RID and architecture. `P2`
 - [ ] `PACKS-007` Resolve framework references and shared-framework versions,
   including runtime roll-forward policy. `P2`
-- [ ] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and
+- [~] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and
   build assets in the plan. `P1`
-- [ ] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the
+- [~] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the
   required pack identity and acquisition action. `P1`
 - [ ] `PACKS-010` Cache immutable SDK pack inventories by selected SDK
   fingerprint and invalidate on installation changes. `P2`
@@ -564,16 +565,16 @@ change a supported output but is not understood.
   `P2`
 - [ ] `COMP-006` Transform `.resx` and other supported resources into compiler
   inputs with deterministic logical names. `P2`
-- [ ] `COMP-007` Build one immutable compiler batch with ordered ranges for
+- [~] `COMP-007` Build one immutable compiler batch with ordered ranges for
   sources, generated sources, references, analyzers, generators, resources,
   additional files, and configs. `P1`
-- [ ] `COMP-008` Map C# language options: language version, nullable,
+- [~] `COMP-008` Map C# language options: language version, nullable,
   constants, unsafe, overflow checking, features, and checked context. `P1`
-- [ ] `COMP-009` Map output/codegen options: target kind, platform target,
+- [~] `COMP-009` Map output/codegen options: target kind, platform target,
   optimization, debug type, PDB path, deterministic, reference assembly,
   main type, subsystem, high entropy VA, and preferred base address as
   supported. `P1/P2`
-- [ ] `COMP-010` Map warning/diagnostic options: warning level, no-warn,
+- [~] `COMP-010` Map warning/diagnostic options: warning level, no-warn,
   warnings-as-errors, warnings-not-as-errors, rulesets, analyzer severity, and
   error log. `P1`
 - [ ] `COMP-011` Map signing options: key file/container, public signing, delay
@@ -581,13 +582,13 @@ change a supported output but is not understood.
 - [ ] `COMP-012` Map advanced inputs: modules, Win32 icon/manifest/resource,
   application configuration, link resources, embedded files, and reference
   aliases. `P2`
-- [ ] `COMP-013` Select the Roslyn compiler and built-in analyzers/generators
+- [x] `COMP-013` Select the Roslyn compiler and built-in analyzers/generators
   from the selected SDK, never from ambient PATH. `P1`
 - [ ] `COMP-014` Load `hostfxr` through its native hosting interface and launch
   a build-pinned managed compiler host without `dotnet exec`. `P1`
 - [ ] `COMP-015` Define a versioned length-bounded binary compiler-host
   protocol over typed batches and typed diagnostic/result batches. `P1`
-- [ ] `COMP-016` Reject missing inputs, bad indices, unsupported compiler
+- [~] `COMP-016` Reject missing inputs, bad indices, unsupported compiler
   properties, and output collisions before process/host invocation. `P1`
 - [ ] `COMP-017` Preserve Roslyn diagnostic ID, severity, warning level, file
   span, message, arguments where exposed, and help link as structured data.
