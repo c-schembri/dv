@@ -50,8 +50,11 @@ dv restore (config merge)       9.422 ms median
 dotnet restore (source policy) 527.659 ms median
 dv restore (source policy)       5.850 ms median
 
-dotnet restore (unmapped source) 639.131 ms median
-dv restore (unmapped source)       8.445 ms median
+dotnet restore (unmapped source) 531.249 ms median
+dv restore (unmapped source)       9.566 ms median
+
+dotnet restore (request budget) 3109.409 ms median
+dv restore (request budget)      247.157 ms median
 
 dotnet restore (storage policy) 523.051 ms median
 dv restore (storage policy)       5.370 ms median
@@ -123,6 +126,7 @@ The project is in the first implementation phase.
 | Machine/user/repository/explicit NuGet config discovery | Implemented |
 | Keyed NuGet config merge and environment expansion | Implemented |
 | NuGet package/audit sources, protocols, and pre-discovery source mapping | Implemented |
+| Bounded global and per-source NuGet request scheduling | Implemented |
 | NuGet storage, fallback, signature, proxy, and audit policy | Implemented |
 | NuGet CLI source, config, and package-folder overrides | Implemented |
 | NuGet flat and hierarchical local sources | Implemented |
@@ -338,7 +342,8 @@ Initial machine:
 | Validate a six-file NuGet configuration hierarchy | `dotnet restore ConfigHierarchy.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigHierarchy.csproj --offline --json` | 532.948 ms | 5.651 ms | 94.3x | 545.049 ms | 6.296 ms |
 | Merge keyed NuGet configuration | `dotnet restore ConfigMerge.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigMerge.csproj --offline --json` | 558.126 ms | 9.422 ms | 59.2x | 648.298 ms | 10.606 ms |
 | Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
-| Reject an unmapped package before source discovery | `dotnet restore SourceMapping.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceMapping.csproj --packages .packages --json` | 639.131 ms | 8.445 ms | 75.7x | 1684.299 ms | 9.459 ms |
+| Reject an unmapped package before source discovery | `dotnet restore SourceMapping.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceMapping.csproj --packages .packages --json` | 531.249 ms | 9.566 ms | 55.5x | 1153.411 ms | 11.215 ms |
+| Restore six packages through bounded delayed feeds | `dotnet restore RequestBudget.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore RequestBudget.csproj --packages .packages --json` | 3109.409 ms | 247.157 ms | 12.6x | 5249.874 ms | 1178.249 ms |
 | Resolve NuGet storage and restore policy | `dotnet restore StoragePolicy.csproj --locked-mode --no-http-cache --nologo --verbosity quiet` | `dv restore StoragePolicy.csproj --offline --json` | 523.051 ms | 5.370 ms | 97.4x | 605.407 ms | 6.526 ms |
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
@@ -382,7 +387,15 @@ fixture follows that policy into restore: `Unmapped.Package` has no winning
 enabled source while the only configured v3 endpoint is deliberately
 unreachable. Microsoft must emit `NU1100`, `dv` must emit typed `DV0412`, and
 either source-contact error fails preflight. This makes the retained
-`639.131 ms` versus `8.445 ms` comparison like-for-like with zero HTTP work.
+`531.249 ms` versus `9.566 ms` comparison like-for-like with zero HTTP work.
+The request-budget case then restores the same six exact packages from two
+loopback V3 feeds. Every response has the same fixed 25 ms delay, both tools
+receive a global budget of four and a per-source budget of two, and the harness
+requires every sample to contact both sources, stay within both bounds, and
+publish all six archives. Public
+network work and package seeding are outside timing, so the retained
+`3109.409 ms` versus `247.157 ms` result compares equivalent cold restore work
+under deterministic contention.
 The storage-policy case uses that same official assembly plus an MSBuild
 property query to verify
 global, HTTP-cache, scratch, ordered fallback, signature, audit, and proxy
@@ -444,6 +457,7 @@ recorded in the curated
 [NuGet keyed-merge baseline](docs/performance-baselines/2026-08-01-nuget-config-merge-windows.md),
 [NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
 [NuGet source-mapping baseline](docs/performance-baselines/2026-08-01-nuget-source-mapping-windows.md),
+[NuGet request-budget baseline](docs/performance-baselines/2026-08-01-nuget-request-budget-windows.md),
 [NuGet storage-policy baseline](docs/performance-baselines/2026-08-01-nuget-storage-policy-windows.md),
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
@@ -502,6 +516,7 @@ cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
 cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
 cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
+cargo bench-all --case nuget_request_budget --samples 30 --warmups 3
 cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3

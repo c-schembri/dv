@@ -840,11 +840,19 @@ boundary, not final drop-in parity.
   source-independent. An uncached identity with no enabled winning source fails
   as typed `DV0412` before URL, credential, DNS, TLS, or HTTP work. A fresh
   expected-failure fixture validates Microsoft's `NU1100` against `DV0412` and
-  zero requests; 30 Windows samples measure `639.131 ms` for Microsoft versus
-  `8.445 ms` for `dv` (`75.7x`). `P2`
-- [~] `NUGET-014` Bound concurrent requests per source and globally; the
-  current twenty-four-task Tokio set provides global backpressure and
-  deterministic graph merge, while distinct per-source budgets remain. `P2`
+  zero requests; 30 Windows samples measure `531.249 ms` for Microsoft versus
+  `9.566 ms` for `dv` (`55.5x`). `P2`
+- [x] `NUGET-014` Bound concurrent requests per source and globally. A compact
+  command budget honors positive `NUGET_CONCURRENCY_LIMIT` values up to the
+  measured 24-task ceiling across service discovery, metadata expansion, and
+  acquisition. A smaller selection creates one shared global semaphore;
+  `maxHttpRequestsPerSource` creates one independent semaphore per remote source
+  only when it is tighter than the global budget. Permits cover response-body
+  consumption. The common default allocates no semaphore, queues stay bounded,
+  and identity-ordered merges remain deterministic. A
+  delayed two-source fixture enforces global `4` and per-source `2` limits for
+  both tools. Thirty Windows samples measure `3109.409 ms` for Microsoft versus
+  `247.157 ms` for `dv` (`12.6x`). `P2`
 - [~] `NUGET-015` Record request count, bytes, cache outcome, and source timing
   without recording credentials. `P2`
 

@@ -4,10 +4,15 @@ use std::{
   ffi::OsStr,
   fmt::Write as _,
   fs,
-  io::{self, IsTerminal},
+  io::{self, IsTerminal, Read, Write},
+  net::{SocketAddr, TcpListener, TcpStream},
   path::{Path, PathBuf},
   process::{Command, Output, Stdio},
-  thread,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+  },
+  thread::{self, JoinHandle},
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +41,7 @@ enum CaseKind {
   NugetConfigMerge,
   NugetSourceSections,
   NugetSourceMapping,
+  NugetRequestBudget,
   NugetStoragePolicy,
   NugetCliOverrides,
   NugetLocalSources,
@@ -69,6 +75,7 @@ struct Fixtures<'a> {
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
   nuget_source_mapping: &'a Path,
+  nuget_request_budget: &'a Path,
   nuget_storage_policy: &'a Path,
   nuget_cli_overrides: &'a Path,
   nuget_local_sources: &'a Path,
@@ -280,6 +287,22 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "SourceMapping.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "nuget_request_budget",
+    kind: CaseKind::NugetRequestBudget,
+    args: &[
+      "restore",
+      "RequestBudget.csproj",
       "--packages",
       ".packages",
       "--no-http-cache",
@@ -546,6 +569,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_request_budget",
+    kind: CaseKind::NugetRequestBudget,
+    args: &["restore", "RequestBudget.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_storage_policy",
     kind: CaseKind::NugetStoragePolicy,
     args: &["restore", "StoragePolicy.csproj", "--offline", "--json"],
@@ -749,6 +778,7 @@ fn run() -> Result<()> {
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
   let nuget_source_mapping_fixture = repository.join("benchmarks/fixtures/nuget-source-mapping");
+  let nuget_request_budget_fixture = repository.join("benchmarks/fixtures/nuget-request-budget");
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
@@ -772,6 +802,7 @@ fn run() -> Result<()> {
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
     nuget_source_mapping: &nuget_source_mapping_fixture,
+    nuget_request_budget: &nuget_request_budget_fixture,
     nuget_storage_policy: &nuget_storage_policy_fixture,
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
     nuget_local_sources: &nuget_local_sources_fixture,
@@ -880,7 +911,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 17,
+    schema_version: 18,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -3371,17 +3402,31 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
     } else {
       None
     };
+    let request_budget_fixture = if matches!(case.kind, CaseKind::NugetRequestBudget) {
+      Some(RequestBudgetFixture::start(&case_workspace)?)
+    } else {
+      None
+    };
 
     let mut samples_ns = Vec::with_capacity(options.samples);
     let mut work = None;
     let total = options.warmups + options.samples;
     for index in 0..total {
       prepare_iteration(executable, case, case_fixture, &case_workspace)?;
-      let measurement = measure(executable, case, case_cwd(case, case_fixture, &case_workspace))?;
+      if let Some(fixture) = request_budget_fixture.as_ref() {
+        fixture.reset_metrics();
+      }
+      let mut measurement = measure(executable, case, case_cwd(case, case_fixture, &case_workspace))?;
+      if let Some(fixture) = request_budget_fixture.as_ref() {
+        measurement.work = Some(fixture.validate_metrics()?);
+      }
       if index >= options.warmups {
         samples_ns.push(measurement.elapsed_ns);
         merge_work_evidence(&mut work, measurement.work, tool_name, case.name)?;
       }
+    }
+    if let Some(fixture) = request_budget_fixture.as_ref() {
+      fixture.validate_saturation()?;
     }
 
     let statistics_ns = statistics(&samples_ns);
@@ -3421,6 +3466,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
       | CaseKind::NugetSourceMapping
+      | CaseKind::NugetRequestBudget
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -3684,6 +3730,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::NugetLocalSources) {
     prepare_nuget_local_sources(workspace)?;
   }
+  if matches!(case.kind, CaseKind::NugetRequestBudget) {
+    prepare_nuget_request_budget(workspace)?;
+  }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
     if is_dotnet(executable) {
       run_checked(
@@ -3879,6 +3928,361 @@ fn prepare_nuget_local_sources(workspace: &Path) -> Result<()> {
   reset_nuget_local_iteration(workspace)
 }
 
+fn prepare_nuget_request_budget(workspace: &Path) -> Result<()> {
+  for relative in [
+    ".seed",
+    ".packages",
+    ".http-cache",
+    "obj",
+    "dv.lock.json",
+    "packages.lock.json",
+    "NuGet.Config",
+    ".seed.config",
+  ] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  fs::write(
+    workspace.join(".seed.config"),
+    r#"<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" /></packageSources></configuration>"#,
+  )?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "RequestBudget.csproj",
+      "--configfile",
+      ".seed.config",
+      "--packages",
+      ".seed",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    workspace,
+    "NuGet request-budget package seed",
+  )?;
+  remove_generated_path(&workspace.join("obj"))?;
+  fs::remove_file(workspace.join(".seed.config"))?;
+  Ok(())
+}
+
+struct ServedPackage {
+  id: String,
+  version: String,
+  archive: Arc<[u8]>,
+}
+
+struct RequestMetrics {
+  active: AtomicUsize,
+  peak: AtomicUsize,
+  requests: AtomicUsize,
+  bytes: AtomicUsize,
+}
+
+impl RequestMetrics {
+  fn new() -> Self {
+    Self {
+      active: AtomicUsize::new(0),
+      peak: AtomicUsize::new(0),
+      requests: AtomicUsize::new(0),
+      bytes: AtomicUsize::new(0),
+    }
+  }
+
+  fn enter(&self) -> ActiveRequest<'_> {
+    let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+    self.peak.fetch_max(active, Ordering::SeqCst);
+    self.requests.fetch_add(1, Ordering::Relaxed);
+    ActiveRequest { metrics: self }
+  }
+
+  fn reset(&self) {
+    debug_assert_eq!(self.active.load(Ordering::SeqCst), 0);
+    self.peak.store(0, Ordering::SeqCst);
+    self.requests.store(0, Ordering::Relaxed);
+    self.bytes.store(0, Ordering::Relaxed);
+  }
+}
+
+struct ActiveRequest<'a> {
+  metrics: &'a RequestMetrics,
+}
+
+impl Drop for ActiveRequest<'_> {
+  fn drop(&mut self) {
+    self.metrics.active.fetch_sub(1, Ordering::SeqCst);
+  }
+}
+
+struct RequestBudgetFixture {
+  stop: Arc<AtomicBool>,
+  workers: Vec<JoinHandle<()>>,
+  global: Arc<RequestMetrics>,
+  sources: [Arc<RequestMetrics>; 2],
+  package_root: PathBuf,
+  packages: Arc<Vec<ServedPackage>>,
+  observed_global_peak: AtomicUsize,
+  observed_source_peaks: [AtomicUsize; 2],
+}
+
+impl RequestBudgetFixture {
+  fn start(workspace: &Path) -> Result<Self> {
+    let packages = Arc::new(read_seed_packages(&workspace.join(".seed"))?);
+    if packages.len() < 6 {
+      return Err(format!("request-budget seed produced only {} packages", packages.len()).into());
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let global = Arc::new(RequestMetrics::new());
+    let sources = [Arc::new(RequestMetrics::new()), Arc::new(RequestMetrics::new())];
+    let first = start_delayed_feed(0, packages.clone(), stop.clone(), global.clone(), sources[0].clone())?;
+    let second = start_delayed_feed(1, packages.clone(), stop.clone(), global.clone(), sources[1].clone())?;
+    write_request_budget_config(workspace, &packages, [first.0, second.0])?;
+    Ok(Self {
+      stop,
+      workers: vec![first.1, second.1],
+      global,
+      sources,
+      package_root: workspace.join(".packages"),
+      packages,
+      observed_global_peak: AtomicUsize::new(0),
+      observed_source_peaks: [AtomicUsize::new(0), AtomicUsize::new(0)],
+    })
+  }
+
+  fn reset_metrics(&self) {
+    self.global.reset();
+    for source in &self.sources {
+      source.reset();
+    }
+  }
+
+  fn validate_metrics(&self) -> Result<WorkEvidence> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while self.global.active.load(Ordering::SeqCst) != 0 {
+      if Instant::now() >= deadline {
+        return Err("request-budget server did not become idle after the measured process exited".into());
+      }
+      thread::sleep(Duration::from_millis(1));
+    }
+    let global_peak = self.global.peak.load(Ordering::SeqCst);
+    let source_peaks = self.sources.each_ref().map(|source| source.peak.load(Ordering::SeqCst));
+    let requests = self.global.requests.load(Ordering::Relaxed);
+    if requests == 0 {
+      return Err("request-budget benchmark performed no HTTP requests".into());
+    }
+    if !(2..=4).contains(&global_peak) {
+      return Err(format!("global request budget mismatch: observed {global_peak}, expected 2..=4").into());
+    }
+    for (index, peak) in source_peaks.into_iter().enumerate() {
+      if !(1..=2).contains(&peak) {
+        return Err(format!("source {} request budget mismatch: observed {peak}, expected 1..=2", index + 1).into());
+      }
+      self.observed_source_peaks[index].fetch_max(peak, Ordering::Relaxed);
+    }
+    self.observed_global_peak.fetch_max(global_peak, Ordering::Relaxed);
+    let (downloaded_packages, downloaded_bytes) = validate_published_packages(&self.package_root, &self.packages)?;
+    Ok(WorkEvidence {
+      network_requests: Some(u64::try_from(requests)?),
+      downloaded_bytes: Some(downloaded_bytes),
+      downloaded_packages: Some(downloaded_packages),
+      resolved_packages: Some(u64::try_from(self.packages.len())?),
+    })
+  }
+
+  fn validate_saturation(&self) -> Result<()> {
+    let global = self.observed_global_peak.load(Ordering::Relaxed);
+    let sources = self.observed_source_peaks.each_ref().map(|peak| peak.load(Ordering::Relaxed));
+    if global != 4 || sources != [2, 2] {
+      return Err(format!("request budgets never reached their safe limits: global={global}, sources={sources:?}").into());
+    }
+    Ok(())
+  }
+}
+
+fn validate_published_packages(root: &Path, packages: &[ServedPackage]) -> Result<(u64, u64)> {
+  let (archive_count, archive_bytes) = package_archive_work(root)?;
+  if archive_count != u64::try_from(packages.len())? {
+    return Err(format!("request-budget restore published {archive_count} packages instead of {}", packages.len()).into());
+  }
+  for package in packages {
+    let path = root
+      .join(&package.id)
+      .join(&package.version)
+      .join(format!("{}.{}.nupkg", package.id, package.version));
+    let published = fs::read(&path).map_err(|error| format!("read published request-budget package {}: {error}", path.display()))?;
+    if published.as_slice() != package.archive.as_ref() {
+      return Err(format!("request-budget package bytes differ for {} {}", package.id, package.version).into());
+    }
+  }
+  Ok((archive_count, archive_bytes))
+}
+
+impl Drop for RequestBudgetFixture {
+  fn drop(&mut self) {
+    self.stop.store(true, Ordering::Release);
+    for worker in self.workers.drain(..) {
+      let _ = worker.join();
+    }
+  }
+}
+
+fn read_seed_packages(root: &Path) -> Result<Vec<ServedPackage>> {
+  let mut packages = Vec::new();
+  for id in fs::read_dir(root)? {
+    let id = id?;
+    if !id.file_type()?.is_dir() || id.file_name() == ".dv" {
+      continue;
+    }
+    let lower_id = id.file_name().to_string_lossy().into_owned();
+    for version in fs::read_dir(id.path())? {
+      let version = version?;
+      if !version.file_type()?.is_dir() {
+        continue;
+      }
+      let normalized = version.file_name().to_string_lossy().into_owned();
+      let archive_path = version.path().join(format!("{lower_id}.{normalized}.nupkg"));
+      if archive_path.is_file() {
+        packages.push(ServedPackage {
+          id: lower_id.clone(),
+          version: normalized,
+          archive: Arc::from(fs::read(archive_path)?),
+        });
+      }
+    }
+  }
+  packages.sort_unstable_by(|left, right| left.id.cmp(&right.id).then_with(|| left.version.cmp(&right.version)));
+  Ok(packages)
+}
+
+fn start_delayed_feed(
+  source_index: usize,
+  packages: Arc<Vec<ServedPackage>>,
+  stop: Arc<AtomicBool>,
+  global: Arc<RequestMetrics>,
+  source: Arc<RequestMetrics>,
+) -> Result<(SocketAddr, JoinHandle<()>)> {
+  let listener = TcpListener::bind("127.0.0.1:0")?;
+  let address = listener.local_addr()?;
+  listener.set_nonblocking(true)?;
+  let worker = thread::spawn(move || {
+    while !stop.load(Ordering::Acquire) {
+      match listener.accept() {
+        Ok((stream, _)) => {
+          let packages = packages.clone();
+          let global = global.clone();
+          let source = source.clone();
+          thread::spawn(move || serve_delayed_request(stream, address, source_index, &packages, &global, &source));
+        },
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
+        Err(_) => break,
+      }
+    }
+  });
+  Ok((address, worker))
+}
+
+fn serve_delayed_request(
+  mut stream: TcpStream,
+  address: SocketAddr,
+  source_index: usize,
+  packages: &[ServedPackage],
+  global: &RequestMetrics,
+  source: &RequestMetrics,
+) {
+  let _global_active = global.enter();
+  let _source_active = source.enter();
+  let mut request = [0u8; 8192];
+  let Ok(read) = stream.read(&mut request) else {
+    return;
+  };
+  let request = String::from_utf8_lossy(&request[..read]);
+  let path = request
+    .lines()
+    .next()
+    .and_then(|line| line.split_ascii_whitespace().nth(1))
+    .and_then(|path| path.split('?').next())
+    .unwrap_or("/");
+  thread::sleep(Duration::from_millis(25));
+  let response = feed_response(path, address, source_index, packages);
+  global.bytes.fetch_add(response.1.len(), Ordering::Relaxed);
+  source.bytes.fetch_add(response.1.len(), Ordering::Relaxed);
+  let status = if response.0 { "200 OK" } else { "404 Not Found" };
+  let content_type = if path.ends_with(".nupkg") {
+    "application/octet-stream"
+  } else {
+    "application/json"
+  };
+  let header = format!(
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    response.1.len()
+  );
+  let _ = stream.write_all(header.as_bytes());
+  let _ = stream.write_all(&response.1);
+}
+
+fn feed_response(path: &str, address: SocketAddr, source_index: usize, packages: &[ServedPackage]) -> (bool, Vec<u8>) {
+  if path == "/index.json" {
+    return (
+      true,
+      format!(
+        r#"{{"version":"3.0.0","resources":[{{"@id":"http://{address}/flat/","@type":"PackageBaseAddress/3.0.0","comment":"delayed source {}"}}]}}"#,
+        source_index + 1
+      )
+      .into_bytes(),
+    );
+  }
+  let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+  if parts.len() == 3 && parts[0] == "flat" && parts[2] == "index.json" {
+    let versions = packages
+      .iter()
+      .filter(|package| package.id == parts[1])
+      .map(|package| format!("\"{}\"", package.version))
+      .collect::<Vec<_>>();
+    if !versions.is_empty() {
+      return (true, format!(r#"{{"versions":[{}]}}"#, versions.join(",")).into_bytes());
+    }
+  }
+  if parts.len() == 4
+    && parts[0] == "flat"
+    && parts[3].ends_with(".nupkg")
+    && let Some(package) = packages.iter().find(|package| package.id == parts[1] && package.version == parts[2])
+  {
+    return (true, package.archive.to_vec());
+  }
+  (false, b"{}".to_vec())
+}
+
+fn write_request_budget_config(workspace: &Path, packages: &[ServedPackage], addresses: [SocketAddr; 2]) -> Result<()> {
+  let mut mappings = [String::new(), String::new()];
+  for (index, package) in packages.iter().enumerate() {
+    writeln!(mappings[index % 2], "      <package pattern=\"{}\" />", package.id)?;
+  }
+  let config = format!(
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="source-a" value="http://{}/index.json" protocolVersion="3" allowInsecureConnections="true" />
+    <add key="source-b" value="http://{}/index.json" protocolVersion="3" allowInsecureConnections="true" />
+  </packageSources>
+  <packageSourceMapping>
+    <packageSource key="source-a">
+{}    </packageSource>
+    <packageSource key="source-b">
+{}    </packageSource>
+  </packageSourceMapping>
+  <config>
+    <add key="maxHttpRequestsPerSource" value="2" />
+  </config>
+</configuration>
+"#,
+    addresses[0], addresses[1], mappings[0], mappings[1]
+  );
+  fs::write(workspace.join("NuGet.Config"), config)?;
+  Ok(())
+}
+
 fn copy_with_parent(source: &Path, destination: &Path) -> Result<()> {
   let parent = destination
     .parent()
@@ -3890,6 +4294,13 @@ fn copy_with_parent(source: &Path, destination: &Path) -> Result<()> {
 
 fn reset_nuget_local_iteration(workspace: &Path) -> Result<()> {
   for relative in [".packages", "obj", "dv.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
+fn reset_nuget_request_budget_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", ".http-cache", "obj", "dv.lock.json", "packages.lock.json"] {
     remove_generated_path(&workspace.join(relative))?;
   }
   Ok(())
@@ -3934,6 +4345,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
+    CaseKind::NugetRequestBudget => reset_nuget_request_budget_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold
@@ -4001,6 +4413,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
     CaseKind::NugetSourceMapping => fixtures.nuget_source_mapping,
+    CaseKind::NugetRequestBudget => fixtures.nuget_request_budget,
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
@@ -4029,6 +4442,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
     CaseKind::NugetSourceMapping => Some("nuget-source-mapping"),
+    CaseKind::NugetRequestBudget => Some("nuget-request-budget"),
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
@@ -4054,6 +4468,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
       | CaseKind::NugetSourceMapping
+      | CaseKind::NugetRequestBudget
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -4099,6 +4514,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetStoragePolicy
         | CaseKind::NugetCliOverrides
         | CaseKind::NugetLocalSources
+        | CaseKind::NugetRequestBudget
     )
   {
     Some(parse_work_evidence(&output.stdout)?)
@@ -4206,9 +4622,19 @@ fn reference_package_work(cwd: &Path) -> Result<WorkEvidence> {
       .ok_or("dotnet project.assets.json omitted libraries")?
       .len(),
   )?;
+  let (archive_count, downloaded_bytes) = package_archive_work(&cwd.join(".packages"))?;
+  Ok(WorkEvidence {
+    network_requests: None,
+    downloaded_bytes: Some(downloaded_bytes),
+    downloaded_packages: Some(archive_count),
+    resolved_packages: Some(package_count),
+  })
+}
+
+fn package_archive_work(root: &Path) -> Result<(u64, u64)> {
   let mut archive_count = 0u64;
   let mut downloaded_bytes = 0u64;
-  let mut directories = vec![cwd.join(".packages")];
+  let mut directories = vec![root.to_path_buf()];
   while let Some(directory) = directories.pop() {
     for entry in fs::read_dir(&directory)? {
       let entry = entry?;
@@ -4223,12 +4649,7 @@ fn reference_package_work(cwd: &Path) -> Result<WorkEvidence> {
       }
     }
   }
-  Ok(WorkEvidence {
-    network_requests: None,
-    downloaded_bytes: Some(downloaded_bytes),
-    downloaded_packages: Some(archive_count),
-    resolved_packages: Some(package_count),
-  })
+  Ok((archive_count, downloaded_bytes))
 }
 
 fn merge_work_evidence(current: &mut Option<WorkEvidence>, observed: Option<WorkEvidence>, tool: &str, case: &str) -> Result<()> {
@@ -4363,6 +4784,17 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
     apply_nuget_client_certificate_environment(command, cwd)?;
   } else if matches!(kind, CaseKind::NugetHttpPolicy) {
     apply_nuget_http_policy_environment(command, cwd);
+  } else if matches!(kind, CaseKind::NugetRequestBudget) {
+    apply_nuget_config_environment(command, cwd);
+    command
+      .env("NUGET_CONCURRENCY_LIMIT", "4")
+      .env("NUGET_HTTP_CACHE_PATH", cwd.join(".http-cache"))
+      .env_remove("http_proxy")
+      .env_remove("HTTP_PROXY")
+      .env_remove("https_proxy")
+      .env_remove("HTTPS_PROXY")
+      .env_remove("no_proxy")
+      .env_remove("NO_PROXY");
   } else {
     apply_nuget_config_environment(command, cwd);
   }
@@ -4621,6 +5053,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_config_merge"
           | "nuget_source_sections"
           | "nuget_source_mapping"
+          | "nuget_request_budget"
           | "nuget_storage_policy"
           | "nuget_cli_overrides"
           | "nuget_local_sources"
@@ -4760,6 +5193,7 @@ fn case_label(case: &str) -> &str {
     "nuget_config_merge" => "NuGet.Config keyed merge",
     "nuget_source_sections" => "NuGet source sections",
     "nuget_source_mapping" => "NuGet source mapping",
+    "nuget_request_budget" => "NuGet request budget",
     "nuget_storage_policy" => "NuGet storage policy",
     "nuget_cli_overrides" => "NuGet CLI overrides",
     "nuget_local_sources" => "NuGet local sources",
@@ -4852,7 +5286,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 17,
+      schema_version: 18,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -4916,7 +5350,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 17,
+      schema_version: 18,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

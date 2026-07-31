@@ -45,6 +45,7 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_DOWNLOAD_WORKERS: usize = 24;
+const DEFAULT_GLOBAL_NETWORK_REQUESTS: u16 = MAX_DOWNLOAD_WORKERS as u16;
 const DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE: u16 = 64;
 const MAX_NETWORK_TRIES: u8 = 32;
 const MAX_RETRY_DELAY_MS: u32 = 60_000;
@@ -106,6 +107,26 @@ const DEFAULT_HTTP_POLICY: PackageHttpPolicy = PackageHttpPolicy {
 
 const _: () = assert!(size_of::<PackageHttpPolicy>() == 16);
 const _: () = assert!(align_of::<PackageHttpPolicy>() == 4);
+
+/// Command-wide network task budget, clamped to the measured scheduler ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageRequestBudget {
+  global_requests: u16,
+}
+
+const DEFAULT_REQUEST_BUDGET: PackageRequestBudget = PackageRequestBudget {
+  global_requests: DEFAULT_GLOBAL_NETWORK_REQUESTS,
+};
+
+const _: () = assert!(MAX_DOWNLOAD_WORKERS <= u16::MAX as usize);
+const _: () = assert!(size_of::<PackageRequestBudget>() == 2);
+const _: () = assert!(align_of::<PackageRequestBudget>() == 2);
+
+impl PackageRequestBudget {
+  const fn global_limit(self) -> usize {
+    self.global_requests as usize
+  }
+}
 
 impl PackageHttpPolicy {
   /// Maximum attempts for retryable HTTP work, including the first request.
@@ -183,13 +204,9 @@ impl PackageHttpPolicy {
     10
   }
 
-  const fn effective_request_limit(self) -> usize {
+  const fn effective_request_limit(self, global_limit: usize) -> usize {
     let configured = self.max_requests_per_source as usize;
-    if configured < MAX_DOWNLOAD_WORKERS {
-      configured
-    } else {
-      MAX_DOWNLOAD_WORKERS
-    }
+    if configured < global_limit { configured } else { global_limit }
   }
 
   const fn with_offline(mut self, offline: bool) -> Self {
@@ -1597,7 +1614,8 @@ struct SourceCredential {
   provider: Option<Box<SourceProviderCredential>>,
   client: Option<reqwest::Client>,
   transport_client: Option<reqwest::Client>,
-  limiter: Option<Arc<Semaphore>>,
+  global_limiter: Option<Arc<Semaphore>>,
+  source_limiter: Option<Arc<Semaphore>>,
   http_policy: PackageHttpPolicy,
   security_flags: u8,
 }
@@ -1620,7 +1638,7 @@ struct ProviderCredentialState {
 const _: () = {
   assert!(size_of::<HttpOrigin>() == 24);
   assert!(align_of::<HttpOrigin>() == 8);
-  assert!(size_of::<SourceCredential>() == 120);
+  assert!(size_of::<SourceCredential>() == 128);
   assert!(align_of::<SourceCredential>() == 8);
 };
 
@@ -2417,6 +2435,7 @@ fn discover_configuration(
   }
   let proxy = effective_proxy(&merged)?;
   let http_policy = effective_http_policy(&merged, proxy.as_ref());
+  let request_budget = effective_request_budget();
   let signature_validation = merged.signature_validation.unwrap_or(SignatureValidationMode::Accept);
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
@@ -2425,7 +2444,7 @@ fn discover_configuration(
   let http_policy = http_policy.with_source_security(&sources);
   let mut credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
   attach_client_certificates(&sources, merged.client_certificates, proxy.as_ref(), project_directory, &mut credentials)?;
-  attach_http_policy(&sources, http_policy, proxy.as_ref(), project_directory, &mut credentials)?;
+  attach_http_policy(&sources, http_policy, request_budget, proxy.as_ref(), project_directory, &mut credentials)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -2557,7 +2576,8 @@ fn resolve_source_credentials_with(
         provider,
         client: None,
         transport_client: None,
-        limiter: None,
+        global_limiter: None,
+        source_limiter: None,
         http_policy: DEFAULT_HTTP_POLICY,
         security_flags: source.security_flags,
       }))
@@ -2623,7 +2643,8 @@ fn attach_client_certificates(
         provider: None,
         client: Some(client),
         transport_client: None,
-        limiter: None,
+        global_limiter: None,
+        source_limiter: None,
         http_policy: DEFAULT_HTTP_POLICY,
         security_flags: source.security_flags,
       }));
@@ -2636,20 +2657,26 @@ fn attach_client_certificates(
 fn attach_http_policy(
   sources: &[(String, PackageSource)],
   policy: PackageHttpPolicy,
+  request_budget: PackageRequestBudget,
   proxy: Option<&ProxySettings>,
   context: &Path,
   credentials: &mut SourceCredentialBatch,
 ) -> Result<(), PackageError> {
+  let global_limit = request_budget.global_limit();
+  let global_changed = global_limit < MAX_DOWNLOAD_WORKERS;
+  let source_limit = policy.effective_request_limit(global_limit);
   let runtime_changed = policy.max_tries != DEFAULT_HTTP_POLICY.max_tries
     || policy.retry_delay_ms != DEFAULT_HTTP_POLICY.retry_delay_ms
     || policy.max_retry_after_seconds != DEFAULT_HTTP_POLICY.max_retry_after_seconds
     || (policy.flags ^ DEFAULT_HTTP_POLICY.flags) & (HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER) != 0
-    || policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS;
+    || global_changed
+    || source_limit < global_limit;
   let source_security_changed = sources.iter().any(|(_, source)| source.security_flags != 0);
   if credentials.entries.is_empty() && !runtime_changed && !source_security_changed {
     return Ok(());
   }
 
+  let global_limiter = global_changed.then(|| Arc::new(Semaphore::new(global_limit)));
   let mut entries = std::mem::take(&mut credentials.entries).into_vec();
   entries.resize_with(sources.len(), || None);
   for (source_index, (_, source)) in sources.iter().enumerate() {
@@ -2661,11 +2688,12 @@ fn attach_http_policy(
     } else {
       Some(source_http_client(proxy, source.security_flags)?)
     };
-    let limiter = (policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS).then(|| Arc::new(Semaphore::new(policy.effective_request_limit())));
+    let source_limiter = (source_limit < global_limit).then(|| Arc::new(Semaphore::new(source_limit)));
     if let Some(credential) = entries[source_index].as_mut() {
       let credential = Arc::get_mut(credential).expect("source policy is uniquely owned during configuration");
       credential.http_policy = policy;
-      credential.limiter = limiter;
+      credential.global_limiter = global_limiter.clone();
+      credential.source_limiter = source_limiter;
       credential.security_flags = source.security_flags;
       credential.transport_client = transport_client;
     } else if runtime_changed || source.security_flags != 0 {
@@ -2675,7 +2703,8 @@ fn attach_http_policy(
         provider: None,
         client: None,
         transport_client,
-        limiter,
+        global_limiter: global_limiter.clone(),
+        source_limiter,
         http_policy: policy,
         security_flags: source.security_flags,
       }));
@@ -3172,6 +3201,20 @@ fn proxy_settings(raw_url: String, no_proxy: Option<String>, configured_credenti
 
 fn effective_http_policy(merged: &NugetConfigMerge, proxy: Option<&ProxySettings>) -> PackageHttpPolicy {
   effective_http_policy_with(merged, proxy, |name| env::var(name).ok())
+}
+
+fn effective_request_budget() -> PackageRequestBudget {
+  effective_request_budget_with(|name| env::var(name).ok())
+}
+
+fn effective_request_budget_with(mut environment: impl FnMut(&str) -> Option<String>) -> PackageRequestBudget {
+  let global_requests = environment("NUGET_CONCURRENCY_LIMIT")
+    .and_then(|value| value.trim().parse::<i32>().ok())
+    .filter(|value| *value > 0)
+    .map_or(DEFAULT_REQUEST_BUDGET.global_requests, |value| {
+      (value as u32).min(u32::from(DEFAULT_REQUEST_BUDGET.global_requests)) as u16
+    });
+  PackageRequestBudget { global_requests }
 }
 
 fn effective_http_policy_with(
@@ -4155,7 +4198,7 @@ impl LazyServiceEndpoints {
   ) -> Result<u32, PackageError> {
     debug_assert!(options.worker_budget > 0);
     let worker_budget = options.worker_budget.max(1);
-    let required_rank = mapping.and_then(|mapping| mapping.enabled_rank(package_id));
+    let required_rank = mapping.and_then(|mapping| mapping.required_rank(package_id));
     if mapping.is_some() && required_rank.is_none() {
       return Err(unmapped_identity(package_id));
     }
@@ -4562,7 +4605,6 @@ async fn resolve_streaming_graph(
   let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
   let mut tasks = JoinSet::new();
   let mut in_flight = BTreeSet::new();
-
   while !ready.is_empty() || !tasks.is_empty() {
     while tasks.len() < MAX_DOWNLOAD_WORKERS {
       let Some(lower_id) = ready
@@ -4582,7 +4624,10 @@ async fn resolve_streaming_graph(
         version: version.normalized.clone(),
         direct: node.direct.is_some(),
       });
-      let mapping_available = config.source_mapping.as_ref().is_none_or(|mapping| mapping.enabled_rank(&lower_id).is_some());
+      // Exact cache misses can delegate selection directly to endpoint
+      // discovery. Ranged identities need this precheck so an unmapped but
+      // already cached version batch remains source-independent like NuGet.
+      let mapping_available = request.is_some() || config.source_mapping.as_ref().is_none_or(|mapping| mapping.enabled_rank(&lower_id).is_some());
       let needs_sources = match request.as_ref() {
         Some(request) => find_package_root(&config.cache_root, &config.fallback_roots, request).is_none(),
         None if !mapping_available => enumerate_cached_versions(&config.cache_root, &config.fallback_roots, &lower_id)?.is_empty(),
@@ -5018,6 +5063,20 @@ async fn load_node_metadata(
   source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
 ) -> Result<MetadataTaskResult, PackageError> {
+  if let Some(request) = request
+    && let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request)
+  {
+    let request = request.clone();
+    let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
+      .await
+      .map_err(package_blocking_task_error)??;
+    return Ok(MetadataTaskResult::Requirements {
+      dependencies,
+      requests: 0,
+      bytes: 0,
+      package: None,
+    });
+  }
   let selected_rank = source_mapping.and_then(|mapping| mapping.enabled_rank(lower_id));
   let unmapped = source_mapping.is_some() && selected_rank.is_none();
   let has_selected_endpoint = endpoints
@@ -5032,20 +5091,6 @@ async fn load_node_metadata(
         bytes: 0,
       });
     }
-  }
-  if let Some(request) = request
-    && let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request)
-  {
-    let request = request.clone();
-    let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
-      .await
-      .map_err(package_blocking_task_error)??;
-    return Ok(MetadataTaskResult::Requirements {
-      dependencies,
-      requests: 0,
-      bytes: 0,
-      package: None,
-    });
   }
   if unmapped {
     return Err(unmapped_identity(lower_id));
@@ -6082,7 +6127,9 @@ async fn send_authenticated(
     .or_else(|| source.and_then(|credential| credential.transport_client.as_ref()))
     .unwrap_or(client);
   let policy = source.map_or(DEFAULT_HTTP_POLICY, |credential| credential.http_policy);
-  let permit = match source.and_then(|credential| credential.limiter.as_ref()) {
+  // Acquire the narrower source budget first so a busy source cannot reserve
+  // global slots while it waits for its own permits.
+  let source_permit = match source.and_then(|credential| credential.source_limiter.as_ref()) {
     Some(limiter) => Some(
       Arc::clone(limiter)
         .acquire_owned()
@@ -6091,12 +6138,22 @@ async fn send_authenticated(
     ),
     None => None,
   };
-  send_with_policy(client, credential, url, operation, policy, permit).await
+  let global_permit = match source.and_then(|credential| credential.global_limiter.as_ref()) {
+    Some(limiter) => Some(
+      Arc::clone(limiter)
+        .acquire_owned()
+        .await
+        .map_err(|_| network_error(url, "global package request limiter closed"))?,
+    ),
+    None => None,
+  };
+  send_with_policy(client, credential, url, operation, policy, global_permit, source_permit).await
 }
 
 struct AuthenticatedResponse {
   response: reqwest::Response,
-  _permit: Option<OwnedSemaphorePermit>,
+  _global_permit: Option<OwnedSemaphorePermit>,
+  _source_permit: Option<OwnedSemaphorePermit>,
   download_timeout: Duration,
 }
 
@@ -6129,7 +6186,8 @@ async fn send_with_policy(
   url: &str,
   operation: &str,
   policy: PackageHttpPolicy,
-  permit: Option<OwnedSemaphorePermit>,
+  global_permit: Option<OwnedSemaphorePermit>,
+  source_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<AuthenticatedResponse, PackageError> {
   'network: for network_attempt in 0..policy.max_tries {
     for authentication_attempt in 0..=2 {
@@ -6167,10 +6225,10 @@ async fn send_with_policy(
       };
       if response.status() == reqwest::StatusCode::UNAUTHORIZED && authentication_attempt < 2 {
         let Some(credential) = credential else {
-          return Ok(authenticated_response(response, permit, policy));
+          return Ok(authenticated_response(response, global_permit, source_permit, policy));
         };
         if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
-          return Ok(authenticated_response(response, permit, policy));
+          return Ok(authenticated_response(response, global_permit, source_permit, policy));
         }
         drop(response);
         continue;
@@ -6181,16 +6239,22 @@ async fn send_with_policy(
         tokio::time::sleep(delay).await;
         continue 'network;
       }
-      return Ok(authenticated_response(response, permit, policy));
+      return Ok(authenticated_response(response, global_permit, source_permit, policy));
     }
   }
   unreachable!("the bounded transport loop always returns")
 }
 
-fn authenticated_response(response: reqwest::Response, permit: Option<OwnedSemaphorePermit>, policy: PackageHttpPolicy) -> AuthenticatedResponse {
+fn authenticated_response(
+  response: reqwest::Response,
+  global_permit: Option<OwnedSemaphorePermit>,
+  source_permit: Option<OwnedSemaphorePermit>,
+  policy: PackageHttpPolicy,
+) -> AuthenticatedResponse {
   AuthenticatedResponse {
     response,
-    _permit: permit,
+    _global_permit: global_permit,
+    _source_permit: source_permit,
     download_timeout: Duration::from_secs(policy.download_timeout_seconds as u64),
   }
 }
@@ -9093,6 +9157,22 @@ mod tests {
   }
 
   #[test]
+  fn global_request_budget_matches_nuget_environment_and_stays_bounded() {
+    let selected = effective_request_budget_with(|name| (name == "NUGET_CONCURRENCY_LIMIT").then(|| "4".into()));
+    let padded = effective_request_budget_with(|name| (name == "NUGET_CONCURRENCY_LIMIT").then(|| "  +4  ".into()));
+    let oversized = effective_request_budget_with(|name| (name == "NUGET_CONCURRENCY_LIMIT").then(|| "1000".into()));
+
+    assert_eq!(selected.global_requests, 4);
+    assert_eq!(padded, selected);
+    assert_eq!(oversized, DEFAULT_REQUEST_BUDGET);
+    for invalid in ["0", "-1", "invalid", ""] {
+      let budget = effective_request_budget_with(|name| (name == "NUGET_CONCURRENCY_LIMIT").then(|| invalid.into()));
+      assert_eq!(budget, DEFAULT_REQUEST_BUDGET);
+    }
+    assert_eq!(effective_request_budget_with(|_| None), DEFAULT_REQUEST_BUDGET);
+  }
+
+  #[test]
   fn proxy_url_credentials_are_zeroized_and_never_retained_in_the_url() {
     let proxy = proxy_settings(
       "http://us%65r:s%65cret@proxy.example.test:8080".into(),
@@ -9165,7 +9245,9 @@ mod tests {
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-    let mut response = runtime.block_on(send_with_policy(&client, None, &url, "test request", policy, None)).unwrap();
+    let mut response = runtime
+      .block_on(send_with_policy(&client, None, &url, "test request", policy, None, None))
+      .unwrap();
     let body = runtime.block_on(response.chunk(&url, "test")).unwrap().unwrap();
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -9244,7 +9326,7 @@ mod tests {
     let mut credentials = SourceCredentialBatch::default();
     let policy = DEFAULT_HTTP_POLICY.with_source_security(&sources);
 
-    attach_http_policy(&sources, policy, None, Path::new("NuGet.Config"), &mut credentials).unwrap();
+    attach_http_policy(&sources, policy, DEFAULT_REQUEST_BUDGET, None, Path::new("NuGet.Config"), &mut credentials).unwrap();
 
     let source = credentials.get(0).unwrap();
     assert!(source.transport_client.is_some());
@@ -9254,26 +9336,76 @@ mod tests {
   }
 
   #[test]
-  fn source_rate_limit_is_bounded_and_shared_by_all_source_requests() {
+  fn default_request_budget_allocates_no_limiter_context() {
     let sources = vec![(
-      "limited".into(),
+      "public".into(),
       PackageSource {
-        url: "https://packages.example.test/v3/index.json".into(),
+        url: DEFAULT_SOURCE.into(),
         protocol: NugetProtocol::V3,
         security_flags: 0,
       },
     )];
+    let mut credentials = SourceCredentialBatch::default();
+
+    attach_http_policy(
+      &sources,
+      DEFAULT_HTTP_POLICY,
+      DEFAULT_REQUEST_BUDGET,
+      None,
+      Path::new("NuGet.Config"),
+      &mut credentials,
+    )
+    .unwrap();
+
+    assert!(credentials.entries.is_empty());
+  }
+
+  #[test]
+  fn source_rate_limit_is_bounded_and_shared_by_all_source_requests() {
+    let sources = vec![
+      (
+        "first".into(),
+        PackageSource {
+          url: "https://first.example.test/v3/index.json".into(),
+          protocol: NugetProtocol::V3,
+          security_flags: 0,
+        },
+      ),
+      (
+        "second".into(),
+        PackageSource {
+          url: "https://second.example.test/v3/index.json".into(),
+          protocol: NugetProtocol::V3,
+          security_flags: 0,
+        },
+      ),
+    ];
     let mut credentials = SourceCredentialBatch::default();
     let policy = PackageHttpPolicy {
       max_requests_per_source: 2,
       ..DEFAULT_HTTP_POLICY
     };
 
-    attach_http_policy(&sources, policy, None, Path::new("NuGet.Config"), &mut credentials).unwrap();
+    attach_http_policy(
+      &sources,
+      policy,
+      PackageRequestBudget { global_requests: 4 },
+      None,
+      Path::new("NuGet.Config"),
+      &mut credentials,
+    )
+    .unwrap();
 
-    let source = credentials.get(0).unwrap();
-    assert_eq!(source.limiter.as_ref().unwrap().available_permits(), 2);
-    assert_eq!(source.http_policy, policy);
+    let first = credentials.get(0).unwrap();
+    let second = credentials.get(1).unwrap();
+    assert_eq!(first.global_limiter.as_ref().unwrap().available_permits(), 4);
+    assert_eq!(second.global_limiter.as_ref().unwrap().available_permits(), 4);
+    assert!(Arc::ptr_eq(first.global_limiter.as_ref().unwrap(), second.global_limiter.as_ref().unwrap()));
+    assert_eq!(first.source_limiter.as_ref().unwrap().available_permits(), 2);
+    assert_eq!(second.source_limiter.as_ref().unwrap().available_permits(), 2);
+    assert!(!Arc::ptr_eq(first.source_limiter.as_ref().unwrap(), second.source_limiter.as_ref().unwrap()));
+    assert_eq!(first.http_policy, policy);
+    assert_eq!(second.http_policy, policy);
   }
 
   #[test]
@@ -9297,7 +9429,9 @@ mod tests {
       ..DEFAULT_HTTP_POLICY
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let mut response = runtime.block_on(send_with_policy(&client, None, &url, "test request", policy, None)).unwrap();
+    let mut response = runtime
+      .block_on(send_with_policy(&client, None, &url, "test request", policy, None, None))
+      .unwrap();
 
     let error = runtime.block_on(response.chunk(&url, "test")).unwrap_err();
 

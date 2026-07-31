@@ -73,6 +73,7 @@ Invalid input behavior:
 | `nuget_config_merge` | four machine/user/repository configs with keyed overrides and environment values, populated isolated package cache, matching native lock | process launch, config discovery, keyed merge/expansion, one-package locked validation, and output |
 | `nuget_source_sections` | four config levels with package/audit sources, protocols, disabled state, and nested mappings; populated isolated package cache and matching native lock | process launch, typed source-policy merge, mapping construction, one-package locked validation, and output |
 | `nuget_source_mapping` | fresh project/config copy, empty isolated package cache, one unreachable v3 source whose only mapping does not match the requested identity | process launch, project/config discovery, cache-miss proof, longest-pattern selection, zero-source proof, and the expected typed failure; source contact is forbidden |
+| `nuget_request_budget` | six seeded exact packages, empty isolated cache, two delayed loopback v3 feeds, global limit 4, per-source limit 2 | process launch, project/config discovery, bounded service discovery and archive fetch, integrity/extraction, and asset planning; both peak bounds and six byte-identical published packages are verified |
 | `nuget_storage_policy` | machine/user/repository policy, fallback-only package, empty global cache, matching native lock, reference HTTP cache bypassed | process launch, typed storage/signature/audit/proxy merge, fallback lookup, one-package locked validation, and output |
 | `nuget_cli_overrides` | conflicting implicit/config/environment values, explicit config/source/packages, populated CLI cache, matching native lock | process launch, explicit-config parse, CLI precedence transform, one-package locked validation, and output |
 | `nuget_local_sources` | mapped flat and hierarchical local feeds, empty global cache and restore outputs | process launch, local layout discovery, two-package graph resolution, 2,980,145 source bytes, hash/ZIP validation, extraction, atomic publication, and output |
@@ -114,6 +115,7 @@ directional decisions.`
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-source-mapping` | 1 `net10.0` project, 1 exact package request, empty cache, 1 unreachable v3 source, and 1 nonmatching mapping pattern | mapping-before-discovery behavior and typed unmapped failure | executable for both tools with expected-failure, diagnostic, and zero-request preflight |
+| `nuget-request-budget` | 1 `net10.0` project, 6 dependency-free exact packages, 2 delayed loopback v3 feeds, 4 global and 2 per-source active requests | deterministic request backpressure and cold restore throughput | executable for both tools with upper-bound, package-count, and source-contact validation |
 | `nuget-storage-policy` | 1 project, 3 config levels, 1 fallback-only package, isolated global/HTTP/scratch roots | storage precedence, fallback consumption, typed signature/audit policy, and proxy redaction | executable for both tools with official NuGet/MSBuild and package parity preflight |
 | `nuget-local-sources` | 1 project, 2 mapped local feeds, 1 flat package, 1 hierarchical package, 2,980,145 archive bytes | offline layout detection, local range/exact lookup, integrity validation, and cold cache publication | executable for both tools with source/package/hash parity preflight |
 | `nuget-service-index` | 1 project, 1 v3 source, 40 resource rows, 31 distinct types, 5 capability families, 9,272 response bytes | official resource preference, client-version compatibility, mirror retention, and live request latency | executable for both tools with exact SDK-shipped NuGet.Protocol endpoint parity preflight |
@@ -246,6 +248,13 @@ request into a failed preflight rather than a misleading timing:
 
 ```text
 cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
+```
+
+Measure global and per-source request backpressure against two deterministic
+delayed feeds. Package seeding and public network work remain outside timing:
+
+```text
+cargo bench-all --case nuget_request_budget --samples 30 --warmups 3
 ```
 
 Measure global/HTTP/scratch path precedence, fallback consumption, signature

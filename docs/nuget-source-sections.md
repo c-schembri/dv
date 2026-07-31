@@ -65,7 +65,9 @@ the graph walk.
 `PackageSourceMapping` is 48 bytes with eight-byte alignment. The restore-owned
 `LazyServiceEndpoints` state is 40 bytes with eight-byte alignment and owns one
 source-indexed `Vec<Option<ServiceEndpoint>>` plus an immutable `Arc` snapshot
-borrowed by in-flight tasks. These layouts have compile-time assertions.
+borrowed by in-flight tasks. Its 16-byte, eight-byte-aligned
+`ServiceDiscoveryOptions` value carries the remaining global worker budget and
+the network permission bit. These layouts have compile-time assertions.
 `ASSUMPTION: the Windows x64 benchmark host has 64-byte cache lines - affects
 the expectation that either hot control record fits in one cache line; neither
 record is explicitly over-aligned because workers read snapshots rather than
@@ -123,7 +125,7 @@ longest-pattern selection, and structured failure with zero HTTP requests:
 cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
 ```
 
-Thirty retained Windows samples measured `639.131 ms` for Microsoft and
-`8.445 ms` for `dv`, a `75.7x` median improvement. The full distribution and
+Thirty retained Windows samples measured `531.249 ms` for Microsoft and
+`9.566 ms` for `dv`, a `55.5x` median improvement. The full distribution and
 commands are retained in the
 [source-mapping baseline](performance-baselines/2026-08-01-nuget-source-mapping-windows.md).

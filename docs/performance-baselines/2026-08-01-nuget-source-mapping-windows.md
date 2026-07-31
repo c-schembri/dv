@@ -27,9 +27,9 @@ dv restore SourceMapping.csproj --packages .packages --json
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| Microsoft | 639.131 ms | 1684.299 ms | 515.672 ms | 1692.450 ms |
-| `dv` | 8.445 ms | 9.459 ms | 7.628 ms | 9.649 ms |
+| Microsoft | 531.249 ms | 1153.411 ms | 514.884 ms | 1345.574 ms |
+| `dv` | 9.566 ms | 11.215 ms | 8.160 ms | 12.165 ms |
 
-`dv` is 75.7x faster by median. This measures process launch, project and
+`dv` is 55.5x faster by median. This measures process launch, project and
 configuration discovery, empty-cache proof, longest-pattern source selection,
 and structured expected failure. It is not a network-transfer benchmark.
