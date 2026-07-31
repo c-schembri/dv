@@ -73,6 +73,7 @@ Invalid input behavior:
 | `nuget_config_merge` | four machine/user/repository configs with keyed overrides and environment values, populated isolated package cache, matching native lock | process launch, config discovery, keyed merge/expansion, one-package locked validation, and output |
 | `nuget_source_sections` | four config levels with package/audit sources, protocols, disabled state, and nested mappings; populated isolated package cache and matching native lock | process launch, typed source-policy merge, mapping construction, one-package locked validation, and output |
 | `nuget_storage_policy` | machine/user/repository policy, fallback-only package, empty global cache, matching native lock, reference HTTP cache bypassed | process launch, typed storage/signature/audit/proxy merge, fallback lookup, one-package locked validation, and output |
+| `nuget_cli_overrides` | conflicting implicit/config/environment values, explicit config/source/packages, populated CLI cache, matching native lock | process launch, explicit-config parse, CLI precedence transform, one-package locked validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -229,6 +230,13 @@ the warm locked boundary:
 
 ```text
 cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
+```
+
+Measure source replacement, explicit-config isolation, and CLI package-folder
+precedence through the same warm locked boundary:
+
+```text
+cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

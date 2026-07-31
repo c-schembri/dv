@@ -35,6 +35,7 @@ enum CaseKind {
   NugetConfigMerge,
   NugetSourceSections,
   NugetStoragePolicy,
+  NugetCliOverrides,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -59,6 +60,7 @@ struct Fixtures<'a> {
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
   nuget_storage_policy: &'a Path,
+  nuget_cli_overrides: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -270,6 +272,26 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_cli_overrides",
+    kind: CaseKind::NugetCliOverrides,
+    args: &[
+      "restore",
+      "CliOverrides.csproj",
+      "--locked-mode",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--configfile",
+      "config/selected.config",
+      "--packages",
+      "policy/cli-global",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -440,6 +462,23 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_cli_overrides",
+    kind: CaseKind::NugetCliOverrides,
+    args: &[
+      "restore",
+      "CliOverrides.csproj",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--configfile",
+      "config/selected.config",
+      "--packages",
+      "policy/cli-global",
+      "--offline",
+      "--json",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -571,6 +610,7 @@ fn run() -> Result<()> {
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
+  let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -585,6 +625,7 @@ fn run() -> Result<()> {
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
     nuget_storage_policy: &nuget_storage_policy_fixture,
+    nuget_cli_overrides: &nuget_cli_overrides_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -638,6 +679,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_storage_policy") {
     verify_nuget_storage_policy(&repository, &dv_executable, &nuget_storage_policy_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_cli_overrides") {
+    verify_nuget_cli_overrides(&repository, &dv_executable, &nuget_cli_overrides_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -657,7 +701,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 10,
+    schema_version: 11,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2044,6 +2088,142 @@ fn verify_nuget_storage_policy(repository: &Path, dv_executable: &Path, fixture:
   Ok(())
 }
 
+fn verify_nuget_cli_overrides(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join("target/benchmark-nuget-cli-overrides-verification");
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  prepare_nuget_cli_overrides(Path::new("dotnet"), &dotnet_workspace)?;
+  prepare_nuget_cli_overrides(dv_executable, &dv_workspace)?;
+
+  run_nuget_cli_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "CliOverrides.csproj",
+      "--locked-mode",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--configfile",
+      "config/selected.config",
+      "--packages",
+      "policy/cli-global",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &dotnet_workspace,
+    "NuGet CLI override verification",
+  )?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let restore = assets
+    .get("project")
+    .and_then(|project| project.get("restore"))
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft CLI override assets omitted project.restore")?;
+  let packages_path = restore
+    .get("packagesPath")
+    .and_then(serde_json::Value::as_str)
+    .ok_or("Microsoft CLI override assets omitted packagesPath")?;
+  if relative_policy_path(packages_path, &dotnet_workspace)? != "policy/cli-global" {
+    return Err(format!("Microsoft --packages did not beat environment/config precedence: {packages_path:?}").into());
+  }
+  let config_paths = restore
+    .get("configFilePaths")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("Microsoft CLI override assets omitted configFilePaths")?;
+  if config_paths.len() != 1
+    || config_paths[0]
+      .as_str()
+      .is_none_or(|path| relative_policy_path(path, &dotnet_workspace).ok().as_deref() != Some("config/selected.config"))
+  {
+    return Err(format!("Microsoft --configfile did not isolate the selected file: {config_paths:?}").into());
+  }
+  let sources = restore
+    .get("sources")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft CLI override assets omitted sources")?;
+  let remote_sources = sources
+    .keys()
+    .filter(|source| source.starts_with("http://") || source.starts_with("https://"))
+    .collect::<Vec<_>>();
+  if remote_sources != ["https://api.nuget.org/v3/index.json"] {
+    return Err(format!("Microsoft --source did not replace configured remote sources: {remote_sources:?}").into());
+  }
+  let package_folders = assets
+    .get("packageFolders")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft CLI override assets omitted packageFolders")?;
+  let reference_folders = package_folders
+    .keys()
+    .map(|path| relative_policy_path(path, &dotnet_workspace))
+    .collect::<Result<Vec<_>>>()?;
+  if reference_folders != ["policy/cli-global"] {
+    return Err(format!("Microsoft CLI packages override differs: {reference_folders:?}").into());
+  }
+  let reference_metadata: serde_json::Value =
+    serde_json::from_slice(&fs::read(dotnet_workspace.join("policy/cli-global/newtonsoft.json/13.0.3/.nupkg.metadata"))?)?;
+  if reference_metadata.get("source").and_then(serde_json::Value::as_str) != Some("https://api.nuget.org/v3/index.json") {
+    return Err("Microsoft CLI source override did not select the requested package source".into());
+  }
+
+  let dv_text = nuget_cli_command_text(
+    dv_executable,
+    &[
+      "restore",
+      "CliOverrides.csproj",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--configfile",
+      "config/selected.config",
+      "--packages",
+      "policy/cli-global",
+      "--offline",
+      "--json",
+    ],
+    &dv_workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv CLI override verification omitted package_resolution_created")?;
+  if required_string(&dv, "source")? != "https://api.nuget.org/v3/index.json"
+    || required_string(&dv, "source_protocol")? != "v3"
+    || relative_policy_path(required_string(&dv, "cache_root")?, &dv_workspace)? != "policy/cli-global"
+  {
+    return Err(format!("dv CLI source/package overrides differ: {dv}").into());
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) || dv.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(0) {
+    return Err("dv CLI override verification performed network or package-download work".into());
+  }
+  let package = dv
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|packages| packages.first())
+    .ok_or("dv CLI override verification omitted Newtonsoft.Json")?;
+  let reference_hash = fs::read_to_string(dotnet_workspace.join("policy/cli-global/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512"))?;
+  if package.get("id").and_then(serde_json::Value::as_str) != Some("Newtonsoft.Json")
+    || package.get("version").and_then(serde_json::Value::as_str) != Some("13.0.3")
+    || package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash.trim())
+  {
+    return Err("NuGet CLI override package identity, version, or hash differs".into());
+  }
+  for workspace in [&dotnet_workspace, &dv_workspace] {
+    for relative in ["policy/env-global", "policy/config-global", "policy/selected-config-global"] {
+      if workspace.join(relative).exists() {
+        return Err(format!("CLI override unexpectedly used lower-precedence path {relative:?}").into());
+      }
+    }
+  }
+  Ok(())
+}
+
 fn assert_relative_policy_path(value: &serde_json::Value, field: &str, workspace: &Path, expected: &str) -> Result<()> {
   let path = value
     .get(field)
@@ -2323,6 +2503,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
       | CaseKind::NugetStoragePolicy
+      | CaseKind::NugetCliOverrides
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -2499,6 +2680,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::NugetStoragePolicy) {
     prepare_nuget_storage_policy(executable, workspace)?;
   }
+  if matches!(case.kind, CaseKind::NugetCliOverrides) {
+    prepare_nuget_cli_overrides(executable, workspace)?;
+  }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
     if is_dotnet(executable) {
       run_checked(
@@ -2599,6 +2783,54 @@ fn prepare_nuget_storage_policy(executable: &Path, workspace: &Path) -> Result<(
   }
 }
 
+fn prepare_nuget_cli_overrides(executable: &Path, workspace: &Path) -> Result<()> {
+  let packages = workspace.join("policy/cli-global");
+  if packages.exists() {
+    fs::remove_dir_all(&packages)?;
+  }
+  run_nuget_cli_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "CliOverrides.csproj",
+      "--use-lock-file",
+      "--source",
+      "https://api.nuget.org/v3/index.json",
+      "--configfile",
+      "config/selected.config",
+      "--packages",
+      "policy/cli-global",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    workspace,
+    "NuGet CLI override package seed",
+  )?;
+  if is_dotnet(executable) {
+    Ok(())
+  } else {
+    run_nuget_cli_checked(
+      executable,
+      &[
+        "restore",
+        "CliOverrides.csproj",
+        "--source",
+        "https://api.nuget.org/v3/index.json",
+        "--configfile",
+        "config/selected.config",
+        "--packages",
+        "policy/cli-global",
+        "--offline",
+        "--json",
+      ],
+      workspace,
+      "NuGet CLI override setup",
+    )
+  }
+}
+
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::RidGraph
@@ -2611,7 +2843,8 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetConfigHierarchy
     | CaseKind::NugetConfigMerge
     | CaseKind::NugetSourceSections
-    | CaseKind::NugetStoragePolicy => Ok(()),
+    | CaseKind::NugetStoragePolicy
+    | CaseKind::NugetCliOverrides => Ok(()),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
       reset_fixture(fixture, workspace)
@@ -2671,6 +2904,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
+    CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -2690,6 +2924,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
+    CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -2702,7 +2937,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   command.args(case.args).current_dir(cwd);
   if matches!(
     case.kind,
-    CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge | CaseKind::NugetSourceSections | CaseKind::NugetStoragePolicy
+    CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge | CaseKind::NugetSourceSections | CaseKind::NugetStoragePolicy | CaseKind::NugetCliOverrides
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd);
   }
@@ -2728,6 +2963,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetConfigMerge
         | CaseKind::NugetSourceSections
         | CaseKind::NugetStoragePolicy
+        | CaseKind::NugetCliOverrides
     ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
@@ -2879,9 +3115,22 @@ fn apply_nuget_storage_environment(command: &mut Command, cwd: &Path) {
     .env_remove("no_proxy");
 }
 
+fn apply_nuget_cli_environment(command: &mut Command, cwd: &Path) {
+  apply_nuget_config_environment(command, cwd);
+  command
+    .env("NUGET_PACKAGES", cwd.join("policy/env-global"))
+    .env("NUGET_HTTP_CACHE_PATH", cwd.join("policy/http-cache"))
+    .env("NUGET_SCRATCH", cwd.join("policy/scratch"))
+    .env_remove("NUGET_FALLBACK_PACKAGES")
+    .env_remove("http_proxy")
+    .env_remove("no_proxy");
+}
+
 fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) {
   if matches!(kind, CaseKind::NugetStoragePolicy) {
     apply_nuget_storage_environment(command, cwd);
+  } else if matches!(kind, CaseKind::NugetCliOverrides) {
+    apply_nuget_cli_environment(command, cwd);
   } else {
     apply_nuget_config_environment(command, cwd);
   }
@@ -2898,6 +3147,13 @@ fn run_nuget_storage_checked(executable: &Path, args: &[&str], cwd: &Path, purpo
   let mut command = Command::new(executable);
   command.args(args).current_dir(cwd);
   apply_nuget_storage_environment(&mut command, cwd);
+  check_output(command.output()?, executable, args, purpose)
+}
+
+fn run_nuget_cli_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_cli_environment(&mut command, cwd);
   check_output(command.output()?, executable, args, purpose)
 }
 
@@ -2942,6 +3198,15 @@ fn nuget_storage_command_text(executable: &Path, args: &[&str], cwd: &Path) -> R
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+fn nuget_cli_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_cli_environment(&mut command, cwd);
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, "NuGet CLI override command")?;
+  Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
 fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
   if destination.exists() {
     fs::remove_dir_all(destination)?;
@@ -2952,18 +3217,20 @@ fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
   fs::create_dir_all(destination)?;
   let storage_policy_root = source.join("StoragePolicy.csproj").is_file();
+  let generated_policy_root = storage_policy_root || source.join("CliOverrides.csproj").is_file();
   for entry in fs::read_dir(source)? {
     let entry = entry?;
     let source_path = entry.path();
     let destination_path = destination.join(entry.file_name());
     if entry.file_type()?.is_dir() {
-      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed")) || (storage_policy_root && entry.file_name() == OsStr::new("policy"))
+      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed"))
+        || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
       {
         continue;
       }
       copy_directory(&source_path, &destination_path)?;
     } else {
-      if storage_policy_root && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
+      if generated_policy_root && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
         continue;
       }
       fs::copy(source_path, destination_path)?;
@@ -3069,6 +3336,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_config_merge"
           | "nuget_source_sections"
           | "nuget_storage_policy"
+          | "nuget_cli_overrides"
       )
     })
     .collect::<Vec<_>>();
@@ -3195,6 +3463,7 @@ fn case_label(case: &str) -> &str {
     "nuget_config_merge" => "NuGet.Config keyed merge",
     "nuget_source_sections" => "NuGet source sections",
     "nuget_storage_policy" => "NuGet storage policy",
+    "nuget_cli_overrides" => "NuGet CLI overrides",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -3278,7 +3547,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 10,
+      schema_version: 11,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -3342,7 +3611,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 10,
+      schema_version: 11,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

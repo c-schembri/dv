@@ -213,6 +213,10 @@ pub struct PackageResolveOptions {
   /// Explicit NuGet configuration file. When present, no implicit hierarchy
   /// is discovered.
   pub config_file: Option<PathBuf>,
+  /// Ordered command-line package sources, replacing configured sources.
+  /// Variable-sized external URI text must be owned across project/config
+  /// evaluation; the empty default allocates no backing buffer.
+  pub sources: Vec<String>,
   /// Reject every operation that would require an HTTP request.
   pub offline: bool,
   /// Write or refresh `dv.lock.json` after successful resolution.
@@ -1229,6 +1233,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     project.project_directory(),
     options.packages_directory.as_deref(),
     options.config_file.as_deref(),
+    &options.sources,
   )?;
   validate_signature_policy(config.signature_validation)?;
   validate_audit_policy(project)?;
@@ -1521,7 +1526,12 @@ fn invalid_prune_line(path: &Path, line: usize) -> PackageError {
   )
 }
 
-fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>, explicit_config: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
+fn discover_configuration(
+  project_directory: &Path,
+  explicit_cache: Option<&Path>,
+  explicit_config: Option<&Path>,
+  explicit_sources: &[String],
+) -> Result<NugetConfiguration, PackageError> {
   let config_paths = discover_config_paths(project_directory, explicit_config, &NugetConfigRoots::from_environment())?;
 
   let mut merged = NugetConfigMerge::default();
@@ -1542,12 +1552,12 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
+  let sources = command_line_sources(explicit_sources, merged.sources)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
-    Some(Arc::new(PackageSourceMapping::compile(merged.source_mapping, &merged.sources)?))
+    Some(Arc::new(PackageSourceMapping::compile(merged.source_mapping, &sources)?))
   };
-  let sources = merged.sources;
   if sources.is_empty() {
     return Err(PackageError::new(
       PackageErrorKind::Configuration,
@@ -1586,6 +1596,40 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
     signature_validation,
     proxy,
   })
+}
+
+fn command_line_sources(overrides: &[String], configured: Vec<(String, PackageSource)>) -> Result<Vec<(String, PackageSource)>, PackageError> {
+  if overrides.is_empty() {
+    return Ok(configured);
+  }
+  let mut sources = Vec::with_capacity(overrides.len());
+  for value in overrides {
+    if value.is_empty() {
+      return Err(config_error(Path::new("--source"), "command-line package source cannot be empty"));
+    }
+    if !value.starts_with("https://") {
+      return Err(PackageError::new(
+        PackageErrorKind::Configuration,
+        value,
+        format!("package resolution supports HTTPS NuGet v2 and v3 sources; {value:?} is unsupported"),
+      ));
+    }
+    if sources.iter().any(|(_, source): &(String, PackageSource)| source.url == *value) {
+      continue;
+    }
+    if let Some((name, source)) = configured.iter().rev().find(|(_, source)| source.url == *value) {
+      sources.push((name.clone(), source.clone()));
+    } else {
+      sources.push((
+        value.clone(),
+        PackageSource {
+          url: value.clone(),
+          protocol: NugetProtocol::parse(None, value, Path::new("--source"))?,
+        },
+      ));
+    }
+  }
+  Ok(sources)
 }
 
 struct NugetConfigRoots {
@@ -1811,7 +1855,7 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
   if let Some(cache) = environment_path("NUGET_PACKAGES")? {
     return Ok(cache);
   }
-  discover_configuration(project_directory, None, None).map(|configuration| configuration.cache_root)
+  discover_configuration(project_directory, None, None, &[]).map(|configuration| configuration.cache_root)
 }
 
 fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
@@ -5521,6 +5565,41 @@ mod tests {
   }
 
   #[test]
+  fn command_line_sources_replace_config_and_keep_matching_mapping_identity() {
+    let temp = TempDirectory::new();
+    let config = temp.write(
+      "selected.config",
+      r#"<configuration>
+<packageSources>
+  <clear />
+  <add key="selected" value="https://packages.example.test/v3/index.json" protocolVersion="3" />
+  <add key="ignored" value="https://ignored.example.test/api/v2" protocolVersion="2" />
+</packageSources>
+<packageSourceMapping>
+  <clear />
+  <packageSource key="selected"><package pattern="Example.*" /></packageSource>
+</packageSourceMapping>
+</configuration>"#,
+    );
+    let overrides = vec![
+      "https://packages.example.test/v3/index.json".to_owned(),
+      "https://new.example.test/v3/index.json".to_owned(),
+      "https://packages.example.test/v3/index.json".to_owned(),
+    ];
+
+    let discovered = discover_configuration(&temp.0, Some(&temp.0.join("packages")), Some(&config), &overrides).unwrap();
+
+    assert_eq!(discovered.sources.len(), 2);
+    assert_eq!(discovered.sources[0].0, "selected");
+    assert_eq!(discovered.sources[0].1.protocol, NugetProtocol::V3);
+    assert_eq!(discovered.sources[1].0, "https://new.example.test/v3/index.json");
+    assert_eq!(discovered.sources[1].1.protocol, NugetProtocol::V3);
+    let mapping = discovered.source_mapping.unwrap();
+    assert!(mapping.allows(0, "Example.Package"));
+    assert!(!mapping.allows(1, "Example.Package"));
+  }
+
+  #[test]
   fn fallback_package_roots_are_searched_after_the_global_cache() {
     let temp = TempDirectory::new();
     let global = temp.0.join("global");
@@ -5665,7 +5744,7 @@ mod tests {
 
     let selected = discover_config_paths(&temp.0.join("repository"), Some(&explicit), &roots).unwrap();
     assert_eq!(selected.as_slice(), std::slice::from_ref(&explicit));
-    let no_sources = discover_configuration(&temp.0.join("repository"), Some(&temp.0.join("packages")), Some(&explicit))
+    let no_sources = discover_configuration(&temp.0.join("repository"), Some(&temp.0.join("packages")), Some(&explicit), &[])
       .err()
       .unwrap();
     assert_eq!(no_sources.kind(), PackageErrorKind::Configuration);
@@ -5916,6 +5995,7 @@ mod tests {
     let options = PackageResolveOptions {
       packages_directory: Some(temp.0.join("packages")),
       config_file: None,
+      sources: Vec::new(),
       offline: true,
       write_lock: true,
     };
@@ -5957,6 +6037,7 @@ mod tests {
     let options = PackageResolveOptions {
       packages_directory: Some(temp.0.join("packages")),
       config_file: None,
+      sources: Vec::new(),
       offline: true,
       write_lock: false,
     };
@@ -6004,6 +6085,7 @@ mod tests {
     let options = PackageResolveOptions {
       packages_directory: Some(cache),
       config_file: None,
+      sources: Vec::new(),
       offline: true,
       write_lock: true,
     };

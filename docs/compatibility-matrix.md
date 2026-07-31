@@ -25,6 +25,7 @@ diagnostic rather than approximate Microsoft behavior.
 | NuGet configuration merge | keyed sources, disabled sources, package folder, and `%NAME%` values | Case-insensitive add/replace/remove/clear and single-pass environment expansion implemented |
 | NuGet source policy | package/audit sources, v2/v3 metadata, and package-source mappings | Typed source batches and longest-pattern package routing implemented; pre-discovery filtering remains planned |
 | NuGet storage and restore policy | global packages, HTTP cache, scratch, fallback folders, signature/audit modes, and proxy | Microsoft-compatible precedence, fallback lookup, scratch staging, atomic publication, and proxy construction are implemented; unimplemented HTTP reuse, signature verification, and advisory execution fail or remain explicitly tracked |
+| NuGet CLI restore overrides | repeatable HTTPS source, one explicit config, and one packages folder | Source replacement, config isolation, working-directory path normalization, and config/environment precedence implemented for `restore` and `sync` |
 | Configuration | `Debug` and `Release` | Implemented |
 | Generated inputs | global usings, assembly attributes, editor config | Paths planned; content generation planned |
 | Compiler inputs | framework references, SDK/pack analyzers, defines and core options | Initial immutable plan implemented |

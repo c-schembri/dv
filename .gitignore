@@ -16,3 +16,6 @@
 /benchmarks/fixtures/nuget-storage-policy/policy/
 /benchmarks/fixtures/nuget-storage-policy/dv.lock.json
 /benchmarks/fixtures/nuget-storage-policy/packages.lock.json
+/benchmarks/fixtures/nuget-cli-overrides/policy/
+/benchmarks/fixtures/nuget-cli-overrides/dv.lock.json
+/benchmarks/fixtures/nuget-cli-overrides/packages.lock.json

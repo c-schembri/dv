@@ -28,6 +28,12 @@ NuGet sources are typed records containing URL and protocol generation:
 Configuration discovers machine fragments, additional-user fragments, the
 main .NET CLI user file, and one `NuGet.Config` from each drive-to-project
 ancestor in precedence order. `--configfile` selects only its validated file.
+Repeatable `-s`/`--source` values replace the configured package-source batch
+in command-line order, with exact duplicates removed. An exact URL match keeps
+the configured source identity and protocol so source mapping remains valid;
+otherwise the protocol is inferred from the HTTPS URL. Relative explicit
+config and package-directory paths are normalized against the working
+directory before configuration discovery.
 Keyed `packageSources`, `disabledPackageSources`, and
 `globalPackagesFolder` values merge case-insensitively with add, remove, and
 clear operations. A disabled-source key disables by presence; both Boolean

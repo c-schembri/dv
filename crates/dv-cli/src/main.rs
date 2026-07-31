@@ -64,8 +64,10 @@ Usage:
 
 const PACKAGE_HELP: &str = "\
 Usage:
-  dv restore [PROJECT] [--packages PATH] [--configfile PATH] [--offline]
-  dv sync [PROJECT] [--packages PATH] [--configfile PATH] [--offline]
+  dv restore [PROJECT] [-s|--source SOURCE]... [--packages PATH]
+             [--configfile PATH] [--offline]
+  dv sync [PROJECT] [-s|--source SOURCE]... [--packages PATH]
+          [--configfile PATH] [--offline]
 ";
 
 fn main() -> ExitCode {
@@ -201,10 +203,13 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
   let options = PackageResolveOptions {
-    packages_directory: options.packages_directory,
+    packages_directory: options
+      .packages_directory
+      .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
     config_file: options
       .config_file
       .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
+    sources: options.sources,
     offline: options.offline,
     write_lock: true,
   };
@@ -223,6 +228,7 @@ struct PackageCommandOptions {
   project: Option<PathBuf>,
   packages_directory: Option<PathBuf>,
   config_file: Option<PathBuf>,
+  sources: Vec<String>,
   offline: bool,
 }
 
@@ -231,18 +237,70 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
     project: None,
     packages_directory: None,
     config_file: None,
+    sources: Vec::new(),
     offline: false,
   };
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].as_str() {
+      "--packages" if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
       "--packages" => {
         index += 1;
-        options.packages_directory = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
+        let path = arguments.get(index).ok_or("--packages requires a path")?;
+        if path.is_empty() {
+          return Err("--packages requires a path".into());
+        }
+        options.packages_directory = Some(PathBuf::from(path));
       },
+      value if value.starts_with("--packages=") => {
+        if options.packages_directory.is_some() {
+          return Err("--packages cannot be specified more than once".into());
+        }
+        let value = &value["--packages=".len()..];
+        if value.is_empty() {
+          return Err("--packages requires a path".into());
+        }
+        options.packages_directory = Some(PathBuf::from(value));
+      },
+      "--configfile" if options.config_file.is_some() => return Err("--configfile cannot be specified more than once".into()),
       "--configfile" => {
         index += 1;
-        options.config_file = Some(PathBuf::from(arguments.get(index).ok_or("--configfile requires a path")?));
+        let path = arguments.get(index).ok_or("--configfile requires a path")?;
+        if path.is_empty() {
+          return Err("--configfile requires a path".into());
+        }
+        options.config_file = Some(PathBuf::from(path));
+      },
+      value if value.starts_with("--configfile=") => {
+        if options.config_file.is_some() {
+          return Err("--configfile cannot be specified more than once".into());
+        }
+        let value = &value["--configfile=".len()..];
+        if value.is_empty() {
+          return Err("--configfile requires a path".into());
+        }
+        options.config_file = Some(PathBuf::from(value));
+      },
+      "--source" | "-s" => {
+        index += 1;
+        let source = arguments.get(index).ok_or("--source requires a package source")?;
+        if source.is_empty() {
+          return Err("--source requires a package source".into());
+        }
+        if !source.starts_with("https://") {
+          return Err("--source currently requires an HTTPS NuGet v2 or v3 source".into());
+        }
+        options.sources.push(source.clone());
+      },
+      value if value.starts_with("--source=") || value.starts_with("-s=") => {
+        let source = value.strip_prefix("--source=").or_else(|| value.strip_prefix("-s=")).unwrap_or_default();
+        if source.is_empty() {
+          return Err("--source requires a package source".into());
+        }
+        if !source.starts_with("https://") {
+          return Err("--source currently requires an HTTPS NuGet v2 or v3 source".into());
+        }
+        options.sources.push(source.to_owned());
       },
       "--offline" => options.offline = true,
       value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
@@ -309,6 +367,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
   let package_options = PackageResolveOptions {
     packages_directory: None,
     config_file: None,
+    sources: Vec::new(),
     offline: false,
     write_lock: true,
   };

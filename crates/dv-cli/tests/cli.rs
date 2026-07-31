@@ -322,6 +322,156 @@ fn explicit_nuget_config_replaces_the_implicit_hierarchy() {
 }
 
 #[test]
+fn package_cli_overrides_replace_sources_and_win_cache_precedence() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="implicit" value="http://invalid.example.test/v2" /></packageSources></configuration>"#,
+  );
+  temp.write(
+    "config/selected.config",
+    r#"<configuration>
+<config><add key="globalPackagesFolder" value="../wrong-packages" /></config>
+<packageSources><clear /><add key="configured" value="https://configured.example.test/api/v2/" protocolVersion="2" /></packageSources>
+</configuration>"#,
+  );
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "cli-packages/sample.package/1.2.3/sample.package.nuspec",
+    r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+  );
+  temp.write("cli-packages/sample.package/1.2.3/sample.package.1.2.3.nupkg", "");
+  temp.write(
+    "cli-packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  );
+  temp.write("cli-packages/sample.package/1.2.3/.dv.metadata.json", "{}");
+  temp.write("cli-packages/sample.package/1.2.3/lib/net6.0/Sample.Package.dll", "");
+
+  let output = dv()
+    .args([
+      "restore",
+      "App.csproj",
+      "--configfile",
+      "config/selected.config",
+      "--source",
+      "https://cli.example.test/api/v2/",
+      "--packages",
+      "cli-packages",
+      "--offline",
+      "--json",
+    ])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"source\":\"https://cli.example.test/api/v2/\""));
+  assert!(stdout.contains("\"cache_root\":"));
+  assert!(stdout.contains("cli-packages"));
+  assert!(!stdout.contains("wrong-packages"));
+  assert!(stdout.contains("\"network_requests\":0"));
+}
+
+#[test]
+fn package_cli_rejects_repeated_singleton_overrides_before_project_io() {
+  for arguments in [
+    ["restore", "missing.csproj", "--packages", "one", "--packages", "two"],
+    ["restore", "missing.csproj", "--configfile", "one", "--configfile", "two"],
+  ] {
+    let output = dv().args(arguments).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr).unwrap().contains("cannot be specified more than once"));
+  }
+}
+
+#[test]
+fn restore_cli_overrides_replace_sources_config_and_package_directory() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="implicit" value="http://invalid.example.test/v2" /></packageSources></configuration>"#,
+  );
+  temp.write(
+    "config/selected.config",
+    r#"<configuration>
+<config><add key="globalPackagesFolder" value="../config-packages" /></config>
+<packageSources><clear /><add key="configured" value="https://configured.example.test/api/v2" protocolVersion="2" /></packageSources>
+</configuration>"#,
+  );
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "cli-packages/sample.package/1.2.3/sample.package.nuspec",
+    r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+  );
+  temp.write("cli-packages/sample.package/1.2.3/sample.package.1.2.3.nupkg", "");
+  temp.write(
+    "cli-packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  );
+  temp.write("cli-packages/sample.package/1.2.3/.dv.metadata.json", "{}");
+  temp.write("cli-packages/sample.package/1.2.3/lib/net6.0/Sample.Package.dll", "");
+
+  let output = dv()
+    .args([
+      "restore",
+      "App.csproj",
+      "-s=https://packages.example.test/v3/index.json",
+      "--packages=cli-packages",
+      "--configfile=config/selected.config",
+      "--offline",
+      "--json",
+    ])
+    .current_dir(&temp.0)
+    .env("NUGET_PACKAGES", temp.0.join("env-packages"))
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"source\":\"https://packages.example.test/v3/index.json\""));
+  assert!(stdout.contains("\"source_protocol\":\"v3\""));
+  assert!(stdout.contains("cli-packages"));
+  assert!(stdout.contains("\"network_requests\":0"));
+  assert!(!temp.0.join("env-packages").exists());
+  assert!(!temp.0.join("config-packages").exists());
+}
+
+#[test]
+fn restore_rejects_repeated_single_value_overrides() {
+  let output = dv().args(["restore", "--packages", "one", "--packages", "two", "--json"]).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(
+    String::from_utf8(output.stdout)
+      .unwrap()
+      .contains("--packages cannot be specified more than once")
+  );
+}
+
+#[test]
+fn restore_rejects_unsupported_cli_sources_before_project_io() {
+  let output = dv()
+    .args(["restore", "missing.csproj", "--source", "http://insecure.example.test/v2"])
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(String::from_utf8(output.stderr).unwrap().contains("requires an HTTPS NuGet v2 or v3 source"));
+}
+
+#[test]
 fn build_plan_json_reports_framework_and_compiler_inputs() {
   let temp = TempDirectory::new();
   temp.write("Program.cs", "Console.WriteLine(\"hello\");");
