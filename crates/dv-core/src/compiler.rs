@@ -691,18 +691,24 @@ impl TextTable {
 
 #[cfg(test)]
 mod tests {
-  use std::time::{SystemTime, UNIX_EPOCH};
+  use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+  };
 
   use crate::{SdkVersion, evaluate_project_path};
 
   use super::*;
 
+  static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
   struct TempDirectory(PathBuf);
 
   impl TempDirectory {
     fn new() -> Self {
+      let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
       let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-      let path = std::env::temp_dir().join(format!("dv-compiler-test-{}-{unique}", std::process::id()));
+      let path = std::env::temp_dir().join(format!("dv-compiler-test-{}-{unique}-{nonce}", std::process::id()));
       fs::create_dir_all(&path).unwrap();
       Self(path)
     }

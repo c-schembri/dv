@@ -69,7 +69,7 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 7,447 source lines,
+The Rust workspace currently has 12 Rust source files, 7,452 source lines,
 and 40 `#[test]` functions. These counts describe the current repository, not
 the expected shape of real customer repositories.
 
