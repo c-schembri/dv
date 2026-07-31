@@ -14,6 +14,9 @@ the expensive orchestration around them.
 dotnet --version               60.637 ms median
 dv sdk current                  3.798 ms median
 
+dotnet NuGet RID expansion     36.217 ms median
+dv sdk compatible-rids          6.049 ms median
+
 dotnet msbuild project query  282.186 ms median
 dv project inspect              3.846 ms median
 
@@ -75,6 +78,11 @@ SDK discovery supports all documented roll-forward policies, prerelease
 filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
 
+`dv sdk compatible-rids RID` loads the selected SDK's portable RID graph as
+data and returns NuGet-compatible breadth-first fallbacks. The compiled graph
+stores 16-byte sorted nodes, contiguous 32-bit edges, and precomputed
+compatibility ranges; it never guesses compatibility by splitting RID text.
+
 Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting one
 modern unified .NET TFM, `Exe` and `Library` outputs, default source discovery,
 Debug/Release configuration, project-reference paths, and exact package
@@ -119,6 +127,9 @@ cargo run -p dv-cli --release -- sdk list
 # Emit the versioned JSON event stream
 cargo run -p dv-cli --release -- sdk current --json
 
+# Inspect portable RID compatibility from the selected SDK
+cargo run -p dv-cli --release -- sdk compatible-rids linux-musl-x64
+
 # Inspect the project in the current directory
 cargo run -p dv-cli --release -- project inspect
 
@@ -159,8 +170,8 @@ Initial machine:
 - Windows 11 `10.0.22631`, x86-64
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
-- 30 retained samples after 3 warm-ups for SDK selection, project evaluation,
-  and the one-package cold case; compiler planning uses 5 warm-ups; 10
+- 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
+  project evaluation, and the one-package cold case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; 10 retained
   samples after 3 warm-ups for warm locked restore; the massive graph uses 5
   retained samples after 1 warm-up
@@ -170,6 +181,7 @@ Initial machine:
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
+| Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
@@ -180,15 +192,18 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
-project property plus the ordered compile-item identities. The runtime case
-also verifies the selected RID, ordered plural RID property, and unique target
-dimension batch. For package sync it
+project property plus the ordered compile-item identities. The RID graph case
+compares the complete ordered expansion against the selected SDK's shipped
+`NuGet.Packaging` implementation; its tiny adapter is built outside timed
+intervals. The runtime project case also verifies the selected RID, ordered
+plural RID property, and unique target dimension batch. For package sync it
 also compares the complete package identity, exact-version, archive-SHA-512,
 and selected asset batches. The massive case additionally compares runtime,
 resource, content, analyzer, build, build-multitargeting, native, and RID
 runtime-target paths plus runtime-target metadata. Exact commands are printed in benchmark
 output and recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
+[RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md), and
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md).
 
@@ -226,6 +241,7 @@ Reproduce the comparison:
 
 ```powershell
 cargo bench-all --case sdk_current --samples 30 --warmups 3
+cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5

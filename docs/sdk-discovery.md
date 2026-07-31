@@ -4,6 +4,10 @@
 managed process. `dv sdk list` exposes the discovered batch and marks the
 selected record.
 
+`dv sdk compatible-rids RID` reuses that selection and loads the installation's
+portable runtime graph natively. Its compact graph and breadth-first semantics
+are specified in [Portable Runtime Identifier Graph](runtime-identifier-graph.md).
+
 The selection behavior follows Microsoft's
 [`global.json` contract](https://learn.microsoft.com/en-us/dotnet/core/tools/global-json)
 for standalone CLI use.

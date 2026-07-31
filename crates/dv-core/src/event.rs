@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 3;
+pub const EVENT_SCHEMA_VERSION: u16 = 4;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,6 +160,23 @@ pub enum EventPayload {
     installations: Vec<SdkInstallationEvent>,
     /// `global.json` used for selection, when present.
     global_json: Option<String>,
+  },
+  /// One SDK-owned runtime identifier was expanded through the portable graph.
+  RuntimeCompatibility {
+    /// Selected SDK version that owns the graph.
+    sdk_version: String,
+    /// Full portable runtime-graph path.
+    graph_path: String,
+    /// Requested opaque runtime identifier.
+    runtime_identifier: String,
+    /// Compatible RIDs in breadth-first nearest-first order.
+    compatible_runtimes: Vec<String>,
+    /// Number of graph nodes.
+    node_count: u32,
+    /// Number of direct graph edges.
+    edge_count: u32,
+    /// Number of precomputed compatibility indices.
+    compatibility_count: u32,
   },
   /// One SDK-style project was discovered and evaluated.
   ProjectEvaluated {

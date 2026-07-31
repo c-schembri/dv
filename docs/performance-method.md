@@ -53,6 +53,7 @@ Invalid input behavior:
 |---|---|---|
 | `sdk_current` | no project state | process launch, SDK discovery, and selection |
 | `cli_version` | none | `dv` process launch and self-version output |
+| `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
 | `restore_cold` | fresh fixture copy | restore |
@@ -81,6 +82,7 @@ directional decisions.`
 | Fixture | Concrete data | Primary question | Status |
 |---|---|---|---|
 | `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
+| `rid-graph-oracle` | selected SDK graph, official `NuGet.Packaging` parser/expander, `linux-musl-x64` query | graph compatibility parity and one-shot latency | executable for both tools with exact sequence preflight |
 | `runtime-project` | 1 project, 1 selected RID, 3 ordered RID expansion values | compact target expansion and selected-index lookup | executable with property parity preflight |
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
@@ -137,6 +139,12 @@ Measure only SDK selection:
 
 ```text
 cargo bench-all --case sdk_current --dv target/release/dv
+```
+
+Measure SDK-owned portable RID expansion:
+
+```text
+cargo bench-all --case rid_graph --samples 30 --warmups 3
 ```
 
 Measure only like-for-like project evaluation:

@@ -51,6 +51,14 @@ fn help_exposes_the_initial_command_surface() {
 }
 
 #[test]
+fn sdk_help_exposes_portable_runtime_compatibility() {
+  let output = dv().args(["sdk", "--help"]).output().unwrap();
+
+  assert!(output.status.success());
+  assert!(String::from_utf8(output.stdout).unwrap().contains("sdk compatible-rids RID"));
+}
+
+#[test]
 fn unknown_command_is_an_explicit_failure() {
   let output = dv().arg("frobnicate").output().unwrap();
 
@@ -69,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":3"));
+  assert!(lines[0].contains("\"schema_version\":4"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -105,6 +113,31 @@ fn sdk_current_json_reports_selected_path() {
   assert!(stdout.contains("\"type\":\"sdk_selected\""));
   assert!(stdout.contains("\"version\":\"10.0.100\""));
   assert!(stdout.contains("\"outcome\":\"succeeded\""));
+}
+
+#[test]
+fn sdk_compatible_rids_loads_the_selected_graph_without_inference() {
+  let temp = TempDirectory::new();
+  fs::create_dir_all(temp.0.join("sdk/10.0.100")).unwrap();
+  fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
+  temp.write(
+    "sdk/10.0.100/PortableRuntimeIdentifierGraph.json",
+    r##"{"runtimes":{"base":{"#import":[]},"any":{"#import":["base"]},"linux":{"#import":["any"]},"linux-x64":{"#import":["linux"]}}}"##,
+  );
+
+  let output = dv()
+    .args(["sdk", "compatible-rids", "linux-x64", "--json"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"runtime_compatibility\""));
+  assert!(stdout.contains("\"runtime_identifier\":\"linux-x64\""));
+  assert!(stdout.contains("\"compatible_runtimes\":[\"linux-x64\",\"linux\",\"any\",\"base\"]"));
+  assert!(stdout.contains("\"node_count\":4"));
 }
 
 #[test]

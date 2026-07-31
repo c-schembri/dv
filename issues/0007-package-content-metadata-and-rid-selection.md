@@ -13,15 +13,15 @@ paths. It also preserves runtime-target RID and asset-type metadata.
 
 Two remaining decisions need additional selection or metadata inputs:
 
-- The evaluated runtime dimensions must select one compatible RID through the
-  SDK's portable RID graph rather than by string inference.
+- The evaluated runtime dimensions and loaded SDK portable graph must drive
+  concrete package asset selection.
 - `contentFiles` entries need their nuspec `buildAction`, `copyToOutput`, and
   `flatten` metadata compiled into the lock and downstream build plan.
 
 ## Acceptance
 
-- Use the compact `EVAL-022` runtime dimensions and implement `PACKS-005`
-  before selecting RID-specific assets.
+- Use the compact `EVAL-022` runtime dimensions and `PACKS-005` compatibility
+  ranges to select RID-specific assets.
 - Parse bounded content-file patterns and metadata without general glob or XML
   interpretation in the restore hot path.
 - Extend lock and event schemas deliberately if their contracts change.

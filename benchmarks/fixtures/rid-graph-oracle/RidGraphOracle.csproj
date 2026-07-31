@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="NuGet.Packaging" HintPath="$(MSBuildBinPath)\NuGet.Packaging.dll" Private="true" />
+    <Reference Include="Newtonsoft.Json" HintPath="$(MSBuildBinPath)\Newtonsoft.Json.dll" Private="true" />
+    <None Include="$(MSBuildBinPath)\PortableRuntimeIdentifierGraph.json"
+          Link="PortableRuntimeIdentifierGraph.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

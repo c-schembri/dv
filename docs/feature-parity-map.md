@@ -664,8 +664,12 @@ boundary, not final drop-in parity.
   missing or unsupported packs before compiler launch. `P1`
 - [x] `PACKS-004` Produce an ordered reference-assembly range from the selected
   pack with stable path indices. `P1`
-- [ ] `PACKS-005` Load the SDK's portable RID graph as data; never infer RID
-  compatibility by splitting the RID string. `P2`
+- [x] `PACKS-005` Load the SDK's portable RID graph as data; never infer RID
+  compatibility by splitting the RID string. The selected .NET 10 SDK graph
+  compiles to 85 sorted 16-byte nodes, 133 contiguous direct edges, and 494
+  precomputed breadth-first compatibility indices. Unknown keys remain opaque
+  exact-only RIDs. A 30-sample official `NuGet.Packaging` oracle measures
+  `36.217 ms` versus `6.049 ms` for `dv` (`6.0x`). `P2`
 - [ ] `PACKS-006` Select runtime packs, host packs, native assets, and apphost
   templates for requested RID and architecture. `P2`
 - [ ] `PACKS-007` Resolve framework references and shared-framework versions,
@@ -742,11 +746,11 @@ boundary, not final drop-in parity.
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by compatible TFM and NuGet include/exclude
-  propagation. Lock schema 3 and event schema 2 preserve every selected family
+  propagation. Lock schema 3 and event schema 4 preserve every selected family
   in compact per-package ranges. The 203-package massive acceptance graph now
   matches `project.assets.json` across portable asset paths and runtime-target
   RID/type metadata and is benchmarked end to end. Selecting one concrete RID
-  still depends on `PACKS-005`; `contentFiles` build-action,
+  from the now-available SDK graph plus `contentFiles` build-action,
   copy, and flatten metadata remain. `P2`
   See `issues/0007-package-content-metadata-and-rid-selection.md`.
 - [~] `RES-012` .NET 10 package pruning reads the selected SDK's

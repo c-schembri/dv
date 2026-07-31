@@ -10,6 +10,7 @@ diagnostic rather than approximate Microsoft behavior.
 | SDK discovery | Native root enumeration and `global.json` selection | Implemented |
 | SDK declaration | `Microsoft.NET.Sdk` | Implemented |
 | Target frameworks | one installed modern unified .NET target; .NET 10 fixture baseline | Parsed dynamically and matching reference pack validated |
+| Runtime identifiers | selected SDK portable graph, opaque ordinal RID keys | Loaded into compact breadth-first compatibility ranges; concrete asset selection planned |
 | Output types | `Exe` and `Library` | Implemented |
 | Source items | default `**/*.cs`, excluding generated/output trees | Implemented |
 | Nullable | `enable` or omitted SDK default | Implemented |

@@ -7,6 +7,7 @@ mod framework;
 mod package;
 mod project;
 mod reporter;
+mod runtime_graph;
 mod sdk;
 
 pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_compiler_inputs, plan_compiler_inputs_with_packages};
@@ -21,4 +22,5 @@ pub use project::{
   PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec, evaluate_project, evaluate_project_path,
 };
 pub use reporter::write_json_lines;
+pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};
 pub use sdk::{SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion, discover_sdks, discover_sdks_in_roots};

@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `3`;
+- schema version `4`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -44,6 +44,7 @@ items.
 - `cache_decision`
 - `sdk_selected`
 - `sdk_inventory`
+- `runtime_compatibility`
 - `project_evaluated`
 - `compiler_plan_created`
 - `package_resolution_created`
@@ -51,8 +52,8 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 3 adds selected, plural, and materialized runtime-dimension fields to
-`project_evaluated`.
+Schema 4 adds `runtime_compatibility`; schema 3 added selected, plural, and
+materialized runtime-dimension fields to `project_evaluated`.
 
 ## Diagnostic Contract
 
@@ -82,6 +83,10 @@ Initial codes:
 | `DV0103` | Invalid SDK version |
 | `DV0104` | No compatible installed SDK |
 | `DV0105` | SDK path cannot be represented losslessly in JSON |
+| `DV0110` | Selected SDK portable RID graph missing |
+| `DV0111` | Portable RID graph filesystem failure |
+| `DV0112` | Invalid portable RID graph JSON or data |
+| `DV0113` | Portable RID graph compact range overflow |
 | `DV0200` | No project found |
 | `DV0201` | Ambiguous implicit project selection |
 | `DV0202` | Project filesystem failure |

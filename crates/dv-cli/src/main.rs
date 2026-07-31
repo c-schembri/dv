@@ -10,8 +10,8 @@ use std::{
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, PackageError,
   PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec,
-  ResolvedPackageEvent, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path,
-  plan_compiler_inputs_with_packages, resolve_package_inputs, write_json_lines,
+  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks,
+  evaluate_project, evaluate_project_path, load_portable_runtime_graph, plan_compiler_inputs_with_packages, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -44,6 +44,8 @@ const SDK_HELP: &str = "\
 Usage:
   dv sdk current    Print the selected .NET SDK version
   dv sdk list       List discovered .NET SDKs
+  dv sdk compatible-rids RID
+                    Print RID fallbacks from the selected SDK graph
 ";
 
 const PROJECT_HELP: &str = "\
@@ -447,6 +449,19 @@ fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[String])
     },
     [sdk] if sdk == "current" => sdk_current(started, json, args),
     [sdk] if sdk == "list" => sdk_list(started, json, args),
+    [sdk, runtime_identifier] if sdk == "compatible-rids" => sdk_compatible_rids(started, json, args, runtime_identifier),
+    [sdk, ..] if sdk == "compatible-rids" => fail(
+      started,
+      json,
+      "sdk compatible-rids",
+      args,
+      diagnostic(
+        "DV0002",
+        "sdk compatible-rids requires exactly one runtime identifier",
+        None,
+        Some("Use `dv sdk compatible-rids RID`."),
+      ),
+    ),
     _ => {
       let subcommand = sdk_args.first().map_or("<missing>", String::as_str);
       fail(
@@ -535,6 +550,57 @@ fn sdk_list(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
     Err(diagnostic) => return fail(started, true, "sdk list", args, *diagnostic),
   };
   succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
+}
+
+fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
+  if runtime_identifier.is_empty() {
+    return fail(
+      started,
+      json,
+      "sdk compatible-rids",
+      args,
+      diagnostic(
+        "DV0002",
+        "runtime identifier must not be empty",
+        None,
+        Some("Pass one literal runtime identifier."),
+      ),
+    );
+  }
+  let inventory = match load_sdk_inventory(started, json, &args) {
+    Ok(inventory) => inventory,
+    Err(exit_code) => return exit_code,
+  };
+  let graph = match load_portable_runtime_graph(&inventory) {
+    Ok(graph) => graph,
+    Err(error) => return fail(started, json, "sdk compatible-rids", args, runtime_graph_diagnostic(error)),
+  };
+
+  if !json {
+    for compatible in graph.compatible_rids(runtime_identifier) {
+      println!("{compatible}");
+    }
+    return ExitCode::SUCCESS;
+  }
+
+  let graph_path = match path_text(graph.source(), "portable RID graph") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, true, "sdk compatible-rids", args, *diagnostic),
+  };
+  succeed(
+    started,
+    "sdk compatible-rids",
+    args,
+    EventPayload::RuntimeCompatibility {
+      sdk_version: inventory.selected().version.as_str().into(),
+      graph_path,
+      runtime_identifier: runtime_identifier.into(),
+      compatible_runtimes: graph.compatible_rids(runtime_identifier).map(str::to_owned).collect(),
+      node_count: graph.node_count() as u32,
+      edge_count: graph.edge_count() as u32,
+      compatibility_count: graph.compatibility_count() as u32,
+    },
+  )
 }
 
 fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
@@ -865,6 +931,24 @@ fn sdk_diagnostic(current_directory: &Path, error: SdkError) -> Diagnostic {
     Some(ContextField {
       name: "directory".into(),
       value: current_directory.display().to_string(),
+    }),
+    help,
+  )
+}
+
+fn runtime_graph_diagnostic(error: RuntimeGraphError) -> Diagnostic {
+  let (code, help) = match error.kind() {
+    RuntimeGraphErrorKind::NotFound => ("DV0110", Some("Repair or reinstall the selected .NET SDK.")),
+    RuntimeGraphErrorKind::Io => ("DV0111", None),
+    RuntimeGraphErrorKind::InvalidJson | RuntimeGraphErrorKind::InvalidGraph => ("DV0112", Some("Repair or reinstall the selected .NET SDK.")),
+    RuntimeGraphErrorKind::TextOverflow => ("DV0113", Some("Use an SDK with a valid bounded portable RID graph.")),
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
     }),
     help,
   )

@@ -17,6 +17,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(Clone, Copy)]
 enum CaseKind {
   Startup,
+  RidGraph,
   ProjectEvaluate,
   RuntimeEvaluate,
   CompilerPlan,
@@ -39,6 +40,7 @@ struct Case {
 
 struct Fixtures<'a> {
   small: &'a Path,
+  rid_graph: &'a Path,
   runtime: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
@@ -50,6 +52,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "sdk_current",
     kind: CaseKind::Startup,
     args: &["--version"],
+    implemented: true,
+  },
+  Case {
+    name: "rid_graph",
+    kind: CaseKind::RidGraph,
+    args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
     implemented: true,
   },
   Case {
@@ -180,6 +188,12 @@ const DV_CASES: &[Case] = &[
     name: "sdk_current",
     kind: CaseKind::Startup,
     args: &["sdk", "current"],
+    implemented: true,
+  },
+  Case {
+    name: "rid_graph",
+    kind: CaseKind::RidGraph,
+    args: &["sdk", "compatible-rids", "linux-musl-x64"],
     implemented: true,
   },
   Case {
@@ -340,12 +354,14 @@ fn run() -> Result<()> {
   let options = parse_options(env::args_os().skip(1))?;
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
+  let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
     small: &fixture,
+    rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
@@ -356,6 +372,9 @@ fn run() -> Result<()> {
   ensure_workspace_is_safe(&repository, &workspace)?;
   if options.case.as_deref().is_none_or(|case| case == "sdk_current") {
     verify_sdk_selection(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
+    verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture)?;
@@ -416,6 +435,24 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let dv_version = command_text(dv_executable, &["sdk", "current"], fixture)?;
   if dotnet_version != dv_version {
     return Err(format!("SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {dv_version:?}").into());
+  }
+  Ok(())
+}
+
+fn verify_rid_graph(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-rid-graph-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  reset_fixture(fixture, &verification)?;
+  prepare_rid_oracle(Path::new("dotnet"), &verification)?;
+  verify_sdk_selection(dv_executable, &verification)?;
+
+  let runtime_identifier = "linux-musl-x64";
+  let reference = command_text(Path::new("dotnet"), &["bin/Release/RidGraphOracle.dll", runtime_identifier], &verification)?;
+  let reference = reference.lines().map(str::to_owned).collect::<Vec<_>>();
+  let actual = command_text(dv_executable, &["sdk", "compatible-rids", runtime_identifier], &verification)?;
+  let actual = actual.lines().map(str::to_owned).collect::<Vec<_>>();
+  if reference != actual {
+    return Err(format!("portable RID expansion mismatch: NuGet={reference:?}, dv={actual:?}").into());
   }
   Ok(())
 }
@@ -1094,9 +1131,18 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
 fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   if matches!(
     case.kind,
-    CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm
+    CaseKind::RidGraph
+      | CaseKind::ProjectEvaluate
+      | CaseKind::RuntimeEvaluate
+      | CaseKind::CompilerPlan
+      | CaseKind::PackageSyncWarm
+      | CaseKind::BuildNoOp
+      | CaseKind::RunWarm
   ) {
     reset_fixture(fixture, workspace)?;
+  }
+  if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
+    prepare_rid_oracle(executable, workspace)?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
     run_checked(executable, &["restore", "--nologo", "--verbosity", "quiet"], workspace, "compiler plan restore")?;
@@ -1134,9 +1180,18 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   Ok(())
 }
 
+fn prepare_rid_oracle(executable: &Path, workspace: &Path) -> Result<()> {
+  run_checked(
+    executable,
+    &["build", "RidGraphOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    workspace,
+    "RID graph oracle build",
+  )
+}
+
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan => Ok(()),
+    CaseKind::RidGraph | CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan => Ok(()),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -1175,6 +1230,7 @@ fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path
 
 fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
+    CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
@@ -1186,6 +1242,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
 fn fixture_name(case: &Case) -> Option<&'static str> {
   match case.kind {
     CaseKind::Startup => None,
+    CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
