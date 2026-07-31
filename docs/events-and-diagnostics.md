@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `9`;
+- schema version `10`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -55,7 +55,8 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 9 adds the redacted `none` or `basic` authentication kind to each
+Schema 10 extends the redacted authentication kind with `client_certificate`
+and `basic_and_client_certificate`. Schema 9 added `none` or `basic` to each
 effective source in `package_sources_inspected`; usernames, passwords, tokens,
 and authorization headers are never event data. Schema 8 adds the effective source and selected service-capability endpoint
 batch plus service-index request and byte counts in

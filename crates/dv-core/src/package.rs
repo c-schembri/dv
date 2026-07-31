@@ -33,6 +33,7 @@ use crate::{
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CLIENT_CERTIFICATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PRUNE_DATA_BYTES: u64 = 1024 * 1024;
 const MAX_PRUNE_PACKAGES: usize = 10_000;
 const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
@@ -324,6 +325,10 @@ pub enum PackageSourceAuthentication {
   None,
   /// The source uses HTTP Basic authentication, including PAT-as-password feeds.
   Basic,
+  /// The source presents an X.509 client certificate during TLS negotiation.
+  ClientCertificate,
+  /// The source combines HTTP Basic authentication with a client certificate.
+  BasicAndClientCertificate,
 }
 
 impl PackageSourceAuthentication {
@@ -332,6 +337,8 @@ impl PackageSourceAuthentication {
     match self {
       Self::None => "none",
       Self::Basic => "basic",
+      Self::ClientCertificate => "client_certificate",
+      Self::BasicAndClientCertificate => "basic_and_client_certificate",
     }
   }
 }
@@ -1354,6 +1361,33 @@ struct MergedSourceCredential {
   valid_authentication_types: Option<String>,
 }
 
+enum MergedClientCertificate {
+  File {
+    source: String,
+    path: PathBuf,
+    password: Option<StoredCredentialPassword>,
+  },
+  Store {
+    source: String,
+    location: String,
+    name: String,
+    find_by: String,
+    find_value: String,
+  },
+}
+
+impl MergedClientCertificate {
+  fn source(&self) -> &str {
+    match self {
+      Self::File { source, .. } | Self::Store { source, .. } => source,
+    }
+  }
+
+  const fn is_file(&self) -> bool {
+    matches!(self, Self::File { .. })
+  }
+}
+
 struct PendingSourceCredential {
   source: String,
   username: Option<Zeroizing<String>>,
@@ -1365,6 +1399,7 @@ struct SourceCredential {
   authorization: Option<HeaderValue>,
   origin: HttpsOrigin,
   provider: Option<Box<SourceProviderCredential>>,
+  client: Option<reqwest::Client>,
 }
 
 struct SourceProviderCredential {
@@ -1385,7 +1420,7 @@ struct ProviderCredentialState {
 const _: () = {
   assert!(size_of::<HttpsOrigin>() == 24);
   assert!(align_of::<HttpsOrigin>() == 8);
-  assert!(size_of::<SourceCredential>() == 72);
+  assert!(size_of::<SourceCredential>() == 80);
   assert!(align_of::<SourceCredential>() == 8);
 };
 
@@ -1395,8 +1430,14 @@ impl SourceCredential {
     self.authorization.as_ref()
   }
 
-  fn is_configured(&self) -> bool {
-    self.authorization.is_some() || self.provider.as_deref().is_some_and(|provider| provider.acquired.load(AtomicOrdering::Acquire))
+  fn authentication(&self) -> PackageSourceAuthentication {
+    let basic = self.authorization.is_some() || self.provider.as_deref().is_some_and(|provider| provider.acquired.load(AtomicOrdering::Acquire));
+    match (basic, self.client.is_some()) {
+      (false, false) => PackageSourceAuthentication::None,
+      (true, false) => PackageSourceAuthentication::Basic,
+      (false, true) => PackageSourceAuthentication::ClientCertificate,
+      (true, true) => PackageSourceAuthentication::BasicAndClientCertificate,
+    }
   }
 
   async fn authorization_snapshot(&self) -> (Option<HeaderValue>, u32, bool) {
@@ -1468,8 +1509,10 @@ impl SourceCredentialBatch {
     self.entries.get(source).and_then(Option::as_ref)
   }
 
-  fn is_configured(&self, source: usize) -> bool {
-    self.get(source).is_some_and(|credential| credential.is_configured())
+  fn authentication(&self, source: usize) -> PackageSourceAuthentication {
+    self
+      .get(source)
+      .map_or(PackageSourceAuthentication::None, |credential| credential.authentication())
   }
 }
 
@@ -1553,6 +1596,7 @@ struct NugetConfiguration {
 struct NugetConfigMerge {
   sources: Vec<(String, PackageSource)>,
   credentials: Vec<MergedSourceCredential>,
+  client_certificates: Vec<MergedClientCertificate>,
   disabled: Vec<String>,
   audit_sources: Vec<(String, PackageSource)>,
   source_mapping: MergedSourceMapping,
@@ -1813,11 +1857,7 @@ async fn inspect_source_batch(
         len: u32_len(endpoint_rows.len() - start as usize, "package-source endpoint range")?,
       },
       protocol: source.protocol,
-      authentication: if credentials.is_configured(index) {
-        PackageSourceAuthentication::Basic
-      } else {
-        PackageSourceAuthentication::None
-      },
+      authentication: credentials.authentication(index),
     });
   }
   Ok(PackageSourceInventory {
@@ -2156,7 +2196,8 @@ fn discover_configuration(
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
   let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
-  let credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
+  let mut credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
+  attach_client_certificates(&sources, merged.client_certificates, proxy.as_ref(), project_directory, &mut credentials)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -2282,6 +2323,7 @@ fn resolve_source_credentials_with(
         authorization,
         origin: HttpsOrigin::parse(&source.url, context)?,
         provider,
+        client: None,
       }))
     } else {
       None
@@ -2298,6 +2340,233 @@ fn resolve_source_credentials_with(
   Ok(SourceCredentialBatch {
     entries: entries.map_or_else(Box::default, Vec::into_boxed_slice),
   })
+}
+
+fn attach_client_certificates(
+  sources: &[(String, PackageSource)],
+  certificates: Vec<MergedClientCertificate>,
+  proxy: Option<&ProxySettings>,
+  context: &Path,
+  credentials: &mut SourceCredentialBatch,
+) -> Result<(), PackageError> {
+  if certificates.is_empty() {
+    return Ok(());
+  }
+  for (index, certificate) in certificates.iter().enumerate() {
+    if certificates[index + 1..]
+      .iter()
+      .any(|candidate| candidate.source().eq_ignore_ascii_case(certificate.source()))
+    {
+      return Err(config_error(
+        context,
+        format!(
+          "NuGet package source {:?} has more than one client certificate configuration",
+          certificate.source()
+        ),
+      ));
+    }
+  }
+  let mut entries = std::mem::take(&mut credentials.entries).into_vec();
+  entries.resize_with(sources.len(), || None);
+  for (source_index, (name, source)) in sources.iter().enumerate() {
+    if source.protocol == NugetProtocol::Local {
+      continue;
+    }
+    let Some(certificate) = certificates.iter().find(|certificate| certificate.source() == name) else {
+      continue;
+    };
+    let client = client_certificate_http_client(certificate, proxy, context)?;
+    if let Some(credential) = entries[source_index].as_mut() {
+      Arc::get_mut(credential)
+        .expect("source authentication is uniquely owned during configuration")
+        .client = Some(client);
+    } else {
+      entries[source_index] = Some(Arc::new(SourceCredential {
+        authorization: None,
+        origin: HttpsOrigin::parse(&source.url, context)?,
+        provider: None,
+        client: Some(client),
+      }));
+    }
+  }
+  credentials.entries = entries.into_boxed_slice();
+  Ok(())
+}
+
+fn client_certificate_http_client(
+  certificate: &MergedClientCertificate,
+  proxy: Option<&ProxySettings>,
+  context: &Path,
+) -> Result<reqwest::Client, PackageError> {
+  let identity = match certificate {
+    MergedClientCertificate::File { source, path, password } => {
+      let bytes = Zeroizing::new(read_bounded_client_certificate(path)?);
+      let password = match password {
+        Some(StoredCredentialPassword::Clear(password)) => Zeroizing::new(password.as_str().to_owned()),
+        Some(StoredCredentialPassword::Encrypted(password)) => decrypt_source_password(source, StoredCredentialPassword::Encrypted(password.clone()), context)?,
+        None => Zeroizing::new(String::new()),
+      };
+      reqwest::Identity::from_pkcs12_der(&bytes, &password).map_err(|error| {
+        config_error(
+          path,
+          format!("failed to load PKCS#12 client certificate for package source {source:?}: {error}"),
+        )
+      })?
+    },
+    MergedClientCertificate::Store {
+      source,
+      location,
+      name,
+      find_by,
+      find_value,
+    } => platform_store_identity(source, location, name, find_by, find_value, context)?,
+  };
+  configured_http_client_builder(proxy)?
+    .tls_backend_native()
+    .redirect(reqwest::redirect::Policy::none())
+    .identity(identity)
+    .build()
+    .map_err(|error| network_error("client-certificate HTTP client", format!("failed to create HTTP client: {error}")))
+}
+
+fn read_bounded_client_certificate(path: &Path) -> Result<Vec<u8>, PackageError> {
+  let file = fs::File::open(path).map_err(|error| package_io("open NuGet client certificate", path, error))?;
+  let mut bytes = Vec::with_capacity(
+    file
+      .metadata()
+      .map_err(|error| package_io("inspect NuGet client certificate", path, error))?
+      .len()
+      .min(MAX_CLIENT_CERTIFICATE_BYTES) as usize,
+  );
+  file
+    .take(MAX_CLIENT_CERTIFICATE_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .map_err(|error| package_io("read NuGet client certificate", path, error))?;
+  if bytes.len() as u64 > MAX_CLIENT_CERTIFICATE_BYTES {
+    return Err(config_error(
+      path,
+      format!("NuGet client certificate exceeds the {MAX_CLIENT_CERTIFICATE_BYTES}-byte limit"),
+    ));
+  }
+  Ok(bytes)
+}
+
+#[cfg(windows)]
+fn platform_store_identity(
+  source: &str,
+  location: &str,
+  name: &str,
+  find_by: &str,
+  find_value: &str,
+  context: &Path,
+) -> Result<reqwest::Identity, PackageError> {
+  use schannel::{
+    cert_context::HashAlgorithm,
+    cert_store::{CertAdd, CertStore, Memory},
+  };
+
+  const STORE_NAMES: [&str; 8] = [
+    "AddressBook",
+    "AuthRoot",
+    "CertificateAuthority",
+    "Disallowed",
+    "My",
+    "Root",
+    "TrustedPeople",
+    "TrustedPublisher",
+  ];
+  let store_name = STORE_NAMES
+    .iter()
+    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+    .ok_or_else(|| config_error(context, format!("NuGet client certificate store name {name:?} is unsupported")))?;
+  if !find_by.eq_ignore_ascii_case("Thumbprint") {
+    return Err(config_error(
+      context,
+      format!("NuGet client certificate selector {find_by:?} is unsupported; dv currently supports Thumbprint"),
+    ));
+  }
+  let thumbprint = parse_certificate_thumbprint(find_value, context)?;
+  let store = if location.eq_ignore_ascii_case("CurrentUser") {
+    CertStore::open_current_user(store_name)
+  } else if location.eq_ignore_ascii_case("LocalMachine") {
+    CertStore::open_local_machine(store_name)
+  } else {
+    return Err(config_error(
+      context,
+      format!("NuGet client certificate store location {location:?} is unsupported; expected CurrentUser or LocalMachine"),
+    ));
+  }
+  .map_err(|error| config_error(context, format!("failed to open {location}\\{store_name} certificate store: {error}")))?;
+  let selected = store
+    .certs()
+    .find(|certificate| certificate.fingerprint(HashAlgorithm::sha1()).is_ok_and(|candidate| candidate == thumbprint))
+    .ok_or_else(|| {
+      config_error(
+        context,
+        format!("NuGet client certificate for package source {source:?} was not found in {location}\\{store_name}"),
+      )
+    })?;
+  selected.private_key().acquire().map_err(|error| {
+    config_error(
+      context,
+      format!("NuGet client certificate for package source {source:?} has no accessible private key: {error}"),
+    )
+  })?;
+  let mut memory = Memory::new()
+    .map_err(|error| config_error(context, format!("failed to create temporary client certificate store: {error}")))?
+    .into_store();
+  memory
+    .add_cert(&selected, CertAdd::Always)
+    .map_err(|error| config_error(context, format!("failed to stage client certificate for package source {source:?}: {error}")))?;
+  const TRANSIENT_PASSWORD: &str = "dv-client-certificate";
+  let pkcs12 = Zeroizing::new(
+    memory
+      .export_pkcs12(TRANSIENT_PASSWORD)
+      .map_err(|error| config_error(context, format!("failed to export client certificate for package source {source:?}: {error}")))?,
+  );
+  reqwest::Identity::from_pkcs12_der(&pkcs12, TRANSIENT_PASSWORD)
+    .map_err(|error| config_error(context, format!("failed to load client certificate for package source {source:?}: {error}")))
+}
+
+#[cfg(windows)]
+fn parse_certificate_thumbprint(value: &str, context: &Path) -> Result<Vec<u8>, PackageError> {
+  let mut bytes = Vec::with_capacity(20);
+  let mut high = None::<u8>;
+  for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+    let digit = match byte {
+      b'0'..=b'9' => byte - b'0',
+      b'a'..=b'f' => byte - b'a' + 10,
+      b'A'..=b'F' => byte - b'A' + 10,
+      _ => return Err(config_error(context, "NuGet client certificate thumbprint must contain hexadecimal digits")),
+    };
+    if let Some(high) = high.take() {
+      bytes.push((high << 4) | digit);
+    } else {
+      high = Some(digit);
+    }
+  }
+  if high.is_some() || bytes.len() != 20 {
+    return Err(config_error(
+      context,
+      "NuGet client certificate SHA-1 thumbprint must contain exactly 40 hexadecimal digits",
+    ));
+  }
+  Ok(bytes)
+}
+
+#[cfg(not(windows))]
+fn platform_store_identity(
+  source: &str,
+  _location: &str,
+  _name: &str,
+  _find_by: &str,
+  _find_value: &str,
+  context: &Path,
+) -> Result<reqwest::Identity, PackageError> {
+  Err(config_error(
+    context,
+    format!("platform certificate stores for package source {source:?} are currently supported only on Windows; use fileCert on this platform"),
+  ))
 }
 
 enum EnvironmentOrConfigCredential {
@@ -2666,8 +2935,12 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         _ if matches!(section, ConfigSection::Credentials) => {
           begin_source_credential(&reader, &element, path, &mut pending_credential)?;
         },
+        b"fileCert" | b"storeCert" if matches!(section, ConfigSection::ClientCertificates) => {
+          append_client_certificate(&reader, &element, path, &mut merged.client_certificates)?;
+        },
         b"packageSources" => section = ConfigSection::Sources,
         b"packageSourceCredentials" => section = ConfigSection::Credentials,
+        b"clientCertificates" => section = ConfigSection::ClientCertificates,
         b"disabledPackageSources" => section = ConfigSection::Disabled,
         b"auditSources" => section = ConfigSection::AuditSources,
         b"packageSourceMapping" => section = ConfigSection::SourceMapping,
@@ -2692,6 +2965,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         ConfigSection::Sources => merged.sources.clear(),
         ConfigSection::Credentials if pending_credential.is_none() => merged.credentials.clear(),
         ConfigSection::Credentials => return Err(config_error(path, "NuGet source credential groups do not support clear")),
+        ConfigSection::ClientCertificates => merged.client_certificates.clear(),
         ConfigSection::Disabled => merged.disabled.clear(),
         ConfigSection::AuditSources => merged.audit_sources.clear(),
         ConfigSection::SourceMapping => merged.source_mapping.clear(),
@@ -2750,8 +3024,22 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
           ConfigSection::Config if key.eq_ignore_ascii_case("no_proxy") => {
             merged.no_proxy = Some(value);
           },
-          ConfigSection::Other | ConfigSection::SourceMapping | ConfigSection::Config => {},
+          ConfigSection::Other | ConfigSection::ClientCertificates | ConfigSection::SourceMapping | ConfigSection::Config => {},
         }
+      },
+      Ok(Event::Empty(element))
+        if matches!(section, ConfigSection::ClientCertificates) && matches!(local_name(element.name().as_ref()), b"fileCert" | b"storeCert") =>
+      {
+        append_client_certificate(&reader, &element, path, &mut merged.client_certificates)?;
+      },
+      Ok(Event::Empty(element)) if matches!(section, ConfigSection::ClientCertificates) => {
+        return Err(config_error(
+          path,
+          format!(
+            "unsupported NuGet clientCertificates element {:?}; expected fileCert or storeCert",
+            String::from_utf8_lossy(local_name(element.name().as_ref()))
+          ),
+        ));
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"packageSource" && matches!(section, ConfigSection::SourceMapping) => {
         return Err(config_error(path, "NuGet package-source mapping requires at least one package pattern"));
@@ -2764,6 +3052,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         match section {
           ConfigSection::Sources => merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::Credentials => return Err(config_error(path, "NuGet source credential groups do not support remove")),
+          ConfigSection::ClientCertificates => return Err(config_error(path, "NuGet clientCertificates does not support remove")),
           ConfigSection::Disabled => merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::AuditSources => merged.audit_sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::SourceMapping => merged.source_mapping.remove(&key),
@@ -2792,7 +3081,13 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
           }
           section = ConfigSection::Other;
         },
-        b"packageSources" | b"disabledPackageSources" | b"auditSources" | b"packageSourceMapping" | b"fallbackPackageFolders" | b"config" => {
+        b"packageSources"
+        | b"clientCertificates"
+        | b"disabledPackageSources"
+        | b"auditSources"
+        | b"packageSourceMapping"
+        | b"fallbackPackageFolders"
+        | b"config" => {
           if pending_mapping.is_some() {
             return Err(config_error(path, "NuGet package-source mapping did not close its source"));
           }
@@ -2821,6 +3116,83 @@ fn add_or_replace_source(sources: &mut Vec<(String, PackageSource)>, key: String
   } else {
     sources.push((key, source));
   }
+}
+
+fn append_client_certificate(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  config_path: &Path,
+  certificates: &mut Vec<MergedClientCertificate>,
+) -> Result<(), PackageError> {
+  let source = required_expanded_attribute(reader, element, b"packageSource", config_path)?;
+  if source.is_empty() {
+    return Err(config_error(config_path, "NuGet client certificate packageSource cannot be empty"));
+  }
+  let certificate = match local_name(element.name().as_ref()) {
+    b"fileCert" => {
+      let configured_path = required_expanded_attribute(reader, element, b"path", config_path)?;
+      if configured_path.is_empty() {
+        return Err(config_error(
+          config_path,
+          format!("NuGet file certificate for source {source:?} has an empty path"),
+        ));
+      }
+      let password = config_attribute(reader, element, b"password", config_path)?;
+      let clear_password = config_attribute(reader, element, b"clearTextPassword", config_path)?;
+      if password.is_some() && clear_password.is_some() {
+        return Err(config_error(
+          config_path,
+          format!("NuGet file certificate for source {source:?} cannot specify both password and clearTextPassword"),
+        ));
+      }
+      let password = match (password, clear_password) {
+        (Some(value), None) => Some(StoredCredentialPassword::Encrypted(expand_config_value(value, config_path)?)),
+        (None, Some(value)) => Some(StoredCredentialPassword::Clear(Zeroizing::new(expand_config_value(value, config_path)?))),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("the conflicting password attributes returned above"),
+      };
+      MergedClientCertificate::File {
+        source,
+        path: resolve_config_path(config_path, &configured_path),
+        password,
+      }
+    },
+    b"storeCert" => MergedClientCertificate::Store {
+      source,
+      location: optional_expanded_attribute(reader, element, b"storeLocation", config_path)?.unwrap_or_else(|| "CurrentUser".to_owned()),
+      name: optional_expanded_attribute(reader, element, b"storeName", config_path)?.unwrap_or_else(|| "My".to_owned()),
+      find_by: optional_expanded_attribute(reader, element, b"findBy", config_path)?.unwrap_or_else(|| "Thumbprint".to_owned()),
+      find_value: required_expanded_attribute(reader, element, b"findValue", config_path)?,
+    },
+    _ => return Err(config_error(config_path, "unsupported NuGet client certificate element")),
+  };
+  let file = certificate.is_file();
+  if let Some(existing) = certificates
+    .iter_mut()
+    .find(|existing| existing.source() == certificate.source() && existing.is_file() == file)
+  {
+    *existing = certificate;
+  } else {
+    certificates.push(certificate);
+  }
+  Ok(())
+}
+
+fn required_expanded_attribute(reader: &Reader<&[u8]>, element: &quick_xml::events::BytesStart<'_>, name: &[u8], path: &Path) -> Result<String, PackageError> {
+  let value = config_attribute(reader, element, name, path)?
+    .ok_or_else(|| config_error(path, format!("NuGet client certificate requires attribute {:?}", String::from_utf8_lossy(name))))?;
+  expand_config_value(value, path)
+}
+
+fn optional_expanded_attribute(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  name: &[u8],
+  path: &Path,
+) -> Result<Option<String>, PackageError> {
+  config_attribute(reader, element, name, path)?
+    .map(|value| expand_config_value(value, path))
+    .transpose()
 }
 
 fn begin_source_credential(
@@ -3165,6 +3537,7 @@ enum ConfigSection {
   Other,
   Sources,
   Credentials,
+  ClientCertificates,
   Disabled,
   AuditSources,
   SourceMapping,
@@ -3231,6 +3604,13 @@ fn config_error(path: &Path, message: impl Into<String>) -> PackageError {
 }
 
 fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, PackageError> {
+  configured_http_client_builder(proxy)?
+    .tls_backend_rustls()
+    .build()
+    .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
+}
+
+fn configured_http_client_builder(proxy: Option<&ProxySettings>) -> Result<reqwest::ClientBuilder, PackageError> {
   let mut builder = reqwest::Client::builder().https_only(true).timeout(Duration::from_secs(60));
   if let Some(settings) = proxy {
     let mut configured =
@@ -3238,9 +3618,7 @@ fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, Package
     configured = configured.no_proxy(settings.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string));
     builder = builder.no_proxy().proxy(configured);
   }
-  builder
-    .build()
-    .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
+  Ok(builder)
 }
 
 async fn discover_service_endpoints(
@@ -5010,11 +5388,9 @@ async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredentia
 
 #[cfg(test)]
 fn authenticated_get(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str) -> reqwest::RequestBuilder {
-  let request = client.get(url);
-  match credential
-    .filter(|credential| credential.origin.matches(url))
-    .and_then(SourceCredential::authorization)
-  {
+  let credential = credential.filter(|credential| credential.origin.matches(url));
+  let request = credential.and_then(|credential| credential.client.as_ref()).unwrap_or(client).get(url);
+  match credential.and_then(SourceCredential::authorization) {
     Some(authorization) => request.header(AUTHORIZATION, authorization.clone()),
     None => request,
   }
@@ -5027,6 +5403,7 @@ async fn send_authenticated(
   operation: &str,
 ) -> Result<reqwest::Response, PackageError> {
   let credential = credential.filter(|credential| credential.origin.matches(url));
+  let client = credential.and_then(|credential| credential.client.as_ref()).unwrap_or(client);
   for attempt in 0..=2 {
     let (authorization, generation, provider_was_used) = match credential {
       Some(credential) => credential.authorization_snapshot().await,
@@ -6986,6 +7363,47 @@ mod tests {
 
     assert_eq!(error.kind(), PackageErrorKind::Configuration);
     assert!(error.message.contains("must not embed credentials"));
+  }
+
+  #[test]
+  fn client_certificates_merge_by_kind_and_reject_ambiguous_sources() {
+    let temp = TempDirectory::new();
+    let lower = temp.write(
+      "lower.config",
+      r#"<configuration>
+<packageSources><clear /><add key="private" value="https://packages.example.test/v3/index.json" protocolVersion="3" /></packageSources>
+<clientCertificates>
+  <fileCert packageSource="private" path="old.pfx" clearTextPassword="old-secret" />
+</clientCertificates></configuration>"#,
+    );
+    let higher = temp.write(
+      "higher.config",
+      r#"<configuration><clientCertificates>
+  <fileCert packageSource="private" path="new.pfx" clearTextPassword="new-secret" />
+  <storeCert packageSource="private" findValue="00112233445566778899AABBCCDDEEFF00112233" />
+</clientCertificates></configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+
+    merge_config(&lower, &mut merged).unwrap();
+    merge_config(&higher, &mut merged).unwrap();
+
+    assert_eq!(merged.client_certificates.len(), 2);
+    let MergedClientCertificate::File { path, password, .. } = &merged.client_certificates[0] else {
+      panic!("the higher fileCert replaces the lower fileCert");
+    };
+    assert_eq!(path, &temp.0.join("new.pfx"));
+    assert!(matches!(password, Some(StoredCredentialPassword::Clear(value)) if value.as_str() == "new-secret"));
+    let error = attach_client_certificates(
+      &merged.sources,
+      merged.client_certificates,
+      None,
+      &temp.0,
+      &mut SourceCredentialBatch::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("more than one client certificate"));
+    assert!(!error.to_string().contains("secret"));
   }
 
   #[test]

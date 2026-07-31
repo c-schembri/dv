@@ -6,7 +6,7 @@ use std::{
   fs,
   io::{self, IsTerminal},
   path::{Path, PathBuf},
-  process::{Command, Output},
+  process::{Command, Output, Stdio},
   thread,
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -41,6 +41,7 @@ enum CaseKind {
   NugetServiceIndex,
   NugetCredentials,
   NugetCredentialProvider,
+  NugetClientCertificates,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -70,6 +71,7 @@ struct Fixtures<'a> {
   nuget_service_index: &'a Path,
   nuget_credentials: &'a Path,
   nuget_credential_provider: &'a Path,
+  nuget_client_certificates: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -334,6 +336,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_client_certificates",
+    kind: CaseKind::NugetClientCertificates,
+    args: &["oracle/bin/Release/ClientCertificateOracle.dll", "query", "."],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -552,6 +560,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_client_certificates",
+    kind: CaseKind::NugetClientCertificates,
+    args: &["project", "package-sources", "ClientCertificateProject.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -688,6 +702,7 @@ fn run() -> Result<()> {
   let nuget_service_index_fixture = repository.join("benchmarks/fixtures/nuget-service-index");
   let nuget_credentials_fixture = repository.join("benchmarks/fixtures/nuget-credentials");
   let nuget_credential_provider_fixture = repository.join("benchmarks/fixtures/nuget-credential-provider");
+  let nuget_client_certificates_fixture = repository.join("benchmarks/fixtures/nuget-client-certificates");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -707,6 +722,7 @@ fn run() -> Result<()> {
     nuget_service_index: &nuget_service_index_fixture,
     nuget_credentials: &nuget_credentials_fixture,
     nuget_credential_provider: &nuget_credential_provider_fixture,
+    nuget_client_certificates: &nuget_client_certificates_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -774,6 +790,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_credential_provider") {
     verify_nuget_credential_provider(&repository, &dv_executable, &nuget_credential_provider_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_client_certificates") {
+    verify_nuget_client_certificates(&repository, &dv_executable, &nuget_client_certificates_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
@@ -2605,6 +2624,106 @@ fn verify_nuget_credential_provider(repository: &Path, dv_executable: &Path, fix
   Ok(())
 }
 
+struct ClientCertificateFixture {
+  workspace: PathBuf,
+}
+
+impl Drop for ClientCertificateFixture {
+  fn drop(&mut self) {
+    let _ = Command::new("dotnet")
+      .args(["oracle/bin/Release/ClientCertificateOracle.dll", "cleanup", "."])
+      .current_dir(&self.workspace)
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status();
+  }
+}
+
+fn prepare_client_certificate_fixture(workspace: &Path) -> Result<ClientCertificateFixture> {
+  let oracle = "oracle/bin/Release/ClientCertificateOracle.dll";
+  let _ = Command::new("dotnet")
+    .args([oracle, "cleanup", "."])
+    .current_dir(workspace)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status();
+  run_checked(Path::new("dotnet"), &[oracle, "setup", "."], workspace, "client-certificate fixture setup")?;
+  if !cfg!(windows) {
+    return Err("the platform-store client-certificate benchmark currently requires Windows".into());
+  }
+  let metadata: serde_json::Value = serde_json::from_slice(&fs::read(workspace.join("certs/metadata.json"))?)?;
+  let thumbprint = metadata
+    .get("client")
+    .and_then(serde_json::Value::as_str)
+    .ok_or("client-certificate fixture metadata omitted client thumbprint")?;
+  let config = fs::read_to_string(workspace.join("NuGet.Config.template"))?.replace("__THUMBPRINT__", thumbprint);
+  fs::write(workspace.join("NuGet.Config"), config)?;
+  Ok(ClientCertificateFixture {
+    workspace: workspace.to_owned(),
+  })
+}
+
+fn verify_nuget_client_certificates(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let workspace = repository.join(format!("target/benchmark-nuget-client-certificates-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &workspace)?;
+  reset_fixture(fixture, &workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "build",
+      "oracle/ClientCertificateOracle.csproj",
+      "-c",
+      "Release",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &workspace,
+    "NuGet client-certificate oracle build",
+  )?;
+  let _fixture = prepare_client_certificate_fixture(&workspace)?;
+  let oracle_text = client_certificate_command_text(
+    Path::new("dotnet"),
+    &["oracle/bin/Release/ClientCertificateOracle.dll", "query", "."],
+    &workspace,
+  )?;
+  let oracle: serde_json::Value = serde_json::from_str(&oracle_text)?;
+  let dv_text = client_certificate_command_text(
+    dv_executable,
+    &["project", "package-sources", "ClientCertificateProject.csproj", "--offline", "--json"],
+    &workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv client-certificate verification omitted package_sources_inspected")?;
+  let expected = oracle.as_array().ok_or("client-certificate oracle did not return an array")?;
+  let actual = dv
+    .get("sources")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv client-certificate verification omitted sources")?;
+  if expected.len() != 2 || actual.len() != expected.len() {
+    return Err(format!("client-certificate source count differs: oracle={} dv={}", expected.len(), actual.len()).into());
+  }
+  for (expected, actual) in expected.iter().zip(actual) {
+    for field in ["name", "location", "protocol", "authentication"] {
+      if required_string(expected, field)? != required_string(actual, field)? {
+        return Err(format!("client-certificate source field {field} differs: oracle={expected} dv={actual}").into());
+      }
+    }
+    if expected.get("certificateCount").and_then(serde_json::Value::as_u64) != Some(1) {
+      return Err(format!("Microsoft client-certificate oracle did not select exactly one certificate: {expected}").into());
+    }
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) {
+    return Err("offline client-certificate verification performed network work".into());
+  }
+  Ok(())
+}
+
 fn verify_credential_provider_interactive(dv_executable: &Path, workspace: &Path) -> Result<()> {
   const LOGIN_MESSAGE: &str = "fixture device login required";
   let trace = workspace.join("dv-provider-interactive.trace");
@@ -2705,6 +2824,8 @@ fn reject_credential_output(label: &str, output: &str) -> Result<()> {
     "fixture-secret",
     "provider-benchmark-user",
     "provider-benchmark-secret",
+    "fixture-client-password",
+    "fixture-server-password",
   ] {
     if output.contains(secret) {
       return Err(format!("{label} exposed credential text {secret:?}").into());
@@ -2965,6 +3086,11 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
     }
 
     prepare_persistent_case(executable, case, case_fixture, &case_workspace)?;
+    let _client_certificate_fixture = if matches!(case.kind, CaseKind::NugetClientCertificates) {
+      Some(prepare_client_certificate_fixture(&case_workspace)?)
+    } else {
+      None
+    };
 
     let mut samples_ns = Vec::with_capacity(options.samples);
     let mut work = None;
@@ -3020,6 +3146,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetServiceIndex
       | CaseKind::NugetCredentials
       | CaseKind::NugetCredentialProvider
+      | CaseKind::NugetClientCertificates
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -3058,6 +3185,22 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       ],
       workspace,
       "NuGet credential-provider oracle build",
+    )?;
+  }
+  if matches!(case.kind, CaseKind::NugetClientCertificates) {
+    run_checked(
+      Path::new("dotnet"),
+      &[
+        "build",
+        "oracle/ClientCertificateOracle.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "NuGet client-certificate oracle build",
     )?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
@@ -3478,7 +3621,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
-    CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider => Ok(()),
+    CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
@@ -3549,6 +3692,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetServiceIndex => fixtures.nuget_service_index,
     CaseKind::NugetCredentials => fixtures.nuget_credentials,
     CaseKind::NugetCredentialProvider => fixtures.nuget_credential_provider,
+    CaseKind::NugetClientCertificates => fixtures.nuget_client_certificates,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -3573,6 +3717,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetServiceIndex => Some("nuget-service-index"),
     CaseKind::NugetCredentials => Some("nuget-credentials"),
     CaseKind::NugetCredentialProvider => Some("nuget-credential-provider"),
+    CaseKind::NugetClientCertificates => Some("nuget-client-certificates"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -3594,8 +3739,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetServiceIndex
       | CaseKind::NugetCredentials
       | CaseKind::NugetCredentialProvider
+      | CaseKind::NugetClientCertificates
   ) {
-    apply_case_nuget_environment(&mut command, case.kind, cwd);
+    apply_case_nuget_environment(&mut command, case.kind, cwd)?;
   }
   let output = command.output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -3626,7 +3772,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   } else if !is_dotnet(executable)
     && matches!(
       case.kind,
-      CaseKind::NugetServiceIndex | CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider
+      CaseKind::NugetServiceIndex | CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates
     )
   {
     Some(parse_source_work_evidence(&output.stdout)?)
@@ -3835,7 +3981,20 @@ fn apply_nuget_credential_provider_environment(command: &mut Command, cwd: &Path
     .env_remove("DV_TEST_PROVIDER_TRACE");
 }
 
-fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) {
+fn apply_nuget_client_certificate_environment(command: &mut Command, cwd: &Path) -> Result<()> {
+  apply_nuget_config_environment(command, cwd);
+  let metadata: serde_json::Value = serde_json::from_slice(&fs::read(cwd.join("certs/metadata.json"))?)?;
+  let thumbprint = metadata
+    .get("client")
+    .and_then(serde_json::Value::as_str)
+    .ok_or("client-certificate fixture metadata omitted client thumbprint")?;
+  command
+    .env("DV_CERT_THUMBPRINT", thumbprint)
+    .env("NUGET_HTTP_CACHE_PATH", cwd.join(".http-cache"));
+  Ok(())
+}
+
+fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) -> Result<()> {
   if matches!(kind, CaseKind::NugetStoragePolicy) {
     apply_nuget_storage_environment(command, cwd);
   } else if matches!(kind, CaseKind::NugetCliOverrides) {
@@ -3847,9 +4006,12 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
     apply_nuget_credential_environment(command, cwd);
   } else if matches!(kind, CaseKind::NugetCredentialProvider) {
     apply_nuget_credential_provider_environment(command, cwd);
+  } else if matches!(kind, CaseKind::NugetClientCertificates) {
+    apply_nuget_client_certificate_environment(command, cwd)?;
   } else {
     apply_nuget_config_environment(command, cwd);
   }
+  Ok(())
 }
 
 fn run_nuget_config_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
@@ -3908,7 +4070,7 @@ fn nuget_config_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Re
 fn service_index_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
   let mut command = Command::new(executable);
   command.args(args).current_dir(cwd);
-  apply_case_nuget_environment(&mut command, CaseKind::NugetServiceIndex, cwd);
+  apply_case_nuget_environment(&mut command, CaseKind::NugetServiceIndex, cwd)?;
   let output = command.output()?;
   check_output(output.clone(), executable, args, "NuGet service-index command")?;
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
@@ -3941,6 +4103,19 @@ fn credential_provider_command_text(executable: &Path, args: &[&str], cwd: &Path
   let stderr = String::from_utf8(output.stderr)?;
   reject_credential_output("NuGet credential-provider stdout", &stdout)?;
   reject_credential_output("NuGet credential-provider stderr", &stderr)?;
+  Ok(stdout.trim().to_owned())
+}
+
+fn client_certificate_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_client_certificate_environment(&mut command, cwd)?;
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, "NuGet client-certificate command")?;
+  let stdout = String::from_utf8(output.stdout)?;
+  let stderr = String::from_utf8(output.stderr)?;
+  reject_credential_output("NuGet client-certificate stdout", &stdout)?;
+  reject_credential_output("NuGet client-certificate stderr", &stderr)?;
   Ok(stdout.trim().to_owned())
 }
 
@@ -4096,6 +4271,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_service_index"
           | "nuget_credentials"
           | "nuget_credential_provider"
+          | "nuget_client_certificates"
       )
     })
     .collect::<Vec<_>>();
@@ -4231,6 +4407,7 @@ fn case_label(case: &str) -> &str {
     "nuget_service_index" => "NuGet service index",
     "nuget_credentials" => "NuGet credentials",
     "nuget_credential_provider" => "NuGet credential provider",
+    "nuget_client_certificates" => "NuGet client certificates",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",

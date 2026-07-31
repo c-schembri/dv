@@ -7,7 +7,7 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 quick-xml.workspace = true
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -16,6 +16,7 @@ zeroize.workspace = true
 zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+schannel = "0.1.29"
 windows-dpapi = "0.2.0"
 
 [lints]

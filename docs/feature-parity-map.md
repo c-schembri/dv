@@ -801,8 +801,17 @@ boundary, not final drop-in parity.
   Microsoft versus `22.519 ms` for `dv` (`5.1x`) across 30 retained samples
   while both launch the same fixture provider and perform zero network work.
   `P2`
-- [ ] `NUGET-010` Support client certificates and platform certificate stores
-  only after authenticated-source fixtures exist. `P5`
+- [x] `NUGET-010` Support NuGet client certificates from relative/absolute PFX
+  files and Windows platform certificate stores. File secrets are zeroed,
+  certificate files are bounded at 8 MiB, encrypted passwords use NuGet DPAPI,
+  and source-specific native TLS clients cannot redirect an identity across an
+  origin boundary. Windows supports `CurrentUser`/`LocalMachine`, NuGet's store
+  names, and exact thumbprint lookup with an accessible private key; other
+  selectors and non-Windows stores fail explicitly. The official
+  `NuGet.Configuration` oracle measures `89.254 ms` for Microsoft versus
+  `30.003 ms` for `dv` (`3.0x`) across 30 retained offline samples while both
+  load one PFX and one `CurrentUser\\My` certificate. Redacted certificate
+  authentication is published through event schema 10. `P5`
 - [~] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,
   timeout, rate-limit, and offline behavior. `P2`
 - [ ] `NUGET-012` Require explicit opt-in for insecure HTTP or disabled TLS

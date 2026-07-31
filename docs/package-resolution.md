@@ -33,6 +33,10 @@ NuGet sources are typed records containing URL and protocol generation:
 - a 401 from that origin can lazily launch a configured self-contained NuGet
   V2 credential provider. Provider authentication is noninteractive by default,
   bounded by NuGet timeout variables, cancellable, and cached for the command;
+- merged `clientCertificates` can attach a bounded PFX identity or a Windows
+  store certificate selected by thumbprint. The native TLS client is built
+  once, used only for the configured HTTPS origin, and cannot redirect the
+  identity to another origin;
 - credential-free config or lowercase environment HTTP proxies are applied by
   the native client. Proxy addresses and source credentials are not retained
   in locks, results, diagnostics, or events; source inventory reports only the
