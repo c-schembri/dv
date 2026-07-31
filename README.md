@@ -17,6 +17,9 @@ dv sdk current                  3.798 ms median
 dotnet msbuild project query  282.186 ms median
 dv project inspect              3.846 ms median
 
+dotnet msbuild runtime query  321.215 ms median
+dv runtime project inspect      5.687 ms median
+
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
@@ -75,9 +78,11 @@ without launching `dotnet`.
 Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting one
 modern unified .NET TFM, `Exe` and `Library` outputs, default source discovery,
 Debug/Release configuration, project-reference paths, and exact package
-references. Target family and version are parsed once and shared by pack,
-compiler, dependency-group, and package-asset selection. Unsupported MSBuild
-behavior fails explicitly.
+references. Literal `RuntimeIdentifier` and `RuntimeIdentifiers` values become
+one compact target-dimension batch rather than copies of the project. Target
+family and version are parsed once and shared by pack, compiler,
+dependency-group, and package-asset selection. Unsupported MSBuild behavior
+fails explicitly.
 
 The baseline tracks [.NET 10](https://dotnet.microsoft.com/en-us/download/dotnet/10.0),
 the latest stable LTS release as of 2026-07-31. Preview TFMs are not selected
@@ -166,6 +171,7 @@ Initial machine:
 |---|---|---|---:|---:|---:|---:|---:|
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
+| Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
@@ -174,13 +180,16 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
-project property plus the ordered compile-item identities. For package sync it
+project property plus the ordered compile-item identities. The runtime case
+also verifies the selected RID, ordered plural RID property, and unique target
+dimension batch. For package sync it
 also compares the complete package identity, exact-version, archive-SHA-512,
 and selected asset batches. The massive case additionally compares runtime,
 resource, content, analyzer, build, build-multitargeting, native, and RID
 runtime-target paths plus runtime-target metadata. Exact commands are printed in benchmark
 output and recorded in the curated
-[compiler baseline](docs/performance-baselines/2026-07-31-windows.md) and
+[compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
+[runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md), and
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md).
 
 The cold dependency result starts each timed process with a fresh project copy
@@ -218,6 +227,7 @@ Reproduce the comparison:
 ```powershell
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
+cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2

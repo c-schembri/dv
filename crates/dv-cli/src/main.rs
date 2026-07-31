@@ -614,6 +614,9 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     project: project.project_path().display().to_string(),
     sdk: project.sdk().into(),
     target_framework: project.target_framework().into(),
+    runtime_identifier: project.runtime_identifier().map(str::to_owned),
+    runtime_identifiers: project.runtime_identifiers().map(str::to_owned).collect(),
+    runtime_dimensions: project.runtime_dimensions().map(str::to_owned).collect(),
     output_type: project.output_type().as_str().into(),
     configuration: project.configuration().as_str().into(),
     assembly_name: project.assembly_name().into(),
@@ -705,6 +708,11 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
   writeln!(output, "Project             {}", project.project_path().display()).expect("writing a String succeeds");
   writeln!(output, "SDK                 {}", project.sdk()).expect("writing a String succeeds");
   writeln!(output, "Target              {}", project.target_framework()).expect("writing a String succeeds");
+  writeln!(output, "Runtime             {}", project.runtime_identifier().unwrap_or("portable")).expect("writing a String succeeds");
+  writeln!(output, "Runtime dimensions  {}", project.runtime_dimensions().len()).expect("writing a String succeeds");
+  for runtime in project.runtime_dimensions() {
+    writeln!(output, "  {runtime}").expect("writing a String succeeds");
+  }
   writeln!(output, "Output              {}", project.output_type().as_str()).expect("writing a String succeeds");
   writeln!(output, "Configuration       {}", project.configuration().as_str()).expect("writing a String succeeds");
   writeln!(output, "Assembly            {}", project.assembly_name()).expect("writing a String succeeds");

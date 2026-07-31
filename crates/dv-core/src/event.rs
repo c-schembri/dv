@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 2;
+pub const EVENT_SCHEMA_VERSION: u16 = 3;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -169,6 +169,12 @@ pub enum EventPayload {
     sdk: String,
     /// Single evaluated target framework.
     target_framework: String,
+    /// Selected runtime identifier, when one inner runtime target is active.
+    runtime_identifier: Option<String>,
+    /// Ordered runtime-identifier expansion property.
+    runtime_identifiers: Vec<String>,
+    /// Unique runtime target dimensions materialized for downstream work.
+    runtime_dimensions: Vec<String>,
     /// Managed output type.
     output_type: String,
     /// Selected build configuration.

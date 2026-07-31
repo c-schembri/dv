@@ -18,6 +18,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 enum CaseKind {
   Startup,
   ProjectEvaluate,
+  RuntimeEvaluate,
   CompilerPlan,
   RestoreCold,
   PackageSyncCold,
@@ -38,6 +39,7 @@ struct Case {
 
 struct Fixtures<'a> {
   small: &'a Path,
+  runtime: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
@@ -59,6 +61,17 @@ const DOTNET_CASES: &[Case] = &[
       "--nologo",
       "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
       "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "runtime_evaluate",
+    kind: CaseKind::RuntimeEvaluate,
+    args: &[
+      "msbuild",
+      "RuntimeProject.csproj",
+      "--nologo",
+      "-getProperty:TargetFramework,RuntimeIdentifier,RuntimeIdentifiers",
     ],
     implemented: true,
   },
@@ -173,6 +186,12 @@ const DV_CASES: &[Case] = &[
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "runtime_evaluate",
+    kind: CaseKind::RuntimeEvaluate,
+    args: &["project", "inspect", "RuntimeProject.csproj", "--json"],
     implemented: true,
   },
   Case {
@@ -321,11 +340,13 @@ fn run() -> Result<()> {
   let options = parse_options(env::args_os().skip(1))?;
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
+  let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
     small: &fixture,
+    runtime: &runtime_fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
@@ -338,6 +359,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "runtime_evaluate") {
+    verify_runtime_evaluation(&repository, &dv_executable, &runtime_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
     verify_compiler_plan(&repository, &dv_executable, &fixture)?;
@@ -452,6 +476,66 @@ fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()>
   }
   if !dv.get("package_references").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
     return Err("dv small-console evaluation unexpectedly contains package references".into());
+  }
+  Ok(())
+}
+
+fn verify_runtime_evaluation(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-runtime-evaluation-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  reset_fixture(fixture, &verification)?;
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "RuntimeProject.csproj",
+      "--nologo",
+      "-getProperty:TargetFramework,RuntimeIdentifier,RuntimeIdentifiers",
+    ],
+    &verification,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(dv_executable, &["project", "inspect", "RuntimeProject.csproj", "--json"], &verification)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
+    .ok_or("dv runtime project inspection did not emit project_evaluated")?;
+
+  for (dotnet_name, dv_name) in [("TargetFramework", "target_framework"), ("RuntimeIdentifier", "runtime_identifier")] {
+    let reference = dotnet.pointer(&format!("/Properties/{dotnet_name}")).and_then(serde_json::Value::as_str);
+    let actual = dv.get(dv_name).and_then(serde_json::Value::as_str);
+    if reference != actual {
+      return Err(format!("runtime evaluation mismatch for {dotnet_name}: dotnet={reference:?}, dv={actual:?}").into());
+    }
+  }
+
+  let reference_identifiers = dotnet
+    .pointer("/Properties/RuntimeIdentifiers")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or_default()
+    .split(';')
+    .map(str::trim)
+    .filter(|identifier| !identifier.is_empty())
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+  let actual_identifiers = string_array(&dv, "runtime_identifiers")?;
+  if reference_identifiers != actual_identifiers {
+    return Err(format!("RuntimeIdentifiers mismatch: dotnet={reference_identifiers:?}, dv={actual_identifiers:?}").into());
+  }
+
+  let mut reference_dimensions = reference_identifiers;
+  if let Some(selected) = dotnet.pointer("/Properties/RuntimeIdentifier").and_then(serde_json::Value::as_str)
+    && !selected.is_empty()
+    && !reference_dimensions.iter().any(|identifier| identifier == selected)
+  {
+    reference_dimensions.push(selected.to_owned());
+  }
+  let actual_dimensions = string_array(&dv, "runtime_dimensions")?;
+  if reference_dimensions != actual_dimensions {
+    return Err(format!("runtime target dimensions mismatch: expected={reference_dimensions:?}, dv={actual_dimensions:?}").into());
   }
   Ok(())
 }
@@ -1010,7 +1094,7 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
 fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   if matches!(
     case.kind,
-    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm
+    CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm
   ) {
     reset_fixture(fixture, workspace)?;
   }
@@ -1052,7 +1136,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan => Ok(()),
+    CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan => Ok(()),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -1091,6 +1175,7 @@ fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path
 
 fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
+    CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive => fixtures.package_graph_massive,
@@ -1101,6 +1186,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
 fn fixture_name(case: &Case) -> Option<&'static str> {
   match case.kind {
     CaseKind::Startup => None,
+    CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive => Some("massive-package-graph"),

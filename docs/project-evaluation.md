@@ -9,6 +9,8 @@ exactly one `.csproj` from the current directory.
 Observed fixture data:
 
 - `small-console`: one project, one source, no references;
+- `runtime-project`: one project, no sources, one selected RID, and three
+  ordered runtime expansion dimensions;
 - `multi-project`: three projects, three sources, three project-reference
   edges;
 - project files are currently below 1 KiB and use one target framework.
@@ -16,6 +18,8 @@ Observed fixture data:
 The supported property and item subset is:
 
 - one literal modern unified .NET `TargetFramework` (`net5.0` or later);
+- one optional literal `RuntimeIdentifier`;
+- an optional literal semicolon-delimited `RuntimeIdentifiers` batch;
 - `OutputType` equal to `Exe` or `Library`;
 - `Debug` or `Release` configuration;
 - literal `AssemblyName` and `RootNamespace`, with project-name defaults;
@@ -39,7 +43,7 @@ directory or project path
   -> stream XML events through a fixed-depth state machine
   -> scan source directories once
   -> sort relative source paths
-  -> compact text and item batches
+  -> compact text, item, and target-dimension batches
   -> ProjectSpec
 ```
 
@@ -50,6 +54,12 @@ data, so temporary owned buffers are necessary at this boundary. The completed
 
 Source and project-reference batches contain 8-byte `(offset, length)` spans.
 Package references contain two spans and are 16 bytes with 4-byte alignment.
+Runtime target dimensions use the same 8-byte spans in one contiguous batch.
+Two 32-bit values mark the plural-property prefix and selected-RID index; the
+selected RID reuses its plural span when present, and duplicate plural values
+are removed without allocating a hash table. RIDs remain opaque and
+case-sensitive here; compatibility traversal belongs to runtime-graph
+selection.
 The parsed target descriptor is stored once beside its original text and
 shared with package and compiler planning. Compile-time assertions protect the
 compact layouts.
@@ -72,6 +82,7 @@ batch.
 - ordered source spans;
 - ordered project-reference spans;
 - ordered exact package-reference records;
+- one ordered unique runtime-dimension span batch and a selected index;
 - fixed enums and flags for configuration, output type, nullable mode,
   implicit usings, and deterministic output.
 
@@ -104,3 +115,15 @@ dv project inspect SmallConsole.csproj --json
 
 It compares every requested property and the ordered compile item identities
 before retaining timing samples.
+
+Runtime expansion has its own like-for-like parity gate and timed case:
+
+```text
+dotnet msbuild RuntimeProject.csproj --nologo -getProperty:TargetFramework,RuntimeIdentifier,RuntimeIdentifiers
+dv project inspect RuntimeProject.csproj --json
+```
+
+The gate compares the TFM, selected RID, ordered plural RID property, and the
+unique target-dimension batch. The maintained 30-sample Windows baseline is
+`321.215 ms` for the Microsoft query and `5.687 ms` for `dv`, a `56.5x`
+median improvement.

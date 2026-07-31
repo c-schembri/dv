@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `1`;
+- schema version `3`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -51,6 +51,8 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
+Schema 3 adds selected, plural, and materialized runtime-dimension fields to
+`project_evaluated`.
 
 ## Diagnostic Contract
 

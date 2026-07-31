@@ -69,7 +69,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":2"));
+  assert!(lines[0].contains("\"schema_version\":3"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -117,6 +117,8 @@ fn project_inspect_discovers_and_prints_one_project() {
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -130,6 +132,8 @@ fn project_inspect_discovers_and_prints_one_project() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   assert!(stdout.contains("Assembly            App"));
   assert!(stdout.contains("Target              net10.0"));
+  assert!(stdout.contains("Runtime             win-x64"));
+  assert!(stdout.contains("Runtime dimensions  2"));
   assert!(stdout.contains("  Program.cs"));
 }
 
@@ -143,6 +147,8 @@ fn project_inspect_json_reports_the_evaluated_batch() {
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Example.Package" Version="1.2.3" />
@@ -161,6 +167,9 @@ fn project_inspect_json_reports_the_evaluated_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   assert!(stdout.contains("\"type\":\"project_evaluated\""));
   assert!(stdout.contains("\"configuration\":\"Release\""));
+  assert!(stdout.contains("\"runtime_identifier\":\"win-x64\""));
+  assert!(stdout.contains("\"runtime_identifiers\":[\"win-x64\",\"linux-x64\"]"));
+  assert!(stdout.contains("\"runtime_dimensions\":[\"win-x64\",\"linux-x64\"]"));
   assert!(stdout.contains("\"sources\":[\"Program.cs\"]"));
   assert!(stdout.contains("\"id\":\"Example.Package\",\"version\":\"1.2.3\""));
 }

@@ -13,6 +13,7 @@ use crate::TargetFramework;
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
+const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 
 /// A supported build configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,9 +95,12 @@ pub struct ProjectSpec {
   target_framework_text: TextSpan,
   assembly_name: TextSpan,
   root_namespace: TextSpan,
+  runtime_dimensions: Box<[TextSpan]>,
   sources: Box<[TextSpan]>,
   project_references: Box<[TextSpan]>,
   package_references: Box<[PackageReference]>,
+  runtime_identifier_index: u32,
+  runtime_identifiers_len: u32,
   configuration: ProjectConfiguration,
   output_type: ProjectOutputType,
   nullable: bool,
@@ -129,6 +133,23 @@ impl ProjectSpec {
   /// Returns parsed target-framework data for downstream selection.
   pub fn target(&self) -> TargetFramework {
     self.target_framework
+  }
+
+  /// Returns the selected runtime identifier, when an inner target is selected.
+  pub fn runtime_identifier(&self) -> Option<&str> {
+    (self.runtime_identifier_index != NO_RUNTIME_IDENTIFIER).then(|| self.text(self.runtime_dimensions[self.runtime_identifier_index as usize]))
+  }
+
+  /// Iterates the ordered `RuntimeIdentifiers` expansion values.
+  pub fn runtime_identifiers(&self) -> impl ExactSizeIterator<Item = &str> {
+    self.runtime_dimensions[..self.runtime_identifiers_len as usize]
+      .iter()
+      .map(|span| self.text(*span))
+  }
+
+  /// Iterates every unique runtime target dimension without repeating the project.
+  pub fn runtime_dimensions(&self) -> impl ExactSizeIterator<Item = &str> {
+    self.runtime_dimensions.iter().map(|span| self.text(*span))
   }
 
   /// Returns the selected build configuration.
@@ -256,6 +277,8 @@ impl Error for ProjectError {}
 enum Property {
   TargetFramework,
   TargetFrameworks,
+  RuntimeIdentifier,
+  RuntimeIdentifiers,
   OutputType,
   Nullable,
   ImplicitUsings,
@@ -279,6 +302,8 @@ enum Element {
 #[derive(Default)]
 struct RawProject {
   target_framework: Option<String>,
+  runtime_identifier: Option<String>,
+  runtime_identifiers: Option<String>,
   output_type: Option<String>,
   nullable: Option<String>,
   implicit_usings: Option<String>,
@@ -558,6 +583,8 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
           "multi-target projects are unsupported; use TargetFramework",
         ));
       },
+      Property::RuntimeIdentifier => raw.runtime_identifier = Some(text.to_owned()),
+      Property::RuntimeIdentifiers => raw.runtime_identifiers = Some(text.to_owned()),
       Property::OutputType => raw.output_type = Some(text.to_owned()),
       Property::Nullable => raw.nullable = Some(text.to_owned()),
       Property::ImplicitUsings => raw.implicit_usings = Some(text.to_owned()),
@@ -612,6 +639,39 @@ fn materialize_project(
   let nullable = parse_toggle(&project_path, "Nullable", raw.nullable.as_deref(), false, true)?;
   let implicit_usings = parse_toggle(&project_path, "ImplicitUsings", raw.implicit_usings.as_deref(), false, false)?;
   let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
+  let selected_runtime = parse_runtime_identifier(&project_path, raw.runtime_identifier.as_deref())?;
+  let mut runtime_dimensions = parse_runtime_identifiers(&project_path, raw.runtime_identifiers.as_deref())?;
+  let runtime_identifiers_len = u32::try_from(runtime_dimensions.len()).map_err(|_| {
+    ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      &project_path,
+      "RuntimeIdentifiers contains more than 4 billion target dimensions",
+    )
+  })?;
+  let runtime_identifier_index = if let Some(selected) = selected_runtime {
+    if let Some(index) = runtime_dimensions.iter().position(|candidate| *candidate == selected) {
+      index as u32
+    } else {
+      if runtime_dimensions.len() == NO_RUNTIME_IDENTIFIER as usize {
+        return Err(ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          &project_path,
+          "runtime target dimensions exhaust the compact selected-index space",
+        ));
+      }
+      let index = u32::try_from(runtime_dimensions.len()).map_err(|_| {
+        ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          &project_path,
+          "runtime target dimensions exceed the compact 32-bit index space",
+        )
+      })?;
+      runtime_dimensions.push(selected);
+      index
+    }
+  } else {
+    NO_RUNTIME_IDENTIFIER
+  };
   let default_name = project_path
     .file_stem()
     .and_then(|value| value.to_str())
@@ -641,6 +701,7 @@ fn materialize_project(
     + target_framework.len()
     + assembly_name.len()
     + root_namespace.len()
+    + runtime_dimensions.iter().map(|value| value.len()).sum::<usize>()
     + sources.iter().map(String::len).sum::<usize>()
     + raw.project_references.iter().map(String::len).sum::<usize>()
     + raw
@@ -654,6 +715,10 @@ fn materialize_project(
   let target_framework_span = table.push(&target_framework, &project_path)?;
   let assembly_name_span = table.push(assembly_name, &project_path)?;
   let root_namespace_span = table.push(root_namespace, &project_path)?;
+  let runtime_dimension_spans = runtime_dimensions
+    .iter()
+    .map(|value| table.push(value, &project_path))
+    .collect::<Result<Box<_>, _>>()?;
   let source_spans = sources.iter().map(|source| table.push(source, &project_path)).collect::<Result<Box<_>, _>>()?;
   let reference_spans = raw
     .project_references
@@ -689,9 +754,12 @@ fn materialize_project(
     target_framework_text: target_framework_span,
     assembly_name: assembly_name_span,
     root_namespace: root_namespace_span,
+    runtime_dimensions: runtime_dimension_spans,
     sources: source_spans,
     project_references: reference_spans,
     package_references: package_references.into_boxed_slice(),
+    runtime_identifier_index,
+    runtime_identifiers_len,
     configuration,
     output_type,
     nullable,
@@ -762,6 +830,43 @@ fn parse_bool(path: &Path, property: &str, value: Option<&str>, default: bool) -
   }
 }
 
+fn parse_runtime_identifier<'a>(path: &Path, value: Option<&'a str>) -> Result<Option<&'a str>, ProjectError> {
+  let Some(value) = value.filter(|value| !value.is_empty()) else {
+    return Ok(None);
+  };
+  if value.contains("$(") || value.contains(';') {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      format!("RuntimeIdentifier {value:?} must be one literal runtime identifier"),
+    ));
+  }
+  Ok(Some(value))
+}
+
+fn parse_runtime_identifiers<'a>(path: &Path, value: Option<&'a str>) -> Result<Vec<&'a str>, ProjectError> {
+  let Some(value) = value else {
+    return Ok(Vec::new());
+  };
+  if value.contains("$(") {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      "RuntimeIdentifiers must be a literal semicolon-delimited list",
+    ));
+  }
+
+  let mut identifiers = Vec::with_capacity(value.bytes().filter(|byte| *byte == b';').count() + 1);
+  for identifier in value.split(';').map(str::trim).filter(|identifier| !identifier.is_empty()) {
+    // RID batches are tiny. A linear uniqueness check avoids a second allocation
+    // and keeps the hot downstream representation contiguous.
+    if !identifiers.contains(&identifier) {
+      identifiers.push(identifier);
+    }
+  }
+  Ok(identifiers)
+}
+
 fn required_property(path: &Path, name: &str, value: Option<String>) -> Result<String, ProjectError> {
   value
     .filter(|value| !value.is_empty() && !value.contains("$("))
@@ -772,6 +877,8 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
   match name {
     "TargetFramework" => Ok(Property::TargetFramework),
     "TargetFrameworks" => Ok(Property::TargetFrameworks),
+    "RuntimeIdentifier" => Ok(Property::RuntimeIdentifier),
+    "RuntimeIdentifiers" => Ok(Property::RuntimeIdentifiers),
     "OutputType" => Ok(Property::OutputType),
     "Nullable" => Ok(Property::Nullable),
     "ImplicitUsings" => Ok(Property::ImplicitUsings),
@@ -1037,6 +1144,8 @@ mod tests {
     assert_eq!(result.output_type(), ProjectOutputType::Exe);
     assert_eq!(result.assembly_name(), "App");
     assert_eq!(result.root_namespace(), "App");
+    assert_eq!(result.runtime_identifier(), None);
+    assert_eq!(result.runtime_dimensions().len(), 0);
     assert!(result.nullable_enabled());
     assert!(result.implicit_usings_enabled());
     assert!(result.deterministic());
@@ -1044,6 +1153,56 @@ mod tests {
     let package = result.package_references()[0];
     assert_eq!(result.package_id(package), "Example.Package");
     assert_eq!(result.package_version(package), "1.2.3");
+  }
+
+  #[test]
+  fn materializes_runtime_targets_as_one_compact_dimension_batch() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeIdentifier>osx-arm64</RuntimeIdentifier><RuntimeIdentifiers>win-x64; linux-x64;win-x64;</RuntimeIdentifiers>",
+        "",
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.runtime_identifier(), Some("osx-arm64"));
+    assert_eq!(result.runtime_identifiers().collect::<Vec<_>>(), ["win-x64", "linux-x64"]);
+    assert_eq!(result.runtime_dimensions().collect::<Vec<_>>(), ["win-x64", "linux-x64", "osx-arm64"]);
+    assert_eq!(result.text.matches("win-x64").count(), 1);
+    assert_eq!(result.text.matches("osx-arm64").count(), 1);
+  }
+
+  #[test]
+  fn selected_runtime_reuses_the_plural_dimension_span() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeIdentifier>win-x64</RuntimeIdentifier><RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>",
+        "",
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.runtime_identifier(), Some("win-x64"));
+    assert_eq!(result.runtime_dimensions().collect::<Vec<_>>(), ["win-x64", "linux-x64"]);
+    assert_eq!(result.runtime_identifier_index, 0);
+    assert_eq!(result.text.matches("win-x64").count(), 1);
+  }
+
+  #[test]
+  fn rejects_dynamic_runtime_dimensions() {
+    let temp = TempDirectory::new();
+    let project = temp.write("App.csproj", &project_xml("<RuntimeIdentifiers>win-x64;$(OtherRids)</RuntimeIdentifiers>", ""));
+
+    let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty);
+    assert!(error.to_string().contains("literal"));
   }
 
   #[test]

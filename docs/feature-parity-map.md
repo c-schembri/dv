@@ -591,8 +591,13 @@ boundary, not final drop-in parity.
   condition, affected output, and supported alternative when known. `P1`
 - [ ] `EVAL-021` Evaluate outer and inner builds for `TargetFrameworks`,
   including target-specific conditional properties/items. `P2`
-- [ ] `EVAL-022` Evaluate `RuntimeIdentifier` and `RuntimeIdentifiers` as
-  target expansion dimensions rather than repeated project objects. `P2`
+- [x] `EVAL-022` Evaluate `RuntimeIdentifier` and `RuntimeIdentifiers` as
+  target expansion dimensions rather than repeated project objects. One
+  project owns a contiguous unique RID-span batch, a 32-bit plural boundary,
+  and a 32-bit selected index; selected/plural overlap reuses one text span.
+  The .NET 10 property oracle and 30-sample process benchmark verify the TFM,
+  selected RID, ordered plural RIDs, and materialized dimensions. `dv` measures
+  `5.687 ms` median versus `321.215 ms` for MSBuild (`56.5x`). `P2`
 - [ ] `EVAL-023` Support `Debug` and `Release` defaults plus arbitrary named
   configurations whose values are fully declarative. `P1`
 - [ ] `EVAL-024` Parse and apply `MSBuild.rsp` and `Directory.Build.rsp` with
@@ -741,7 +746,7 @@ boundary, not final drop-in parity.
   in compact per-package ranges. The 203-package massive acceptance graph now
   matches `project.assets.json` across portable asset paths and runtime-target
   RID/type metadata and is benchmarked end to end. Selecting one concrete RID
-  still depends on `EVAL-022` and `PACKS-005`; `contentFiles` build-action,
+  still depends on `PACKS-005`; `contentFiles` build-action,
   copy, and flatten metadata remain. `P2`
   See `issues/0007-package-content-metadata-and-rid-selection.md`.
 - [~] `RES-012` .NET 10 package pruning reads the selected SDK's
