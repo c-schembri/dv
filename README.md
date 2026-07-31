@@ -157,7 +157,8 @@ Initial machine:
 - 30 retained samples after 3 warm-ups for SDK selection, project evaluation,
   and the one-package cold case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; 10 retained
-  samples after 3 warm-ups for warm locked restore
+  samples after 3 warm-ups for warm locked restore; the massive graph uses 5
+  retained samples after 1 warm-up
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
@@ -168,16 +169,19 @@ Initial machine:
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
+| Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
 | Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 521.346 ms | 7.362 ms | 70.8x | 560.223 ms | 8.206 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
 project property plus the ordered compile-item identities. For package sync it
 also compares the complete package identity, exact-version, archive-SHA-512,
-and selected-compile-asset batches. Exact commands are printed in benchmark
+and selected asset batches. The massive case additionally compares runtime,
+resource, content, analyzer, build, build-multitargeting, native, and RID
+runtime-target paths plus runtime-target metadata. Exact commands are printed in benchmark
 output and recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md) and
-[package baseline](docs/performance-baselines/2026-07-31-package-sync-windows.md).
+[package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md).
 
 The cold dependency result starts each timed process with a fresh project copy
 and empty isolated package directory. The reference command also bypasses
@@ -198,13 +202,12 @@ package baseline.
 The massive acceptance fixture unions 51 direct package references from
 Microsoft's eShop application into one `net10.0` restore workload. The .NET
 SDK selected 203 packages and populated 272 package archives totaling
-197,860,237 bytes. A five-sample cold reference run measured 10,079.053 ms
-median and 11,241.686 ms p95. `dv` now converges every reference-selected
-identity to the same exact version and prunes framework-owned packages from
-the selected .NET 10 SDK's authoritative data. It now reaches the explicit
-`buildTransitive` asset-family rejection with the same 203-package graph as
-the reference restore. The end-to-end case therefore stays `TBI` and is not
-promoted into the like-for-like table.
+197,860,237 bytes. The current five-sample run measured 9,977.524 ms median
+for `dotnet` and 4,325.957 ms for `dv`, a 2.3x median improvement. Both outputs
+contain the same 203 selected package identities, versions, hashes, and
+portable asset families. `dv` downloaded 203 retained packages and observed
+at most 208 requests and 164,964,741 payload bytes; the eager streaming graph
+can vary slightly in speculative request work between network samples.
 
 The warm one-shot target for lightweight commands on this machine is `5 ms`
 end to end. It is a local engineering budget, not a universal Windows

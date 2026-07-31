@@ -1,6 +1,6 @@
 use std::{
   cmp::Ordering,
-  collections::{BTreeMap, BTreeSet, HashSet},
+  collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
   env,
   error::Error,
   fmt::{self, Write as _},
@@ -36,7 +36,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 2;
+const LOCK_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TextSpan {
@@ -78,6 +78,72 @@ struct PackageAssets {
 const _: () = assert!(size_of::<PackageAssets>() == 32);
 const _: () = assert!(align_of::<PackageAssets>() == 4);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageExtendedAssets {
+  resources: ItemRange,
+  content_files: ItemRange,
+  build: ItemRange,
+  build_multi_targeting: ItemRange,
+  build_transitive: ItemRange,
+  native: ItemRange,
+  runtime_targets: ItemRange,
+}
+
+const _: () = assert!(size_of::<PackageExtendedAssets>() == 56);
+const _: () = assert!(align_of::<PackageExtendedAssets>() == 4);
+
+/// The role assigned to an RID-specific runtime target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTargetKind {
+  /// A managed runtime assembly.
+  Runtime,
+  /// A native library or executable.
+  Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeTargetAsset {
+  path: TextSpan,
+  runtime_identifier: TextSpan,
+  kind: RuntimeTargetKind,
+}
+
+const _: () = assert!(size_of::<RuntimeTargetAsset>() == 20);
+const _: () = assert!(align_of::<RuntimeTargetAsset>() == 4);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AssetFlags(u8);
+
+impl AssetFlags {
+  const NONE: Self = Self(0);
+  const RUNTIME: Self = Self(1 << 0);
+  const COMPILE: Self = Self(1 << 1);
+  const BUILD: Self = Self(1 << 2);
+  const NATIVE: Self = Self(1 << 3);
+  const CONTENT_FILES: Self = Self(1 << 4);
+  const ANALYZERS: Self = Self(1 << 5);
+  const BUILD_TRANSITIVE: Self = Self(1 << 6);
+  const ALL: Self = Self((1 << 7) - 1);
+  const NO_CONTENT: Self = Self(Self::ALL.0 & !Self::CONTENT_FILES.0);
+
+  const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+  }
+
+  const fn union(self, other: Self) -> Self {
+    Self(self.0 | other.0)
+  }
+
+  const fn intersect(self, other: Self) -> Self {
+    Self(self.0 & other.0)
+  }
+
+  const fn without(self, other: Self) -> Self {
+    Self(self.0 & !other.0)
+  }
+}
+
 /// Options controlling exact package resolution.
 #[derive(Clone, Debug, Default)]
 pub struct PackageResolveOptions {
@@ -105,10 +171,18 @@ pub struct PackageResolution {
   source_protocol: NugetProtocol,
   packages: Box<[ResolvedPackage]>,
   package_assets: Box<[PackageAssets]>,
+  package_extended_assets: Box<[PackageExtendedAssets]>,
   dependencies: Box<[u32]>,
   compile_assets: Box<[TextSpan]>,
   runtime_assets: Box<[TextSpan]>,
   analyzers: Box<[TextSpan]>,
+  resource_assets: Box<[TextSpan]>,
+  content_files: Box<[TextSpan]>,
+  build_assets: Box<[TextSpan]>,
+  build_multi_targeting_assets: Box<[TextSpan]>,
+  build_transitive_assets: Box<[TextSpan]>,
+  native_assets: Box<[TextSpan]>,
+  runtime_targets: Box<[RuntimeTargetAsset]>,
   cache_hits: u32,
   downloaded_packages: u32,
   network_requests: u32,
@@ -187,6 +261,44 @@ impl PackageResolution {
     self.analyzers.iter().map(|span| Path::new(self.get(*span)))
   }
 
+  /// Iterates selected satellite resource assemblies across the graph.
+  pub fn resource_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.resource_assets.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates selected package content files across the graph.
+  pub fn content_files(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.content_files.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates selected inner-build MSBuild imports across the graph.
+  pub fn build_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.build_assets.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates selected outer-build MSBuild imports across the graph.
+  pub fn build_multi_targeting_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.build_multi_targeting_assets.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates selected transitive MSBuild imports across the graph.
+  pub fn build_transitive_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.build_transitive_assets.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates selected legacy native assets across the graph.
+  pub fn native_assets(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.native_assets.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Iterates RID-specific runtime targets across the graph.
+  pub fn runtime_targets(&self) -> impl ExactSizeIterator<Item = (&Path, &str, RuntimeTargetKind)> {
+    self
+      .runtime_targets
+      .iter()
+      .map(|asset| (Path::new(self.get(asset.path)), self.get(asset.runtime_identifier), asset.kind))
+  }
+
   /// Returns how many packages were reused from the cache.
   pub fn cache_hits(&self) -> u32 {
     self.cache_hits
@@ -220,6 +332,41 @@ impl PackageResolution {
   fn package_analyzers(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
     let range = range(self.package_assets[index].analyzers);
     self.analyzers[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_resource_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].resources);
+    self.resource_assets[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_content_files(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].content_files);
+    self.content_files[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_build_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].build);
+    self.build_assets[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_build_multi_targeting_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].build_multi_targeting);
+    self.build_multi_targeting_assets[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_build_transitive_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].build_transitive);
+    self.build_transitive_assets[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_native_assets(&self, index: usize) -> impl ExactSizeIterator<Item = &str> {
+    let range = range(self.package_extended_assets[index].native);
+    self.native_assets[range].iter().map(|span| self.get(*span))
+  }
+
+  fn package_runtime_targets(&self, index: usize) -> impl ExactSizeIterator<Item = RuntimeTargetAsset> + '_ {
+    let range = range(self.package_extended_assets[index].runtime_targets);
+    self.runtime_targets[range].iter().copied()
   }
 
   fn get(&self, span: TextSpan) -> &str {
@@ -320,6 +467,8 @@ struct PackageRequirement {
   lower_id: String,
   range: VersionRange,
   direct: bool,
+  include_assets: AssetFlags,
+  suppress_parent: AssetFlags,
 }
 
 /// Parsed NuGet version used only while converging cold dependency metadata.
@@ -602,8 +751,21 @@ struct WorkPackage {
   compile_assets: Vec<PathBuf>,
   runtime_assets: Vec<PathBuf>,
   analyzers: Vec<PathBuf>,
+  resource_assets: Vec<PathBuf>,
+  content_files: Vec<PathBuf>,
+  build_assets: Vec<PathBuf>,
+  build_multi_targeting_assets: Vec<PathBuf>,
+  build_transitive_assets: Vec<PathBuf>,
+  native_assets: Vec<PathBuf>,
+  runtime_targets: Vec<WorkRuntimeTarget>,
   cache_hit: bool,
   origin: Option<PackageSource>,
+}
+
+struct WorkRuntimeTarget {
+  path: PathBuf,
+  runtime_identifier: String,
+  kind: RuntimeTargetKind,
 }
 
 struct ResolutionContext<'a> {
@@ -798,6 +960,27 @@ struct LockPackage {
   compile_assets: Vec<String>,
   runtime_assets: Vec<String>,
   analyzers: Vec<String>,
+  #[serde(default)]
+  resource_assets: Vec<String>,
+  #[serde(default)]
+  content_files: Vec<String>,
+  #[serde(default)]
+  build_assets: Vec<String>,
+  #[serde(default)]
+  build_multi_targeting_assets: Vec<String>,
+  #[serde(default)]
+  build_transitive_assets: Vec<String>,
+  #[serde(default)]
+  native_assets: Vec<String>,
+  #[serde(default)]
+  runtime_targets: Vec<LockRuntimeTarget>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LockRuntimeTarget {
+  path: String,
+  runtime_identifier: String,
+  kind: RuntimeTargetKind,
 }
 
 /// Resolves exact package graphs for an evaluated project batch.
@@ -888,6 +1071,8 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, Pac
       lower_id,
       range,
       direct: true,
+      include_assets: AssetFlags::ALL,
+      suppress_parent: AssetFlags::NONE,
     });
   }
   direct.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id));
@@ -1512,10 +1697,12 @@ async fn resolve_streaming_graph(
     acquired.insert(request.lower_id.clone(), (request, cached));
   }
 
+  let asset_flags = flatten_asset_flags(&nodes);
   let mut resolved = BTreeMap::<String, WorkPackage>::new();
   for (lower_id, (request, cached)) in acquired {
     let dependencies = concrete_dependencies(&nodes, &request.lower_id)?;
-    let parsed = parse_cached_package(request.clone(), cached, target, target_text, dependencies)?;
+    let flags = asset_flags.get(&lower_id).copied().unwrap_or(AssetFlags::NONE);
+    let parsed = parse_cached_package(request.clone(), cached, target, target_text, dependencies, flags)?;
     resolved.insert(lower_id, parsed);
   }
 
@@ -1524,6 +1711,36 @@ async fn resolve_streaming_graph(
     network_requests,
     downloaded_bytes,
   })
+}
+
+fn flatten_asset_flags(nodes: &BTreeMap<String, ConstraintNode>) -> BTreeMap<String, AssetFlags> {
+  let mut result = BTreeMap::<String, AssetFlags>::new();
+  let mut queue = VecDeque::<(&str, AssetFlags)>::new();
+  for (id, node) in nodes {
+    if node.direct.is_some() && !node.pruned {
+      queue.push_back((id, AssetFlags::ALL));
+    }
+  }
+  while let Some((id, incoming)) = queue.pop_front() {
+    let current = result.get(id).copied().unwrap_or(AssetFlags::NONE);
+    if current.contains(incoming) {
+      continue;
+    }
+    result.insert(id.to_owned(), current.union(incoming));
+    let Some(node) = nodes.get(id) else {
+      continue;
+    };
+    for dependency in &node.dependencies {
+      if dependency.suppress_parent == AssetFlags::ALL || nodes.get(&dependency.lower_id).is_some_and(|node| node.pruned) {
+        continue;
+      }
+      queue.push_back((
+        &dependency.lower_id,
+        incoming.intersect(dependency.include_assets).without(dependency.suppress_parent),
+      ));
+    }
+  }
+  result
 }
 
 fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageError> {
@@ -2531,23 +2748,46 @@ fn parse_cached_package(
   request: PackageRequest,
   cached: CachedPackage,
   target: TargetFramework,
-  target_text: &str,
+  _target_text: &str,
   dependencies: Vec<PackageRequest>,
+  flags: AssetFlags,
 ) -> Result<WorkPackage, PackageError> {
-  reject_unsupported_package_assets(&cached.root)?;
-  let compile_assets = select_compile_assets(&cached.root, target)?;
-  let runtime_assets = select_runtime_assets(&cached.root, target)?;
+  let compile_assets = select_if(flags.contains(AssetFlags::COMPILE), || select_compile_assets(&cached.root, target))?;
+  let runtime_assets = select_if(flags.contains(AssetFlags::RUNTIME), || select_runtime_assets(&cached.root, target))?;
+  // Package analyzers are resolved graph-wide by ResolvePackageAssets rather
+  // than serialized as a target-library family in project.assets.json.
   let analyzers = collect_analyzers(&cached.root)?;
-  if dependencies.is_empty() && compile_assets.is_empty() && runtime_assets.is_empty() && analyzers.is_empty() {
-    return Err(PackageError::new(
-      PackageErrorKind::Incompatible,
-      format!("{} {}", request.id, request.version),
-      format!(
-        "package {} {} has no compatible assets or dependencies for {target_text}",
-        request.id, request.version,
-      ),
-    ));
-  }
+  let resource_assets = select_if(flags.contains(AssetFlags::RUNTIME), || select_resource_assets(&cached.root, target))?;
+  let content_files = select_content_files(&cached.root, target, flags.contains(AssetFlags::CONTENT_FILES))?;
+  let native_assets = select_if(flags.contains(AssetFlags::NATIVE), || select_legacy_native_assets(&cached.root))?;
+  let runtime_targets = select_runtime_targets(&cached.root, target, flags)?;
+  let selected_build = select_build_assets(&cached.root, "build", &request.id, target, true)?;
+  let selected_build_transitive = select_build_assets(&cached.root, "buildTransitive", &request.id, target, true)?;
+  let build_transitive_assets = if flags.contains(AssetFlags::BUILD) || flags.contains(AssetFlags::BUILD_TRANSITIVE) {
+    selected_build_transitive
+  } else {
+    Vec::new()
+  };
+  let mut build_assets = if flags.contains(AssetFlags::BUILD) {
+    selected_build
+  } else if build_transitive_assets.is_empty() {
+    excluded_asset_marker(&selected_build)
+  } else {
+    Vec::new()
+  };
+  build_assets.retain(|asset| {
+    !build_transitive_assets.iter().any(|transitive| {
+      transitive
+        .file_name()
+        .is_some_and(|name| asset.file_name().is_some_and(|asset_name| asset_name.eq_ignore_ascii_case(name)))
+    })
+  });
+  let selected_build_multi_targeting = select_build_assets(&cached.root, "buildMultiTargeting", &request.id, target, false)?;
+  let build_multi_targeting_assets = if flags.contains(AssetFlags::BUILD) {
+    selected_build_multi_targeting
+  } else {
+    excluded_asset_marker(&selected_build_multi_targeting)
+  };
   Ok(WorkPackage {
     request,
     hash: cached.hash,
@@ -2555,14 +2795,41 @@ fn parse_cached_package(
     compile_assets,
     runtime_assets,
     analyzers,
+    resource_assets,
+    content_files,
+    build_assets,
+    build_multi_targeting_assets,
+    build_transitive_assets,
+    native_assets,
+    runtime_targets,
     cache_hit: cached.cache_hit,
     origin: cached.origin,
   })
 }
 
+fn select_if<T>(enabled: bool, select: impl FnOnce() -> Result<Vec<T>, PackageError>) -> Result<Vec<T>, PackageError> {
+  if enabled { select() } else { Ok(Vec::new()) }
+}
+
+fn excluded_asset_marker(assets: &[PathBuf]) -> Vec<PathBuf> {
+  assets
+    .iter()
+    .min_by(|left, right| left.components().count().cmp(&right.components().count()).then_with(|| left.cmp(right)))
+    .and_then(|asset| asset.parent().map(|directory| directory.join("_._")))
+    .into_iter()
+    .collect()
+}
+
 struct DependencyGroup {
   framework: Option<String>,
-  dependencies: Vec<(String, String)>,
+  dependencies: Vec<RawDependency>,
+}
+
+struct RawDependency {
+  id: String,
+  version: String,
+  include_assets: AssetFlags,
+  suppress_parent: AssetFlags,
 }
 
 #[cfg(test)]
@@ -2613,10 +2880,18 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
         let dependency_id = nuspec_attribute(&reader, &element, b"id", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires id"))?;
         let dependency_version =
           nuspec_attribute(&reader, &element, b"version", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires version"))?;
+        let include_assets = parse_asset_flags(nuspec_attribute(&reader, &element, b"include", path)?.as_deref(), AssetFlags::NO_CONTENT, path)?;
+        let exclude_assets = parse_asset_flags(nuspec_attribute(&reader, &element, b"exclude", path)?.as_deref(), AssetFlags::NONE, path)?;
+        let dependency = RawDependency {
+          id: dependency_id,
+          version: dependency_version,
+          include_assets: include_assets.without(exclude_assets),
+          suppress_parent: AssetFlags::NONE,
+        };
         if let Some(group) = groups.last_mut() {
-          group.dependencies.push((dependency_id, dependency_version));
+          group.dependencies.push(dependency);
         } else {
-          ungrouped.push((dependency_id, dependency_version));
+          ungrouped.push(dependency);
         }
       },
       Ok(Event::Text(text)) => {
@@ -2678,15 +2953,49 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
   };
   selected
     .iter()
-    .map(|(id, range)| {
+    .map(|dependency| {
       Ok(PackageRequirement {
-        id: id.clone(),
-        lower_id: normalize_id(id)?,
-        range: VersionRange::parse(range)?,
+        id: dependency.id.clone(),
+        lower_id: normalize_id(&dependency.id)?,
+        range: VersionRange::parse(&dependency.version)?,
         direct: false,
+        include_assets: dependency.include_assets,
+        suppress_parent: dependency.suppress_parent,
       })
     })
     .collect()
+}
+
+fn parse_asset_flags(value: Option<&str>, default: AssetFlags, path: &Path) -> Result<AssetFlags, PackageError> {
+  let Some(value) = value else {
+    return Ok(default);
+  };
+  let mut flags = AssetFlags::NONE;
+  for token in value.split([',', ';']).map(str::trim).filter(|token| !token.is_empty()) {
+    let flag = if token.eq_ignore_ascii_case("all") {
+      AssetFlags::ALL
+    } else if token.eq_ignore_ascii_case("none") {
+      AssetFlags::NONE
+    } else if token.eq_ignore_ascii_case("runtime") {
+      AssetFlags::RUNTIME
+    } else if token.eq_ignore_ascii_case("compile") {
+      AssetFlags::COMPILE
+    } else if token.eq_ignore_ascii_case("build") {
+      AssetFlags::BUILD
+    } else if token.eq_ignore_ascii_case("native") {
+      AssetFlags::NATIVE
+    } else if token.eq_ignore_ascii_case("contentFiles") {
+      AssetFlags::CONTENT_FILES
+    } else if token.eq_ignore_ascii_case("analyzers") {
+      AssetFlags::ANALYZERS
+    } else if token.eq_ignore_ascii_case("buildTransitive") {
+      AssetFlags::BUILD_TRANSITIVE.union(AssetFlags::BUILD)
+    } else {
+      return Err(package_manifest_error(path, format!("unknown dependency asset category {token:?}")));
+    };
+    flags = flags.union(flag);
+  }
+  Ok(flags)
 }
 
 #[derive(Clone, Copy)]
@@ -2713,20 +3022,6 @@ fn package_manifest_error(path: &Path, message: impl Into<String>) -> PackageErr
   PackageError::new(PackageErrorKind::Integrity, path.display().to_string(), message)
 }
 
-fn reject_unsupported_package_assets(root: &Path) -> Result<(), PackageError> {
-  for directory in ["build", "buildTransitive", "buildMultiTargeting", "runtimes"] {
-    let path = root.join(directory);
-    if path.is_dir() {
-      return Err(PackageError::new(
-        PackageErrorKind::Incompatible,
-        path.display().to_string(),
-        format!("package assets under {directory} are not supported by the initial resolver"),
-      ));
-    }
-  }
-  Ok(())
-}
-
 fn select_compile_assets(root: &Path, target: TargetFramework) -> Result<Vec<PathBuf>, PackageError> {
   if let Some(directory) = select_framework_directory(&root.join("ref"), target)? {
     return dlls_in(&directory);
@@ -2736,6 +3031,169 @@ fn select_compile_assets(root: &Path, target: TargetFramework) -> Result<Vec<Pat
 
 fn select_runtime_assets(root: &Path, target: TargetFramework) -> Result<Vec<PathBuf>, PackageError> {
   select_framework_directory(&root.join("lib"), target)?.map_or_else(|| Ok(Vec::new()), |directory| dlls_in(&directory))
+}
+
+fn select_resource_assets(root: &Path, target: TargetFramework) -> Result<Vec<PathBuf>, PackageError> {
+  let Some(directory) = select_framework_directory(&root.join("lib"), target)? else {
+    return Ok(Vec::new());
+  };
+  let mut resources = Vec::new();
+  for entry in fs::read_dir(&directory).map_err(|error| package_io("enumerate package resources", &directory, error))? {
+    let entry = entry.map_err(|error| package_io("enumerate package resources", &directory, error))?;
+    let path = entry.path();
+    if entry
+      .file_type()
+      .map_err(|error| package_io("inspect package resources", &path, error))?
+      .is_dir()
+    {
+      collect_files(&path, &mut resources, |path| {
+        path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+      })?;
+    }
+  }
+  resources.sort_unstable();
+  Ok(resources)
+}
+
+fn select_content_files(root: &Path, target: TargetFramework, included: bool) -> Result<Vec<PathBuf>, PackageError> {
+  let content_root = root.join("contentFiles");
+  if !content_root.is_dir() {
+    return Ok(Vec::new());
+  }
+  if !included {
+    return Ok(vec![content_root.join("any/any/_._")]);
+  }
+  let mut selected = Vec::new();
+  for language in ["any", "cs"] {
+    let language_root = content_root.join(language);
+    if !language_root.is_dir() {
+      continue;
+    }
+    let directory = select_framework_directory(&language_root, target)?.or_else(|| {
+      let any = language_root.join("any");
+      any.is_dir().then_some(any)
+    });
+    if let Some(directory) = directory {
+      collect_files(&directory, &mut selected, |_| true)?;
+    }
+  }
+  selected.sort_unstable();
+  selected.dedup();
+  Ok(selected)
+}
+
+fn select_legacy_native_assets(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
+  let directory = root.join("native");
+  let mut assets = Vec::new();
+  if directory.is_dir() {
+    collect_files(&directory, &mut assets, |_| true)?;
+    assets.sort_unstable();
+  }
+  Ok(assets)
+}
+
+fn select_build_assets(root: &Path, category: &str, package_id: &str, target: TargetFramework, use_framework: bool) -> Result<Vec<PathBuf>, PackageError> {
+  let category_root = root.join(category);
+  if !category_root.is_dir() {
+    return Ok(Vec::new());
+  }
+  let directory = if use_framework {
+    select_framework_directory(&category_root, target)?.unwrap_or_else(|| category_root.clone())
+  } else {
+    category_root
+  };
+  let props = format!("{package_id}.props");
+  let targets = format!("{package_id}.targets");
+  let mut entries = fs::read_dir(&directory)
+    .map_err(|error| package_io("enumerate package build assets", &directory, error))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| package_io("enumerate package build assets", &directory, error))?;
+  entries.sort_unstable_by_key(|entry| entry.file_name().to_ascii_lowercase());
+  let mut selected = Vec::with_capacity(2);
+  let mut placeholder = None;
+  for entry in entries {
+    let path = entry.path();
+    if !entry
+      .file_type()
+      .map_err(|error| package_io("inspect package build asset", &path, error))?
+      .is_file()
+    {
+      continue;
+    }
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    if name.eq_ignore_ascii_case(&props) || name.eq_ignore_ascii_case(&targets) {
+      selected.push(path);
+    } else if name == "_._" {
+      placeholder = Some(path);
+    }
+  }
+  if selected.is_empty()
+    && let Some(placeholder) = placeholder
+  {
+    selected.push(placeholder);
+  }
+  selected.sort_unstable();
+  Ok(selected)
+}
+
+fn select_runtime_targets(root: &Path, target: TargetFramework, flags: AssetFlags) -> Result<Vec<WorkRuntimeTarget>, PackageError> {
+  let runtimes = root.join("runtimes");
+  if !runtimes.is_dir() || !flags.contains(AssetFlags::RUNTIME) && !flags.contains(AssetFlags::NATIVE) {
+    return Ok(Vec::new());
+  }
+  let mut selected = Vec::new();
+  for entry in fs::read_dir(&runtimes).map_err(|error| package_io("enumerate package runtimes", &runtimes, error))? {
+    let entry = entry.map_err(|error| package_io("enumerate package runtimes", &runtimes, error))?;
+    let rid_root = entry.path();
+    if !entry
+      .file_type()
+      .map_err(|error| package_io("inspect package runtime", &rid_root, error))?
+      .is_dir()
+    {
+      continue;
+    }
+    let Some(runtime_identifier) = entry.file_name().to_str().map(str::to_owned) else {
+      continue;
+    };
+    if flags.contains(AssetFlags::RUNTIME)
+      && let Some(directory) = select_framework_directory(&rid_root.join("lib"), target)?
+    {
+      for path in dlls_in(&directory)? {
+        selected.push(WorkRuntimeTarget {
+          path,
+          runtime_identifier: runtime_identifier.clone(),
+          kind: RuntimeTargetKind::Runtime,
+        });
+      }
+    }
+    if flags.contains(AssetFlags::NATIVE) {
+      let native_assets = select_framework_directory(&rid_root.join("nativeassets"), target)?;
+      let native = native_assets.or_else(|| {
+        let directory = rid_root.join("native");
+        directory.is_dir().then_some(directory)
+      });
+      if let Some(directory) = native {
+        let mut paths = Vec::new();
+        collect_files(&directory, &mut paths, |_| true)?;
+        for path in paths {
+          selected.push(WorkRuntimeTarget {
+            path,
+            runtime_identifier: runtime_identifier.clone(),
+            kind: RuntimeTargetKind::Native,
+          });
+        }
+      }
+    }
+  }
+  selected.sort_unstable_by(|left, right| {
+    left
+      .runtime_identifier
+      .cmp(&right.runtime_identifier)
+      .then_with(|| left.path.cmp(&right.path))
+      .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
+  });
+  Ok(selected)
 }
 
 fn select_framework_directory(category: &Path, target: TargetFramework) -> Result<Option<PathBuf>, PackageError> {
@@ -2796,25 +3254,35 @@ fn dlls_in(directory: &Path) -> Result<Vec<PathBuf>, PackageError> {
   Ok(assets)
 }
 
-fn collect_analyzers(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
-  let analyzer_root = root.join("analyzers/dotnet/cs");
-  if !analyzer_root.is_dir() {
-    return Ok(Vec::new());
-  }
-  let mut directories = vec![analyzer_root];
-  let mut analyzers = Vec::new();
+fn collect_files(directory: &Path, target: &mut Vec<PathBuf>, include: impl Copy + Fn(&Path) -> bool) -> Result<(), PackageError> {
+  let mut directories = vec![directory.to_owned()];
   while let Some(directory) = directories.pop() {
-    for entry in fs::read_dir(&directory).map_err(|error| package_io("enumerate package analyzers", &directory, error))? {
-      let entry = entry.map_err(|error| package_io("enumerate package analyzers", &directory, error))?;
+    for entry in fs::read_dir(&directory).map_err(|error| package_io("enumerate package assets", &directory, error))? {
+      let entry = entry.map_err(|error| package_io("enumerate package assets", &directory, error))?;
       let path = entry.path();
-      let file_type = entry.file_type().map_err(|error| package_io("inspect package analyzer", &path, error))?;
+      let file_type = entry.file_type().map_err(|error| package_io("inspect package asset", &path, error))?;
       if file_type.is_dir() {
         directories.push(path);
-      } else if file_type.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("dll")) {
-        analyzers.push(path);
+      } else if file_type.is_file() && include(&path) {
+        target.push(path);
       }
     }
   }
+  Ok(())
+}
+
+fn collect_analyzers(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
+  let analyzer_root = root.join("analyzers");
+  if !analyzer_root.is_dir() {
+    return Ok(Vec::new());
+  }
+  let mut analyzers = Vec::new();
+  collect_files(&analyzer_root, &mut analyzers, |path| {
+    let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+      && !normalized.ends_with(".resources.dll")
+      && !normalized.contains("/dotnet/vb/")
+  })?;
   analyzers.sort_unstable();
   Ok(analyzers)
 }
@@ -2894,7 +3362,18 @@ fn materialize_resolution(
           .iter()
           .chain(&package.runtime_assets)
           .chain(&package.analyzers)
+          .chain(&package.resource_assets)
+          .chain(&package.content_files)
+          .chain(&package.build_assets)
+          .chain(&package.build_multi_targeting_assets)
+          .chain(&package.build_transitive_assets)
+          .chain(&package.native_assets)
           .map(|path| path.as_os_str().len())
+          .sum::<usize>()
+        + package
+          .runtime_targets
+          .iter()
+          .map(|asset| asset.path.as_os_str().len() + asset.runtime_identifier.len())
           .sum::<usize>()
     })
     .sum::<usize>()
@@ -2911,10 +3390,18 @@ fn materialize_resolution(
   let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
   let mut packages = Vec::with_capacity(work.len());
   let mut package_assets = Vec::with_capacity(work.len());
+  let mut package_extended_assets = Vec::with_capacity(work.len());
   let mut dependencies = Vec::new();
   let mut compile_assets = Vec::new();
   let mut runtime_assets = Vec::new();
   let mut analyzers = Vec::new();
+  let mut resource_assets = Vec::new();
+  let mut content_files = Vec::new();
+  let mut build_assets = Vec::new();
+  let mut build_multi_targeting_assets = Vec::new();
+  let mut build_transitive_assets = Vec::new();
+  let mut native_assets = Vec::new();
+  let mut runtime_targets = Vec::new();
   let mut cache_hits = 0u32;
 
   for package in work.values() {
@@ -2932,6 +3419,24 @@ fn materialize_resolution(
     let compile = push_asset_range(&mut table, &mut compile_assets, &package.compile_assets)?;
     let runtime = push_asset_range(&mut table, &mut runtime_assets, &package.runtime_assets)?;
     let analyzer_range = push_asset_range(&mut table, &mut analyzers, &package.analyzers)?;
+    let resources = push_asset_range(&mut table, &mut resource_assets, &package.resource_assets)?;
+    let content = push_asset_range(&mut table, &mut content_files, &package.content_files)?;
+    let build = push_asset_range(&mut table, &mut build_assets, &package.build_assets)?;
+    let build_multi_targeting = push_asset_range(&mut table, &mut build_multi_targeting_assets, &package.build_multi_targeting_assets)?;
+    let build_transitive = push_asset_range(&mut table, &mut build_transitive_assets, &package.build_transitive_assets)?;
+    let native = push_asset_range(&mut table, &mut native_assets, &package.native_assets)?;
+    let runtime_target_start = u32_len(runtime_targets.len(), "package runtime target range")?;
+    for asset in &package.runtime_targets {
+      runtime_targets.push(RuntimeTargetAsset {
+        path: table.push_path(&asset.path)?,
+        runtime_identifier: table.push(&asset.runtime_identifier)?,
+        kind: asset.kind,
+      });
+    }
+    let runtime_target_range = ItemRange {
+      start: runtime_target_start,
+      len: u32_len(package.runtime_targets.len(), "package runtime target range")?,
+    };
     packages.push(ResolvedPackage {
       id: table.push(&package.request.id)?,
       version: table.push(&package.request.version)?,
@@ -2947,6 +3452,15 @@ fn materialize_resolution(
       runtime,
       analyzers: analyzer_range,
     });
+    package_extended_assets.push(PackageExtendedAssets {
+      resources,
+      content_files: content,
+      build,
+      build_multi_targeting,
+      build_transitive,
+      native,
+      runtime_targets: runtime_target_range,
+    });
     cache_hits += u32::from(package.cache_hit);
   }
 
@@ -2960,10 +3474,18 @@ fn materialize_resolution(
     source_protocol: context.source_protocol,
     packages: packages.into_boxed_slice(),
     package_assets: package_assets.into_boxed_slice(),
+    package_extended_assets: package_extended_assets.into_boxed_slice(),
     dependencies: dependencies.into_boxed_slice(),
     compile_assets: compile_assets.into_boxed_slice(),
     runtime_assets: runtime_assets.into_boxed_slice(),
     analyzers: analyzers.into_boxed_slice(),
+    resource_assets: resource_assets.into_boxed_slice(),
+    content_files: content_files.into_boxed_slice(),
+    build_assets: build_assets.into_boxed_slice(),
+    build_multi_targeting_assets: build_multi_targeting_assets.into_boxed_slice(),
+    build_transitive_assets: build_transitive_assets.into_boxed_slice(),
+    native_assets: native_assets.into_boxed_slice(),
+    runtime_targets: runtime_targets.into_boxed_slice(),
     cache_hits,
     downloaded_packages: work.len() as u32 - cache_hits,
     network_requests,
@@ -2997,10 +3519,18 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     source_protocol: NugetProtocol::V3,
     packages: Box::new([]),
     package_assets: Box::new([]),
+    package_extended_assets: Box::new([]),
     dependencies: Box::new([]),
     compile_assets: Box::new([]),
     runtime_assets: Box::new([]),
     analyzers: Box::new([]),
+    resource_assets: Box::new([]),
+    content_files: Box::new([]),
+    build_assets: Box::new([]),
+    build_multi_targeting_assets: Box::new([]),
+    build_transitive_assets: Box::new([]),
+    native_assets: Box::new([]),
+    runtime_targets: Box::new([]),
     cache_hits: 0,
     downloaded_packages: 0,
     network_requests: 0,
@@ -3068,6 +3598,30 @@ fn read_warm_lock(
     let compile_assets = lock_asset_paths(&root, &package.compile_assets)?;
     let runtime_assets = lock_asset_paths(&root, &package.runtime_assets)?;
     let analyzers = lock_asset_paths(&root, &package.analyzers)?;
+    let resource_assets = lock_asset_paths(&root, &package.resource_assets)?;
+    let content_files = lock_asset_paths(&root, &package.content_files)?;
+    let build_assets = lock_asset_paths(&root, &package.build_assets)?;
+    let build_multi_targeting_assets = lock_asset_paths(&root, &package.build_multi_targeting_assets)?;
+    let build_transitive_assets = lock_asset_paths(&root, &package.build_transitive_assets)?;
+    let native_assets = lock_asset_paths(&root, &package.native_assets)?;
+    let runtime_targets = package
+      .runtime_targets
+      .into_iter()
+      .map(|asset| {
+        if asset.runtime_identifier.is_empty() || asset.runtime_identifier.contains(['/', '\\']) || asset.runtime_identifier.contains("..") {
+          return Err(PackageError::new(
+            PackageErrorKind::Integrity,
+            root.display().to_string(),
+            format!("invalid locked runtime identifier {:?}", asset.runtime_identifier),
+          ));
+        }
+        Ok(WorkRuntimeTarget {
+          path: lock_asset_path(&root, &asset.path)?,
+          runtime_identifier: asset.runtime_identifier,
+          kind: asset.kind,
+        })
+      })
+      .collect::<Result<Vec<_>, PackageError>>()?;
     let dependencies = package
       .dependencies
       .into_iter()
@@ -3090,6 +3644,13 @@ fn read_warm_lock(
           compile_assets,
           runtime_assets,
           analyzers,
+          resource_assets,
+          content_files,
+          build_assets,
+          build_multi_targeting_assets,
+          build_transitive_assets,
+          native_assets,
+          runtime_targets,
           cache_hit: true,
           origin: None,
         },
@@ -3135,29 +3696,34 @@ fn read_warm_lock(
 fn lock_asset_paths(root: &Path, values: &[String]) -> Result<Vec<PathBuf>, PackageError> {
   let mut paths = Vec::with_capacity(values.len());
   for value in values {
-    let relative = Path::new(value);
-    if relative.is_absolute()
-      || relative
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
-    {
-      return Err(PackageError::new(
-        PackageErrorKind::Integrity,
-        root.display().to_string(),
-        format!("lock asset path {value:?} escapes its package"),
-      ));
-    }
-    let path = root.join(relative);
-    if !path.is_file() {
-      return Err(PackageError::new(
-        PackageErrorKind::Integrity,
-        path.display().to_string(),
-        "locked package asset is missing",
-      ));
-    }
-    paths.push(path);
+    paths.push(lock_asset_path(root, value)?);
   }
   Ok(paths)
+}
+
+fn lock_asset_path(root: &Path, value: &str) -> Result<PathBuf, PackageError> {
+  let relative = Path::new(value);
+  if relative.is_absolute()
+    || relative
+      .components()
+      .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+  {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      root.display().to_string(),
+      format!("lock asset path {value:?} escapes its package"),
+    ));
+  }
+  let path = root.join(relative);
+  let virtual_marker = relative.file_name().is_some_and(|name| name == "_._");
+  if !path.is_file() && !virtual_marker {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      path.display().to_string(),
+      "locked package asset is missing",
+    ));
+  }
+  Ok(path)
 }
 
 fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
@@ -3195,6 +3761,22 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
       compile_assets: relative_assets(&root, resolution.package_compile_assets(index))?,
       runtime_assets: relative_assets(&root, resolution.package_runtime_assets(index))?,
       analyzers: relative_assets(&root, resolution.package_analyzers(index))?,
+      resource_assets: relative_assets(&root, resolution.package_resource_assets(index))?,
+      content_files: relative_assets(&root, resolution.package_content_files(index))?,
+      build_assets: relative_assets(&root, resolution.package_build_assets(index))?,
+      build_multi_targeting_assets: relative_assets(&root, resolution.package_build_multi_targeting_assets(index))?,
+      build_transitive_assets: relative_assets(&root, resolution.package_build_transitive_assets(index))?,
+      native_assets: relative_assets(&root, resolution.package_native_assets(index))?,
+      runtime_targets: resolution
+        .package_runtime_targets(index)
+        .map(|asset| {
+          Ok(LockRuntimeTarget {
+            path: relative_asset(&root, resolution.get(asset.path))?,
+            runtime_identifier: resolution.get(asset.runtime_identifier).to_owned(),
+            kind: asset.kind,
+          })
+        })
+        .collect::<Result<Vec<_>, PackageError>>()?,
     });
   }
   let lock = LockFile {
@@ -3231,21 +3813,21 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
 }
 
 fn relative_assets<'a>(root: &Path, assets: impl Iterator<Item = &'a str>) -> Result<Vec<String>, PackageError> {
-  assets
-    .map(|asset| {
-      let path = Path::new(asset);
-      path
-        .strip_prefix(root)
-        .map_err(|_| {
-          PackageError::new(
-            PackageErrorKind::Integrity,
-            path.display().to_string(),
-            "package asset is outside its cache entry",
-          )
-        })
-        .and_then(portable_path)
+  assets.map(|asset| relative_asset(root, asset)).collect()
+}
+
+fn relative_asset(root: &Path, asset: &str) -> Result<String, PackageError> {
+  let path = Path::new(asset);
+  path
+    .strip_prefix(root)
+    .map_err(|_| {
+      PackageError::new(
+        PackageErrorKind::Integrity,
+        path.display().to_string(),
+        "package asset is outside its cache entry",
+      )
     })
-    .collect()
+    .and_then(portable_path)
 }
 
 fn portable_path(path: &Path) -> Result<String, PackageError> {
@@ -3454,6 +4036,8 @@ mod tests {
       lower_id: "grandchild.package".into(),
       range: VersionRange::parse("1.0").unwrap(),
       direct: false,
+      include_assets: AssetFlags::ALL,
+      suppress_parent: AssetFlags::NONE,
     };
     let mut nodes = BTreeMap::from([
       (
@@ -3580,6 +4164,8 @@ mod tests {
       lower_id: "child.package".into(),
       range: VersionRange::parse("1.0").unwrap(),
       direct: false,
+      include_assets: AssetFlags::ALL,
+      suppress_parent: AssetFlags::NONE,
     };
     let mut nodes = BTreeMap::from([
       (
@@ -3713,6 +4299,89 @@ mod tests {
   }
 
   #[test]
+  fn nuspec_dependency_asset_filters_subtract_excludes_from_no_content_default() {
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version><dependencies>
+<group targetFramework="net10.0"><dependency id="Child.Package" version="1.0" exclude="Build,Analyzers" /></group>
+</dependencies></metadata></package>"#;
+
+    let dependencies = parse_nuspec_requirements(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request(),
+      TargetFramework::parse("net10.0").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(dependencies.len(), 1);
+    assert!(dependencies[0].include_assets.contains(AssetFlags::RUNTIME));
+    assert!(dependencies[0].include_assets.contains(AssetFlags::COMPILE));
+    assert!(dependencies[0].include_assets.contains(AssetFlags::BUILD_TRANSITIVE));
+    assert!(!dependencies[0].include_assets.contains(AssetFlags::BUILD));
+    assert!(!dependencies[0].include_assets.contains(AssetFlags::ANALYZERS));
+    assert!(!dependencies[0].include_assets.contains(AssetFlags::CONTENT_FILES));
+    assert_eq!(dependencies[0].suppress_parent, AssetFlags::NONE);
+  }
+
+  #[test]
+  fn package_asset_selection_materializes_every_portable_family() {
+    let temp = TempDirectory::new();
+    temp.write("ref/net10.0/Sample.Package.dll", []);
+    temp.write("lib/net10.0/Sample.Package.dll", []);
+    temp.write("lib/net10.0/de/Sample.Package.resources.dll", []);
+    temp.write("contentFiles/any/any/readme.txt", []);
+    temp.write("build/net10.0/Sample.Package.props", []);
+    temp.write("build/net10.0/Unrelated.props", []);
+    temp.write("buildTransitive/net10.0/Sample.Package.targets", []);
+    temp.write("buildMultiTargeting/Sample.Package.props", []);
+    temp.write("analyzers/dotnet/cs/Generator.dll", []);
+    temp.write("analyzers/dotnet/cs/de/Generator.resources.dll", []);
+    temp.write("analyzers/dotnet/vb/VisualBasic.dll", []);
+    temp.write("runtimes/win/lib/net10.0/Sample.Package.dll", []);
+    temp.write("runtimes/linux-x64/native/libsample.so", []);
+    let cached = CachedPackage {
+      root: temp.0.clone(),
+      hash: BASE64.encode([0u8; 64]),
+      dependencies: None,
+      cache_hit: true,
+      requests: 0,
+      bytes: 0,
+      origin: None,
+    };
+
+    let package = parse_cached_package(
+      request(),
+      cached,
+      TargetFramework::parse("net10.0").unwrap(),
+      "net10.0",
+      Vec::new(),
+      AssetFlags::ALL,
+    )
+    .unwrap();
+
+    assert_eq!(package.compile_assets, [temp.0.join("ref/net10.0/Sample.Package.dll")]);
+    assert_eq!(package.runtime_assets, [temp.0.join("lib/net10.0/Sample.Package.dll")]);
+    assert_eq!(package.resource_assets, [temp.0.join("lib/net10.0/de/Sample.Package.resources.dll")]);
+    assert_eq!(package.content_files, [temp.0.join("contentFiles/any/any/readme.txt")]);
+    assert_eq!(package.build_assets, [temp.0.join("build/net10.0/Sample.Package.props")]);
+    assert_eq!(package.build_transitive_assets, [temp.0.join("buildTransitive/net10.0/Sample.Package.targets")]);
+    assert_eq!(package.build_multi_targeting_assets, [temp.0.join("buildMultiTargeting/Sample.Package.props")]);
+    assert_eq!(package.analyzers, [temp.0.join("analyzers/dotnet/cs/Generator.dll")]);
+    assert_eq!(package.runtime_targets.len(), 2);
+    assert!(
+      package
+        .runtime_targets
+        .iter()
+        .any(|asset| asset.kind == RuntimeTargetKind::Runtime && asset.runtime_identifier == "win")
+    );
+    assert!(
+      package
+        .runtime_targets
+        .iter()
+        .any(|asset| asset.kind == RuntimeTargetKind::Native && asset.runtime_identifier == "linux-x64")
+    );
+  }
+
+  #[test]
   fn dependency_only_meta_package_is_a_valid_graph_node() {
     let temp = TempDirectory::new();
     temp.write(
@@ -3742,6 +4411,7 @@ mod tests {
         version: "1.0.0".into(),
         direct: false,
       }],
+      AssetFlags::ALL,
     )
     .unwrap();
 
@@ -3857,7 +4527,10 @@ mod tests {
     temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512", BASE64.encode([0u8; 64]));
     temp.write("packages/sample.package/1.2.3/.dv.metadata.json", "{}");
     temp.write("packages/sample.package/1.2.3/lib/net6.0/Sample.Package.dll", []);
+    temp.write("packages/sample.package/1.2.3/lib/net6.0/de/Sample.Package.resources.dll", []);
     temp.write("packages/sample.package/1.2.3/lib/net10.0/Sample.Package.dll", []);
+    temp.write("packages/sample.package/1.2.3/build/net6.0/Sample.Package.props", []);
+    temp.write("packages/sample.package/1.2.3/runtimes/win/lib/net6.0/Sample.Package.dll", []);
     let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let options = PackageResolveOptions {
       packages_directory: Some(cache),
@@ -3874,6 +4547,16 @@ mod tests {
     assert_eq!(second.network_requests(), 0);
     assert_eq!(second.cache_hits(), 1);
     assert_eq!(second.compile_assets().collect::<Vec<_>>(), [root.join("lib/net6.0/Sample.Package.dll")]);
+    assert_eq!(
+      second.resource_assets().collect::<Vec<_>>(),
+      [root.join("lib/net6.0/de/Sample.Package.resources.dll")]
+    );
+    assert_eq!(second.build_assets().collect::<Vec<_>>(), [root.join("build/net6.0/Sample.Package.props")]);
+    let runtime_target = root.join("runtimes/win/lib/net6.0/Sample.Package.dll");
+    assert_eq!(
+      second.runtime_targets().collect::<Vec<_>>(),
+      [(runtime_target.as_path(), "win", RuntimeTargetKind::Runtime)]
+    );
   }
 
   #[test]

@@ -2,10 +2,10 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Diagnostic;
+use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 1;
+pub const EVENT_SCHEMA_VERSION: u16 = 2;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,6 +68,17 @@ pub struct SdkInstallationEvent {
   pub path: String,
   /// Whether this record was selected.
   pub selected: bool,
+}
+
+/// One RID-specific package runtime target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeTargetEvent {
+  /// Full selected asset path.
+  pub path: String,
+  /// Runtime identifier associated with the asset.
+  pub runtime_identifier: String,
+  /// Whether the target is managed runtime code or native code.
+  pub kind: RuntimeTargetKind,
 }
 
 /// One exact package dependency materialized at the reporter boundary.
@@ -254,6 +265,22 @@ pub enum EventPayload {
     compile_assets: Vec<String>,
     /// Ordered runtime assemblies selected for the evaluated target.
     runtime_assets: Vec<String>,
+    /// Ordered package analyzers.
+    analyzers: Vec<String>,
+    /// Ordered satellite resource assemblies.
+    resource_assets: Vec<String>,
+    /// Ordered package content files.
+    content_files: Vec<String>,
+    /// Ordered inner-build imports from `build`.
+    build_assets: Vec<String>,
+    /// Ordered outer-build imports from `buildMultiTargeting`.
+    build_multi_targeting_assets: Vec<String>,
+    /// Ordered transitive imports from `buildTransitive`.
+    build_transitive_assets: Vec<String>,
+    /// Ordered legacy native assets.
+    native_assets: Vec<String>,
+    /// Ordered RID-specific managed and native targets.
+    runtime_targets: Vec<RuntimeTargetEvent>,
     /// Packages reused from the cache.
     cache_hits: u32,
     /// Packages downloaded and atomically published.

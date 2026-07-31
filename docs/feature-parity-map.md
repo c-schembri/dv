@@ -736,9 +736,14 @@ boundary, not final drop-in parity.
   remain incomplete. `P1`
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
-  `buildTransitive` assets by TFM/RID and metadata. The massive acceptance
-  fixture keeps `dv` at `TBI` until these asset families are handled without
-  weakening build correctness. `P2`
+  `buildTransitive` assets by compatible TFM and NuGet include/exclude
+  propagation. Lock schema 3 and event schema 2 preserve every selected family
+  in compact per-package ranges. The 203-package massive acceptance graph now
+  matches `project.assets.json` across portable asset paths and runtime-target
+  RID/type metadata and is benchmarked end to end. Selecting one concrete RID
+  still depends on `EVAL-022` and `PACKS-005`; `contentFiles` build-action,
+  copy, and flatten metadata remain. `P2`
+  See `issues/0007-package-content-metadata-and-rid-selection.md`.
 - [~] `RES-012` .NET 10 package pruning reads the selected SDK's
   `PrunePackageData` or matching reference-pack `PackageOverrides.txt`, applies
   the SDK's stable patch ceiling, retracts pruned graph edges, and fingerprints

@@ -215,7 +215,7 @@ const DV_CASES: &[Case] = &[
     name: "package_graph_massive",
     kind: CaseKind::PackageGraphMassive,
     args: &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--json"],
-    implemented: false,
+    implemented: true,
   },
   Case {
     name: "build_clean",
@@ -297,7 +297,7 @@ struct Statistics {
   max: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkEvidence {
   network_requests: Option<u64>,
   downloaded_bytes: Option<u64>,
@@ -351,6 +351,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_graph_massive") {
+    verify_package_sync(&repository, &dv_executable, &massive_package_graph_fixture, "MassivePackageGraph.csproj", 203)?;
   }
 
   let mut runs = run_tool("dotnet", Path::new("dotnet"), DOTNET_CASES, &options, &fixtures, &workspace.join("dotnet"))?;
@@ -539,6 +542,7 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, 
       "--packages",
       ".packages",
       "--no-http-cache",
+      "-p:NuGetAudit=false",
       "--nologo",
       "--verbosity",
       "quiet",
@@ -662,6 +666,138 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, 
         "package compile asset batch differs: dotnet={} dv={}",
         reference_compile.len(),
         actual_compile.len()
+      )
+      .into(),
+    );
+  }
+  let mut reference_analyzers = Vec::new();
+  for (identity, library) in reference_libraries {
+    if library.get("type").and_then(serde_json::Value::as_str) != Some("package") {
+      continue;
+    }
+    let (id, version) = identity
+      .split_once('/')
+      .ok_or_else(|| format!("dotnet package identity {identity:?} omitted its version"))?;
+    for asset in library
+      .get("files")
+      .and_then(serde_json::Value::as_array)
+      .into_iter()
+      .flatten()
+      .filter_map(serde_json::Value::as_str)
+    {
+      let lower = asset.to_ascii_lowercase();
+      if lower.starts_with("analyzers/") && lower.ends_with(".dll") && !lower.ends_with(".resources.dll") && !lower.contains("/dotnet/vb/") {
+        reference_analyzers.push(format!("{}/{}/{}", id.to_ascii_lowercase(), version.to_ascii_lowercase(), asset));
+      }
+    }
+  }
+  reference_analyzers.sort_unstable();
+  let mut actual_analyzers = string_array(&dv, "analyzers")?
+    .into_iter()
+    .map(|path| package_relative_path(&path))
+    .collect::<Result<Vec<_>>>()?;
+  actual_analyzers.sort_unstable();
+  if reference_analyzers != actual_analyzers {
+    let reference_only = reference_analyzers.iter().find(|asset| actual_analyzers.binary_search(asset).is_err());
+    let actual_only = actual_analyzers.iter().find(|asset| reference_analyzers.binary_search(asset).is_err());
+    return Err(
+      format!(
+        "package analyzer batch differs: dotnet={} dv={} first_dotnet_only={reference_only:?} first_dv_only={actual_only:?}",
+        reference_analyzers.len(),
+        actual_analyzers.len()
+      )
+      .into(),
+    );
+  }
+  compare_package_asset_family(target, &dv, "runtime", &["runtime_assets"], false)?;
+  compare_package_asset_family(target, &dv, "resource", &["resource_assets"], false)?;
+  compare_package_asset_family(target, &dv, "contentFiles", &["content_files"], true)?;
+  compare_package_asset_family(target, &dv, "build", &["build_assets", "build_transitive_assets"], true)?;
+  compare_package_asset_family(target, &dv, "buildMultiTargeting", &["build_multi_targeting_assets"], true)?;
+  compare_package_asset_family(target, &dv, "native", &["native_assets"], true)?;
+  let mut actual_runtime_targets = dv
+    .get("runtime_targets")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv sync omitted runtime_targets")?
+    .iter()
+    .map(|asset| {
+      let path = asset.get("path").and_then(serde_json::Value::as_str).ok_or("dv runtime target omitted path")?;
+      let rid = asset
+        .get("runtime_identifier")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("dv runtime target omitted runtime_identifier")?;
+      let kind = asset.get("kind").and_then(serde_json::Value::as_str).ok_or("dv runtime target omitted kind")?;
+      Ok((package_relative_path(path)?, rid.to_owned(), kind.to_owned()))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  actual_runtime_targets.sort_unstable();
+  let mut reference_runtime_targets = Vec::new();
+  for (identity, package) in target {
+    let Some(assets) = package.get("runtimeTargets").and_then(serde_json::Value::as_object) else {
+      continue;
+    };
+    let (id, version) = identity
+      .split_once('/')
+      .ok_or_else(|| format!("dotnet target identity {identity:?} omitted its version"))?;
+    for (path, metadata) in assets {
+      let rid = metadata.get("rid").and_then(serde_json::Value::as_str).unwrap_or_default();
+      let kind = metadata.get("assetType").and_then(serde_json::Value::as_str).unwrap_or_default();
+      reference_runtime_targets.push((
+        format!("{}/{}/{}", id.to_ascii_lowercase(), version.to_ascii_lowercase(), path),
+        rid.to_owned(),
+        kind.to_owned(),
+      ));
+    }
+  }
+  reference_runtime_targets.sort_unstable();
+  if reference_runtime_targets != actual_runtime_targets {
+    return Err(
+      format!(
+        "package runtimeTargets differ: dotnet={} dv={}",
+        reference_runtime_targets.len(),
+        actual_runtime_targets.len()
+      )
+      .into(),
+    );
+  }
+  Ok(())
+}
+
+fn compare_package_asset_family(
+  target: &serde_json::Map<String, serde_json::Value>,
+  dv: &serde_json::Value,
+  reference_field: &str,
+  actual_fields: &[&str],
+  include_placeholders: bool,
+) -> Result<()> {
+  let mut reference = Vec::new();
+  for (identity, package) in target {
+    let Some(assets) = package.get(reference_field).and_then(serde_json::Value::as_object) else {
+      continue;
+    };
+    let (id, version) = identity
+      .split_once('/')
+      .ok_or_else(|| format!("dotnet target identity {identity:?} omitted its version"))?;
+    for asset in assets.keys().filter(|asset| include_placeholders || !asset.ends_with("/_._")) {
+      reference.push(format!("{}/{}/{}", id.to_ascii_lowercase(), version.to_ascii_lowercase(), asset));
+    }
+  }
+  reference.sort_unstable();
+  let mut actual = Vec::new();
+  for field in actual_fields {
+    for path in string_array(dv, field)? {
+      actual.push(package_relative_path(&path)?);
+    }
+  }
+  actual.sort_unstable();
+  if reference != actual {
+    let reference_only = reference.iter().find(|asset| actual.binary_search(asset).is_err());
+    let actual_only = actual.iter().find(|asset| reference.binary_search(asset).is_err());
+    return Err(
+      format!(
+        "package {reference_field} asset batch differs: dotnet={} dv={} first_dotnet_only={reference_only:?} first_dv_only={actual_only:?}",
+        reference.len(),
+        actual.len()
       )
       .into(),
     );
@@ -977,7 +1113,11 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let output = Command::new(executable).args(case.args).current_dir(cwd).output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
   check_output(output.clone(), executable, case.args, "measured command")?;
-  let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageSyncWarm) {
+  let work = if !is_dotnet(executable)
+    && matches!(
+      case.kind,
+      CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackageSyncWarm
+    ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
     Some(reference_package_work(cwd)?)
@@ -1065,11 +1205,23 @@ fn merge_work_evidence(current: &mut Option<WorkEvidence>, observed: Option<Work
   let Some(observed) = observed else {
     return Ok(());
   };
-  if current.is_some_and(|current| current != observed) {
-    return Err(format!("{tool} {case} reported inconsistent package, request, or byte counts across retained samples").into());
+  if let Some(previous) = current {
+    if previous.resolved_packages != observed.resolved_packages || previous.downloaded_packages != observed.downloaded_packages {
+      return Err(format!("{tool} {case} reported inconsistent package counts across retained samples: previous={previous:?} observed={observed:?}").into());
+    }
+    previous.network_requests = max_optional(previous.network_requests, observed.network_requests);
+    previous.downloaded_bytes = max_optional(previous.downloaded_bytes, observed.downloaded_bytes);
+  } else {
+    *current = Some(observed);
   }
-  *current = Some(observed);
   Ok(())
+}
+
+fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+  match (left, right) {
+    (Some(left), Some(right)) => Some(left.max(right)),
+    _ => None,
+  }
 }
 
 fn run_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
@@ -1242,7 +1394,7 @@ fn render_summary(report: &Report, color: bool) -> String {
         (_, Some(resolved), Some(downloaded), Some(requests), Some(bytes)) => {
           let package_label = if resolved == 1 { "package" } else { "packages" };
           format!(
-            "{} resolved {package_label} · {} downloaded · {requests} HTTP requests · {} payload bytes",
+            "{} resolved {package_label} · {} downloaded · max {requests} HTTP requests · max {} payload bytes",
             format_integer(resolved),
             format_integer(downloaded),
             format_integer(bytes)
@@ -1251,7 +1403,7 @@ fn render_summary(report: &Report, color: bool) -> String {
         (_, Some(resolved), Some(downloaded), None, Some(bytes)) => {
           let package_label = if resolved == 1 { "package" } else { "packages" };
           format!(
-            "{} resolved {package_label} · {} downloaded · HTTP requests not exposed · {} payload bytes",
+            "{} resolved {package_label} · {} downloaded · HTTP requests not exposed · max {} payload bytes",
             format_integer(resolved),
             format_integer(downloaded),
             format_integer(bytes)
@@ -1508,7 +1660,7 @@ mod tests {
     let output = render_summary(&report, false);
 
     assert!(output.contains("Cold dependency readiness"));
-    assert!(output.contains("1 resolved package · 1 downloaded · 2 HTTP requests · 2,441,966 payload bytes"));
+    assert!(output.contains("1 resolved package · 1 downloaded · max 2 HTTP requests · max 2,441,966 payload bytes"));
     assert!(output.find("Observed work").unwrap() < output.find("Commands").unwrap());
   }
 
@@ -1530,6 +1682,32 @@ mod tests {
 
     assert_eq!(evidence.resolved_packages, Some(2));
     assert_eq!(evidence.downloaded_packages, Some(2));
+  }
+
+  #[test]
+  fn retained_network_evidence_keeps_the_largest_observed_work() {
+    let mut evidence = Some(WorkEvidence {
+      network_requests: Some(208),
+      downloaded_bytes: Some(165_000_000),
+      downloaded_packages: Some(203),
+      resolved_packages: Some(203),
+    });
+
+    merge_work_evidence(
+      &mut evidence,
+      Some(WorkEvidence {
+        network_requests: Some(210),
+        downloaded_bytes: Some(168_000_000),
+        downloaded_packages: Some(203),
+        resolved_packages: Some(203),
+      }),
+      "dv",
+      "package_graph_massive",
+    )
+    .unwrap();
+
+    assert_eq!(evidence.unwrap().network_requests, Some(210));
+    assert_eq!(evidence.unwrap().downloaded_bytes, Some(168_000_000));
   }
 
   #[test]

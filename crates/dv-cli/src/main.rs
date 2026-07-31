@@ -10,7 +10,7 @@ use std::{
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, PackageError,
   PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec,
-  ResolvedPackageEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path,
+  ResolvedPackageEvent, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path,
   plan_compiler_inputs_with_packages, resolve_package_inputs, write_json_lines,
 };
 
@@ -361,6 +361,21 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
     packages,
     compile_assets: resolution.compile_assets().map(|path| path.display().to_string()).collect(),
     runtime_assets: resolution.runtime_assets().map(|path| path.display().to_string()).collect(),
+    analyzers: resolution.analyzers().map(|path| path.display().to_string()).collect(),
+    resource_assets: resolution.resource_assets().map(|path| path.display().to_string()).collect(),
+    content_files: resolution.content_files().map(|path| path.display().to_string()).collect(),
+    build_assets: resolution.build_assets().map(|path| path.display().to_string()).collect(),
+    build_multi_targeting_assets: resolution.build_multi_targeting_assets().map(|path| path.display().to_string()).collect(),
+    build_transitive_assets: resolution.build_transitive_assets().map(|path| path.display().to_string()).collect(),
+    native_assets: resolution.native_assets().map(|path| path.display().to_string()).collect(),
+    runtime_targets: resolution
+      .runtime_targets()
+      .map(|(path, runtime_identifier, kind)| RuntimeTargetEvent {
+        path: path.display().to_string(),
+        runtime_identifier: runtime_identifier.to_owned(),
+        kind,
+      })
+      .collect(),
     cache_hits: resolution.cache_hits(),
     downloaded_packages: resolution.downloaded_packages(),
     network_requests: resolution.network_requests(),
@@ -379,6 +394,15 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   writeln!(output, "  Payload bytes  {}", resolution.downloaded_bytes()).expect("writing a String succeeds");
   writeln!(output, "  Compile assets {}", resolution.compile_assets().len()).expect("writing a String succeeds");
   writeln!(output, "  Runtime assets {}", resolution.runtime_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Resource assets {}", resolution.resource_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Content files   {}", resolution.content_files().len()).expect("writing a String succeeds");
+  writeln!(
+    output,
+    "  Build imports   {}",
+    resolution.build_assets().len() + resolution.build_transitive_assets().len()
+  )
+  .expect("writing a String succeeds");
+  writeln!(output, "  Runtime targets {}", resolution.runtime_targets().len()).expect("writing a String succeeds");
   writeln!(output, "  Target         {}", resolution.target_framework()).expect("writing a String succeeds");
   writeln!(output, "  Source         {} ({})", resolution.source(), resolution.source_protocol()).expect("writing a String succeeds");
   writeln!(output, "  Cache          {}", resolution.cache_root().display()).expect("writing a String succeeds");

@@ -57,7 +57,7 @@ Invalid input behavior:
 | `restore_cold` | fresh fixture copy | restore |
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
-| `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload; `dv` remains `TBI` until its asset contracts cover the graph |
+| `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload with package and portable-asset oracle comparison |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
@@ -82,7 +82,7 @@ directional decisions.`
 | `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
-| `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 downloaded archives, 197,860,237 payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | reference executable; `dv` TBI |
+| `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | package workload captured; project-graph shape still pending |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
