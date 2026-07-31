@@ -20,14 +20,14 @@ dv project inspect              3.846 ms median
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
-dotnet restore (cold deps)     916.034 ms median
-dv restore (cold deps)         353.981 ms median
+dotnet restore (cold deps)     994.180 ms median
+dv restore (cold deps)         400.814 ms median
 
-dotnet restore (50 packages)  1243.644 ms median
-dv restore (50 packages)       562.799 ms median
+dotnet restore (50 packages)  1350.559 ms median
+dv restore (50 packages)       581.450 ms median
 
-dotnet restore (warm locked)   456.544 ms median
-dv restore (warm locked)         5.155 ms median
+dotnet restore (warm locked)   498.177 ms median
+dv restore (warm locked)         5.881 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK and the same evaluated
@@ -164,9 +164,9 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
-| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 916.034 ms | 353.981 ms | 2.6x | 955.827 ms | 443.317 ms |
-| Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1243.644 ms | 562.799 ms | 2.2x | 1433.290 ms | 660.337 ms |
-| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 456.544 ms | 5.155 ms | 88.6x | 481.635 ms | 7.208 ms |
+| Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 994.180 ms | 400.814 ms | 2.5x | 1048.203 ms | 634.719 ms |
+| Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1350.559 ms | 581.450 ms | 2.3x | 1401.944 ms | 641.654 ms |
+| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 498.177 ms | 5.881 ms | 84.7x | 508.203 ms | 7.601 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
@@ -187,8 +187,19 @@ real 50-package closure. `dv` reported 50 package downloads, 51 HTTP requests,
 and 3,241,550 payload bytes per retained sample. This case emphasizes graph
 expansion and scheduling across many small archives rather than bandwidth.
 Streaming dependency discovery, a measured sixteen-worker crossover, and
-removal of redundant staging I/O reduced the `dv` median from 904.097 ms to
-562.799 ms.
+removal of redundant staging I/O reduced the scoped-worker `dv` median from
+904.097 ms to 562.799 ms. The current bounded Tokio scheduler measures
+581.450 ms under the latest low-latency run and has separate congested-network
+A/B evidence in the package baseline.
+
+The massive acceptance fixture unions 51 direct package references from
+Microsoft's eShop application into one `net10.0` restore workload. The .NET
+SDK selected 203 packages and populated 272 package archives totaling
+197,860,237 bytes. A five-sample cold reference run measured 10,079.053 ms
+median and 11,241.686 ms p95. `dv` is intentionally reported as `TBI`: its
+current minimum-range convergence and `build`/`runtimes` asset contracts do
+not yet cover this graph, so this result is not promoted into the
+like-for-like table.
 
 The warm one-shot target for lightweight commands on this machine is `5 ms`
 end to end. It is a local engineering budget, not a universal Windows
@@ -202,6 +213,7 @@ cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
+cargo bench-all --case package_graph_massive --samples 5 --warmups 1
 cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 

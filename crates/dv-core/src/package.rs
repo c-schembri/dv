@@ -3,10 +3,10 @@ use std::{
   env,
   error::Error,
   fmt, fs,
-  io::{self, Read, Write},
+  io::{self, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
-  sync::{Mutex, OnceLock, mpsc::sync_channel},
+  sync::Arc,
   thread,
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +15,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{Reader, XmlVersion, events::Event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use tokio::{io::AsyncWriteExt, task::JoinSet};
 use zip::ZipArchive;
 
 use crate::{FrameworkFamily, ProjectSpec, TargetFramework};
@@ -25,7 +26,8 @@ const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
-const MAX_DOWNLOAD_WORKERS: usize = 16;
+const MAX_DOWNLOAD_WORKERS: usize = 24;
+const ASYNC_RUNTIME_WORKERS: usize = 2;
 const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
@@ -454,8 +456,13 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     return Ok(resolution);
   }
 
-  let agent = http_agent();
-  let graph = resolve_streaming_graph(&agent, &direct, &config, options, target, target_text)?;
+  let client = http_client()?;
+  let runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(ASYNC_RUNTIME_WORKERS)
+    .enable_all()
+    .build()
+    .map_err(|error| PackageError::new(PackageErrorKind::Io, "package scheduler", format!("failed to create async runtime: {error}")))?;
+  let graph = runtime.block_on(resolve_streaming_graph(&client, &direct, &config, options, target, target_text))?;
   let resolved = graph.packages;
 
   validate_acyclic(&resolved)?;
@@ -699,11 +706,15 @@ fn config_error(path: &Path, message: impl Into<String>) -> PackageError {
   PackageError::new(PackageErrorKind::Configuration, path.display().to_string(), message)
 }
 
-fn http_agent() -> ureq::Agent {
-  ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60))).build().into()
+fn http_client() -> Result<reqwest::Client, PackageError> {
+  reqwest::Client::builder()
+    .https_only(true)
+    .timeout(Duration::from_secs(60))
+    .build()
+    .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
 }
 
-fn discover_service_endpoints(agent: &ureq::Agent, sources: &[PackageSource]) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
+async fn discover_service_endpoints(client: &reqwest::Client, sources: &[PackageSource]) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
   let mut endpoints = Vec::with_capacity(sources.len());
   let mut requests = 0;
   for source in sources {
@@ -713,7 +724,7 @@ fn discover_service_endpoints(agent: &ureq::Agent, sources: &[PackageSource]) ->
         base: with_trailing_slash(source.url.clone()),
       }),
       NugetProtocol::V3 => {
-        let document: serde_json::Value = get_json(agent, &source.url)?;
+        let document: serde_json::Value = get_json(client, &source.url).await?;
         requests += 1;
         endpoints.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
@@ -759,8 +770,8 @@ fn with_trailing_slash(mut value: String) -> String {
   value
 }
 
-fn resolve_streaming_graph(
-  agent: &ureq::Agent,
+async fn resolve_streaming_graph(
+  client: &reqwest::Client,
   direct: &[PackageRequest],
   config: &NugetConfiguration,
   options: &PackageResolveOptions,
@@ -770,110 +781,83 @@ fn resolve_streaming_graph(
   let mut known: BTreeMap<String, PackageRequest> = direct.iter().cloned().map(|request| (request.lower_id.clone(), request)).collect();
   let mut ready = known.clone();
   let mut resolved = BTreeMap::<String, WorkPackage>::new();
-  let endpoints = OnceLock::<Vec<ServiceEndpoint>>::new();
+  let mut endpoints: Option<Arc<[ServiceEndpoint]>> = None;
   let mut network_requests = 0;
   let mut downloaded_bytes = 0;
-  let (task_sender, task_receiver) = sync_channel::<(PackageRequest, bool)>(MAX_DOWNLOAD_WORKERS);
-  let (result_sender, result_receiver) = sync_channel::<(PackageRequest, Result<CachedPackage, PackageError>)>(MAX_DOWNLOAD_WORKERS);
-  let task_receiver = Mutex::new(task_receiver);
+  let mut tasks = JoinSet::new();
   let mut cache_root_ready = config.cache_root.is_dir();
 
-  thread::scope(|scope| {
-    for _ in 0..MAX_DOWNLOAD_WORKERS {
-      let worker_agent = agent.clone();
-      let task_receiver = &task_receiver;
-      let result_sender = result_sender.clone();
-      let endpoints = &endpoints;
-      let cache_root = &config.cache_root;
-      scope.spawn(move || {
-        loop {
-          let task = {
-            let receiver = task_receiver.lock().expect("package task queue is not poisoned");
-            receiver.recv()
-          };
-          let Ok((request, parallel_extract)) = task else {
-            break;
-          };
-          let discovered = endpoints.get().map(Vec::as_slice).unwrap_or(&[]);
-          let result = ensure_package(&worker_agent, &request, cache_root, discovered, target, parallel_extract);
-          if result_sender.send((request, result)).is_err() {
-            break;
-          }
-        }
+  while !ready.is_empty() || !tasks.is_empty() {
+    while tasks.len() < MAX_DOWNLOAD_WORKERS
+      && let Some((_, request)) = ready.pop_first()
+    {
+      let cache_miss = !package_root(&config.cache_root, &request).exists();
+      if cache_miss && options.offline {
+        return Err(PackageError::new(
+          PackageErrorKind::OfflineMiss,
+          format!("{} {}", request.id, request.version),
+          format!("package {} {} is not available in the global package cache", request.id, request.version),
+        ));
+      }
+      if cache_miss && !cache_root_ready {
+        fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
+        cache_root_ready = true;
+      }
+      if cache_miss && endpoints.is_none() {
+        let (discovered, requests) = discover_service_endpoints(client, &config.sources).await?;
+        network_requests += requests;
+        endpoints = Some(discovered.into());
+      }
+
+      let task_client = client.clone();
+      let task_cache_root = config.cache_root.clone();
+      let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let parallel_extract = tasks.is_empty() && ready.is_empty();
+      tasks.spawn(async move {
+        let result = ensure_package(&task_client, &request, &task_cache_root, &task_endpoints, target, parallel_extract).await;
+        (request, result)
       });
     }
-    drop(result_sender);
 
-    let mut active = 0;
-    while !ready.is_empty() || active > 0 {
-      while active < MAX_DOWNLOAD_WORKERS
-        && let Some((_, request)) = ready.pop_first()
-      {
-        let cache_miss = !package_root(&config.cache_root, &request).exists();
-        if cache_miss && options.offline {
+    let (request, cached) = tasks.join_next().await.ok_or_else(package_worker_stopped)?.map_err(|error| {
+      PackageError::new(
+        PackageErrorKind::Io,
+        "package scheduler",
+        format!("package task stopped before the graph completed: {error}"),
+      )
+    })?;
+    let cached = cached?;
+    network_requests += cached.requests;
+    downloaded_bytes += cached.bytes;
+    let parsed = parse_cached_package(request.clone(), cached, target, target_text)?;
+    for dependency in &parsed.dependencies {
+      match known.get_mut(&dependency.lower_id) {
+        Some(existing) if existing.version != dependency.version => {
+          let (lower, upper) = if existing.version <= dependency.version {
+            (&existing.version, &dependency.version)
+          } else {
+            (&dependency.version, &existing.version)
+          };
           return Err(PackageError::new(
-            PackageErrorKind::OfflineMiss,
-            format!("{} {}", request.id, request.version),
-            format!("package {} {} is not available in the global package cache", request.id, request.version),
+            PackageErrorKind::Resolution,
+            &dependency.id,
+            format!("package {} requires conflicting exact versions {lower} and {upper}", dependency.id),
           ));
-        }
-        if cache_miss && !cache_root_ready {
-          fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
-          cache_root_ready = true;
-        }
-        if cache_miss && endpoints.get().is_none() {
-          let (discovered, requests) = discover_service_endpoints(agent, &config.sources)?;
-          network_requests += requests;
-          if endpoints.set(discovered).is_err() {
-            return Err(PackageError::new(
-              PackageErrorKind::Resolution,
-              "package scheduler",
-              "NuGet service endpoints were initialized more than once",
-            ));
-          }
-        }
-
-        let parallel_extract = active == 0 && ready.is_empty();
-        task_sender.send((request, parallel_extract)).map_err(|_| package_worker_stopped())?;
-        active += 1;
+        },
+        Some(existing) => existing.direct |= dependency.direct,
+        None => {
+          known.insert(dependency.lower_id.clone(), dependency.clone());
+          ready.insert(dependency.lower_id.clone(), dependency.clone());
+        },
       }
-
-      let (request, cached) = result_receiver.recv().map_err(|_| package_worker_stopped())?;
-      active -= 1;
-      let cached = cached?;
-      network_requests += cached.requests;
-      downloaded_bytes += cached.bytes;
-      let parsed = parse_cached_package(request.clone(), cached, target, target_text)?;
-      for dependency in &parsed.dependencies {
-        match known.get_mut(&dependency.lower_id) {
-          Some(existing) if existing.version != dependency.version => {
-            let (lower, upper) = if existing.version <= dependency.version {
-              (&existing.version, &dependency.version)
-            } else {
-              (&dependency.version, &existing.version)
-            };
-            return Err(PackageError::new(
-              PackageErrorKind::Resolution,
-              &dependency.id,
-              format!("package {} requires conflicting exact versions {lower} and {upper}", dependency.id),
-            ));
-          },
-          Some(existing) => existing.direct |= dependency.direct,
-          None => {
-            known.insert(dependency.lower_id.clone(), dependency.clone());
-            ready.insert(dependency.lower_id.clone(), dependency.clone());
-          },
-        }
-      }
-      resolved.insert(request.lower_id, parsed);
     }
+    resolved.insert(request.lower_id, parsed);
+  }
 
-    drop(task_sender);
-    Ok(ResolvedGraph {
-      packages: resolved,
-      network_requests,
-      downloaded_bytes,
-    })
+  Ok(ResolvedGraph {
+    packages: resolved,
+    network_requests,
+    downloaded_bytes,
   })
 }
 
@@ -885,8 +869,8 @@ fn package_worker_stopped() -> PackageError {
   )
 }
 
-fn ensure_package(
-  agent: &ureq::Agent,
+async fn ensure_package(
+  client: &reqwest::Client,
   request: &PackageRequest,
   cache_root: &Path,
   endpoints: &[ServiceEndpoint],
@@ -895,11 +879,14 @@ fn ensure_package(
 ) -> Result<CachedPackage, PackageError> {
   let root = package_root(cache_root, request);
   if root.exists() {
-    return validate_cached_package(&root, request, true, 0, 0);
+    let request = request.clone();
+    return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true, 0, 0))
+      .await
+      .map_err(package_blocking_task_error)?;
   }
   let mut last_error = None;
   for endpoint in endpoints {
-    match download_and_publish(agent, request, cache_root, endpoint, target, parallel_extract) {
+    match download_and_publish(client, request, cache_root, endpoint, target, parallel_extract).await {
       Ok(package) => return Ok(package),
       Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
       Err(error) => return Err(error),
@@ -925,8 +912,23 @@ struct PackageMetadata {
   requests: u32,
 }
 
-fn download_and_publish(
-  agent: &ureq::Agent,
+/// Owned handoff from async network/file streaming to bounded blocking archive work.
+struct DownloadedPackage {
+  request: PackageRequest,
+  cache_root: PathBuf,
+  endpoint: ServiceEndpoint,
+  temp_root: PathBuf,
+  nupkg_name: String,
+  nupkg_path: PathBuf,
+  hash: String,
+  bytes: u64,
+  requests: u32,
+  target: TargetFramework,
+  parallel_extract: bool,
+}
+
+async fn download_and_publish(
+  client: &reqwest::Client,
   request: &PackageRequest,
   cache_root: &Path,
   endpoint: &ServiceEndpoint,
@@ -934,7 +936,7 @@ fn download_and_publish(
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
   let metadata = match endpoint {
-    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(agent, request, base)?,
+    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, request, base).await?,
     ServiceEndpoint::V3 { package_base, .. } => v3_package_metadata(request, package_base),
   };
   if let Some(size) = metadata.expected_size
@@ -948,11 +950,13 @@ fn download_and_publish(
   }
 
   let temp_root = unique_temp_root(cache_root, request);
-  fs::create_dir(&temp_root).map_err(|error| package_io("create package staging directory", &temp_root, error))?;
-  let mut guard = TempGuard(Some(temp_root.clone()));
+  tokio::fs::create_dir(&temp_root)
+    .await
+    .map_err(|error| package_io("create package staging directory", &temp_root, error))?;
+  let guard = TempGuard(Some(temp_root.clone()));
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
   let nupkg_path = temp_root.join(&nupkg_name);
-  let (hash, bytes) = download_package(agent, &metadata.content_url, &nupkg_path)?;
+  let (hash, bytes) = download_package(client, &metadata.content_url, &nupkg_path).await?;
   if let Some(expected) = metadata.expected_size
     && bytes != expected
   {
@@ -971,47 +975,70 @@ fn download_and_publish(
       "downloaded package SHA-512 does not match source metadata",
     ));
   }
-  validate_and_extract_archive(&nupkg_path, &temp_root, parallel_extract)?;
-  normalize_nuspec_name(&temp_root, request)?;
-  let nuspec_path = temp_root.join(format!("{}.nuspec", request.lower_id));
+  let downloaded = DownloadedPackage {
+    request: request.clone(),
+    cache_root: cache_root.to_owned(),
+    endpoint: endpoint.clone(),
+    temp_root,
+    nupkg_name,
+    nupkg_path,
+    hash,
+    bytes,
+    requests: metadata.requests + 1,
+    target,
+    parallel_extract,
+  };
+  tokio::task::spawn_blocking(move || finish_download_and_publish(downloaded, guard))
+    .await
+    .map_err(package_blocking_task_error)?
+}
+
+fn finish_download_and_publish(downloaded: DownloadedPackage, mut guard: TempGuard) -> Result<CachedPackage, PackageError> {
+  validate_and_extract_archive(&downloaded.nupkg_path, &downloaded.temp_root, downloaded.parallel_extract)?;
+  normalize_nuspec_name(&downloaded.temp_root, &downloaded.request)?;
+  let nuspec_path = downloaded.temp_root.join(format!("{}.nuspec", downloaded.request.lower_id));
   let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-  let dependencies = parse_nuspec(&nuspec_path, &nuspec, request, target)?;
-  fs::write(temp_root.join(format!("{nupkg_name}.sha512")), hash.as_bytes()).map_err(|error| package_io("write package hash", &temp_root, error))?;
+  let dependencies = parse_nuspec(&nuspec_path, &nuspec, &downloaded.request, downloaded.target)?;
+  fs::write(
+    downloaded.temp_root.join(format!("{}.sha512", downloaded.nupkg_name)),
+    downloaded.hash.as_bytes(),
+  )
+  .map_err(|error| package_io("write package hash", &downloaded.temp_root, error))?;
   let package_metadata = serde_json::json!({
     "schemaVersion": 1,
-    "sha512": &hash,
-    "source": endpoint.source(),
-    "protocol": endpoint.protocol().as_str(),
+    "sha512": &downloaded.hash,
+    "source": downloaded.endpoint.source(),
+    "protocol": downloaded.endpoint.protocol().as_str(),
   });
   fs::write(
-    temp_root.join(".dv.metadata.json"),
+    downloaded.temp_root.join(".dv.metadata.json"),
     serde_json::to_vec_pretty(&package_metadata).expect("serializing package metadata succeeds"),
   )
-  .map_err(|error| package_io("write package metadata", &temp_root, error))?;
+  .map_err(|error| package_io("write package metadata", &downloaded.temp_root, error))?;
 
-  let final_root = package_root(cache_root, request);
+  let final_root = package_root(&downloaded.cache_root, &downloaded.request);
   fs::create_dir_all(final_root.parent().expect("package version has an identity parent"))
     .map_err(|error| package_io("create package identity directory", &final_root, error))?;
-  let published = publish_package_directory(&temp_root, &final_root)?;
+  let published = publish_package_directory(&downloaded.temp_root, &final_root)?;
   if published {
     guard.0 = None;
   }
   let mut cached = if published {
     CachedPackage {
       root: final_root,
-      hash,
+      hash: downloaded.hash,
       dependencies: Some(dependencies),
       cache_hit: false,
-      requests: metadata.requests + 1,
-      bytes,
+      requests: downloaded.requests,
+      bytes: downloaded.bytes,
       origin: None,
     }
   } else {
-    validate_cached_package(&final_root, request, false, metadata.requests + 1, bytes)?
+    validate_cached_package(&final_root, &downloaded.request, false, downloaded.requests, downloaded.bytes)?
   };
   cached.origin = Some(PackageSource {
-    url: endpoint.source().to_owned(),
-    protocol: endpoint.protocol(),
+    url: downloaded.endpoint.source().to_owned(),
+    protocol: downloaded.endpoint.protocol(),
   });
   Ok(cached)
 }
@@ -1042,9 +1069,9 @@ fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageM
   }
 }
 
-fn v2_package_metadata(agent: &ureq::Agent, request: &PackageRequest, base: &str) -> Result<PackageMetadata, PackageError> {
+async fn v2_package_metadata(client: &reqwest::Client, request: &PackageRequest, base: &str) -> Result<PackageMetadata, PackageError> {
   let metadata_url = format!("{base}Packages(Id='{}',Version='{}')", request.id, request.version);
-  let bytes = get_bytes(agent, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata")?;
+  let bytes = get_bytes(client, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
   parse_v2_package_metadata(request, &metadata_url, &bytes)
 }
 
@@ -1142,58 +1169,98 @@ enum V2MetadataText {
   Size,
 }
 
-fn download_package(agent: &ureq::Agent, url: &str, destination: &Path) -> Result<(String, u64), PackageError> {
-  let mut response = agent
+async fn download_package(client: &reqwest::Client, url: &str, destination: &Path) -> Result<(String, u64), PackageError> {
+  let mut response = client
     .get(url)
-    .call()
+    .send()
+    .await
     .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
-  if response.body().content_length().is_some_and(|length| length > MAX_PACKAGE_BYTES) {
+  response
+    .error_for_status_ref()
+    .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
+  let content_length = response.content_length();
+  if content_length.is_some_and(|length| length > MAX_PACKAGE_BYTES) {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
       url,
       format!("package Content-Length exceeds the {MAX_PACKAGE_BYTES} byte limit"),
     ));
   }
-  let mut input = response.body_mut().as_reader();
-  let mut output = fs::File::create(destination).map_err(|error| package_io("create package archive", destination, error))?;
+  let mut output = tokio::fs::File::create(destination)
+    .await
+    .map_err(|error| package_io("create package archive", destination, error))?;
   let mut hasher = Sha512::new();
-  let mut buffer = [0u8; 64 * 1024];
   let mut total = 0u64;
-  loop {
-    let read = input
-      .read(&mut buffer)
-      .map_err(|error| network_error(url, format!("read package response: {error}")))?;
-    if read == 0 {
-      break;
-    }
+  while let Some(chunk) = response
+    .chunk()
+    .await
+    .map_err(|error| network_error(url, format!("read package response: {error}")))?
+  {
+    let read = chunk.len();
     total = total
       .checked_add(read as u64)
       .filter(|total| *total <= MAX_PACKAGE_BYTES)
       .ok_or_else(|| PackageError::new(PackageErrorKind::Integrity, url, "package response exceeds the download limit"))?;
-    hasher.update(&buffer[..read]);
+    hasher.update(&chunk);
     output
-      .write_all(&buffer[..read])
+      .write_all(&chunk)
+      .await
       .map_err(|error| package_io("write package archive", destination, error))?;
+  }
+  output.flush().await.map_err(|error| package_io("flush package archive", destination, error))?;
+  if let Some(expected) = content_length
+    && total != expected
+  {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      url,
+      format!("package response body has {total} bytes but Content-Length declared {expected}"),
+    ));
   }
   Ok((BASE64.encode(hasher.finalize()), total))
 }
 
-fn get_json<T: for<'de> Deserialize<'de>>(agent: &ureq::Agent, url: &str) -> Result<T, PackageError> {
-  let bytes = get_bytes(agent, url, MAX_JSON_BYTES, "JSON")?;
+async fn get_json<T: for<'de> Deserialize<'de>>(client: &reqwest::Client, url: &str) -> Result<T, PackageError> {
+  let bytes = get_bytes(client, url, MAX_JSON_BYTES, "JSON").await?;
   serde_json::from_slice(&bytes).map_err(|error| network_error(url, format!("invalid JSON response: {error}")))
 }
 
-fn get_bytes(agent: &ureq::Agent, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
-  let mut response = agent
+async fn get_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
+  let mut response = client
     .get(url)
-    .call()
+    .send()
+    .await
     .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
   response
-    .body_mut()
-    .with_config()
-    .limit(limit)
-    .read_to_vec()
-    .map_err(|error| network_error(url, format!("read {kind} response: {error}")))
+    .error_for_status_ref()
+    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  if response.content_length().is_some_and(|length| length > limit) {
+    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+  }
+  let capacity = response.content_length().unwrap_or(0).min(limit) as usize;
+  let mut bytes = Vec::with_capacity(capacity);
+  while let Some(chunk) = response
+    .chunk()
+    .await
+    .map_err(|error| network_error(url, format!("read {kind} response: {error}")))?
+  {
+    let next = bytes
+      .len()
+      .checked_add(chunk.len())
+      .filter(|length| *length as u64 <= limit)
+      .ok_or_else(|| network_error(url, format!("{kind} response exceeds the {limit} byte limit")))?;
+    bytes.extend_from_slice(&chunk);
+    debug_assert_eq!(bytes.len(), next);
+  }
+  Ok(bytes)
+}
+
+fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
+  PackageError::new(
+    PackageErrorKind::Io,
+    "package scheduler",
+    format!("blocking package task stopped before completion: {error}"),
+  )
 }
 
 fn network_error(context: impl Into<String>, message: impl Into<String>) -> PackageError {

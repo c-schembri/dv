@@ -22,6 +22,7 @@ enum CaseKind {
   RestoreCold,
   PackageSyncCold,
   PackageGraphCold,
+  PackageGraphMassive,
   PackageSyncWarm,
   BuildClean,
   BuildNoOp,
@@ -39,6 +40,7 @@ struct Fixtures<'a> {
   small: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
+  package_graph_massive: &'a Path,
 }
 
 const DOTNET_CASES: &[Case] = &[
@@ -125,6 +127,22 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_graph_massive",
+    kind: CaseKind::PackageGraphMassive,
+    args: &[
+      "restore",
+      "MassivePackageGraph.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build", "--no-restore", "--nologo", "--verbosity", "quiet"],
@@ -194,6 +212,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_graph_massive",
+    kind: CaseKind::PackageGraphMassive,
+    args: &["restore", "MassivePackageGraph.csproj", "--packages", ".packages", "--json"],
+    implemented: false,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build"],
@@ -254,6 +278,8 @@ struct Run {
   downloaded_bytes: Option<u64>,
   #[serde(skip_serializing_if = "Option::is_none")]
   downloaded_packages: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  resolved_packages: Option<u64>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -273,9 +299,10 @@ struct Statistics {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct WorkEvidence {
-  network_requests: u64,
-  downloaded_bytes: u64,
-  downloaded_packages: u64,
+  network_requests: Option<u64>,
+  downloaded_bytes: Option<u64>,
+  downloaded_packages: Option<u64>,
+  resolved_packages: Option<u64>,
 }
 
 struct Measurement {
@@ -296,10 +323,12 @@ fn run() -> Result<()> {
   let fixture = repository.join("benchmarks/fixtures/small-console");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
+  let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
     small: &fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
+    package_graph_massive: &massive_package_graph_fixture,
   };
   let workspace = repository.join("target/benchmark-work");
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
@@ -332,7 +361,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 4,
+    schema_version: 5,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -802,6 +831,7 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
         network_requests: None,
         downloaded_bytes: None,
         downloaded_packages: None,
+        resolved_packages: None,
       });
       continue;
     }
@@ -831,9 +861,10 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
       warmups: options.warmups,
       samples_ns,
       statistics_ns: Some(statistics_ns),
-      network_requests: work.map(|evidence| evidence.network_requests),
-      downloaded_bytes: work.map(|evidence| evidence.downloaded_bytes),
-      downloaded_packages: work.map(|evidence| evidence.downloaded_packages),
+      network_requests: work.and_then(|evidence| evidence.network_requests),
+      downloaded_bytes: work.and_then(|evidence| evidence.downloaded_bytes),
+      downloaded_packages: work.and_then(|evidence| evidence.downloaded_packages),
+      resolved_packages: work.and_then(|evidence| evidence.resolved_packages),
     });
   }
 
@@ -886,7 +917,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::ProjectEvaluate | CaseKind::CompilerPlan => Ok(()),
-    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold => reset_fixture(fixture, workspace),
+    CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
       run_checked(executable, restore_args(executable), workspace, "clean build restore")
@@ -926,6 +957,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
+    CaseKind::PackageGraphMassive => fixtures.package_graph_massive,
     _ => fixtures.small,
   }
 }
@@ -935,6 +967,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::Startup => None,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
+    CaseKind::PackageGraphMassive => Some("massive-package-graph"),
     _ => Some("small-console"),
   }
 }
@@ -946,6 +979,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   check_output(output.clone(), executable, case.args, "measured command")?;
   let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageSyncWarm) {
     Some(parse_work_evidence(&output.stdout)?)
+  } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
+    Some(reference_package_work(cwd)?)
   } else {
     None
   };
@@ -962,18 +997,67 @@ fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
     .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
     .ok_or("dv restore did not emit package_resolution_created")?;
   Ok(WorkEvidence {
-    network_requests: event
-      .get("network_requests")
-      .and_then(serde_json::Value::as_u64)
-      .ok_or("dv package event omitted network_requests")?,
-    downloaded_bytes: event
-      .get("downloaded_bytes")
-      .and_then(serde_json::Value::as_u64)
-      .ok_or("dv package event omitted downloaded_bytes")?,
-    downloaded_packages: event
-      .get("downloaded_packages")
-      .and_then(serde_json::Value::as_u64)
-      .ok_or("dv package event omitted downloaded_packages")?,
+    network_requests: Some(
+      event
+        .get("network_requests")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("dv package event omitted network_requests")?,
+    ),
+    downloaded_bytes: Some(
+      event
+        .get("downloaded_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("dv package event omitted downloaded_bytes")?,
+    ),
+    downloaded_packages: Some(
+      event
+        .get("downloaded_packages")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("dv package event omitted downloaded_packages")?,
+    ),
+    resolved_packages: Some(
+      event
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .map(u64::try_from)
+        .transpose()?
+        .ok_or("dv package event omitted packages")?,
+    ),
+  })
+}
+
+fn reference_package_work(cwd: &Path) -> Result<WorkEvidence> {
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(cwd.join("obj/project.assets.json"))?)?;
+  let package_count = u64::try_from(
+    assets
+      .get("libraries")
+      .and_then(serde_json::Value::as_object)
+      .ok_or("dotnet project.assets.json omitted libraries")?
+      .len(),
+  )?;
+  let mut archive_count = 0u64;
+  let mut downloaded_bytes = 0u64;
+  let mut directories = vec![cwd.join(".packages")];
+  while let Some(directory) = directories.pop() {
+    for entry in fs::read_dir(&directory)? {
+      let entry = entry?;
+      let file_type = entry.file_type()?;
+      if file_type.is_dir() {
+        directories.push(entry.path());
+      } else if file_type.is_file() && entry.path().extension().is_some_and(|extension| extension.eq_ignore_ascii_case("nupkg")) {
+        archive_count = archive_count.checked_add(1).ok_or("dotnet package archive count overflowed u64")?;
+        downloaded_bytes = downloaded_bytes
+          .checked_add(entry.metadata()?.len())
+          .ok_or("dotnet package payload bytes overflowed u64")?;
+      }
+    }
+  }
+  Ok(WorkEvidence {
+    network_requests: None,
+    downloaded_bytes: Some(downloaded_bytes),
+    downloaded_packages: Some(archive_count),
+    resolved_packages: Some(package_count),
   })
 }
 
@@ -1123,7 +1207,12 @@ fn render_summary(report: &Report, color: bool) -> String {
   let package_runs = report
     .runs
     .iter()
-    .filter(|run| matches!(run.case.as_str(), "package_sync_cold" | "package_graph_cold" | "package_sync_warm"))
+    .filter(|run| {
+      matches!(
+        run.case.as_str(),
+        "package_sync_cold" | "package_graph_cold" | "package_graph_massive" | "package_sync_warm"
+      )
+    })
     .collect::<Vec<_>>();
   if !package_runs.is_empty() {
     output.push('\n');
@@ -1142,12 +1231,29 @@ fn render_summary(report: &Report, color: bool) -> String {
       .unwrap_or(0);
     for run in package_runs {
       let label = format!("{} · {}", run.tool, case_label(&run.case));
-      let evidence = match (run.downloaded_packages, run.network_requests, run.downloaded_bytes) {
-        (Some(packages), Some(requests), Some(bytes)) => {
-          let package_label = if packages == 1 { "package" } else { "packages" };
+      let evidence = match (
+        run.status,
+        run.resolved_packages,
+        run.downloaded_packages,
+        run.network_requests,
+        run.downloaded_bytes,
+      ) {
+        (RunStatus::Tbi, _, _, _, _) => "TBI".to_owned(),
+        (_, Some(resolved), Some(downloaded), Some(requests), Some(bytes)) => {
+          let package_label = if resolved == 1 { "package" } else { "packages" };
           format!(
-            "{} {package_label} · {requests} HTTP requests · {} payload bytes",
-            format_integer(packages),
+            "{} resolved {package_label} · {} downloaded · {requests} HTTP requests · {} payload bytes",
+            format_integer(resolved),
+            format_integer(downloaded),
+            format_integer(bytes)
+          )
+        },
+        (_, Some(resolved), Some(downloaded), None, Some(bytes)) => {
+          let package_label = if resolved == 1 { "package" } else { "packages" };
+          format!(
+            "{} resolved {package_label} · {} downloaded · HTTP requests not exposed · {} payload bytes",
+            format_integer(resolved),
+            format_integer(downloaded),
             format_integer(bytes)
           )
         },
@@ -1220,6 +1326,7 @@ fn case_label(case: &str) -> &str {
     "sync_cold" => "Cold sync",
     "package_sync_cold" => "Cold dependency readiness",
     "package_graph_cold" => "Cold large dependency graph",
+    "package_graph_massive" => "Cold massive solution graph",
     "package_sync_warm" => "Warm locked restore",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
@@ -1304,7 +1411,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 4,
+      schema_version: 5,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1331,6 +1438,7 @@ mod tests {
           network_requests: None,
           downloaded_bytes: None,
           downloaded_packages: None,
+          resolved_packages: None,
         },
         Run {
           tool: "dv".into(),
@@ -1345,6 +1453,7 @@ mod tests {
           network_requests: None,
           downloaded_bytes: None,
           downloaded_packages: None,
+          resolved_packages: None,
         },
       ],
     };
@@ -1366,7 +1475,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 4,
+      schema_version: 5,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1392,13 +1501,14 @@ mod tests {
         network_requests: Some(2),
         downloaded_bytes: Some(2_441_966),
         downloaded_packages: Some(1),
+        resolved_packages: Some(1),
       }],
     };
 
     let output = render_summary(&report, false);
 
     assert!(output.contains("Cold dependency readiness"));
-    assert!(output.contains("1 package · 2 HTTP requests · 2,441,966 payload bytes"));
+    assert!(output.contains("1 resolved package · 1 downloaded · 2 HTTP requests · 2,441,966 payload bytes"));
     assert!(output.find("Observed work").unwrap() < output.find("Commands").unwrap());
   }
 
@@ -1408,6 +1518,18 @@ mod tests {
     assert_eq!(format_integer(999), "999");
     assert_eq!(format_integer(1_000), "1,000");
     assert_eq!(format_integer(2_441_966), "2,441,966");
+  }
+
+  #[test]
+  fn package_evidence_counts_the_resolved_package_batch() {
+    let stdout =
+      br#"{"type":"package_resolution_created","packages":[{"id":"A"},{"id":"B"}],"downloaded_packages":2,"network_requests":3,"downloaded_bytes":42}
+"#;
+
+    let evidence = parse_work_evidence(stdout).unwrap();
+
+    assert_eq!(evidence.resolved_packages, Some(2));
+    assert_eq!(evidence.downloaded_packages, Some(2));
   }
 
   #[test]

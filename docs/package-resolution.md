@@ -51,10 +51,11 @@ ProjectSpec batch + resolve options
   -> validate a matching dv.lock.json and immutable cache entries
   -> otherwise normalize exact direct references
   -> seed a bounded queue with exact direct references
-  -> fetch, verify, extract, and publish up to sixteen independent requests
+  -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
   -> merge dependency identities and conflicts through one deterministic owner
   -> stream each package through SHA-512 into a bounded staging directory
+  -> hand completed staging records to bounded blocking archive work
   -> validate ZIP paths, duplicates, links, sizes, and expansion bounds
   -> verify embedded nuspec identity and version before publication
   -> extract and atomically publish the NuGet-compatible cache entry
@@ -75,22 +76,24 @@ paths cross the subsystem boundary as 8-byte offset/length spans into one
 owned UTF-8 buffer. Reporters and compiler planning traverse final records and
 asset ranges linearly.
 
-The cold scheduler uses sixteen scoped workers, a sixteen-entry task channel,
-and a sixteen-entry result channel. One main-thread owner merges completed
-manifests into identity-ordered maps and immediately submits newly discovered
-dependencies when capacity exists. Completion order affects which eligible
-transfer starts next but cannot affect final package order, version-conflict
-text, graph indices, or lock output. Queue traffic is bounded; there is no
-unbounded task creation or result retention.
+The cold scheduler uses a two-thread Tokio runtime and one `JoinSet` capped at
+twenty-four active package tasks. The runtime exists only after the warm-lock
+path misses. One scheduler owner merges completed manifests into
+identity-ordered maps and immediately submits newly discovered dependencies
+when capacity exists. Completion order affects which eligible transfer starts
+next but cannot affect final package order, version-conflict text, graph
+indices, or lock output. Active tasks and retained results share the same
+twenty-four-item bound; there is no unbounded task creation or result
+retention.
 
 Scheduling maps contain cold variable-sized external identities. Final graph
-records remain contiguous and identity-sorted. Workers read immutable service
-endpoints and cache configuration, own one request and staging directory at a
-time, and touch the receiver mutex only while dequeuing. Network waits, hash
-updates, and archive writes are sequential within one request and concurrent
-across requests. Downloads use a reused 64 KiB buffer. Package size, entry
-size, expanded size, entry count, queue capacity, and worker count are bounded
-constants.
+records remain contiguous and identity-sorted. Tasks read immutable shared
+service endpoints, own one request and staging directory at a time, and stream
+HTTP response chunks through SHA-512 into `tokio::fs::File`. Network waits are
+concurrent; ZIP validation, extraction, nuspec parsing, and atomic publication
+run through Tokio's blocking pool rather than occupying an executor thread.
+Package size, entry size, expanded size, entry count, active tasks, and
+runtime threads are bounded constants.
 
 A lone package with at least eight archive entries uses up to four
 contiguous-range extraction workers. When multiple package requests are
@@ -98,13 +101,13 @@ already in flight, each package extracts sequentially instead of nesting
 worker pools. On the representative 24-entry archive this reduced ZIP
 validation/extraction from 36.3 ms to 26.5 ms median.
 
-The download archive is closed and immediately reopened from the operating
-system cache for validation and extraction; it is not forced to stable storage
-while still in a disposable staging directory. A successful atomic rename
-uses the already validated in-memory hash and identity rather than rescanning
-the entry. If another publisher wins the race, the winner is fully revalidated
-before use. Transient Windows permission failures during the atomic rename
-receive three bounded retries totaling at most 21 ms.
+The async file is flushed and closed before the blocking ZIP reader opens it.
+It is not forced to stable storage while still in a disposable staging
+directory. A successful atomic rename uses the already validated in-memory
+hash and identity rather than rescanning the entry. If another publisher wins
+the race, the winner is fully revalidated before use. Transient Windows
+permission failures during the atomic rename receive three bounded retries
+totaling at most 21 ms.
 
 ## Output And Lifetime
 

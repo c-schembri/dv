@@ -702,7 +702,7 @@ boundary, not final drop-in parity.
 - [ ] `NUGET-013` Apply package source mapping before network requests and
   diagnose unmapped identities. `P2`
 - [~] `NUGET-014` Bound concurrent requests per source and globally; the
-  current sixteen-worker task/result queues provide global backpressure and
+  current twenty-four-task Tokio set provides global backpressure and
   deterministic graph merge, while distinct per-source budgets remain. `P2`
 - [~] `NUGET-015` Record request count, bytes, cache outcome, and source timing
   without recording credentials. `P2`
@@ -721,7 +721,9 @@ boundary, not final drop-in parity.
 - [ ] `RES-006` Read `Directory.Packages.props` and implement central package
   versions, version overrides, global references, and transitive pinning. `P2`
 - [~] `RES-007` Implement lowest-applicable-version, floating-version,
-  direct-dependency-wins, and cousin-dependency rules. `P1`
+  direct-dependency-wins, and cousin-dependency rules. The 203-package
+  eShop-derived acceptance graph currently exposes minimum-range convergence
+  as the next blocking case. `P1`
 - [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
@@ -730,7 +732,9 @@ boundary, not final drop-in parity.
   `P1`
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
-  `buildTransitive` assets by TFM/RID and metadata. `P2`
+  `buildTransitive` assets by TFM/RID and metadata. The massive acceptance
+  fixture keeps `dv` at `TBI` until these asset families are handled without
+  weakening build correctness. `P2`
 - [~] `RES-012` Implement compatible-framework reduction and framework
   fallback rules using SDK-owned framework data. `P2`
 - [x] `RES-013` Stream exact `.nupkg` content through SHA-512 into bounded
