@@ -45,6 +45,8 @@ items.
 - `sdk_selected`
 - `sdk_inventory`
 - `project_evaluated`
+- `compiler_plan_created`
+- `package_resolution_created`
 - `diagnostic`
 - `command_finished`
 
@@ -85,6 +87,24 @@ Initial codes:
 | `DV0204` | Unsupported project behavior |
 | `DV0205` | Invalid project property |
 | `DV0206` | Project path cannot be represented in the compact UTF-8 table |
+| `DV0300` | Compatible target reference pack not found |
+| `DV0301` | Invalid framework-pack manifest |
+| `DV0302` | Required compiler or pack asset missing |
+| `DV0303` | Selected SDK or target is unsupported by captured compiler policy |
+| `DV0304` | Compiler-plan filesystem failure |
+| `DV0305` | Compiler-plan path is not Unicode |
+| `DV0306` | Compiler-plan compact range overflow |
+| `DV0307` | Package resolution failed during compiler planning |
+| `DV0400` | Unsupported package configuration or source |
+| `DV0401` | Invalid or conflicting package graph |
+| `DV0402` | Package has no compatible supported assets |
+| `DV0403` | Offline package cache miss |
+| `DV0404` | Package source network failure |
+| `DV0405` | Package identity, size, or integrity failure |
+| `DV0406` | Unsafe or malformed package archive |
+| `DV0407` | Package cache or lock filesystem failure |
+| `DV0408` | Package path is not Unicode |
+| `DV0409` | Package compact range overflow |
 
 Codes are never reused for a different meaning.
 

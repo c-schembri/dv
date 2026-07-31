@@ -8,34 +8,11 @@ use std::{
 
 use quick_xml::{Reader, XmlVersion, events::Event};
 
-use crate::{ProjectConfiguration, ProjectOutputType, ProjectSpec, SdkInventory};
+use crate::{PackageResolution, ProjectConfiguration, ProjectOutputType, ProjectSpec, SdkInventory, TargetFramework};
 
-const TARGET_MAJOR: u32 = 10;
-const TARGET_MINOR: u32 = 0;
-const TARGET_FRAMEWORK: &str = "net10.0";
 const FRAMEWORK_IDENTIFIER: &str = ".NETCoreApp";
 const FRAMEWORK_PACK: &str = "Microsoft.NETCore.App.Ref";
-const LANGUAGE_VERSION: &str = "14.0";
 const SDK_ANALYZERS: [&str; 2] = ["Microsoft.CodeAnalysis.CSharp.NetAnalyzers.dll", "Microsoft.CodeAnalysis.NetAnalyzers.dll"];
-const NET_DEFINES: [&str; 16] = [
-  "NET",
-  "NET10_0",
-  "NETCOREAPP",
-  "NET5_0_OR_GREATER",
-  "NET6_0_OR_GREATER",
-  "NET7_0_OR_GREATER",
-  "NET8_0_OR_GREATER",
-  "NET9_0_OR_GREATER",
-  "NET10_0_OR_GREATER",
-  "NETCOREAPP1_0_OR_GREATER",
-  "NETCOREAPP1_1_OR_GREATER",
-  "NETCOREAPP2_0_OR_GREATER",
-  "NETCOREAPP2_1_OR_GREATER",
-  "NETCOREAPP2_2_OR_GREATER",
-  "NETCOREAPP3_0_OR_GREATER",
-  "NETCOREAPP3_1_OR_GREATER",
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TextSpan {
   start: u32,
@@ -58,6 +35,7 @@ pub struct CompilerPlan {
   compiler: TextSpan,
   framework_pack_version: TextSpan,
   framework_pack: TextSpan,
+  language_version: TextSpan,
   output_assembly: TextSpan,
   output_pdb: TextSpan,
   reference_output: TextSpan,
@@ -71,6 +49,7 @@ pub struct CompilerPlan {
   output_type: ProjectOutputType,
   nullable: bool,
   deterministic: bool,
+  warning_level: u16,
 }
 
 impl CompilerPlan {
@@ -100,8 +79,8 @@ impl CompilerPlan {
   }
 
   /// Returns the C# language version fixed by the target framework.
-  pub fn language_version(&self) -> &'static str {
-    LANGUAGE_VERSION
+  pub fn language_version(&self) -> &str {
+    self.get(self.language_version)
   }
 
   /// Returns the build configuration.
@@ -125,8 +104,8 @@ impl CompilerPlan {
   }
 
   /// Returns the compiler warning level.
-  pub fn warning_level(&self) -> u8 {
-    10
+  pub fn warning_level(&self) -> u16 {
+    self.warning_level
   }
 
   /// Returns the planned output assembly.
@@ -201,6 +180,8 @@ pub enum CompilerPlanErrorKind {
   NonUnicodePath,
   /// The compact text table exceeded its four-GiB range.
   TextOverflow,
+  /// Package-bearing projects were not paired with a resolved package graph.
+  PackageResolution,
 }
 
 /// A compiler planning failure with stable path context.
@@ -252,16 +233,64 @@ struct FrameworkAssets {
 /// independent immutable storage. Empty input returns an empty batch without
 /// touching the filesystem.
 pub fn plan_compiler_inputs(projects: &[&ProjectSpec], inventory: &SdkInventory) -> Result<Vec<CompilerPlan>, CompilerPlanError> {
+  if let Some(project) = projects.iter().find(|project| !project.package_references().is_empty()) {
+    return Err(CompilerPlanError::new(
+      CompilerPlanErrorKind::PackageResolution,
+      project.project_path(),
+      "package-bearing projects require a resolved package graph",
+    ));
+  }
+  plan_compiler_inputs_inner(projects, inventory, &[])
+}
+
+/// Plans compiler inputs with one package resolution per project.
+pub fn plan_compiler_inputs_with_packages(
+  projects: &[&ProjectSpec],
+  inventory: &SdkInventory,
+  packages: &[PackageResolution],
+) -> Result<Vec<CompilerPlan>, CompilerPlanError> {
+  if projects.len() != packages.len() {
+    return Err(CompilerPlanError::new(
+      CompilerPlanErrorKind::PackageResolution,
+      PathBuf::new(),
+      format!("compiler planning received {} projects but {} package graphs", projects.len(), packages.len()),
+    ));
+  }
+  for (project, packages) in projects.iter().zip(packages) {
+    if !packages.matches_project(project) {
+      return Err(CompilerPlanError::new(
+        CompilerPlanErrorKind::PackageResolution,
+        project.project_path(),
+        "package graph does not match the project target, identity, or direct references",
+      ));
+    }
+  }
+  plan_compiler_inputs_inner(projects, inventory, packages)
+}
+
+fn plan_compiler_inputs_inner(
+  projects: &[&ProjectSpec],
+  inventory: &SdkInventory,
+  packages: &[PackageResolution],
+) -> Result<Vec<CompilerPlan>, CompilerPlanError> {
   if projects.is_empty() {
     return Ok(Vec::new());
   }
 
   let selected = inventory.selected();
-  if selected.version.major() < TARGET_MAJOR {
+  let target = projects[0].target();
+  if projects.iter().any(|project| project.target() != target) {
+    return Err(CompilerPlanError::new(
+      CompilerPlanErrorKind::UnsupportedSdk,
+      projects[0].project_path(),
+      "one compiler planning batch currently requires a single target framework",
+    ));
+  }
+  if selected.version.major() < u32::from(target.major()) {
     return Err(CompilerPlanError::new(
       CompilerPlanErrorKind::UnsupportedSdk,
       inventory.installation_path(selected),
-      format!(".NET SDK {} cannot compile the current stable target {TARGET_FRAMEWORK}", selected.version),
+      format!(".NET SDK {} cannot compile target {}", selected.version, projects[0].target_framework()),
     ));
   }
 
@@ -272,14 +301,17 @@ pub fn plan_compiler_inputs(projects: &[&ProjectSpec], inventory: &SdkInventory)
   for analyzer in SDK_ANALYZERS {
     sdk_analyzers.push(require_file(sdk_analyzer_root.join(analyzer), "SDK analyzer")?);
   }
+  let analysis_level = target
+    .analysis_level()
+    .map_err(|error| CompilerPlanError::new(CompilerPlanErrorKind::UnsupportedSdk, projects[0].project_path(), error.to_string()))?;
   let analysis_config = require_file(
-    sdk_analyzer_root.join("build/config/analysislevel_10_default.globalconfig"),
+    sdk_analyzer_root.join(format!("build/config/analysislevel_{analysis_level}_default.globalconfig")),
     "SDK analyzer configuration",
   )?;
-  let framework = discover_framework_assets(inventory.root(selected))?;
+  let framework = discover_framework_assets(inventory.root(selected), target, projects[0].target_framework())?;
 
   let mut plans = Vec::with_capacity(projects.len());
-  for project in projects {
+  for (index, project) in projects.iter().enumerate() {
     plans.push(materialize_plan(
       project,
       selected.version.as_str(),
@@ -287,12 +319,13 @@ pub fn plan_compiler_inputs(projects: &[&ProjectSpec], inventory: &SdkInventory)
       &sdk_analyzers,
       &analysis_config,
       &framework,
+      packages.get(index),
     )?);
   }
   Ok(plans)
 }
 
-fn discover_framework_assets(dotnet_root: &Path) -> Result<FrameworkAssets, CompilerPlanError> {
+fn discover_framework_assets(dotnet_root: &Path, target: TargetFramework, target_text: &str) -> Result<FrameworkAssets, CompilerPlanError> {
   let packs_root = dotnet_root.join("packs").join(FRAMEWORK_PACK);
   let entries = fs::read_dir(&packs_root).map_err(|error| {
     CompilerPlanError::new(
@@ -317,7 +350,7 @@ fn discover_framework_assets(dotnet_root: &Path) -> Result<FrameworkAssets, Comp
     let Some(version) = parse_stable_pack_version(&version_text) else {
       continue;
     };
-    if version.0 != TARGET_MAJOR || version.1 != TARGET_MINOR {
+    if version.0 != u32::from(target.major()) || version.1 != u32::from(target.minor()) {
       continue;
     }
     if selected.as_ref().is_none_or(|current| version > current.0) {
@@ -328,15 +361,16 @@ fn discover_framework_assets(dotnet_root: &Path) -> Result<FrameworkAssets, Comp
     CompilerPlanError::new(
       CompilerPlanErrorKind::PackNotFound,
       &packs_root,
-      format!("no installed {FRAMEWORK_PACK} pack supports {TARGET_FRAMEWORK}"),
+      format!("no installed {FRAMEWORK_PACK} pack supports {target_text}"),
     )
   })?;
 
   let manifest = root.join("data/FrameworkList.xml");
   let bytes =
     fs::read(&manifest).map_err(|error| CompilerPlanError::new(CompilerPlanErrorKind::Io, &manifest, format!("failed to read framework manifest: {error}")))?;
-  let (reference_paths, analyzer_paths) = parse_framework_manifest(&manifest, &bytes)?;
-  let references = validate_reference_assemblies(&root, reference_paths)?;
+  let expected_version = target.framework_version();
+  let (reference_paths, analyzer_paths) = parse_framework_manifest(&manifest, &bytes, &expected_version, target_text)?;
+  let references = validate_reference_assemblies(&root, reference_paths, target_text)?;
   let mut analyzers = Vec::with_capacity(analyzer_paths.len());
   for path in analyzer_paths {
     analyzers.push(require_file(root.join(path), "framework analyzer")?);
@@ -357,8 +391,8 @@ fn discover_framework_assets(dotnet_root: &Path) -> Result<FrameworkAssets, Comp
   })
 }
 
-fn validate_reference_assemblies(root: &Path, manifest_paths: Vec<String>) -> Result<Vec<PathBuf>, CompilerPlanError> {
-  let reference_root = root.join("ref").join(TARGET_FRAMEWORK);
+fn validate_reference_assemblies(root: &Path, manifest_paths: Vec<String>, target_text: &str) -> Result<Vec<PathBuf>, CompilerPlanError> {
+  let reference_root = root.join("ref").join(target_text);
   let entries = fs::read_dir(&reference_root).map_err(|error| {
     CompilerPlanError::new(
       CompilerPlanErrorKind::Io,
@@ -402,7 +436,7 @@ fn parse_stable_pack_version(value: &str) -> Option<(u32, u32, u32)> {
   parts.next().is_none().then_some(version)
 }
 
-fn parse_framework_manifest(path: &Path, bytes: &[u8]) -> Result<(Vec<String>, Vec<String>), CompilerPlanError> {
+fn parse_framework_manifest(path: &Path, bytes: &[u8], expected_version: &str, target_text: &str) -> Result<(Vec<String>, Vec<String>), CompilerPlanError> {
   let mut reader = Reader::from_reader(bytes);
   reader.config_mut().trim_text(true);
   let mut root_seen = false;
@@ -417,8 +451,8 @@ fn parse_framework_manifest(path: &Path, bytes: &[u8]) -> Result<(Vec<String>, V
         }
         let identifier = xml_attribute(&reader, &element, b"TargetFrameworkIdentifier", path)?;
         let version = xml_attribute(&reader, &element, b"TargetFrameworkVersion", path)?;
-        if identifier.as_deref() != Some(FRAMEWORK_IDENTIFIER) || version.as_deref() != Some("10.0") {
-          return Err(invalid_manifest(path, "framework manifest target does not match net10.0"));
+        if identifier.as_deref() != Some(FRAMEWORK_IDENTIFIER) || version.as_deref() != Some(expected_version) {
+          return Err(invalid_manifest(path, format!("framework manifest target does not match {target_text}")));
         }
         root_seen = true;
       },
@@ -484,38 +518,51 @@ fn materialize_plan(
   sdk_analyzers: &[PathBuf],
   analysis_config: &Path,
   framework: &FrameworkAssets,
+  packages: Option<&PackageResolution>,
 ) -> Result<CompilerPlan, CompilerPlanError> {
   let project_directory = project.project_directory();
-  let intermediate = project_directory.join("obj").join(project.configuration().as_str()).join(TARGET_FRAMEWORK);
+  let target_text = project.target_framework();
+  let intermediate = project_directory.join("obj").join(project.configuration().as_str()).join(target_text);
   let assembly = project.assembly_name();
   let source_paths: Vec<PathBuf> = project.sources().map(|source| project_directory.join(source)).collect();
   let generated_paths = [
     intermediate.join(format!("{assembly}.GlobalUsings.g.cs")),
-    intermediate.join(".NETCoreApp,Version=v10.0.AssemblyAttributes.cs"),
+    intermediate.join(format!(".NETCoreApp,Version=v{}.AssemblyAttributes.cs", project.target().framework_version())),
     intermediate.join(format!("{assembly}.AssemblyInfo.cs")),
   ];
-  let mut analyzer_paths = Vec::with_capacity(sdk_analyzers.len() + framework.analyzers.len());
+  let package_analyzer_count = packages.map_or(0, |packages| packages.analyzers().len());
+  let mut analyzer_paths = Vec::with_capacity(sdk_analyzers.len() + framework.analyzers.len() + package_analyzer_count);
   analyzer_paths.extend_from_slice(sdk_analyzers);
   analyzer_paths.extend_from_slice(&framework.analyzers);
+  if let Some(packages) = packages {
+    analyzer_paths.extend(packages.analyzers().map(Path::to_owned));
+  }
+  let package_reference_count = packages.map_or(0, |packages| packages.compile_assets().len());
+  let mut reference_paths = Vec::with_capacity(framework.references.len() + package_reference_count);
+  reference_paths.extend_from_slice(&framework.references);
+  if let Some(packages) = packages {
+    reference_paths.extend(packages.compile_assets().map(Path::to_owned));
+  }
   let mut config_paths = discover_editor_configs(project_directory);
   config_paths.push(intermediate.join(format!("{assembly}.GeneratedMSBuildEditorConfig.editorconfig")));
   config_paths.push(analysis_config.to_owned());
-  let mut define_values = Vec::with_capacity(NET_DEFINES.len() + 2);
-  define_values.push("TRACE");
-  if project.configuration() == ProjectConfiguration::Debug {
-    define_values.push("DEBUG");
-  }
-  define_values.extend(NET_DEFINES);
+  let define_values = framework_defines(project.target(), project.configuration())?;
+  let language_major = project
+    .target()
+    .csharp_language_major()
+    .map_err(|error| CompilerPlanError::new(CompilerPlanErrorKind::UnsupportedSdk, project.project_path(), error.to_string()))?;
+  let language_version = format!("{language_major}.0");
 
   let estimated_text = source_paths
     .iter()
     .chain(&generated_paths)
-    .chain(&framework.references)
+    .chain(&reference_paths)
     .chain(&analyzer_paths)
     .chain(&config_paths)
     .map(|p| p.as_os_str().len())
     .sum::<usize>()
-    + define_values.iter().map(|value| value.len()).sum::<usize>()
+    + define_values.iter().map(String::len).sum::<usize>()
+    + language_version.len()
     + 1024;
   let mut table = TextTable::with_capacity(estimated_text);
   let project_path = table.push_path(project.project_path())?;
@@ -523,15 +570,17 @@ fn materialize_plan(
   let compiler_span = table.push_path(compiler)?;
   let pack_version_span = table.push(&framework.version)?;
   let pack_span = table.push_path(&framework.root)?;
+  let language_version_span = table.push(&language_version)?;
   let output_assembly = table.push_path(&intermediate.join(format!("{assembly}.dll")))?;
   let output_pdb = table.push_path(&intermediate.join(format!("{assembly}.pdb")))?;
   let reference_output = table.push_path(&intermediate.join("refint").join(format!("{assembly}.dll")))?;
   let sources = table.push_paths(&source_paths)?;
   let generated_sources = table.push_paths(&generated_paths)?;
-  let references = table.push_paths(&framework.references)?;
+  let references = table.push_paths(&reference_paths)?;
   let analyzers = table.push_paths(&analyzer_paths)?;
   let analyzer_configs = table.push_paths(&config_paths)?;
-  let defines = table.push_values(&define_values)?;
+  let define_refs: Vec<&str> = define_values.iter().map(String::as_str).collect();
+  let defines = table.push_values(&define_refs)?;
 
   Ok(CompilerPlan {
     text: table.text.into_boxed_str(),
@@ -540,6 +589,7 @@ fn materialize_plan(
     compiler: compiler_span,
     framework_pack_version: pack_version_span,
     framework_pack: pack_span,
+    language_version: language_version_span,
     output_assembly,
     output_pdb,
     reference_output,
@@ -553,7 +603,36 @@ fn materialize_plan(
     output_type: project.output_type(),
     nullable: project.nullable_enabled(),
     deterministic: project.deterministic(),
+    warning_level: project
+      .target()
+      .analysis_level()
+      .map_err(|error| CompilerPlanError::new(CompilerPlanErrorKind::UnsupportedSdk, project.project_path(), error.to_string()))?,
   })
+}
+
+fn framework_defines(target: TargetFramework, configuration: ProjectConfiguration) -> Result<Vec<String>, CompilerPlanError> {
+  if target.csharp_language_major().is_err() {
+    return Err(CompilerPlanError::new(
+      CompilerPlanErrorKind::UnsupportedSdk,
+      PathBuf::new(),
+      format!("compiler defines for {target:?} have not been captured"),
+    ));
+  }
+  let mut values = Vec::with_capacity(20);
+  values.push("TRACE".into());
+  if configuration == ProjectConfiguration::Debug {
+    values.push("DEBUG".into());
+  }
+  values.push("NET".into());
+  values.push(format!("NET{}_{}", target.major(), target.minor()));
+  values.push("NETCOREAPP".into());
+  for major in 5..=target.major() {
+    values.push(format!("NET{major}_0_OR_GREATER"));
+  }
+  for version in ["1_0", "1_1", "2_0", "2_1", "2_2", "3_0", "3_1"] {
+    values.push(format!("NETCOREAPP{version}_OR_GREATER"));
+  }
+  Ok(values)
 }
 
 fn discover_editor_configs(project_directory: &Path) -> Vec<PathBuf> {

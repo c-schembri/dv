@@ -9,7 +9,7 @@ It is a capability map, not a schedule. A checked item is present in the
 repository at the snapshot below. An unchecked item is required unless it is
 explicitly marked `DEFER` or `REJECT`.
 
-Snapshot: working tree on 2026-07-31, based on commit `5832007`.
+Snapshot: working tree on 2026-07-31, based on commit `e171e92`.
 
 ## Scope Contract
 
@@ -55,11 +55,11 @@ and risk, so a count-based percentage would be misleading.
 
 Repository-owned representative input currently consists of:
 
-- four SDK-style C# projects;
-- four C# source files;
+- five SDK-style C# projects;
+- five C# source files;
 - three project-reference edges;
-- zero package references;
-- one single-project console fixture and one three-project acyclic fixture;
+- one exact package reference;
+- two single-project console fixtures and one three-project acyclic fixture;
 - one observed Windows machine with three x64 SDK installations and 15 x64
   shared-runtime directories.
 
@@ -69,8 +69,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has nine Rust source files, 3,956 source lines,
-and 26 `#[test]` functions. These counts describe the current repository, not
+The Rust workspace currently has 12 Rust source files, 7,447 source lines,
+and 40 `#[test]` functions. These counts describe the current repository, not
 the expected shape of real customer repositories.
 
 ### Outputs
@@ -156,8 +156,9 @@ prove that nothing changed.
 | Structured diagnostics | Foundation only | codes and ordered fields exist |
 | Benchmark process harness | Foundation only | startup, SDK, and project-evaluation cases measured |
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
-| Project evaluation | Initial subset | literal `net10.0` base-SDK properties/items and `project inspect` |
-| Compiler input planning | Initial subset | .NET 10 reference pack, Roslyn/analyzers, options, and `build --plan` |
+| Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
+| Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
+| Package resolution and cache | Initial subset | exact versions, NuGet v2/v3 HTTPS, verified atomic package cache, deterministic dv lock, and `sync` |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore, build, run, test | Missing | commands return `DV0003` |
 | Pack, publish, SDK/runtime install | Missing | commands return `DV0003` |
@@ -407,20 +408,20 @@ change a supported output but is not understood.
 
 ## 7. NuGet Configuration, Sources, And Authentication
 
-- [ ] `NUGET-001` Discover machine, user, drive, repository, and explicit
+- [~] `NUGET-001` Discover machine, user, drive, repository, and explicit
   `NuGet.Config` files with platform-correct precedence. `P1`
-- [ ] `NUGET-002` Merge keyed sections with `<clear>`, add, remove, disabled
+- [~] `NUGET-002` Merge keyed sections with `<clear>`, add, remove, disabled
   sources, and environment-variable expansion. `P1`
-- [ ] `NUGET-003` Support `packageSources`, `disabledPackageSources`,
+- [~] `NUGET-003` Support `packageSources`, `disabledPackageSources`,
   `packageSourceMapping`, `auditSources`, and source protocol version. `P2`
-- [ ] `NUGET-004` Support global-packages, HTTP cache, temp, fallback folders,
+- [~] `NUGET-004` Support global-packages, HTTP cache, temp, fallback folders,
   signature-validation mode, restore audit mode/level, and proxy settings.
   `P2`
-- [ ] `NUGET-005` Accept CLI source/config/packages-folder overrides with
+- [~] `NUGET-005` Accept CLI source/config/packages-folder overrides with
   documented precedence. `P1`
-- [ ] `NUGET-006` Support local folder sources and NuGet v3 HTTP service
-  indexes. `P1`
-- [ ] `NUGET-007` Resolve registration, flat-container, search, vulnerability,
+- [~] `NUGET-006` Support local folder sources and NuGet v2/v3 HTTP service
+  contracts. `P1`
+- [~] `NUGET-007` Resolve registration, flat-container, search, vulnerability,
   and package-publish endpoints from service-index resources. `P2`
 - [ ] `NUGET-008` Support Basic/PAT credentials from config and environment
   without persisting or reporting plaintext. `P2`
@@ -428,57 +429,57 @@ change a supported output but is not understood.
   interactive login, cancellation, timeout, and noninteractive CI. `P2`
 - [ ] `NUGET-010` Support client certificates and platform certificate stores
   only after authenticated-source fixtures exist. `P5`
-- [ ] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,
+- [~] `NUGET-011` Honor proxy, `NO_PROXY`, TLS validation, redirect, retry,
   timeout, rate-limit, and offline behavior. `P2`
 - [ ] `NUGET-012` Require explicit opt-in for insecure HTTP or disabled TLS
   validation and surface the security consequence. `P2`
 - [ ] `NUGET-013` Apply package source mapping before network requests and
   diagnose unmapped identities. `P2`
-- [ ] `NUGET-014` Bound concurrent requests per source and globally; implement
+- [~] `NUGET-014` Bound concurrent requests per source and globally; implement
   backpressure and deterministic result merge. `P2`
-- [ ] `NUGET-015` Record request count, bytes, cache outcome, and source timing
+- [~] `NUGET-015` Record request count, bytes, cache outcome, and source timing
   without recording credentials. `P2`
 
 ## 8. Package Resolution, Assets, Cache, And Locking
 
-- [ ] `RES-001` Parse NuGet package identities case-insensitively while
+- [x] `RES-001` Parse NuGet package identities case-insensitively while
   preserving display casing. `P1`
-- [ ] `RES-002` Implement NuGet SemVer 2 precedence, normalized versions,
+- [~] `RES-002` Implement NuGet SemVer 2 precedence, normalized versions,
   prerelease identifiers, build metadata, ranges, and floating versions. `P1`
-- [ ] `RES-003` Parse `PackageReference` version and metadata from attributes
+- [x] `RES-003` Parse `PackageReference` version and metadata from attributes
   or child elements. `P1`
 - [ ] `RES-004` Support `IncludeAssets`, `ExcludeAssets`, `PrivateAssets`,
   `NoWarn`, `Aliases`, and `GeneratePathProperty`. `P2`
 - [ ] `RES-005` Support conditional references per TFM/RID/configuration. `P2`
 - [ ] `RES-006` Read `Directory.Packages.props` and implement central package
   versions, version overrides, global references, and transitive pinning. `P2`
-- [ ] `RES-007` Implement lowest-applicable-version, floating-version,
+- [~] `RES-007` Implement lowest-applicable-version, floating-version,
   direct-dependency-wins, and cousin-dependency rules. `P1`
-- [ ] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
+- [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
   downloads are deduplicated. `P2`
-- [ ] `RES-010` Parse `.nuspec` dependency groups and framework assemblies.
+- [~] `RES-010` Parse `.nuspec` dependency groups and framework assemblies.
   `P1`
-- [ ] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
+- [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by TFM/RID and metadata. `P2`
-- [ ] `RES-012` Implement compatible-framework reduction and framework
+- [~] `RES-012` Implement compatible-framework reduction and framework
   fallback rules using SDK-owned framework data. `P2`
-- [ ] `RES-013` Download `.nupkg` and hash metadata concurrently into bounded
+- [x] `RES-013` Download `.nupkg` and hash metadata concurrently into bounded
   temporary storage. `P1`
-- [ ] `RES-014` Verify package identity, version, SHA-512, ZIP structure,
+- [x] `RES-014` Verify package identity, version, SHA-512, ZIP structure,
   duplicate paths, traversal paths, entry sizes, and total expansion limits
   before cache commit. `P1`
 - [ ] `RES-015` Verify author/repository signatures and trusted-signers policy
   with platform-correct certificate roots. `P2`
-- [ ] `RES-016` Extract atomically into a NuGet-compatible global-packages
+- [~] `RES-016` Extract atomically into a NuGet-compatible global-packages
   layout with per-package concurrency coordination. `P1`
-- [ ] `RES-017` Reuse the existing global package and HTTP caches when valid;
+- [~] `RES-017` Reuse the existing global package and HTTP caches when valid;
   never rewrite a valid immutable entry. `P1`
 - [ ] `RES-018` Implement conditional HTTP caching, negative-result policy, and
   corruption quarantine. `P2`
-- [ ] `RES-019` Generate a versioned deterministic `dv` lockfile containing
+- [x] `RES-019` Generate a versioned deterministic `dv` lockfile containing
   source decision, full dependency closure, content hash, selected assets, and
   relevant compatibility inputs. `P1`
 - [ ] `RES-020` Read/write NuGet `packages.lock.json`, including locked mode,
@@ -486,9 +487,9 @@ change a supported output but is not understood.
 - [ ] `RES-021` Decide and document whether `project.assets.json` and generated
   NuGet props/targets are compatibility outputs; produce them if IDE or package
   target compatibility requires them. `P2`
-- [ ] `RES-022` Make warm locked resolution a linear validation over the
+- [x] `RES-022` Make warm locked resolution a linear validation over the
   smallest stable fingerprints with zero network requests. `P1`
-- [ ] `RES-023` Support force, no-cache, no-HTTP-cache, ignore-failed-sources,
+- [~] `RES-023` Support force, no-cache, no-HTTP-cache, ignore-failed-sources,
   disable-parallel, interactive, and offline restore modes. `P2`
 - [ ] `RES-024` Audit direct and transitive dependencies for known
   vulnerabilities with configurable severity and source policy. `P2`

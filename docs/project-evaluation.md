@@ -15,7 +15,7 @@ Observed fixture data:
 
 The supported property and item subset is:
 
-- one literal `TargetFramework` equal to `net10.0`;
+- one literal modern unified .NET `TargetFramework` (`net5.0` or later);
 - `OutputType` equal to `Exe` or `Library`;
 - `Debug` or `Release` configuration;
 - literal `AssemblyName` and `RootNamespace`, with project-name defaults;
@@ -50,7 +50,9 @@ data, so temporary owned buffers are necessary at this boundary. The completed
 
 Source and project-reference batches contain 8-byte `(offset, length)` spans.
 Package references contain two spans and are 16 bytes with 4-byte alignment.
-Compile-time assertions protect those layouts.
+The parsed target descriptor is stored once beside its original text and
+shared with package and compiler planning. Compile-time assertions protect the
+compact layouts.
 
 `ASSUMPTION: the first benchmark machine has 64-byte cache lines - affects the
 expected eight text spans or four package records per line; this is not a

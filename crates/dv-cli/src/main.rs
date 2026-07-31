@@ -8,9 +8,10 @@ use std::{
 };
 
 use dv_core::{
-  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, ProjectConfiguration,
-  ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project,
-  evaluate_project_path, plan_compiler_inputs, write_json_lines,
+  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, PackageError,
+  PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec,
+  ResolvedPackageEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path,
+  plan_compiler_inputs_with_packages, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -52,6 +53,11 @@ Usage:
 const BUILD_HELP: &str = "\
 Usage:
   dv build --plan [PROJECT] [--configuration Debug|Release]
+";
+
+const SYNC_HELP: &str = "\
+Usage:
+  dv sync [PROJECT] [--packages PATH] [--offline]
 ";
 
 fn main() -> ExitCode {
@@ -114,6 +120,7 @@ fn main() -> ExitCode {
     Some("sdk") => run_sdk(started, json, args, &semantic_args[1..]),
     Some("project") => run_project(started, json, args, &semantic_args[1..]),
     Some("build") => run_build(started, json, args, &semantic_args[1..]),
+    Some("sync") => run_sync(started, json, args, &semantic_args[1..]),
     Some(command) if is_known_command(command) => fail(
       started,
       json,
@@ -145,6 +152,76 @@ fn main() -> ExitCode {
       ),
     ),
   }
+}
+
+fn run_sync(started: Instant, json: bool, args: Vec<String>, sync_args: &[String]) -> ExitCode {
+  if matches!(sync_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
+    print!("{SYNC_HELP}");
+    return ExitCode::SUCCESS;
+  }
+  let (requested_path, packages_directory, offline) = match parse_sync_args(sync_args) {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "sync",
+        args,
+        diagnostic("DV0002", problem, None, Some("Use `dv sync --help` to inspect the accepted arguments.")),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "sync",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "sync", args, project_diagnostic(error)),
+  };
+  let options = PackageResolveOptions {
+    packages_directory,
+    offline,
+    write_lock: true,
+  };
+  let resolutions = match resolve_package_inputs(&[&project], &options) {
+    Ok(resolutions) => resolutions,
+    Err(error) => return fail(started, json, "sync", args, package_diagnostic(error)),
+  };
+  let resolution = &resolutions[0];
+  if !json {
+    return write_package_resolution(resolution);
+  }
+  succeed(started, "sync", args, package_resolution_payload(&project, resolution))
+}
+
+fn parse_sync_args(arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>, bool), String> {
+  let mut project = None;
+  let mut packages = None;
+  let mut offline = false;
+  let mut index = 0;
+  while index < arguments.len() {
+    match arguments[index].as_str() {
+      "--packages" => {
+        index += 1;
+        packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
+      },
+      "--offline" => offline = true,
+      value if value.starts_with('-') => return Err(format!("unknown sync option {value:?}")),
+      value if project.is_none() => project = Some(PathBuf::from(value)),
+      value => return Err(format!("unexpected sync argument {value:?}")),
+    }
+    index += 1;
+  }
+  Ok((project, packages, offline))
 }
 
 fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
@@ -199,11 +276,21 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
     Ok(inventory) => inventory,
     Err(error) => return fail(started, json, "build --plan", args, sdk_diagnostic(&current_directory, error)),
   };
-  let plans = match plan_compiler_inputs(&[&project], &inventory) {
+  let package_options = PackageResolveOptions {
+    packages_directory: None,
+    offline: false,
+    write_lock: true,
+  };
+  let package_resolutions = match resolve_package_inputs(&[&project], &package_options) {
+    Ok(resolutions) => resolutions,
+    Err(error) => return fail(started, json, "build --plan", args, package_diagnostic(error)),
+  };
+  let plans = match plan_compiler_inputs_with_packages(&[&project], &inventory, &package_resolutions) {
     Ok(plans) => plans,
     Err(error) => return fail(started, json, "build --plan", args, compiler_plan_diagnostic(error)),
   };
   let plan = &plans[0];
+  let packages = &package_resolutions[0];
   if !json {
     return write_compiler_plan(plan);
   }
@@ -233,8 +320,77 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
       analyzers: plan.analyzers().map(str::to_owned).collect(),
       analyzer_configs: plan.analyzer_configs().map(str::to_owned).collect(),
       defines: plan.defines().map(str::to_owned).collect(),
+      package_count: packages.packages().len() as u32,
+      package_compile_assets: packages.compile_assets().len() as u32,
+      package_cache_hits: packages.cache_hits(),
+      downloaded_packages: packages.downloaded_packages(),
+      package_network_requests: packages.network_requests(),
+      package_downloaded_bytes: packages.downloaded_bytes(),
     },
   )
+}
+
+fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolution) -> EventPayload {
+  let packages = resolution
+    .packages()
+    .iter()
+    .copied()
+    .enumerate()
+    .map(|(index, package)| ResolvedPackageEvent {
+      id: resolution.package_id(package).into(),
+      version: resolution.package_version(package).into(),
+      sha512: resolution.package_hash(index).into(),
+      direct: resolution.package_is_direct(package),
+      dependency_count: resolution.package_dependencies(package).len() as u32,
+    })
+    .collect();
+  EventPayload::PackageResolutionCreated {
+    project: project.project_path().display().to_string(),
+    cache_root: resolution.cache_root().display().to_string(),
+    lock_path: resolution.lock_path().display().to_string(),
+    target_framework: resolution.target_framework().into(),
+    source: resolution.source().into(),
+    source_protocol: resolution.source_protocol().into(),
+    packages,
+    compile_assets: resolution.compile_assets().map(|path| path.display().to_string()).collect(),
+    runtime_assets: resolution.runtime_assets().map(|path| path.display().to_string()).collect(),
+    cache_hits: resolution.cache_hits(),
+    downloaded_packages: resolution.downloaded_packages(),
+    network_requests: resolution.network_requests(),
+    downloaded_bytes: resolution.downloaded_bytes(),
+  }
+}
+
+fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
+  let mut output = String::with_capacity(1024);
+  use std::fmt::Write as _;
+  writeln!(output, "Package resolution").expect("writing a String succeeds");
+  writeln!(output, "  Packages       {}", resolution.packages().len()).expect("writing a String succeeds");
+  writeln!(output, "  Cache hits     {}", resolution.cache_hits()).expect("writing a String succeeds");
+  writeln!(output, "  Downloaded     {}", resolution.downloaded_packages()).expect("writing a String succeeds");
+  writeln!(output, "  HTTP requests  {}", resolution.network_requests()).expect("writing a String succeeds");
+  writeln!(output, "  Payload bytes  {}", resolution.downloaded_bytes()).expect("writing a String succeeds");
+  writeln!(output, "  Compile assets {}", resolution.compile_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Runtime assets {}", resolution.runtime_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Target         {}", resolution.target_framework()).expect("writing a String succeeds");
+  writeln!(output, "  Source         {} ({})", resolution.source(), resolution.source_protocol()).expect("writing a String succeeds");
+  writeln!(output, "  Cache          {}", resolution.cache_root().display()).expect("writing a String succeeds");
+  writeln!(output, "  Lock           {}", resolution.lock_path().display()).expect("writing a String succeeds");
+  for package in resolution.packages().iter().copied() {
+    writeln!(
+      output,
+      "  {} {}{}",
+      resolution.package_id(package),
+      resolution.package_version(package),
+      if resolution.package_is_direct(package) { " (direct)" } else { "" }
+    )
+    .expect("writing a String succeeds");
+  }
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing package resolution to stdout succeeds");
+  ExitCode::SUCCESS
 }
 
 fn decode_args(raw_args: &[OsString]) -> Result<Vec<String>, &OsString> {
@@ -585,11 +741,13 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
     CompilerPlanErrorKind::Io => "DV0304",
     CompilerPlanErrorKind::NonUnicodePath => "DV0305",
     CompilerPlanErrorKind::TextOverflow => "DV0306",
+    CompilerPlanErrorKind::PackageResolution => "DV0307",
   };
   let help = match error.kind() {
-    CompilerPlanErrorKind::PackNotFound => Some("Install the .NET 10 targeting pack."),
+    CompilerPlanErrorKind::PackNotFound => Some("Install the targeting pack required by the project target framework."),
     CompilerPlanErrorKind::InvalidManifest | CompilerPlanErrorKind::MissingAsset => Some("Repair or reinstall the selected .NET SDK."),
-    CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable .NET 10 SDK or newer."),
+    CompilerPlanErrorKind::UnsupportedSdk => Some("Install and select a stable SDK compatible with the project target framework."),
+    CompilerPlanErrorKind::PackageResolution => Some("Run `dv sync` for every package-bearing project before compiler planning."),
     CompilerPlanErrorKind::Io | CompilerPlanErrorKind::NonUnicodePath | CompilerPlanErrorKind::TextOverflow => None,
   };
   diagnostic(
@@ -598,6 +756,38 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
     Some(ContextField {
       name: "path".into(),
       value: error.path().display().to_string(),
+    }),
+    help,
+  )
+}
+
+fn package_diagnostic(error: PackageError) -> Diagnostic {
+  let code = match error.kind() {
+    PackageErrorKind::Configuration => "DV0400",
+    PackageErrorKind::Resolution => "DV0401",
+    PackageErrorKind::Incompatible => "DV0402",
+    PackageErrorKind::OfflineMiss => "DV0403",
+    PackageErrorKind::Network => "DV0404",
+    PackageErrorKind::Integrity => "DV0405",
+    PackageErrorKind::Archive => "DV0406",
+    PackageErrorKind::Io => "DV0407",
+    PackageErrorKind::NonUnicodePath => "DV0408",
+    PackageErrorKind::TextOverflow => "DV0409",
+  };
+  let help = match error.kind() {
+    PackageErrorKind::OfflineMiss => Some("Populate the global package cache or rerun without --offline."),
+    PackageErrorKind::Configuration => Some("Use an HTTPS NuGet v2 or v3 source and the supported NuGet.Config subset."),
+    PackageErrorKind::Incompatible => Some("Use a package with compatible lib or ref assets and no unsupported build/runtime assets."),
+    PackageErrorKind::Network => Some("Check source availability, proxy settings, and package identity/version."),
+    PackageErrorKind::Integrity | PackageErrorKind::Archive => Some("Remove the corrupt cache entry and retry from a trusted source."),
+    PackageErrorKind::Resolution | PackageErrorKind::Io | PackageErrorKind::NonUnicodePath | PackageErrorKind::TextOverflow => None,
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "context".into(),
+      value: error.context().into(),
     }),
     help,
   )

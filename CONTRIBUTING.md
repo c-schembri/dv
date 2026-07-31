@@ -4,7 +4,7 @@
 
 - Rust 1.94.0, installed automatically by `rustup` from
   `rust-toolchain.toml`
-- .NET SDK 9.x for the reference benchmark fixture
+- .NET SDK 10.x for the current stable reference benchmark fixture
 
 ## Before changing a subsystem
 

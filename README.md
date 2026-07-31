@@ -11,14 +11,17 @@ Roslyn remains the compiler and Microsoft .NET remains the runtime; `dv` owns
 the expensive orchestration around them.
 
 ```text
-dotnet --version               62.959 ms median
-dv sdk current                  3.389 ms median
+dotnet --version               60.637 ms median
+dv sdk current                  3.798 ms median
 
-dotnet msbuild project query  296.365 ms median
-dv project inspect              3.299 ms median
+dotnet msbuild project query  282.186 ms median
+dv project inspect              3.846 ms median
 
-dotnet msbuild compiler plan  379.938 ms median
-dv build --plan                 5.292 ms median
+dotnet msbuild compiler plan  368.952 ms median
+dv build --plan                 4.979 ms median
+
+dotnet restore (warm locked)  446.029 ms median
+dv sync (warm locked)           4.459 ms median
 ```
 
 The benchmark preflight verifies the same selected SDK and the same evaluated
@@ -50,10 +53,10 @@ The project is in the first implementation phase.
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
-| .NET 10 framework and compiler input planning | Implemented |
+| Target-aware framework and compiler input planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
-| Package resolution and cache | Planned |
+| Exact package resolution, v2/v3 sources, verified cache, and lock | Initial implementation |
 | Direct Roslyn compilation | Planned |
 | Incremental and no-op builds | Planned |
 | Application runner | Planned |
@@ -63,19 +66,27 @@ SDK discovery supports all documented roll-forward policies, prerelease
 filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
 
-Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting
-`net10.0`, `Exe` and `Library` outputs, default source discovery, Debug/Release
-configuration, project-reference paths, and exact package-reference capture.
-Unsupported MSBuild behavior fails explicitly.
+Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting one
+modern unified .NET TFM, `Exe` and `Library` outputs, default source discovery,
+Debug/Release configuration, project-reference paths, and exact package
+references. Target family and version are parsed once and shared by pack,
+compiler, dependency-group, and package-asset selection. Unsupported MSBuild
+behavior fails explicitly.
 
 The baseline tracks [.NET 10](https://dotnet.microsoft.com/en-us/download/dotnet/10.0),
 the latest stable LTS release as of 2026-07-31. Preview TFMs are not selected
 as the default target.
 
-`dv build --plan` selects the newest installed compatible .NET 10 reference
-pack, parses its manifest, validates 167 framework references on the current
-SDK, selects Roslyn plus built-in analyzers, and emits one immutable compiler
-input plan. It does not compile yet.
+`dv sync` merges the supported `NuGet.Config` subset, speaks HTTPS NuGet v2 or
+v3 according to each source, streams and verifies package SHA-512 data,
+validates ZIP boundaries, publishes a NuGet-compatible cache entry atomically,
+and writes a deterministic `dv.lock.json`. A matching warm lock performs zero
+network requests.
+
+`dv build --plan` selects the newest installed reference pack matching the
+project target, parses its manifest, selects Roslyn plus built-in and package
+analyzers, and emits one immutable compiler input plan. It does not compile
+yet.
 
 ## Quick Start
 
@@ -103,6 +114,12 @@ cargo run -p dv-cli --release -- project inspect path\to\App.csproj --json
 # Plan Roslyn inputs without compiling
 cargo run -p dv-cli --release -- build --plan path\to\App.csproj
 
+# Resolve exact packages and write dv.lock.json
+cargo run -p dv-cli --release -- sync path\to\App.csproj
+
+# Prove a locked package graph from cache with no network
+cargo run -p dv-cli --release -- sync path\to\App.csproj --offline
+
 # Run all implemented and reference benchmarks
 cargo bench-all
 ```
@@ -125,21 +142,26 @@ Initial machine:
 - Windows 11 `10.0.22631`, x86-64
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
-- 30 retained samples after 3 warm-ups (5 for compiler planning)
+- 30 retained samples after 3 warm-ups (5 for compiler planning); 10 retained
+  samples after 3 warm-ups for package sync
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
-| Select current SDK | `dotnet --version` | `dv sdk current` | 62.959 ms | 3.389 ms | 18.6x | 68.050 ms | 4.033 ms |
-| Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 296.365 ms | 3.299 ms | 89.8x | 333.900 ms | 3.785 ms |
-| Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 379.938 ms | 5.292 ms | 71.8x | 408.786 ms | 6.184 ms |
+| Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
+| Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
+| Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
+| Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv sync PackageConsole.csproj --packages .packages --offline --json` | 446.029 ms | 4.459 ms | 100.0x | 459.179 ms | 5.255 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
 Before measuring, the harness verifies SDK text and compares every requested
-project property plus the ordered compile-item identities. The exact MSBuild
-query is printed in benchmark output and recorded in the
-[curated baseline](docs/performance-baselines/2026-07-31-windows.md).
+project property plus the ordered compile-item identities. For package sync it
+also compares target framework, package identity, exact version, archive
+SHA-512, and selected compile assets. Exact commands are printed in benchmark
+output and recorded in the curated
+[compiler baseline](docs/performance-baselines/2026-07-31-windows.md) and
+[package baseline](docs/performance-baselines/2026-07-31-package-sync-windows.md).
 
 The warm one-shot target for lightweight commands on this machine is `5 ms`
 end to end. It is a local engineering budget, not a universal Windows
@@ -151,6 +173,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
+cargo bench-all --case package_sync_warm --samples 10 --warmups 3
 ```
 
 Run the full suite:
@@ -197,6 +220,7 @@ See:
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Project evaluation contract](docs/project-evaluation.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)
+- [Package resolution and cache contract](docs/package-resolution.md)
 - [Performance method](docs/performance-method.md)
 - [Events and diagnostics](docs/events-and-diagnostics.md)
 - [Compatibility matrix](docs/compatibility-matrix.md)

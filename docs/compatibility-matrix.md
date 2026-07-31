@@ -9,13 +9,13 @@ diagnostic rather than approximate Microsoft behavior.
 | Project type | SDK-style C# `.csproj` | Implemented |
 | SDK discovery | Native root enumeration and `global.json` selection | Implemented |
 | SDK declaration | `Microsoft.NET.Sdk` | Implemented |
-| Target frameworks | one installed `net10.0` target | Evaluated and reference pack validated |
+| Target frameworks | one installed modern unified .NET target; .NET 10 fixture baseline | Parsed dynamically and matching reference pack validated |
 | Output types | `Exe` and `Library` | Implemented |
 | Source items | default `**/*.cs`, excluding generated/output trees | Implemented |
 | Nullable | `enable` or omitted SDK default | Implemented |
 | Implicit usings | `enable` or `disable` | Implemented |
 | Project references | acyclic SDK-style references | Paths captured; graph validation planned |
-| Package references | one target, public source, exact versions first | Exact references captured; resolution planned |
+| Package references | one target, HTTPS NuGet v2/v3 source, exact versions first | Initial resolution, verified cache, lock, and compiler assets implemented |
 | Configuration | `Debug` and `Release` | Implemented |
 | Generated inputs | global usings, assembly attributes, editor config | Paths planned; content generation planned |
 | Compiler inputs | framework references, SDK/pack analyzers, defines and core options | Initial immutable plan implemented |

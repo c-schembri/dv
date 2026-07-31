@@ -9,8 +9,9 @@ use quick_xml::{
   events::{BytesRef, BytesStart, Event},
 };
 
+use crate::TargetFramework;
+
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
-const SUPPORTED_TARGET_FRAMEWORK: &str = "net10.0";
 const MAX_XML_DEPTH: usize = 8;
 
 /// A supported build configuration.
@@ -90,6 +91,7 @@ pub struct ProjectSpec {
   text: Box<str>,
   project_path: TextSpan,
   project_directory: TextSpan,
+  target_framework_text: TextSpan,
   assembly_name: TextSpan,
   root_namespace: TextSpan,
   sources: Box<[TextSpan]>,
@@ -100,6 +102,7 @@ pub struct ProjectSpec {
   nullable: bool,
   implicit_usings: bool,
   deterministic: bool,
+  target_framework: TargetFramework,
 }
 
 impl ProjectSpec {
@@ -119,8 +122,13 @@ impl ProjectSpec {
   }
 
   /// Returns the selected target framework.
-  pub fn target_framework(&self) -> &'static str {
-    SUPPORTED_TARGET_FRAMEWORK
+  pub fn target_framework(&self) -> &str {
+    self.text(self.target_framework_text)
+  }
+
+  /// Returns parsed target-framework data for downstream selection.
+  pub fn target(&self) -> TargetFramework {
+    self.target_framework
   }
 
   /// Returns the selected build configuration.
@@ -580,11 +588,13 @@ fn materialize_project(
   raw: RawProject,
 ) -> Result<ProjectSpec, ProjectError> {
   let target_framework = required_property(&project_path, "TargetFramework", raw.target_framework)?;
-  if target_framework != SUPPORTED_TARGET_FRAMEWORK {
+  let parsed_target =
+    TargetFramework::parse(&target_framework).map_err(|error| ProjectError::new(ProjectErrorKind::InvalidProperty, &project_path, error.to_string()))?;
+  if !parsed_target.is_modern_net() {
     return Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       &project_path,
-      format!("target framework {target_framework:?} is unsupported; use {SUPPORTED_TARGET_FRAMEWORK}"),
+      format!("target framework {target_framework:?} is recognized but its SDK/pack family is not implemented yet"),
     ));
   }
 
@@ -628,6 +638,7 @@ fn materialize_project(
   let project_directory_text = unicode_path(project_directory, &project_path)?;
   let estimated_text = project_path_text.len()
     + project_directory_text.len()
+    + target_framework.len()
     + assembly_name.len()
     + root_namespace.len()
     + sources.iter().map(String::len).sum::<usize>()
@@ -640,6 +651,7 @@ fn materialize_project(
   let mut table = TextTable::with_capacity(estimated_text);
   let project_path_span = table.push(project_path_text, &project_path)?;
   let project_directory_span = table.push(project_directory_text, &project_path)?;
+  let target_framework_span = table.push(&target_framework, &project_path)?;
   let assembly_name_span = table.push(assembly_name, &project_path)?;
   let root_namespace_span = table.push(root_namespace, &project_path)?;
   let source_spans = sources.iter().map(|source| table.push(source, &project_path)).collect::<Result<Box<_>, _>>()?;
@@ -674,6 +686,7 @@ fn materialize_project(
     text: table.text.into_boxed_str(),
     project_path: project_path_span,
     project_directory: project_directory_span,
+    target_framework_text: target_framework_span,
     assembly_name: assembly_name_span,
     root_namespace: root_namespace_span,
     sources: source_spans,
@@ -684,6 +697,7 @@ fn materialize_project(
     nullable,
     implicit_usings,
     deterministic,
+    target_framework: parsed_target,
   })
 }
 

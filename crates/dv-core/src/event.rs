@@ -79,6 +79,21 @@ pub struct ProjectPackageEvent {
   pub version: String,
 }
 
+/// One resolved package materialized at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedPackageEvent {
+  /// Package identity with source casing.
+  pub id: String,
+  /// Normalized exact version.
+  pub version: String,
+  /// Verified package archive SHA-512.
+  pub sha512: String,
+  /// Whether this package is directly referenced.
+  pub direct: bool,
+  /// Number of outgoing dependency edges.
+  pub dependency_count: u32,
+}
+
 /// Event variants emitted by command execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -179,7 +194,7 @@ pub enum EventPayload {
     /// Fixed C# language version.
     language_version: String,
     /// Compiler warning level.
-    warning_level: u8,
+    warning_level: u16,
     /// Selected build configuration.
     configuration: String,
     /// Roslyn output kind.
@@ -206,6 +221,47 @@ pub enum EventPayload {
     analyzer_configs: Vec<String>,
     /// Ordered preprocessor symbols.
     defines: Vec<String>,
+    /// Resolved package count.
+    package_count: u32,
+    /// Package compile-asset count included in references.
+    package_compile_assets: u32,
+    /// Packages reused from the global cache.
+    package_cache_hits: u32,
+    /// Packages downloaded during planning.
+    downloaded_packages: u32,
+    /// HTTP requests made during package planning.
+    package_network_requests: u32,
+    /// Package payload bytes downloaded.
+    package_downloaded_bytes: u64,
+  },
+  /// One exact package graph was resolved and cached.
+  PackageResolutionCreated {
+    /// Full project-file path.
+    project: String,
+    /// Global-packages directory.
+    cache_root: String,
+    /// Deterministic dv lock file.
+    lock_path: String,
+    /// Evaluated target framework.
+    target_framework: String,
+    /// Selected NuGet source.
+    source: String,
+    /// Selected NuGet protocol generation.
+    source_protocol: String,
+    /// Packages sorted by case-insensitive identity.
+    packages: Vec<ResolvedPackageEvent>,
+    /// Ordered compile assemblies selected for the evaluated target.
+    compile_assets: Vec<String>,
+    /// Ordered runtime assemblies selected for the evaluated target.
+    runtime_assets: Vec<String>,
+    /// Packages reused from the cache.
+    cache_hits: u32,
+    /// Packages downloaded and atomically published.
+    downloaded_packages: u32,
+    /// HTTP requests made.
+    network_requests: u32,
+    /// Package payload bytes downloaded.
+    downloaded_bytes: u64,
   },
   /// A structured diagnostic was produced.
   Diagnostic {

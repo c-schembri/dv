@@ -2,11 +2,12 @@
 
 ## Supported Input
 
-The initial planner accepts a batch of already evaluated `net10.0`
+The initial planner accepts a batch of already evaluated single-target
 `Microsoft.NET.Sdk` C# projects and one selected SDK inventory. .NET 10 is the
-current stable target baseline. The newest stable installed
-`Microsoft.NETCore.App.Ref` `10.0.x` patch is selected; the SDK patch remains
-controlled by normal SDK discovery and `global.json`.
+current stable fixture baseline, not a production constant. Framework family
+and major/minor version are parsed once from the project. The newest stable
+installed matching `Microsoft.NETCore.App.Ref` patch is selected; the SDK
+patch remains controlled by normal SDK discovery and `global.json`.
 
 The local reference fixture has one user source. SDK `10.0.100` with reference
 pack `10.0.0` contributes 167 managed references, 6 pack analyzers, 2 SDK
@@ -19,7 +20,7 @@ These are observed values, not fixed counts.
 ProjectSpec batch + selected SdkInventory
   -> locate selected SDK compiler and analyzer assets once
   -> enumerate compatible reference-pack versions once
-  -> select highest stable 10.0 patch
+  -> select highest stable patch matching the evaluated target
   -> stream FrameworkList.xml
   -> enumerate references once and validate manifest membership
   -> retain managed references and C# analyzers in manifest order
@@ -65,10 +66,10 @@ source paths are planned but their contents are not materialized yet.
 
 | Boundary | Behavior |
 |---|---|
-| Compatible .NET 10 reference pack absent | `DV0300` |
+| Compatible target reference pack absent | `DV0300` |
 | Framework manifest malformed or targets another TFM | `DV0301` |
 | Manifest, compiler, analyzer, or config asset absent | `DV0302` |
-| Selected SDK cannot compile `net10.0` | `DV0303` |
+| Selected SDK cannot compile the evaluated target | `DV0303` |
 | Pack or manifest filesystem failure | `DV0304` |
 | Non-Unicode retained path | `DV0305` |
 | Compact text exceeds 4 GiB | `DV0306` |

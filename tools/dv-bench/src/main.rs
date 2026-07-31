@@ -20,6 +20,8 @@ enum CaseKind {
   ProjectEvaluate,
   CompilerPlan,
   RestoreCold,
+  PackageSyncCold,
+  PackageSyncWarm,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -71,6 +73,35 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_sync_cold",
+    kind: CaseKind::PackageSyncCold,
+    args: &[
+      "restore",
+      "PackageConsole.csproj",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_sync_warm",
+    kind: CaseKind::PackageSyncWarm,
+    args: &[
+      "restore",
+      "PackageConsole.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "build_clean",
     kind: CaseKind::BuildClean,
     args: &["build", "--no-restore", "--nologo", "--verbosity", "quiet"],
@@ -118,8 +149,20 @@ const DV_CASES: &[Case] = &[
   Case {
     name: "sync_cold",
     kind: CaseKind::RestoreCold,
-    args: &["sync"],
-    implemented: false,
+    args: &["sync", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "package_sync_cold",
+    kind: CaseKind::PackageSyncCold,
+    args: &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "package_sync_warm",
+    kind: CaseKind::PackageSyncWarm,
+    args: &["sync", "PackageConsole.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
   },
   Case {
     name: "build_clean",
@@ -204,6 +247,7 @@ fn run() -> Result<()> {
   let options = parse_options(env::args_os().skip(1))?;
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
+  let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let workspace = repository.join("target/benchmark-work");
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
@@ -216,9 +260,32 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
     verify_compiler_plan(&repository, &dv_executable, &fixture)?;
   }
+  if options
+    .case
+    .as_deref()
+    .is_none_or(|case| matches!(case, "package_sync_cold" | "package_sync_warm"))
+  {
+    verify_package_sync(&repository, &dv_executable, &package_fixture)?;
+  }
 
-  let mut runs = run_tool("dotnet", Path::new("dotnet"), DOTNET_CASES, &options, &fixture, &workspace.join("dotnet"))?;
-  runs.extend(run_tool("dv", &dv_executable, DV_CASES, &options, &fixture, &workspace.join("dv"))?);
+  let mut runs = run_tool(
+    "dotnet",
+    Path::new("dotnet"),
+    DOTNET_CASES,
+    &options,
+    &fixture,
+    &package_fixture,
+    &workspace.join("dotnet"),
+  )?;
+  runs.extend(run_tool(
+    "dv",
+    &dv_executable,
+    DV_CASES,
+    &options,
+    &fixture,
+    &package_fixture,
+    &workspace.join("dv"),
+  )?);
   if runs.is_empty() {
     return Err(format!("no benchmark case named {:?}", options.case.as_deref().unwrap_or_default()).into());
   }
@@ -387,6 +454,87 @@ fn verify_compiler_plan(repository: &Path, dv_executable: &Path, fixture: &Path)
   Ok(())
 }
 
+fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join("target/benchmark-package-sync-verification");
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "PackageConsole.csproj",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &dotnet_workspace,
+    "package-sync verification restore",
+  )?;
+  let dv_text = command_text(
+    dv_executable,
+    &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+    &dv_workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv sync did not emit package_resolution_created")?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let framework = assets
+    .pointer("/project/frameworks")
+    .and_then(serde_json::Value::as_object)
+    .and_then(|frameworks| frameworks.keys().next())
+    .ok_or("dotnet assets omitted the project framework")?;
+  if dv.get("target_framework").and_then(serde_json::Value::as_str) != Some(framework) {
+    return Err("package-sync target framework does not match dotnet restore".into());
+  }
+
+  let package_key = "Newtonsoft.Json/13.0.3";
+  let reference_hash = fs::read_to_string(dotnet_workspace.join(".packages/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512"))?;
+  let reference_hash = reference_hash.trim();
+  let packages = dv.get("packages").and_then(serde_json::Value::as_array).ok_or("dv sync omitted packages")?;
+  let package = packages.first().ok_or("dv sync resolved no package")?;
+  if packages.len() != 1
+    || package.get("id").and_then(serde_json::Value::as_str) != Some("Newtonsoft.Json")
+    || package.get("version").and_then(serde_json::Value::as_str) != Some("13.0.3")
+    || package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash)
+  {
+    return Err("dv package identity, version, or hash does not match dotnet restore".into());
+  }
+
+  let target = assets
+    .get("targets")
+    .and_then(serde_json::Value::as_object)
+    .and_then(|targets| targets.get(framework))
+    .and_then(serde_json::Value::as_object)
+    .and_then(|target| target.get(package_key))
+    .ok_or("dotnet assets omitted the package target")?;
+  let reference_compile = target
+    .get("compile")
+    .and_then(serde_json::Value::as_object)
+    .map(|assets| assets.keys().cloned().collect::<Vec<_>>())
+    .ok_or("dotnet assets omitted package compile assets")?;
+  let actual_compile = string_array(&dv, "compile_assets")?
+    .into_iter()
+    .map(|path| {
+      let path = path.replace('\\', "/");
+      path.find("/lib/").map_or(path.clone(), |index| path[index + 1..].to_owned())
+    })
+    .collect::<Vec<_>>();
+  if reference_compile != actual_compile {
+    return Err(format!("package compile assets differ: dotnet={reference_compile:?}, dv={actual_compile:?}").into());
+  }
+  Ok(())
+}
+
 fn compare_canonical_item_paths(dotnet: &serde_json::Value, dotnet_item: &str, dv: &serde_json::Value, dv_field: &str) -> Result<()> {
   let mut reference = item_identities(dotnet, dotnet_item)?
     .into_iter()
@@ -506,12 +654,21 @@ fn parse_count(option: &str, value: Option<std::ffi::OsString>) -> Result<usize>
     .map_err(|_| format!("{option} requires a non-negative integer").into())
 }
 
-fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Options, fixture: &Path, workspace: &Path) -> Result<Vec<Run>> {
+fn run_tool(
+  tool_name: &str,
+  executable: &Path,
+  cases: &[Case],
+  options: &Options,
+  fixture: &Path,
+  package_fixture: &Path,
+  workspace: &Path,
+) -> Result<Vec<Run>> {
   let version = command_text(executable, &["--version"], fixture)?;
   let mut runs = Vec::with_capacity(cases.len());
 
   for case in cases.iter().filter(|case| options.case.as_deref().is_none_or(|name| name == case.name)) {
     let case_workspace = workspace.join(case.name);
+    let case_fixture = case_fixture(case, fixture, package_fixture);
     let command: Vec<String> = std::iter::once(executable.display().to_string())
       .chain(case.args.iter().map(|value| (*value).into()))
       .collect();
@@ -520,7 +677,7 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
       runs.push(Run {
         tool: tool_name.into(),
         tool_version: version.clone(),
-        fixture: (!matches!(case.kind, CaseKind::Startup)).then(|| "small-console".into()),
+        fixture: fixture_name(case).map(str::to_owned),
         case: case.name.into(),
         command,
         status: RunStatus::Tbi,
@@ -531,13 +688,13 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
       continue;
     }
 
-    prepare_persistent_case(executable, case, fixture, &case_workspace)?;
+    prepare_persistent_case(executable, case, case_fixture, &case_workspace)?;
 
     let mut samples_ns = Vec::with_capacity(options.samples);
     let total = options.warmups + options.samples;
     for index in 0..total {
-      prepare_iteration(executable, case, fixture, &case_workspace)?;
-      let elapsed_ns = measure(executable, case.args, case_cwd(case, fixture, &case_workspace))?;
+      prepare_iteration(executable, case, case_fixture, &case_workspace)?;
+      let elapsed_ns = measure(executable, case.args, case_cwd(case, case_fixture, &case_workspace))?;
       if index >= options.warmups {
         samples_ns.push(elapsed_ns);
       }
@@ -547,7 +704,7 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
     runs.push(Run {
       tool: tool_name.into(),
       tool_version: version.clone(),
-      fixture: (!matches!(case.kind, CaseKind::Startup)).then(|| "small-console".into()),
+      fixture: fixture_name(case).map(str::to_owned),
       case: case.name.into(),
       command,
       status: RunStatus::Measured,
@@ -563,12 +720,38 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
 fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   if matches!(
     case.kind,
-    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan | CaseKind::BuildNoOp | CaseKind::RunWarm
+    CaseKind::ProjectEvaluate | CaseKind::CompilerPlan | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm
   ) {
     reset_fixture(fixture, workspace)?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
     run_checked(executable, &["restore", "--nologo", "--verbosity", "quiet"], workspace, "compiler plan restore")?;
+  }
+  if matches!(case.kind, CaseKind::PackageSyncWarm) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "PackageConsole.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "warm package restore setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["sync", "PackageConsole.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "warm package sync setup",
+      )?;
+    }
   }
   if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
@@ -579,12 +762,12 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::ProjectEvaluate | CaseKind::CompilerPlan => Ok(()),
-    CaseKind::RestoreCold => reset_fixture(fixture, workspace),
+    CaseKind::RestoreCold | CaseKind::PackageSyncCold => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
       run_checked(executable, restore_args(executable), workspace, "clean build restore")
     },
-    CaseKind::Startup | CaseKind::BuildNoOp | CaseKind::RunWarm => Ok(()),
+    CaseKind::Startup | CaseKind::PackageSyncWarm | CaseKind::BuildNoOp | CaseKind::RunWarm => Ok(()),
   }
 }
 
@@ -613,6 +796,22 @@ fn is_dotnet(executable: &Path) -> bool {
 
 fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path {
   if matches!(case.kind, CaseKind::Startup) { fixture } else { workspace }
+}
+
+fn case_fixture<'a>(case: &Case, fixture: &'a Path, package_fixture: &'a Path) -> &'a Path {
+  if matches!(case.kind, CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm) {
+    package_fixture
+  } else {
+    fixture
+  }
+}
+
+fn fixture_name(case: &Case) -> Option<&'static str> {
+  match case.kind {
+    CaseKind::Startup => None,
+    CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
+    _ => Some("small-console"),
+  }
 }
 
 fn measure(executable: &Path, args: &[&str], cwd: &Path) -> Result<u64> {
@@ -815,6 +1014,8 @@ fn case_label(case: &str) -> &str {
     "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
+    "package_sync_cold" => "Cold package sync",
+    "package_sync_warm" => "Warm package sync",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
