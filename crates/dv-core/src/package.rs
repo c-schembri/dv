@@ -20,7 +20,7 @@ use sha2::{Digest, Sha512};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use zip::ZipArchive;
 
-use crate::{FrameworkFamily, ProjectSpec, TargetFramework, discover_sdks};
+use crate::{FrameworkFamily, NugetAuditLevel, NugetAuditMode, ProjectSpec, TargetFramework, discover_sdks};
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
@@ -37,6 +37,25 @@ const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
 const LOCK_SCHEMA_VERSION: u16 = 3;
+
+/// Policy applied when validating NuGet package signatures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureValidationMode {
+  /// Unsigned packages are allowed and signature problems are warnings.
+  Accept,
+  /// Every package must satisfy the configured trusted-signers policy.
+  Require,
+}
+
+impl SignatureValidationMode {
+  /// Returns the canonical NuGet configuration spelling.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Accept => "accept",
+      Self::Require => "require",
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TextSpan {
@@ -209,12 +228,21 @@ pub struct PackageResolveOptions {
 pub struct PackageResolution {
   text: Box<str>,
   cache_root: TextSpan,
+  http_cache_root: TextSpan,
+  temp_root: TextSpan,
   lock_path: TextSpan,
   target_framework: TextSpan,
   source: TextSpan,
   prune_fingerprint: TextSpan,
   source_protocol: NugetProtocol,
+  signature_validation: SignatureValidationMode,
+  audit_enabled: bool,
+  audit_mode: NugetAuditMode,
+  audit_level: NugetAuditLevel,
+  proxy_configured: bool,
   packages: Box<[ResolvedPackage]>,
+  package_roots: Box<[TextSpan]>,
+  fallback_roots: Box<[TextSpan]>,
   package_assets: Box<[PackageAssets]>,
   package_extended_assets: Box<[PackageExtendedAssets]>,
   dependencies: Box<[u32]>,
@@ -227,13 +255,56 @@ pub struct PackageResolution {
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 248);
+const _: () = assert!(size_of::<PackageResolution>() == 304);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
   /// Returns the global-packages directory used by this graph.
   pub fn cache_root(&self) -> &Path {
     Path::new(self.get(self.cache_root))
+  }
+
+  /// Returns the selected NuGet HTTP metadata-cache directory.
+  pub fn http_cache_root(&self) -> &Path {
+    Path::new(self.get(self.http_cache_root))
+  }
+
+  /// Returns the selected NuGet scratch directory.
+  pub fn temp_root(&self) -> &Path {
+    Path::new(self.get(self.temp_root))
+  }
+
+  /// Iterates read-only fallback package roots in lookup order.
+  pub fn fallback_roots(&self) -> impl ExactSizeIterator<Item = &Path> {
+    self.fallback_roots.iter().map(|span| Path::new(self.get(*span)))
+  }
+
+  /// Returns the configured package-signature validation policy.
+  pub fn signature_validation(&self) -> SignatureValidationMode {
+    self.signature_validation
+  }
+
+  /// Returns whether vulnerability auditing is enabled for the project.
+  pub fn audit_enabled(&self) -> bool {
+    self.audit_enabled
+  }
+
+  /// Returns the configured vulnerability-audit dependency scope.
+  pub fn audit_mode(&self) -> NugetAuditMode {
+    self.audit_mode
+  }
+
+  /// Returns the configured minimum vulnerability severity.
+  pub fn audit_level(&self) -> NugetAuditLevel {
+    self.audit_level
+  }
+
+  /// Returns whether an explicit or environment proxy is configured.
+  ///
+  /// Proxy addresses and credentials are deliberately not retained in the
+  /// immutable result or emitted through reporters.
+  pub fn proxy_configured(&self) -> bool {
+    self.proxy_configured
   }
 
   /// Returns the deterministic lock-file path.
@@ -424,6 +495,10 @@ impl PackageResolution {
   fn package_runtime_targets(&self, index: usize) -> impl ExactSizeIterator<Item = RuntimeTargetAsset> + '_ {
     let range = range(self.package_extended_assets[index].runtime_targets);
     self.runtime_targets[range].iter().copied()
+  }
+
+  fn package_root_at(&self, index: usize) -> &Path {
+    Path::new(self.get(self.package_roots[index]))
   }
 
   fn get(&self, span: TextSpan) -> &str {
@@ -803,6 +878,7 @@ fn unsupported_version_range(value: &str) -> PackageError {
 
 struct WorkPackage {
   request: PackageRequest,
+  root: PathBuf,
   hash: String,
   dependencies: Vec<PackageRequest>,
   compile_assets: Vec<PathBuf>,
@@ -827,11 +903,19 @@ struct WorkRuntimeTarget {
 
 struct ResolutionContext<'a> {
   cache_root: &'a Path,
+  http_cache_root: &'a Path,
+  temp_root: &'a Path,
+  fallback_roots: &'a [PathBuf],
   lock_path: &'a Path,
   target_framework: &'a str,
   source: &'a str,
   prune_fingerprint: &'a str,
   source_protocol: NugetProtocol,
+  signature_validation: SignatureValidationMode,
+  audit_enabled: bool,
+  audit_mode: NugetAuditMode,
+  audit_level: NugetAuditLevel,
+  proxy_configured: bool,
 }
 
 #[derive(Default)]
@@ -992,12 +1076,17 @@ impl ServiceEndpoint {
 
 struct NugetConfiguration {
   cache_root: PathBuf,
+  http_cache_root: PathBuf,
+  temp_root: PathBuf,
+  fallback_roots: Arc<[PathBuf]>,
   sources: Vec<(String, PackageSource)>,
   // Audit resolution consumes this batch without reopening configuration
   // files once vulnerability endpoints are wired into restore.
   #[allow(dead_code)]
   audit_sources: Vec<(String, PackageSource)>,
   source_mapping: Option<Arc<PackageSourceMapping>>,
+  signature_validation: SignatureValidationMode,
+  proxy: Option<ProxySettings>,
 }
 
 #[derive(Default)]
@@ -1007,6 +1096,25 @@ struct NugetConfigMerge {
   audit_sources: Vec<(String, PackageSource)>,
   source_mapping: MergedSourceMapping,
   global_packages: Option<PathBuf>,
+  fallback_folders: Vec<FallbackFolder>,
+  config_priority: u32,
+  signature_validation: Option<SignatureValidationMode>,
+  proxy_url: Option<String>,
+  proxy_user: Option<String>,
+  proxy_password: Option<String>,
+  no_proxy: Option<String>,
+}
+
+struct FallbackFolder {
+  name: String,
+  path: PathBuf,
+  config_priority: u32,
+}
+
+#[derive(Clone)]
+struct ProxySettings {
+  url: String,
+  no_proxy: Option<String>,
 }
 
 #[derive(Default)]
@@ -1122,16 +1230,18 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     options.packages_directory.as_deref(),
     options.config_file.as_deref(),
   )?;
+  validate_signature_policy(config.signature_validation)?;
+  validate_audit_policy(project)?;
   let lock_path = project.project_directory().join("dv.lock.json");
   let direct = direct_requests(project)?;
   let target = project.target();
   let target_text = project.target_framework();
   let pruning = discover_package_pruning(project.project_directory(), target)?;
-  if let Some(resolution) = read_warm_lock(&lock_path, &config, &direct, target_text, &pruning.fingerprint)? {
+  if let Some(resolution) = read_warm_lock(&lock_path, &config, &direct, project, &pruning.fingerprint)? {
     return Ok(resolution);
   }
 
-  let client = http_client()?;
+  let client = http_client(config.proxy.as_ref())?;
   let runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(ASYNC_RUNTIME_WORKERS)
     .enable_all()
@@ -1154,11 +1264,19 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   let resolution = materialize_resolution(
     ResolutionContext {
       cache_root: &config.cache_root,
+      http_cache_root: &config.http_cache_root,
+      temp_root: &config.temp_root,
+      fallback_roots: &config.fallback_roots,
       lock_path: &lock_path,
       target_framework: target_text,
       source: &source,
       prune_fingerprint: &pruning.fingerprint,
       source_protocol,
+      signature_validation: config.signature_validation,
+      audit_enabled: project.nuget_audit_enabled(),
+      audit_mode: project.nuget_audit_mode(),
+      audit_level: project.nuget_audit_level(),
+      proxy_configured: config.proxy.is_some(),
     },
     &resolved,
     graph.network_requests,
@@ -1168,6 +1286,28 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     write_lock(&resolution)?;
   }
   Ok(resolution)
+}
+
+fn validate_signature_policy(mode: SignatureValidationMode) -> Result<(), PackageError> {
+  if mode == SignatureValidationMode::Require {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      "signatureValidationMode",
+      "signatureValidationMode=require needs package signature verification, which remains tracked by RES-015",
+    ));
+  }
+  Ok(())
+}
+
+fn validate_audit_policy(project: &ProjectSpec) -> Result<(), PackageError> {
+  if project.nuget_audit_enabled() {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      "NuGetAudit",
+      "NuGetAudit=true needs vulnerability advisory evaluation, which remains tracked by RES-024; set NuGetAudit=false to opt out explicitly",
+    ));
+  }
+  Ok(())
 }
 
 fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, PackageError> {
@@ -1397,6 +1537,8 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   for path in config_paths {
     merge_config(&path, &mut merged)?;
   }
+  let proxy = effective_proxy(&merged)?;
+  let signature_validation = merged.signature_validation.unwrap_or(SignatureValidationMode::Accept);
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
@@ -1415,7 +1557,7 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   }
   let cache_root = explicit_cache
     .map(Path::to_owned)
-    .or_else(|| env::var_os("NUGET_PACKAGES").map(PathBuf::from))
+    .or(environment_path("NUGET_PACKAGES")?)
     .or(merged.global_packages)
     .or_else(default_global_packages)
     .ok_or_else(|| {
@@ -1425,11 +1567,24 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
         "could not determine the global package cache; set NUGET_PACKAGES",
       )
     })?;
+  let fallback_roots = match environment_path_list("NUGET_FALLBACK_PACKAGES")? {
+    Some(paths) => paths,
+    None => ordered_fallback_paths(merged.fallback_folders),
+  };
+  let http_cache_root = environment_path("NUGET_HTTP_CACHE_PATH")?
+    .or_else(default_http_cache)
+    .ok_or_else(|| config_error(project_directory, "could not determine the NuGet HTTP cache; set NUGET_HTTP_CACHE_PATH"))?;
+  let temp_root = nonempty_env("NUGET_SCRATCH").unwrap_or_else(default_nuget_temp);
   Ok(NugetConfiguration {
     cache_root,
+    http_cache_root,
+    temp_root,
+    fallback_roots: fallback_roots.into(),
     sources,
     audit_sources: merged.audit_sources,
     source_mapping,
+    signature_validation,
+    proxy,
   })
 }
 
@@ -1465,6 +1620,99 @@ impl NugetConfigRoots {
 
 fn nonempty_env(name: &str) -> Option<PathBuf> {
   env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn environment_path(name: &str) -> Result<Option<PathBuf>, PackageError> {
+  let Some(path) = nonempty_env(name) else {
+    return Ok(None);
+  };
+  if !path.is_absolute() {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      name,
+      format!("NuGet environment variable {name} must contain an absolute path"),
+    ));
+  }
+  Ok(Some(path))
+}
+
+fn environment_path_list(name: &str) -> Result<Option<Vec<PathBuf>>, PackageError> {
+  let Some(value) = env::var_os(name).filter(|value| !value.is_empty()) else {
+    return Ok(None);
+  };
+  let value = value.to_str().ok_or_else(|| {
+    PackageError::new(
+      PackageErrorKind::Configuration,
+      name,
+      format!("NuGet environment variable {name} is not valid Unicode"),
+    )
+  })?;
+  let mut paths = Vec::with_capacity(value.bytes().filter(|byte| *byte == b';').count() + 1);
+  for path in value.split(';').filter(|path| !path.is_empty()) {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+      return Err(PackageError::new(
+        PackageErrorKind::Configuration,
+        name,
+        format!("NuGet environment variable {name} must contain only absolute paths"),
+      ));
+    }
+    paths.push(path);
+  }
+  Ok(Some(paths))
+}
+
+fn ordered_fallback_paths(mut folders: Vec<FallbackFolder>) -> Vec<PathBuf> {
+  folders.sort_by(|left, right| right.config_priority.cmp(&left.config_priority));
+  folders.into_iter().map(|folder| folder.path).collect()
+}
+
+fn default_http_cache() -> Option<PathBuf> {
+  if cfg!(windows) {
+    nonempty_env("LOCALAPPDATA").map(|path| path.join("NuGet/v3-cache"))
+  } else {
+    nonempty_env("XDG_DATA_HOME")
+      .or_else(|| nonempty_env("HOME").map(|path| path.join(".local/share")))
+      .map(|path| path.join("NuGet/http-cache"))
+  }
+}
+
+fn default_nuget_temp() -> PathBuf {
+  let root = env::temp_dir();
+  if cfg!(target_os = "linux") {
+    let user = env::var_os("USER").unwrap_or_default();
+    let mut name = std::ffi::OsString::from("NuGetScratch");
+    name.push(user);
+    root.join(name)
+  } else {
+    root.join("NuGetScratch")
+  }
+}
+
+fn effective_proxy(merged: &NugetConfigMerge) -> Result<Option<ProxySettings>, PackageError> {
+  let configured = merged.proxy_url.as_ref().filter(|url| !url.is_empty());
+  if let Some(url) = configured {
+    if cfg!(windows)
+      && (merged.proxy_user.as_ref().is_some_and(|value| !value.is_empty()) || merged.proxy_password.as_ref().is_some_and(|value| !value.is_empty()))
+    {
+      return Err(PackageError::new(
+        PackageErrorKind::Configuration,
+        "http_proxy",
+        "separate NuGet proxy credentials require encrypted credential support; use a credential-free proxy or an http_proxy URL until NUGET-011",
+      ));
+    }
+    return Ok(Some(ProxySettings {
+      url: url.clone(),
+      no_proxy: merged.no_proxy.clone().filter(|value| !value.is_empty()),
+    }));
+  }
+  let Some(url) = env::var("http_proxy").ok().filter(|value| !value.is_empty()) else {
+    return Ok(None);
+  };
+  Ok(Some(ProxySettings {
+    url,
+    no_proxy: env::var("no_proxy").ok().filter(|value| !value.is_empty()),
+  }))
 }
 
 fn discover_config_paths(project_directory: &Path, explicit_config: Option<&Path>, roots: &NugetConfigRoots) -> Result<Vec<PathBuf>, PackageError> {
@@ -1560,7 +1808,7 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
   if let Some(cache) = explicit_cache {
     return Ok(cache.to_owned());
   }
-  if let Some(cache) = nonempty_env("NUGET_PACKAGES") {
+  if let Some(cache) = environment_path("NUGET_PACKAGES")? {
     return Ok(cache);
   }
   discover_configuration(project_directory, None, None).map(|configuration| configuration.cache_root)
@@ -1568,6 +1816,7 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
 
 fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
   let bytes = fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?;
+  let config_priority = merged.config_priority;
   let mut reader = Reader::from_reader(bytes.as_slice());
   reader.config_mut().trim_text(true);
   let mut section = ConfigSection::Other;
@@ -1580,6 +1829,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         b"disabledPackageSources" => section = ConfigSection::Disabled,
         b"auditSources" => section = ConfigSection::AuditSources,
         b"packageSourceMapping" => section = ConfigSection::SourceMapping,
+        b"fallbackPackageFolders" => section = ConfigSection::FallbackFolders,
         b"config" => section = ConfigSection::Config,
         b"packageSource" if matches!(section, ConfigSection::SourceMapping) => {
           begin_source_mapping(
@@ -1601,7 +1851,8 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         ConfigSection::Disabled => merged.disabled.clear(),
         ConfigSection::AuditSources => merged.audit_sources.clear(),
         ConfigSection::SourceMapping => merged.source_mapping.clear(),
-        ConfigSection::Config => merged.global_packages = None,
+        ConfigSection::FallbackFolders => merged.fallback_folders.clear(),
+        ConfigSection::Config => merged.clear_config(),
         ConfigSection::Other => {},
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"add" => {
@@ -1629,13 +1880,31 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
             merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key));
             merged.disabled.push(key);
           },
+          ConfigSection::FallbackFolders => {
+            let candidate = resolve_config_path(path, &value);
+            add_or_replace_path(&mut merged.fallback_folders, key, candidate, config_priority);
+          },
           ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => {
-            let candidate = PathBuf::from(value);
-            merged.global_packages = Some(if candidate.is_absolute() {
-              candidate
+            merged.global_packages = Some(resolve_config_path(path, &value));
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("signatureValidationMode") => {
+            merged.signature_validation = Some(if value.eq_ignore_ascii_case("require") {
+              SignatureValidationMode::Require
             } else {
-              path.parent().unwrap_or(Path::new(".")).join(candidate)
+              SignatureValidationMode::Accept
             });
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("http_proxy") => {
+            merged.proxy_url = Some(value);
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("http_proxy.user") => {
+            merged.proxy_user = Some(value);
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("http_proxy.password") => {
+            merged.proxy_password = Some(value);
+          },
+          ConfigSection::Config if key.eq_ignore_ascii_case("no_proxy") => {
+            merged.no_proxy = Some(value);
           },
           ConfigSection::Other | ConfigSection::SourceMapping | ConfigSection::Config => {},
         }
@@ -1653,8 +1922,9 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
           ConfigSection::Disabled => merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::AuditSources => merged.audit_sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
           ConfigSection::SourceMapping => merged.source_mapping.remove(&key),
-          ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => merged.global_packages = None,
-          ConfigSection::Other | ConfigSection::Config => {},
+          ConfigSection::FallbackFolders => merged.fallback_folders.retain(|folder| !folder.name.eq_ignore_ascii_case(&key)),
+          ConfigSection::Config => merged.remove_config(&key),
+          ConfigSection::Other => {},
         }
       },
       Ok(Event::End(element)) => match local_name(element.name().as_ref()) {
@@ -1664,7 +1934,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
             .ok_or_else(|| config_error(path, "NuGet package-source mapping ended without a source"))?;
           merged.source_mapping.finish_source(pending, path)?;
         },
-        b"packageSources" | b"disabledPackageSources" | b"auditSources" | b"packageSourceMapping" | b"config" => {
+        b"packageSources" | b"disabledPackageSources" | b"auditSources" | b"packageSourceMapping" | b"fallbackPackageFolders" | b"config" => {
           if pending_mapping.is_some() {
             return Err(config_error(path, "NuGet package-source mapping did not close its source"));
           }
@@ -1677,6 +1947,9 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
       Err(error) => return Err(config_error(path, format!("invalid NuGet configuration XML: {error}"))),
     }
   }
+  merged.config_priority = config_priority
+    .checked_add(1)
+    .ok_or_else(|| config_error(path, "NuGet configuration file count exceeds u32"))?;
   Ok(())
 }
 
@@ -1686,6 +1959,56 @@ fn add_or_replace_source(sources: &mut Vec<(String, PackageSource)>, key: String
     *existing = source;
   } else {
     sources.push((key, source));
+  }
+}
+
+fn add_or_replace_path(paths: &mut Vec<FallbackFolder>, key: String, path: PathBuf, config_priority: u32) {
+  if let Some(existing) = paths.iter_mut().find(|folder| folder.name.eq_ignore_ascii_case(&key)) {
+    existing.name = key;
+    existing.path = path;
+    existing.config_priority = config_priority;
+  } else {
+    paths.push(FallbackFolder {
+      name: key,
+      path,
+      config_priority,
+    });
+  }
+}
+
+fn resolve_config_path(config_path: &Path, value: &str) -> PathBuf {
+  let candidate = PathBuf::from(value);
+  if candidate.is_absolute() {
+    candidate
+  } else {
+    config_path.parent().unwrap_or(Path::new(".")).join(candidate)
+  }
+}
+
+impl NugetConfigMerge {
+  fn clear_config(&mut self) {
+    self.global_packages = None;
+    self.signature_validation = None;
+    self.proxy_url = None;
+    self.proxy_user = None;
+    self.proxy_password = None;
+    self.no_proxy = None;
+  }
+
+  fn remove_config(&mut self, key: &str) {
+    if key.eq_ignore_ascii_case("globalPackagesFolder") {
+      self.global_packages = None;
+    } else if key.eq_ignore_ascii_case("signatureValidationMode") {
+      self.signature_validation = None;
+    } else if key.eq_ignore_ascii_case("http_proxy") {
+      self.proxy_url = None;
+    } else if key.eq_ignore_ascii_case("http_proxy.user") {
+      self.proxy_user = None;
+    } else if key.eq_ignore_ascii_case("http_proxy.password") {
+      self.proxy_password = None;
+    } else if key.eq_ignore_ascii_case("no_proxy") {
+      self.no_proxy = None;
+    }
   }
 }
 
@@ -1869,6 +2192,7 @@ enum ConfigSection {
   Disabled,
   AuditSources,
   SourceMapping,
+  FallbackFolders,
   Config,
 }
 
@@ -1930,10 +2254,15 @@ fn config_error(path: &Path, message: impl Into<String>) -> PackageError {
   PackageError::new(PackageErrorKind::Configuration, path.display().to_string(), message)
 }
 
-fn http_client() -> Result<reqwest::Client, PackageError> {
-  reqwest::Client::builder()
-    .https_only(true)
-    .timeout(Duration::from_secs(60))
+fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, PackageError> {
+  let mut builder = reqwest::Client::builder().https_only(true).timeout(Duration::from_secs(60));
+  if let Some(settings) = proxy {
+    let mut configured =
+      reqwest::Proxy::all(&settings.url).map_err(|error| config_error(Path::new("http_proxy"), format!("invalid NuGet proxy address: {error}")))?;
+    configured = configured.no_proxy(settings.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string));
+    builder = builder.no_proxy().proxy(configured);
+  }
+  builder
     .build()
     .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
 }
@@ -2060,7 +2389,9 @@ async fn resolve_streaming_graph(
         version: version.normalized.clone(),
         direct: node.direct.is_some(),
       });
-      let cache_miss = request.as_ref().is_none_or(|request| !package_root(&config.cache_root, request).exists());
+      let cache_miss = request
+        .as_ref()
+        .is_none_or(|request| find_package_root(&config.cache_root, &config.fallback_roots, request).is_none());
       if cache_miss && !options.offline && endpoints.is_none() {
         if !config.cache_root.is_dir() {
           fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
@@ -2072,6 +2403,8 @@ async fn resolve_streaming_graph(
 
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
+      let task_fallback_roots = Arc::clone(&config.fallback_roots);
+      let task_temp_root = config.temp_root.clone();
       let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let generation = node.generation;
@@ -2079,11 +2412,16 @@ async fn resolve_streaming_graph(
       let task_target = target;
       in_flight.insert(lower_id.clone());
       tasks.spawn(async move {
+        let storage = PackageStorage {
+          cache_root: &task_cache_root,
+          fallback_roots: &task_fallback_roots,
+          temp_root: &task_temp_root,
+        };
         let result = load_node_metadata(
           &task_client,
           request.as_ref(),
           &lower_id,
-          &task_cache_root,
+          storage,
           &task_endpoints,
           task_source_mapping.as_deref(),
           task_target,
@@ -2185,14 +2523,21 @@ async fn resolve_streaming_graph(
     {
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
+      let task_fallback_roots = Arc::clone(&config.fallback_roots);
+      let task_temp_root = config.temp_root.clone();
       let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
       acquisition_tasks.spawn(async move {
+        let storage = PackageStorage {
+          cache_root: &task_cache_root,
+          fallback_roots: &task_fallback_roots,
+          temp_root: &task_temp_root,
+        };
         let result = ensure_package(
           &task_client,
           &request,
-          &task_cache_root,
+          storage,
           &task_endpoints,
           task_source_mapping.as_deref(),
           target,
@@ -2437,17 +2782,30 @@ fn resolution_error(context: impl Into<String>, message: impl Into<String>) -> P
   PackageError::new(PackageErrorKind::Resolution, context, message)
 }
 
+#[derive(Clone, Copy)]
+struct PackageStorage<'a> {
+  cache_root: &'a Path,
+  fallback_roots: &'a [PathBuf],
+  temp_root: &'a Path,
+}
+
+const _: () = assert!(size_of::<PackageStorage<'_>>() == 6 * size_of::<usize>());
+const _: () = assert!(align_of::<PackageStorage<'_>>() == align_of::<usize>());
+
+const _: () = assert!(size_of::<PackageStorage<'static>>() == 48);
+const _: () = assert!(align_of::<PackageStorage<'static>>() == align_of::<usize>());
+
 async fn load_node_metadata(
   client: &reqwest::Client,
   request: Option<&PackageRequest>,
   lower_id: &str,
-  cache_root: &Path,
+  storage: PackageStorage<'_>,
   endpoints: &[ServiceEndpoint],
   source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
 ) -> Result<MetadataTaskResult, PackageError> {
   if request.is_none() && endpoints.is_empty() {
-    let cached_versions = enumerate_cached_versions(cache_root, lower_id)?;
+    let cached_versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
     if !cached_versions.is_empty() {
       return Ok(MetadataTaskResult::Versions {
         versions: cached_versions,
@@ -2457,8 +2815,7 @@ async fn load_node_metadata(
     }
   }
   if let Some(request) = request {
-    let root = package_root(cache_root, request);
-    if root.exists() {
+    if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
       let request = request.clone();
       let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
         .await
@@ -2472,7 +2829,7 @@ async fn load_node_metadata(
     }
 
     if endpoints.is_empty() {
-      let cached_versions = enumerate_cached_versions(cache_root, lower_id)?;
+      let cached_versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
       if !cached_versions.is_empty() {
         return Ok(MetadataTaskResult::Versions {
           versions: cached_versions,
@@ -2482,7 +2839,7 @@ async fn load_node_metadata(
       }
     }
 
-    match ensure_package(client, request, cache_root, endpoints, source_mapping, target, false).await {
+    match ensure_package(client, request, storage, endpoints, source_mapping, target, false).await {
       Ok(cached) => {
         let dependencies = match &cached.dependencies {
           Some(dependencies) => dependencies.clone(),
@@ -2556,14 +2913,24 @@ fn read_cached_requirements(root: &Path, request: &PackageRequest, target: Targe
   parse_nuspec_requirements(&nuspec_path, &nuspec, request, target)
 }
 
-fn enumerate_cached_versions(cache_root: &Path, lower_id: &str) -> Result<Vec<PackageVersion>, PackageError> {
+fn enumerate_cached_versions(cache_root: &Path, fallback_roots: &[PathBuf], lower_id: &str) -> Result<Vec<PackageVersion>, PackageError> {
+  let mut versions = Vec::new();
+  append_cached_versions(cache_root, lower_id, &mut versions)?;
+  for root in fallback_roots {
+    append_cached_versions(root, lower_id, &mut versions)?;
+  }
+  versions.sort_unstable();
+  versions.dedup();
+  Ok(versions)
+}
+
+fn append_cached_versions(cache_root: &Path, lower_id: &str, versions: &mut Vec<PackageVersion>) -> Result<(), PackageError> {
   let identity_root = cache_root.join(lower_id);
   let entries = match fs::read_dir(&identity_root) {
     Ok(entries) => entries,
-    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
     Err(error) => return Err(package_io("enumerate cached package versions", &identity_root, error)),
   };
-  let mut versions = Vec::new();
   for entry in entries {
     let entry = entry.map_err(|error| package_io("enumerate cached package versions", &identity_root, error))?;
     if entry
@@ -2576,9 +2943,7 @@ fn enumerate_cached_versions(cache_root: &Path, lower_id: &str) -> Result<Vec<Pa
       versions.push(version);
     }
   }
-  versions.sort_unstable();
-  versions.dedup();
-  Ok(versions)
+  Ok(())
 }
 
 async fn get_optional_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Option<Vec<u8>>, PackageError> {
@@ -2621,14 +2986,13 @@ fn package_worker_stopped() -> PackageError {
 async fn ensure_package(
   client: &reqwest::Client,
   request: &PackageRequest,
-  cache_root: &Path,
+  storage: PackageStorage<'_>,
   endpoints: &[ServiceEndpoint],
   source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
-  let root = package_root(cache_root, request);
-  if root.exists() {
+  if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
     let request = request.clone();
     return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true, 0, 0))
       .await
@@ -2639,7 +3003,7 @@ async fn ensure_package(
     if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), &request.lower_id)) {
       continue;
     }
-    match download_and_publish(client, request, cache_root, endpoint, target, parallel_extract).await {
+    match download_and_publish(client, request, storage.cache_root, storage.temp_root, endpoint, target, parallel_extract).await {
       Ok(package) => return Ok(package),
       Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
       Err(error) => return Err(error),
@@ -2656,6 +3020,23 @@ async fn ensure_package(
 
 fn package_root(cache_root: &Path, request: &PackageRequest) -> PathBuf {
   cache_root.join(&request.lower_id).join(&request.version)
+}
+
+fn find_package_root(cache_root: &Path, fallback_roots: &[PathBuf], request: &PackageRequest) -> Option<PathBuf> {
+  let mut candidate = package_root(cache_root, request);
+  if candidate.is_dir() {
+    return Some(candidate);
+  }
+  for fallback in fallback_roots {
+    candidate.clear();
+    candidate.push(fallback);
+    candidate.push(&request.lower_id);
+    candidate.push(&request.version);
+    if candidate.is_dir() {
+      return Some(candidate);
+    }
+  }
+  None
 }
 
 struct PackageMetadata {
@@ -2684,6 +3065,7 @@ async fn download_and_publish(
   client: &reqwest::Client,
   request: &PackageRequest,
   cache_root: &Path,
+  temp_root: &Path,
   endpoint: &ServiceEndpoint,
   target: TargetFramework,
   parallel_extract: bool,
@@ -2702,14 +3084,14 @@ async fn download_and_publish(
     ));
   }
 
-  let temp_root = unique_temp_root(cache_root, request);
-  tokio::fs::create_dir(&temp_root)
+  let scratch_root = unique_temp_root(temp_root, request);
+  tokio::fs::create_dir_all(&scratch_root)
     .await
-    .map_err(|error| package_io("create package staging directory", &temp_root, error))?;
-  let guard = TempGuard(Some(temp_root.clone()));
+    .map_err(|error| package_io("create package scratch directory", &scratch_root, error))?;
+  let scratch_guard = TempGuard(Some(scratch_root.clone()));
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
-  let nupkg_path = temp_root.join(&nupkg_name);
-  let (hash, bytes) = download_package(client, &metadata.content_url, &nupkg_path).await?;
+  let scratch_nupkg = scratch_root.join(&nupkg_name);
+  let (hash, bytes) = download_package(client, &metadata.content_url, &scratch_nupkg).await?;
   if let Some(expected) = metadata.expected_size
     && bytes != expected
   {
@@ -2728,11 +3110,24 @@ async fn download_and_publish(
       "downloaded package SHA-512 does not match source metadata",
     ));
   }
+  // Publication must remain an atomic rename on the global-cache volume.
+  // Link from NuGet scratch when possible and copy only across volumes.
+  let staging_root = unique_temp_root(cache_root, request);
+  tokio::fs::create_dir_all(&staging_root)
+    .await
+    .map_err(|error| package_io("create package staging directory", &staging_root, error))?;
+  let staging_guard = TempGuard(Some(staging_root.clone()));
+  let nupkg_path = staging_root.join(&nupkg_name);
+  if tokio::fs::hard_link(&scratch_nupkg, &nupkg_path).await.is_err() {
+    tokio::fs::copy(&scratch_nupkg, &nupkg_path)
+      .await
+      .map_err(|error| package_io("copy package archive into cache staging", &nupkg_path, error))?;
+  }
   let downloaded = DownloadedPackage {
     request: request.clone(),
     cache_root: cache_root.to_owned(),
     endpoint: endpoint.clone(),
-    temp_root,
+    temp_root: staging_root,
     nupkg_name,
     nupkg_path,
     hash,
@@ -2741,12 +3136,12 @@ async fn download_and_publish(
     target,
     parallel_extract,
   };
-  tokio::task::spawn_blocking(move || finish_download_and_publish(downloaded, guard))
+  tokio::task::spawn_blocking(move || finish_download_and_publish(downloaded, staging_guard, scratch_guard))
     .await
     .map_err(package_blocking_task_error)?
 }
 
-fn finish_download_and_publish(downloaded: DownloadedPackage, mut guard: TempGuard) -> Result<CachedPackage, PackageError> {
+fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard: TempGuard, _scratch_guard: TempGuard) -> Result<CachedPackage, PackageError> {
   validate_and_extract_archive(&downloaded.nupkg_path, &downloaded.temp_root, downloaded.parallel_extract)?;
   normalize_nuspec_name(&downloaded.temp_root, &downloaded.request)?;
   let nuspec_path = downloaded.temp_root.join(format!("{}.nuspec", downloaded.request.lower_id));
@@ -2774,7 +3169,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut guard: TempGua
     .map_err(|error| package_io("create package identity directory", &final_root, error))?;
   let published = publish_package_directory(&downloaded.temp_root, &final_root)?;
   if published {
-    guard.0 = None;
+    staging_guard.0 = None;
   }
   let mut cached = if published {
     CachedPackage {
@@ -3314,6 +3709,7 @@ fn parse_cached_package(
   };
   Ok(WorkPackage {
     request,
+    root: cached.root,
     hash: cached.hash,
     dependencies,
     compile_assets,
@@ -3902,17 +4298,24 @@ fn materialize_resolution(
     })
     .sum::<usize>()
     + context.cache_root.as_os_str().len()
+    + context.http_cache_root.as_os_str().len()
+    + context.temp_root.as_os_str().len()
+    + context.fallback_roots.iter().map(|path| path.as_os_str().len()).sum::<usize>()
     + context.lock_path.as_os_str().len()
     + context.target_framework.len()
     + context.source.len()
     + context.prune_fingerprint.len();
   let mut table = TextTable::with_capacity(estimated);
   let cache_root_span = table.push_path(context.cache_root)?;
+  let http_cache_root_span = table.push_path(context.http_cache_root)?;
+  let temp_root_span = table.push_path(context.temp_root)?;
+  let fallback_roots = context.fallback_roots.iter().map(|path| table.push_path(path)).collect::<Result<Box<_>, _>>()?;
   let lock_path_span = table.push_path(context.lock_path)?;
   let target_framework_span = table.push(context.target_framework)?;
   let source_span = table.push(context.source)?;
   let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
   let mut packages = Vec::with_capacity(work.len());
+  let mut package_roots = Vec::with_capacity(work.len());
   let mut package_assets = Vec::with_capacity(work.len());
   let mut package_extended_assets = Vec::with_capacity(work.len());
   let mut dependencies = Vec::new();
@@ -3974,6 +4377,7 @@ fn materialize_resolution(
       },
       direct: package.request.direct,
     });
+    package_roots.push(table.push_path(&package.root)?);
     package_assets.push(PackageAssets {
       hash: table.push(&package.hash)?,
       compile,
@@ -4008,12 +4412,21 @@ fn materialize_resolution(
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
     cache_root: cache_root_span,
+    http_cache_root: http_cache_root_span,
+    temp_root: temp_root_span,
     lock_path: lock_path_span,
     target_framework: target_framework_span,
     source: source_span,
     prune_fingerprint: prune_fingerprint_span,
     source_protocol: context.source_protocol,
+    signature_validation: context.signature_validation,
+    audit_enabled: context.audit_enabled,
+    audit_mode: context.audit_mode,
+    audit_level: context.audit_level,
+    proxy_configured: context.proxy_configured,
     packages: packages.into_boxed_slice(),
+    package_roots: package_roots.into_boxed_slice(),
+    fallback_roots,
     package_assets: package_assets.into_boxed_slice(),
     package_extended_assets: package_extended_assets.into_boxed_slice(),
     dependencies: dependencies.into_boxed_slice(),
@@ -4095,12 +4508,21 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
     cache_root: empty,
+    http_cache_root: empty,
+    temp_root: empty,
     lock_path: lock,
     target_framework,
     source: empty,
     prune_fingerprint: empty,
     source_protocol: NugetProtocol::V3,
+    signature_validation: SignatureValidationMode::Accept,
+    audit_enabled: project.nuget_audit_enabled(),
+    audit_mode: project.nuget_audit_mode(),
+    audit_level: project.nuget_audit_level(),
+    proxy_configured: false,
     packages: Box::new([]),
+    package_roots: Box::new([]),
+    fallback_roots: Box::new([]),
     package_assets: Box::new([]),
     package_extended_assets: Box::new([]),
     dependencies: Box::new([]),
@@ -4128,9 +4550,10 @@ fn read_warm_lock(
   path: &Path,
   config: &NugetConfiguration,
   direct: &[PackageRequirement],
-  target_text: &str,
+  project: &ProjectSpec,
   prune_fingerprint: &str,
 ) -> Result<Option<PackageResolution>, PackageError> {
+  let target_text = project.target_framework();
   let bytes = match fs::read(path) {
     Ok(bytes) => bytes,
     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -4172,7 +4595,16 @@ fn read_warm_lock(
       id: package.id,
       direct: package.direct,
     };
-    let root = package_root(&config.cache_root, &request);
+    let root = find_package_root(&config.cache_root, &config.fallback_roots, &request).ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::Integrity,
+        format!("{} {}", request.id, request.version),
+        format!(
+          "locked package cache entry for {} {} is absent from global and fallback package folders",
+          request.id, request.version
+        ),
+      )
+    })?;
     validate_locked_package(&root, &request, &package.sha512)?;
     let compile_assets = lock_asset_paths(&root, &package.compile_assets)?;
     let runtime_assets = lock_asset_paths(&root, &package.runtime_assets)?;
@@ -4218,6 +4650,7 @@ fn read_warm_lock(
         request.lower_id.clone(),
         WorkPackage {
           request,
+          root,
           hash: package.sha512,
           dependencies,
           compile_assets,
@@ -4259,11 +4692,19 @@ fn read_warm_lock(
   materialize_resolution(
     ResolutionContext {
       cache_root: &config.cache_root,
+      http_cache_root: &config.http_cache_root,
+      temp_root: &config.temp_root,
+      fallback_roots: &config.fallback_roots,
       lock_path: path,
       target_framework: target_text,
       source: &lock.source,
       prune_fingerprint,
       source_protocol: lock.source_protocol,
+      signature_validation: config.signature_validation,
+      audit_enabled: project.nuget_audit_enabled(),
+      audit_mode: project.nuget_audit_mode(),
+      audit_level: project.nuget_audit_level(),
+      proxy_configured: config.proxy.is_some(),
     },
     &work,
     0,
@@ -4353,27 +4794,27 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
         }
       })
       .collect();
-    let root = resolution.cache_root().join(normalize_id(&id)?).join(normalize_version(&version)?);
+    let root = resolution.package_root_at(index);
     packages.push(LockPackage {
       id,
       version,
       sha512: resolution.package_hash(index).to_owned(),
       direct: package.direct,
       dependencies,
-      compile_assets: relative_assets(&root, resolution.package_compile_assets(index))?,
-      runtime_assets: relative_assets(&root, resolution.package_runtime_assets(index))?,
-      analyzers: relative_assets(&root, resolution.package_analyzers(index))?,
-      resource_assets: relative_assets(&root, resolution.package_resource_assets(index))?,
-      content_files: relative_assets(&root, resolution.package_content_files(index))?,
-      build_assets: relative_assets(&root, resolution.package_build_assets(index))?,
-      build_multi_targeting_assets: relative_assets(&root, resolution.package_build_multi_targeting_assets(index))?,
-      build_transitive_assets: relative_assets(&root, resolution.package_build_transitive_assets(index))?,
-      native_assets: relative_assets(&root, resolution.package_native_assets(index))?,
+      compile_assets: relative_assets(root, resolution.package_compile_assets(index))?,
+      runtime_assets: relative_assets(root, resolution.package_runtime_assets(index))?,
+      analyzers: relative_assets(root, resolution.package_analyzers(index))?,
+      resource_assets: relative_assets(root, resolution.package_resource_assets(index))?,
+      content_files: relative_assets(root, resolution.package_content_files(index))?,
+      build_assets: relative_assets(root, resolution.package_build_assets(index))?,
+      build_multi_targeting_assets: relative_assets(root, resolution.package_build_multi_targeting_assets(index))?,
+      build_transitive_assets: relative_assets(root, resolution.package_build_transitive_assets(index))?,
+      native_assets: relative_assets(root, resolution.package_native_assets(index))?,
       runtime_targets: resolution
         .package_runtime_targets(index)
         .map(|asset| {
           Ok(LockRuntimeTarget {
-            path: relative_asset(&root, resolution.get(asset.path))?,
+            path: relative_asset(root, resolution.get(asset.path))?,
             runtime_identifier: resolution.get(asset.runtime_identifier).to_owned(),
             kind: asset.kind,
           })
@@ -4603,12 +5044,20 @@ mod tests {
   #[test]
   fn legacy_lock_without_a_pruning_fingerprint_is_a_cold_miss() {
     let temp = TempDirectory::new();
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+    );
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
     let path = temp.write(
       "dv.lock.json",
       r#"{"schema_version":1,"target_framework":"net10.0","source":"https://api.nuget.org/v3/index.json","source_protocol":"v3","direct":[],"packages":[]}"#,
     );
     let config = NugetConfiguration {
       cache_root: temp.0.join("packages"),
+      http_cache_root: temp.0.join("http-cache"),
+      temp_root: temp.0.join("scratch"),
+      fallback_roots: Arc::from([]),
       sources: vec![(
         "nuget.org".into(),
         PackageSource {
@@ -4618,9 +5067,11 @@ mod tests {
       )],
       audit_sources: Vec::new(),
       source_mapping: None,
+      signature_validation: SignatureValidationMode::Accept,
+      proxy: None,
     };
 
-    let result = read_warm_lock(&path, &config, &[], "net10.0", "current-table").unwrap();
+    let result = read_warm_lock(&path, &config, &[], &project, "current-table").unwrap();
 
     assert!(result.is_none());
   }
@@ -5010,6 +5461,138 @@ mod tests {
   }
 
   #[test]
+  fn nuget_storage_signature_and_proxy_policy_merge_as_typed_values() {
+    let temp = TempDirectory::new();
+    let lower = temp.write(
+      "lower.config",
+      r#"<configuration>
+<fallbackPackageFolders><clear /><add key="shared" value="lower/shared" /><add key="legacy" value="lower/legacy" /><add key="stale" value="lower/stale" /></fallbackPackageFolders>
+<config>
+  <add key="globalPackagesFolder" value="lower/packages" />
+  <add key="signatureValidationMode" value="require" />
+  <add key="http_proxy" value="http://lower.proxy:8080" />
+  <add key="http_proxy.user" value="lower-user" />
+  <add key="http_proxy.password" value="lower-secret" />
+  <add key="no_proxy" value="localhost" />
+</config>
+</configuration>"#,
+    );
+    let higher = temp.write(
+      "higher.config",
+      r#"<configuration>
+<fallbackPackageFolders><remove key="stale" /><add key="SHARED" value="higher/shared" /><add key="final" value="higher/final" /></fallbackPackageFolders>
+<config>
+  <clear />
+  <add key="globalPackagesFolder" value="higher/packages" />
+  <add key="signatureValidationMode" value="unexpected" />
+  <add key="http_proxy" value="http://higher.proxy:9090" />
+  <add key="no_proxy" value="example.test,localhost" />
+</config>
+</configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+
+    merge_config(&lower, &mut merged).unwrap();
+    assert_eq!(merged.signature_validation, Some(SignatureValidationMode::Require));
+    merge_config(&higher, &mut merged).unwrap();
+
+    assert_eq!(merged.global_packages, Some(temp.0.join("higher/packages")));
+    assert_eq!(merged.signature_validation, Some(SignatureValidationMode::Accept));
+    assert_eq!(merged.fallback_folders.len(), 3);
+    assert_eq!(merged.fallback_folders[0].name, "SHARED");
+    assert_eq!(merged.fallback_folders[0].path, temp.0.join("higher/shared"));
+    assert_eq!(merged.fallback_folders[0].config_priority, 1);
+    assert_eq!(merged.fallback_folders[1].name, "legacy");
+    assert_eq!(merged.fallback_folders[1].config_priority, 0);
+    assert_eq!(merged.fallback_folders[2].name, "final");
+    assert_eq!(merged.fallback_folders[2].path, temp.0.join("higher/final"));
+    assert_eq!(merged.fallback_folders[2].config_priority, 1);
+    assert_eq!(
+      ordered_fallback_paths(merged.fallback_folders)
+        .iter()
+        .map(|path| path.strip_prefix(&temp.0).unwrap())
+        .collect::<Vec<_>>(),
+      [Path::new("higher/shared"), Path::new("higher/final"), Path::new("lower/legacy")]
+    );
+    assert_eq!(merged.proxy_url.as_deref(), Some("http://higher.proxy:9090"));
+    assert_eq!(merged.proxy_user, None);
+    assert_eq!(merged.proxy_password, None);
+    assert_eq!(merged.no_proxy.as_deref(), Some("example.test,localhost"));
+  }
+
+  #[test]
+  fn fallback_package_roots_are_searched_after_the_global_cache() {
+    let temp = TempDirectory::new();
+    let global = temp.0.join("global");
+    let first = temp.0.join("first");
+    let second = temp.0.join("second");
+    fs::create_dir_all(second.join("sample.package/1.2.3")).unwrap();
+    fs::create_dir_all(first.join("sample.package/2.0.0")).unwrap();
+
+    let found = find_package_root(&global, &[first.clone(), second.clone()], &request()).unwrap();
+    let versions = enumerate_cached_versions(&global, &[first, second.clone()], "sample.package").unwrap();
+
+    assert_eq!(found, second.join("sample.package/1.2.3"));
+    assert_eq!(
+      versions.iter().map(|version| version.normalized.as_str()).collect::<Vec<_>>(),
+      ["1.2.3", "2.0.0"]
+    );
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn encrypted_proxy_credentials_fail_instead_of_becoming_plaintext_basic_auth() {
+    let merged = NugetConfigMerge {
+      proxy_url: Some("http://proxy.example.test:8080".into()),
+      proxy_user: Some("user".into()),
+      proxy_password: Some("encrypted-value".into()),
+      ..NugetConfigMerge::default()
+    };
+
+    let result = effective_proxy(&merged);
+    if cfg!(windows) {
+      let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("Windows encrypted proxy credentials must fail"),
+      };
+      assert_eq!(error.kind(), PackageErrorKind::Configuration);
+      assert!(!error.to_string().contains("encrypted-value"));
+    } else {
+      let proxy = result.unwrap().unwrap();
+      assert_eq!(proxy.url, "http://proxy.example.test:8080");
+    }
+  }
+
+  #[test]
+  fn required_signatures_fail_until_packages_are_actually_verified() {
+    let error = validate_signature_policy(SignatureValidationMode::Require).unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert!(error.to_string().contains("RES-015"));
+    validate_signature_policy(SignatureValidationMode::Accept).unwrap();
+  }
+
+  #[test]
+  fn enabled_audit_fails_until_advisories_are_actually_evaluated() {
+    let temp = TempDirectory::new();
+    let enabled_path = temp.write(
+      "Enabled.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+    );
+    let disabled_path = temp.write(
+      "Disabled.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup></Project>"#,
+    );
+    let enabled = evaluate_project_path(&enabled_path, ProjectConfiguration::Debug).unwrap();
+    let disabled = evaluate_project_path(&disabled_path, ProjectConfiguration::Debug).unwrap();
+
+    let error = validate_audit_policy(&enabled).unwrap_err();
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert!(error.to_string().contains("RES-024"));
+    validate_audit_policy(&disabled).unwrap();
+  }
+
+  #[test]
   fn nuget_environment_expansion_is_single_pass_and_preserves_unknown_values() {
     let path = Path::new("NuGet.Config");
     let expanded = expand_config_value_with("before/%ROOT%/%UNKNOWN%/%CHAIN%/after".into(), path, |name| match name {
@@ -5305,7 +5888,7 @@ mod tests {
     temp.write("Program.cs", "");
     let project_path = temp.write(
       "App.csproj",
-      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
 <ItemGroup><PackageReference Include="Meta.Package" Version="1.0.0" /></ItemGroup></Project>"#,
     );
     for (id, version, nuspec) in [
@@ -5356,7 +5939,7 @@ mod tests {
     temp.write("Program.cs", "");
     let project_path = temp.write(
       "App.csproj",
-      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
 <ItemGroup><PackageReference Include="Range.Package" Version="(1.0,3.0)" /></ItemGroup></Project>"#,
     );
     for version in ["1.0.0", "2.0.0"] {
@@ -5395,7 +5978,7 @@ mod tests {
     temp.write("Program.cs", "");
     let project_path = temp.write(
       "App.csproj",
-      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
 <ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" /></ItemGroup></Project>"#,
     );
     let cache = temp.0.join("packages");

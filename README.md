@@ -50,6 +50,9 @@ dv restore (config merge)       9.422 ms median
 dotnet restore (source policy) 527.659 ms median
 dv restore (source policy)       5.850 ms median
 
+dotnet restore (storage policy) 523.051 ms median
+dv restore (storage policy)       5.370 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -93,6 +96,7 @@ The project is in the first implementation phase.
 | Machine/user/repository/explicit NuGet config discovery | Implemented |
 | Keyed NuGet config merge and environment expansion | Implemented |
 | NuGet package/audit sources, protocols, and source mapping | Implemented |
+| NuGet storage, fallback, signature, proxy, and audit policy | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -151,6 +155,15 @@ writes a deterministic `dv.lock.json`. A matching warm lock performs zero
 network requests. Selected compile, runtime, analyzer, resource, content,
 build, build-multitargeting, build-transitive, and native paths occupy
 consecutive ranges in one immutable span batch.
+
+Storage policy follows NuGet precedence for the writable global cache,
+read-only fallback folders, HTTP metadata cache, and scratch directory.
+Restore also retains typed signature-validation and project audit policy and
+constructs proxy address and bypass policy only at the HTTP boundary, without
+reporting either. Separate Windows-encrypted config credentials fail explicitly
+until authenticated proxy support lands. Signature verification, advisory
+lookup, and conditional HTTP-cache semantics remain separately tracked parity
+work.
 
 `dv build --plan` selects the newest installed reference pack matching the
 project target, parses its manifest, selects Roslyn plus built-in and package
@@ -226,9 +239,9 @@ Initial machine:
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
-  policy sections, and the framework-reference plan, unavailable-pack
-  diagnostic, 203-package asset plan, and one-package cold case; compiler
-  planning uses 5 warm-ups; 10
+  policy sections, storage policy, the framework-reference plan,
+  unavailable-pack diagnostic, 203-package asset plan, and one-package cold
+  case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -249,6 +262,7 @@ Initial machine:
 | Validate a six-file NuGet configuration hierarchy | `dotnet restore ConfigHierarchy.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigHierarchy.csproj --offline --json` | 532.948 ms | 5.651 ms | 94.3x | 545.049 ms | 6.296 ms |
 | Merge keyed NuGet configuration | `dotnet restore ConfigMerge.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigMerge.csproj --offline --json` | 558.126 ms | 9.422 ms | 59.2x | 648.298 ms | 10.606 ms |
 | Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
+| Resolve NuGet storage and restore policy | `dotnet restore StoragePolicy.csproj --locked-mode --no-http-cache --nologo --verbosity quiet` | `dv restore StoragePolicy.csproj --offline --json` | 523.051 ms | 5.370 ms | 97.4x | 605.407 ms | 6.526 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -278,9 +292,13 @@ sources, and `%NAME%` expansion across four precedence levels, then applies
 the same package and cache parity gate. The source-policy case uses the SDK's
 official `NuGet.Configuration` assembly to verify enabled and disabled package
 sources, audit sources, v2/v3 metadata, and longest-pattern mapping queries
-before applying the same package and cache parity gate. The
-unavailable-pack case uses an empty checked-in source and isolated package
-cache; both commands must fail and name
+before applying the same package and cache parity gate. The storage-policy
+case uses that same official assembly plus an MSBuild property query to verify
+global, HTTP-cache, scratch, ordered fallback, signature, audit, and proxy
+policy. Both tools then resolve the same locked package from the fallback root
+with empty global roots and zero timed network work. The unavailable-pack case
+uses an empty checked-in source and isolated package cache; both commands must
+fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
 version, TFM, RID, pack kind, acquisition action, and human guidance. The
 massive case additionally compares runtime, resource, content, analyzer,
@@ -302,6 +320,7 @@ recorded in the curated
 [NuGet configuration baseline](docs/performance-baselines/2026-08-01-nuget-config-discovery-windows.md),
 [NuGet keyed-merge baseline](docs/performance-baselines/2026-08-01-nuget-config-merge-windows.md),
 [NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
+[NuGet storage-policy baseline](docs/performance-baselines/2026-08-01-nuget-storage-policy-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -349,6 +368,8 @@ cargo bench-all --case framework_reference_plan --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
 cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
+cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
+cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
@@ -403,6 +424,7 @@ See:
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)
 - [NuGet configuration discovery contract](docs/nuget-config-discovery.md)
 - [NuGet keyed configuration merge contract](docs/nuget-config-merge.md)
+- [NuGet storage and restore policy contract](docs/nuget-storage-policy.md)
 - [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)

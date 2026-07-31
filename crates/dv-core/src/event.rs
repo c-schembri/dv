@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 6;
+pub const EVENT_SCHEMA_VERSION: u16 = 7;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -372,6 +372,22 @@ pub enum EventPayload {
     project: String,
     /// Global-packages directory.
     cache_root: String,
+    /// NuGet HTTP metadata-cache directory.
+    http_cache_root: String,
+    /// NuGet scratch directory.
+    temp_root: String,
+    /// Ordered read-only fallback package roots.
+    fallback_roots: Vec<String>,
+    /// Package-signature validation policy.
+    signature_validation: String,
+    /// Whether vulnerability auditing is enabled.
+    audit_enabled: bool,
+    /// Vulnerability-audit dependency scope.
+    audit_mode: String,
+    /// Minimum reported vulnerability severity.
+    audit_level: String,
+    /// Whether restore constructed an explicit proxy policy.
+    proxy_configured: bool,
     /// Deterministic dv lock file.
     lock_path: String,
     /// Evaluated target framework.

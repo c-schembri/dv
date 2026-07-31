@@ -113,6 +113,76 @@ pub enum RuntimeRollForward {
   LatestMajor,
 }
 
+/// Dependency scope included in NuGet vulnerability auditing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NugetAuditMode {
+  /// Audit only direct package references.
+  Direct,
+  /// Audit direct and transitive package references.
+  All,
+}
+
+impl NugetAuditMode {
+  /// Parses the MSBuild property spelling case-insensitively.
+  pub fn parse(value: &str) -> Option<Self> {
+    if value.eq_ignore_ascii_case("direct") {
+      Some(Self::Direct)
+    } else if value.eq_ignore_ascii_case("all") {
+      Some(Self::All)
+    } else {
+      None
+    }
+  }
+
+  /// Returns the canonical NuGet property spelling.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Direct => "direct",
+      Self::All => "all",
+    }
+  }
+}
+
+/// Minimum vulnerability severity reported by NuGet auditing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NugetAuditLevel {
+  /// Include low-severity advisories and above.
+  Low,
+  /// Include moderate-severity advisories and above.
+  Moderate,
+  /// Include high-severity advisories and above.
+  High,
+  /// Include only critical advisories.
+  Critical,
+}
+
+impl NugetAuditLevel {
+  /// Parses the MSBuild property spelling case-insensitively.
+  pub fn parse(value: &str) -> Option<Self> {
+    if value.eq_ignore_ascii_case("low") {
+      Some(Self::Low)
+    } else if value.eq_ignore_ascii_case("moderate") {
+      Some(Self::Moderate)
+    } else if value.eq_ignore_ascii_case("high") {
+      Some(Self::High)
+    } else if value.eq_ignore_ascii_case("critical") {
+      Some(Self::Critical)
+    } else {
+      None
+    }
+  }
+
+  /// Returns the canonical NuGet property spelling.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Low => "low",
+      Self::Moderate => "moderate",
+      Self::High => "high",
+      Self::Critical => "critical",
+    }
+  }
+}
+
 impl RuntimeRollForward {
   /// Parses the project/runtimeconfig spelling case-insensitively.
   pub fn parse(value: &str) -> Option<Self> {
@@ -172,6 +242,9 @@ pub struct ProjectSpec {
   implicit_usings: bool,
   deterministic: bool,
   self_contained: bool,
+  nuget_audit_enabled: bool,
+  nuget_audit_mode: NugetAuditMode,
+  nuget_audit_level: NugetAuditLevel,
   target_latest_runtime_patch: Option<bool>,
   roll_forward: RuntimeRollForward,
   target_framework: TargetFramework,
@@ -315,6 +388,21 @@ impl ProjectSpec {
     self.self_contained
   }
 
+  /// Returns whether package vulnerability auditing is enabled.
+  pub fn nuget_audit_enabled(&self) -> bool {
+    self.nuget_audit_enabled
+  }
+
+  /// Returns whether auditing covers direct or all dependencies.
+  pub fn nuget_audit_mode(&self) -> NugetAuditMode {
+    self.nuget_audit_mode
+  }
+
+  /// Returns the minimum vulnerability severity reported by auditing.
+  pub fn nuget_audit_level(&self) -> NugetAuditLevel {
+    self.nuget_audit_level
+  }
+
   /// Returns the explicit project-wide latest-patch preference.
   pub fn target_latest_runtime_patch(&self) -> Option<bool> {
     self.target_latest_runtime_patch
@@ -406,6 +494,9 @@ enum Property {
   TargetLatestRuntimePatch,
   RollForward,
   SelfContained,
+  NugetAudit,
+  NugetAuditMode,
+  NugetAuditLevel,
 }
 
 #[derive(Clone, Copy)]
@@ -444,6 +535,9 @@ struct RawProject {
   target_latest_runtime_patch: Option<String>,
   roll_forward: Option<String>,
   self_contained: Option<String>,
+  nuget_audit: Option<String>,
+  nuget_audit_mode: Option<String>,
+  nuget_audit_level: Option<String>,
   project_references: Vec<String>,
   package_references: Vec<RawPackageReference>,
   framework_references: Vec<RawFrameworkReference>,
@@ -770,6 +864,9 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::TargetLatestRuntimePatch => raw.target_latest_runtime_patch = Some(text.to_owned()),
       Property::RollForward => raw.roll_forward = Some(text.to_owned()),
       Property::SelfContained => raw.self_contained = Some(text.to_owned()),
+      Property::NugetAudit => raw.nuget_audit = Some(text.to_owned()),
+      Property::NugetAuditMode => raw.nuget_audit_mode = Some(text.to_owned()),
+      Property::NugetAuditLevel => raw.nuget_audit_level = Some(text.to_owned()),
     },
     Element::PackageVersion(index) => {
       let package = &mut raw.package_references[index];
@@ -835,6 +932,28 @@ fn materialize_project(
   let implicit_usings = parse_toggle(&project_path, "ImplicitUsings", raw.implicit_usings.as_deref(), false, false)?;
   let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
   let self_contained = parse_bool(&project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
+  let nuget_audit_enabled = parse_bool(&project_path, "NuGetAudit", raw.nuget_audit.as_deref(), true)?;
+  let nuget_audit_mode = match raw.nuget_audit_mode.as_deref() {
+    Some(value) => NugetAuditMode::parse(value).ok_or_else(|| {
+      ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        &project_path,
+        format!("NuGetAuditMode value {value:?} must be direct or all"),
+      )
+    })?,
+    None if parsed_target.major() >= 10 => NugetAuditMode::All,
+    None => NugetAuditMode::Direct,
+  };
+  let nuget_audit_level = match raw.nuget_audit_level.as_deref() {
+    Some(value) => NugetAuditLevel::parse(value).ok_or_else(|| {
+      ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        &project_path,
+        format!("NuGetAuditLevel value {value:?} must be low, moderate, high, or critical"),
+      )
+    })?,
+    None => NugetAuditLevel::Low,
+  };
   let target_latest_runtime_patch = raw
     .target_latest_runtime_patch
     .as_deref()
@@ -1032,6 +1151,9 @@ fn materialize_project(
     implicit_usings,
     deterministic,
     self_contained,
+    nuget_audit_enabled,
+    nuget_audit_mode,
+    nuget_audit_level,
     target_latest_runtime_patch,
     roll_forward,
     target_framework: parsed_target,
@@ -1169,6 +1291,9 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
     "TargetLatestRuntimePatch" => Ok(Property::TargetLatestRuntimePatch),
     "RollForward" => Ok(Property::RollForward),
     "SelfContained" => Ok(Property::SelfContained),
+    "NuGetAudit" => Ok(Property::NugetAudit),
+    "NuGetAuditMode" => Ok(Property::NugetAuditMode),
+    "NuGetAuditLevel" => Ok(Property::NugetAuditLevel),
     _ => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
@@ -1481,6 +1606,29 @@ mod tests {
     assert_eq!(result.target_latest_runtime_patch(), Some(false));
     assert_eq!(result.roll_forward(), RuntimeRollForward::LatestMinor);
     assert!(!result.self_contained());
+  }
+
+  #[test]
+  fn evaluates_typed_nuget_audit_policy_and_net10_defaults() {
+    let temp = TempDirectory::new();
+    let explicit = temp.write(
+      "Explicit.csproj",
+      &project_xml(
+        "<NuGetAudit>false</NuGetAudit><NuGetAuditMode>direct</NuGetAuditMode><NuGetAuditLevel>critical</NuGetAuditLevel>",
+        "",
+      ),
+    );
+    let defaulted = temp.write("Defaulted.csproj", &project_xml("", ""));
+
+    let explicit = evaluate_project_path(&explicit, ProjectConfiguration::Debug).unwrap();
+    let defaulted = evaluate_project_path(&defaulted, ProjectConfiguration::Debug).unwrap();
+
+    assert!(!explicit.nuget_audit_enabled());
+    assert_eq!(explicit.nuget_audit_mode(), NugetAuditMode::Direct);
+    assert_eq!(explicit.nuget_audit_level(), NugetAuditLevel::Critical);
+    assert!(defaulted.nuget_audit_enabled());
+    assert_eq!(defaulted.nuget_audit_mode(), NugetAuditMode::All);
+    assert_eq!(defaulted.nuget_audit_level(), NugetAuditLevel::Low);
   }
 
   #[test]

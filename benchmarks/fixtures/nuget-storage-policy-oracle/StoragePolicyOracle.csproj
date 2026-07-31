@@ -1,13 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <NuGetAudit>false</NuGetAudit>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Humanizer" Version="2.14.1" />
+    <Reference Include="NuGet.Common" HintPath="$(MSBuildBinPath)\NuGet.Common.dll" Private="true" />
+    <Reference Include="NuGet.Configuration" HintPath="$(MSBuildBinPath)\NuGet.Configuration.dll" Private="true" />
   </ItemGroup>
 </Project>

@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `6`;
+- schema version `7`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -54,7 +54,9 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 6 adds framework-reference metadata to `project_evaluated` and the
+Schema 7 adds global/HTTP/temp/fallback storage roots, signature and audit
+policy, and a redacted proxy-presence bit to `package_resolution_created`.
+Schema 6 added framework-reference metadata to `project_evaluated` and the
 `framework_reference_plan_created` event. Schema 5 added
 `runtime_pack_plan_created`; schema 4 added
 `runtime_compatibility`; schema 3 added selected, plural, and materialized

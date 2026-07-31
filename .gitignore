@@ -7,3 +7,12 @@
 # Benchmark output is machine-specific evidence, not source.
 /benchmarks/results/*
 !/benchmarks/results/.gitkeep
+
+# Benchmark setup derives these caches and build outputs from source fixtures.
+/benchmarks/fixtures/**/bin/
+/benchmarks/fixtures/**/obj/
+/benchmarks/fixtures/**/.packages/
+/benchmarks/fixtures/nuget-storage-policy/.seed/
+/benchmarks/fixtures/nuget-storage-policy/policy/
+/benchmarks/fixtures/nuget-storage-policy/dv.lock.json
+/benchmarks/fixtures/nuget-storage-policy/packages.lock.json

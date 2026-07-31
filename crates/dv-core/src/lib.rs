@@ -25,11 +25,12 @@ pub use framework_reference::{
 };
 pub use pack_requirement::{PackAcquisition, PackKind, PackRequirement};
 pub use package::{
-  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, resolve_package_inputs,
+  PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ResolvedPackage, RuntimeTargetKind, SignatureValidationMode,
+  resolve_package_inputs,
 };
 pub use project::{
-  FrameworkReference, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward,
-  evaluate_project, evaluate_project_path,
+  FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectOutputType, ProjectSpec,
+  RuntimeRollForward, evaluate_project, evaluate_project_path,
 };
 pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};

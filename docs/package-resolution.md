@@ -18,8 +18,12 @@ NuGet sources are typed records containing URL and protocol generation:
   URL, SHA-512, and size;
 - `protocolVersion="2"` and `"3"` are authoritative; absent values infer v3
   only for a `/v3/index.json` URL and otherwise infer v2;
-- only HTTPS HTTP sources are accepted initially. Local folders,
-  authentication, and proxies fail or remain outside the supported subset.
+- only HTTPS HTTP sources are accepted initially. Local folders and source
+  authentication remain outside the supported subset. Credential-free config
+  or lowercase environment HTTP proxies are applied by the native client;
+  separate encrypted config credentials fail explicitly on Windows and are
+  ignored elsewhere like NuGet. Proxy addresses and credentials are not
+  retained in results or events.
 
 Configuration discovers machine fragments, additional-user fragments, the
 main .NET CLI user file, and one `NuGet.Config` from each drive-to-project
@@ -32,6 +36,22 @@ spellings are accepted for NuGet compatibility, while clear/remove re-enable.
 literal, and MSBuild `$()` syntax remains literal. The explicit
 `--packages` path wins over `NUGET_PACKAGES`, which wins over
 `globalPackagesFolder`, which wins over the platform default.
+
+`fallbackPackageFolders` uses the same case-insensitive keyed operations.
+Higher-precedence configuration rows are searched first after the writable
+global cache; `NUGET_FALLBACK_PACKAGES` replaces that merged list.
+`NUGET_HTTP_CACHE_PATH` and `NUGET_SCRATCH` select the HTTP metadata-cache and
+temporary roots. Conditional HTTP-cache reuse is deliberately tracked by
+`RES-017/018`; retaining the path is not treated as implementing revalidation
+or corruption policy.
+
+`signatureValidationMode` is retained as `accept` or `require` for the
+signature verifier tracked by `RES-015`; `require` fails explicitly until that
+verifier exists. Project `NuGetAudit`,
+`NuGetAuditMode`, and `NuGetAuditLevel` values are parsed into typed policy for
+`RES-024`; .NET 10 defaults to enabled, `all`, and `low`. Enabled auditing also
+fails explicitly until `RES-024`, while `NuGetAudit=false` is the supported
+opt-out.
 
 `auditSources` uses the same keyed URL/protocol representation and precedence
 as package sources; audit execution remains a later policy feature.
@@ -76,7 +96,8 @@ ProjectSpec batch + resolve options
   -> hand completed staging records to bounded blocking archive work
   -> validate ZIP paths, duplicates, links, sizes, and expansion bounds
   -> verify embedded nuspec identity and version before publication
-  -> extract and atomically publish the NuGet-compatible cache entry
+  -> move through same-volume staging and atomically publish the
+     NuGet-compatible cache entry
   -> select dependency and asset groups using the parsed target framework
   -> compact graph indices, asset spans, and text into PackageResolution
   -> write deterministic lock data when requested
@@ -109,12 +130,14 @@ Final package records are contiguous. `ResolvedPackage` is 28 bytes with
 4-byte alignment; its hot asset record is 32 bytes with 4-byte alignment. The
 compile, runtime, analyzer, resource, content, inner-build, outer-build,
 transitive-build, and native families occupy nine consecutive ranges in one
-span allocation. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
-path is an 8-byte offset/length span into one owned UTF-8 buffer. The 248-byte,
-pointer-aligned `PackageResolution` header is 56 bytes smaller than the former
-nine-allocation layout. Assuming the benchmark machine's observed 64-byte
-cache line, eight spans fit per line. Reporters and compiler planning scan only
-the ranges they consume.
+span allocation. Actual per-package roots and ordered fallback roots are cold
+parallel path-span batches, so fallback support does not enlarge the hot
+package scan. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
+path is an 8-byte offset/length span into one owned UTF-8 buffer. The
+pointer-aligned `PackageResolution` header is 320 bytes after adding the two
+cold root batches and typed policy fields. Assuming the benchmark machine's
+observed 64-byte cache line, eight spans fit per line. Reporters and compiler
+planning scan only the ranges they consume.
 
 The cold scheduler uses a two-thread Tokio runtime and one `JoinSet` capped at
 twenty-four active package tasks. The runtime exists only after the warm-lock
@@ -127,11 +150,14 @@ twenty-four-item bound; there is no unbounded task creation or result
 retention.
 
 Scheduling maps contain cold variable-sized external identities. Final graph
-records remain contiguous and identity-sorted. Tasks read immutable shared
-service endpoints, own one request and staging directory at a time, and stream
-HTTP response chunks through SHA-512 into `tokio::fs::File`. Network waits are
+records remain contiguous and identity-sorted. Tasks read immutable service
+endpoints and one borrowed storage-policy view, own one request and staging
+directory at a time, and stream HTTP response chunks through SHA-512 into
+`tokio::fs::File` under the configured scratch root. Network waits are
 concurrent; ZIP validation, extraction, nuspec parsing, and atomic publication
 run through Tokio's blocking pool rather than occupying an executor thread.
+Publication hard-links into same-volume global-cache staging when possible and
+falls back to one asynchronous cross-volume copy when required.
 Package size, entry size, expanded size, entry count, active tasks, and
 runtime threads are bounded constants.
 
@@ -153,7 +179,9 @@ totaling at most 21 ms.
 
 Each `PackageResolution` owns:
 
-- target framework, cache root, lock path, selected source, and protocol;
+- target framework, global/HTTP/temp/fallback roots, lock path, selected
+  source, and protocol;
+- signature and audit policy plus a redacted proxy-presence bit;
 - package records sorted by case-insensitive identity;
 - dependency indices and one contiguous, explicitly partitioned package-asset
   span batch;
@@ -179,8 +207,8 @@ them. `dv.lock.json` is project-owned persistent state.
 | Non-Unicode retained path | `DV0408` |
 | Compact range or text overflow | `DV0409` |
 
-Unsupported package build-target execution, signatures, floating versions,
-and advanced conflict rules fail instead of being approximated.
+Unsupported package build-target execution, signature enforcement, floating
+versions, and advanced conflict rules fail instead of being approximated.
 
 ## Verification
 
@@ -203,6 +231,12 @@ separately for both the single-package startup boundary and the 203-package
 asset-plan boundary.
 `dv` package, request, and payload counts are recorded as typed benchmark
 evidence.
+
+The storage-policy case builds an adapter against the selected SDK's official
+`NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties
+through MSBuild, and compares global/fallback/HTTP/temp paths, signature and
+proxy policy, package folders, identity/version/hash, and the compile asset
+selected from a fallback-only locked state.
 
 The next cold-path optimization is a persistent conditional service-index
 cache keyed by normalized source URL and validators such as ETag or

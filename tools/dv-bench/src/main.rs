@@ -34,6 +34,7 @@ enum CaseKind {
   NugetConfigHierarchy,
   NugetConfigMerge,
   NugetSourceSections,
+  NugetStoragePolicy,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -57,6 +58,7 @@ struct Fixtures<'a> {
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
+  nuget_storage_policy: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -254,6 +256,20 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_storage_policy",
+    kind: CaseKind::NugetStoragePolicy,
+    args: &[
+      "restore",
+      "StoragePolicy.csproj",
+      "--locked-mode",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -418,6 +434,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_storage_policy",
+    kind: CaseKind::NugetStoragePolicy,
+    args: &["restore", "StoragePolicy.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -548,6 +570,7 @@ fn run() -> Result<()> {
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
+  let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -561,6 +584,7 @@ fn run() -> Result<()> {
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
+    nuget_storage_policy: &nuget_storage_policy_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -611,6 +635,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_source_sections") {
     verify_nuget_source_sections(&repository, &dv_executable, &nuget_source_sections_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_storage_policy") {
+    verify_nuget_storage_policy(&repository, &dv_executable, &nuget_storage_policy_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -630,7 +657,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 9,
+    schema_version: 10,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -1863,6 +1890,179 @@ fn verify_nuget_source_sections(repository: &Path, dv_executable: &Path, fixture
   Ok(())
 }
 
+fn verify_nuget_storage_policy(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let oracle_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy-oracle");
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "build",
+      "StoragePolicyOracle.csproj",
+      "-c",
+      "Release",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &oracle_fixture,
+    "NuGet storage-policy oracle build",
+  )?;
+
+  let root = repository.join("target/benchmark-nuget-storage-policy-verification");
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+
+  let oracle = oracle_fixture.join("bin/Release/StoragePolicyOracle.dll");
+  let oracle_path = oracle.to_str().ok_or("NuGet storage-policy oracle path is not valid UTF-8")?;
+  let oracle_root = dotnet_workspace
+    .to_str()
+    .ok_or("NuGet storage-policy verification workspace is not valid UTF-8")?;
+  let oracle_text = nuget_storage_command_text(Path::new("dotnet"), &[oracle_path, oracle_root], &dotnet_workspace)?;
+  let oracle: serde_json::Value = serde_json::from_str(&oracle_text)?;
+  assert_relative_policy_path(&oracle, "globalPackages", &dotnet_workspace, "policy/env-global")?;
+  assert_relative_policy_path(&oracle, "httpCache", &dotnet_workspace, "policy/http-cache")?;
+  assert_relative_policy_path(&oracle, "scratch", &dotnet_workspace, "policy/scratch")?;
+  let fallback = oracle
+    .get("fallbackPackages")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("Microsoft NuGet storage-policy oracle omitted fallbackPackages")?;
+  if fallback.len() != 1 {
+    return Err(
+      format!(
+        "Microsoft NuGet storage-policy oracle selected {} fallback folders instead of one",
+        fallback.len()
+      )
+      .into(),
+    );
+  }
+  let fallback_path = fallback[0].as_str().ok_or("Microsoft NuGet fallback path is not text")?;
+  if relative_policy_path(fallback_path, &dotnet_workspace)? != "policy/fallback-final" {
+    return Err(format!("Microsoft NuGet fallback policy differs: {fallback_path:?}").into());
+  }
+  if oracle.get("signatureValidation").and_then(serde_json::Value::as_str) != Some("accept")
+    || oracle.get("proxy").and_then(serde_json::Value::as_str) != Some("http://127.0.0.1:9")
+    || oracle.get("noProxy").and_then(serde_json::Value::as_str) != Some("api.nuget.org,localhost")
+  {
+    return Err(format!("Microsoft NuGet typed storage/proxy policy differs: {oracle}").into());
+  }
+
+  let properties_text = nuget_storage_command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "StoragePolicy.csproj",
+      "--nologo",
+      "-getProperty:NuGetAudit,NuGetAuditMode,NuGetAuditLevel",
+    ],
+    &dotnet_workspace,
+  )?;
+  let properties: serde_json::Value = serde_json::from_str(&properties_text)?;
+  let properties = properties
+    .get("Properties")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft storage-policy query omitted Properties")?;
+  if properties.get("NuGetAudit").and_then(serde_json::Value::as_str) != Some("false")
+    || properties.get("NuGetAuditMode").and_then(serde_json::Value::as_str) != Some("direct")
+    || properties.get("NuGetAuditLevel").and_then(serde_json::Value::as_str) != Some("critical")
+  {
+    return Err(format!("Microsoft NuGet audit policy differs: {properties:?}").into());
+  }
+
+  prepare_nuget_storage_policy(Path::new("dotnet"), &dotnet_workspace)?;
+  prepare_nuget_storage_policy(dv_executable, &dv_workspace)?;
+  let dv_text = nuget_storage_command_text(dv_executable, &["restore", "StoragePolicy.csproj", "--offline", "--json"], &dv_workspace)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv storage-policy restore did not emit package_resolution_created")?;
+
+  for (field, expected) in [
+    ("cache_root", "policy/env-global"),
+    ("http_cache_root", "policy/http-cache"),
+    ("temp_root", "policy/scratch"),
+  ] {
+    let actual = required_string(&dv, field)?;
+    if relative_policy_path(actual, &dv_workspace)? != expected {
+      return Err(format!("dv {field} differs: {actual:?}").into());
+    }
+  }
+  let dv_fallback = string_array(&dv, "fallback_roots")?;
+  if dv_fallback.len() != 1 || relative_policy_path(&dv_fallback[0], &dv_workspace)? != "policy/fallback-final" {
+    return Err(format!("dv fallback package policy differs: {dv_fallback:?}").into());
+  }
+  if required_string(&dv, "signature_validation")? != "accept"
+    || dv.get("proxy_configured").and_then(serde_json::Value::as_bool) != Some(true)
+    || dv.get("audit_enabled").and_then(serde_json::Value::as_bool) != Some(false)
+    || required_string(&dv, "audit_mode")? != "direct"
+    || required_string(&dv, "audit_level")? != "critical"
+  {
+    return Err(format!("dv typed storage/audit/proxy policy differs: {dv}").into());
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) || dv.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(0) {
+    return Err("dv storage-policy verification performed network or package-download work".into());
+  }
+
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let package_folders = assets
+    .get("packageFolders")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft storage-policy assets omitted packageFolders")?;
+  let mut reference_folders = package_folders
+    .keys()
+    .map(|path| relative_policy_path(path, &dotnet_workspace))
+    .collect::<Result<Vec<_>>>()?;
+  reference_folders.sort_unstable();
+  if reference_folders != ["policy/env-global", "policy/fallback-final"] {
+    return Err(format!("Microsoft storage-policy package folders differ: {reference_folders:?}").into());
+  }
+  let package = dv
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|packages| packages.first())
+    .ok_or("dv storage-policy verification omitted Newtonsoft.Json")?;
+  let reference_hash = fs::read_to_string(dotnet_workspace.join("policy/fallback-final/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512"))?;
+  if package.get("id").and_then(serde_json::Value::as_str) != Some("Newtonsoft.Json")
+    || package.get("version").and_then(serde_json::Value::as_str) != Some("13.0.3")
+    || package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash.trim())
+  {
+    return Err("NuGet storage-policy package identity, version, or hash differs".into());
+  }
+  let compile = string_array(&dv, "compile_assets")?;
+  let compile_path = compile.first().map(|path| path.replace('\\', "/").to_ascii_lowercase());
+  if compile_path
+    .as_deref()
+    .is_none_or(|path| !path.contains("/policy/fallback-final/newtonsoft.json/13.0.3/"))
+  {
+    return Err(format!("dv did not select the package from its fallback root: {compile:?}").into());
+  }
+  Ok(())
+}
+
+fn assert_relative_policy_path(value: &serde_json::Value, field: &str, workspace: &Path, expected: &str) -> Result<()> {
+  let path = value
+    .get(field)
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| format!("Microsoft NuGet storage-policy oracle omitted {field}"))?;
+  let actual = relative_policy_path(path, workspace)?;
+  if actual != expected {
+    return Err(format!("Microsoft NuGet {field} differs: expected={expected:?} actual={actual:?}").into());
+  }
+  Ok(())
+}
+
+fn relative_policy_path(path: &str, workspace: &Path) -> Result<String> {
+  let relative = Path::new(path)
+    .strip_prefix(workspace)
+    .map_err(|_| format!("policy path {path:?} is outside benchmark workspace {}", workspace.display()))?;
+  Ok(relative.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+}
+
 fn compare_package_asset_family(
   target: &serde_json::Map<String, serde_json::Value>,
   dv: &serde_json::Value,
@@ -2122,6 +2322,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
+      | CaseKind::NugetStoragePolicy
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -2295,6 +2496,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       )?;
     }
   }
+  if matches!(case.kind, CaseKind::NugetStoragePolicy) {
+    prepare_nuget_storage_policy(executable, workspace)?;
+  }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
     if is_dotnet(executable) {
       run_checked(
@@ -2338,6 +2542,63 @@ fn prepare_rid_oracle(executable: &Path, workspace: &Path) -> Result<()> {
   )
 }
 
+fn prepare_nuget_storage_policy(executable: &Path, workspace: &Path) -> Result<()> {
+  let fallback = workspace.join("policy/fallback-final");
+  if fallback.exists() {
+    fs::remove_dir_all(&fallback)?;
+  }
+  fs::create_dir_all(&fallback)?;
+  let seed = workspace.join("policy/seed");
+  if seed.exists() {
+    fs::remove_dir_all(&seed)?;
+  }
+  run_nuget_storage_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "StoragePolicy.csproj",
+      "--use-lock-file",
+      "--packages",
+      "policy/seed",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    workspace,
+    "NuGet storage-policy package seed",
+  )?;
+  copy_directory(&seed.join("newtonsoft.json"), &fallback.join("newtonsoft.json"))?;
+  fs::remove_dir_all(seed)?;
+  let global = workspace.join("policy/env-global");
+  if global.exists() {
+    fs::remove_dir_all(&global)?;
+  }
+  if is_dotnet(executable) {
+    run_nuget_storage_checked(
+      executable,
+      &[
+        "restore",
+        "StoragePolicy.csproj",
+        "--use-lock-file",
+        "--no-http-cache",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "NuGet storage-policy setup",
+    )
+  } else {
+    run_nuget_storage_checked(
+      executable,
+      &["restore", "StoragePolicy.csproj", "--offline", "--json"],
+      workspace,
+      "NuGet storage-policy setup",
+    )
+  }
+}
+
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::RidGraph
@@ -2349,7 +2610,8 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::PackageAssetPlan
     | CaseKind::NugetConfigHierarchy
     | CaseKind::NugetConfigMerge
-    | CaseKind::NugetSourceSections => Ok(()),
+    | CaseKind::NugetSourceSections
+    | CaseKind::NugetStoragePolicy => Ok(()),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
       reset_fixture(fixture, workspace)
@@ -2408,6 +2670,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
+    CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -2426,6 +2689,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
+    CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -2438,9 +2702,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   command.args(case.args).current_dir(cwd);
   if matches!(
     case.kind,
-    CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge | CaseKind::NugetSourceSections
+    CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge | CaseKind::NugetSourceSections | CaseKind::NugetStoragePolicy
   ) {
-    apply_nuget_config_environment(&mut command, cwd);
+    apply_case_nuget_environment(&mut command, case.kind, cwd);
   }
   let output = command.output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -2463,6 +2727,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetConfigHierarchy
         | CaseKind::NugetConfigMerge
         | CaseKind::NugetSourceSections
+        | CaseKind::NugetStoragePolicy
     ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
@@ -2603,10 +2868,36 @@ fn apply_nuget_config_environment(command: &mut Command, cwd: &Path) {
     .env_remove("NUGET_PACKAGES");
 }
 
+fn apply_nuget_storage_environment(command: &mut Command, cwd: &Path) {
+  apply_nuget_config_environment(command, cwd);
+  command
+    .env("NUGET_PACKAGES", cwd.join("policy/env-global"))
+    .env("NUGET_HTTP_CACHE_PATH", cwd.join("policy/http-cache"))
+    .env("NUGET_SCRATCH", cwd.join("policy/scratch"))
+    .env_remove("NUGET_FALLBACK_PACKAGES")
+    .env_remove("http_proxy")
+    .env_remove("no_proxy");
+}
+
+fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Path) {
+  if matches!(kind, CaseKind::NugetStoragePolicy) {
+    apply_nuget_storage_environment(command, cwd);
+  } else {
+    apply_nuget_config_environment(command, cwd);
+  }
+}
+
 fn run_nuget_config_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
   let mut command = Command::new(executable);
   command.args(args).current_dir(cwd);
   apply_nuget_config_environment(&mut command, cwd);
+  check_output(command.output()?, executable, args, purpose)
+}
+
+fn run_nuget_storage_checked(executable: &Path, args: &[&str], cwd: &Path, purpose: &str) -> Result<()> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_storage_environment(&mut command, cwd);
   check_output(command.output()?, executable, args, purpose)
 }
 
@@ -2642,6 +2933,15 @@ fn nuget_config_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Re
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+fn nuget_storage_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+  let mut command = Command::new(executable);
+  command.args(args).current_dir(cwd);
+  apply_nuget_storage_environment(&mut command, cwd);
+  let output = command.output()?;
+  check_output(output.clone(), executable, args, "NuGet storage-policy command")?;
+  Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
 fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
   if destination.exists() {
     fs::remove_dir_all(destination)?;
@@ -2651,16 +2951,21 @@ fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
   fs::create_dir_all(destination)?;
+  let storage_policy_root = source.join("StoragePolicy.csproj").is_file();
   for entry in fs::read_dir(source)? {
     let entry = entry?;
     let source_path = entry.path();
     let destination_path = destination.join(entry.file_name());
     if entry.file_type()?.is_dir() {
-      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages")) {
+      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed")) || (storage_policy_root && entry.file_name() == OsStr::new("policy"))
+      {
         continue;
       }
       copy_directory(&source_path, &destination_path)?;
     } else {
+      if storage_policy_root && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
+        continue;
+      }
       fs::copy(source_path, destination_path)?;
     }
   }
@@ -2763,6 +3068,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_config_hierarchy"
           | "nuget_config_merge"
           | "nuget_source_sections"
+          | "nuget_storage_policy"
       )
     })
     .collect::<Vec<_>>();
@@ -2888,6 +3194,7 @@ fn case_label(case: &str) -> &str {
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",
     "nuget_source_sections" => "NuGet source sections",
+    "nuget_storage_policy" => "NuGet storage policy",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -2971,7 +3278,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 9,
+      schema_version: 10,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -3035,7 +3342,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 9,
+      schema_version: 10,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

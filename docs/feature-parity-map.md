@@ -132,13 +132,13 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 16 Rust source files, 16,625 nonblank source
-lines, and 100 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 17,620 nonblank source
+lines, and 106 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
-Current output is command-local human text or a schema-v6 JSON-lines event
+Current output is command-local human text or a schema-v7 JSON-lines event
 batch. Drop-in modes must also reproduce documented or observed
 machine-consumed text/JSON/XML/binary-log formats and tool-specific exit
 behavior. Future workflows must additionally own:
@@ -737,9 +737,19 @@ boundary, not final drop-in parity.
   requests. An official `NuGet.Configuration` oracle validates all effective
   sections; the locked process benchmark measures `527.659 ms` for Microsoft
   versus `5.850 ms` for `dv` (`90.2x`) across 30 retained samples. `P2`
-- [~] `NUGET-004` Support global-packages, HTTP cache, temp, fallback folders,
-  signature-validation mode, restore audit mode/level, and proxy settings.
-  `P2`
+- [x] `NUGET-004` Resolve global-packages, HTTP-cache, scratch, and ordered
+  fallback roots with Microsoft precedence; retain typed signature and audit
+  policy; and construct a proxy client without retaining or reporting its
+  address or credentials. Fallback packages participate in version and
+  locked-asset lookup, while downloads stage through scratch and publish
+  atomically on the global-cache volume. An official NuGet adapter plus an
+  MSBuild property query validates the effective policy. The locked fallback
+  oracle measures `523.051 ms` for Microsoft versus `5.370 ms` for `dv`
+  (`97.4x`) across 30 retained samples. Conditional HTTP caching, signature
+  verification, and vulnerability execution remain in `RES-017/018`,
+  `RES-015`, and `RES-024`; encrypted proxy credentials remain in
+  `NUGET-011`. `require` signatures and enabled auditing fail explicitly until
+  their consumers land. `P2`
 - [~] `NUGET-005` Accept CLI source/config/packages-folder overrides with
   documented precedence. `P1`
 - [~] `NUGET-006` Support local folder sources and NuGet v2/v3 HTTP service

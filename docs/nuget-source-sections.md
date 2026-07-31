@@ -38,8 +38,9 @@ Service indexes are still discovered as one batch before that filter; moving
 mapping ahead of service-index requests and emitting a dedicated unmapped-ID
 diagnostic is the remaining `NUGET-013` work.
 
-Audit source rows are parsed, merged, typed, and retained. Vulnerability audit
-execution and its mode/level policy remain in `NUGET-004` and `NUGET-007`.
+Audit source rows are parsed, merged, typed, and retained. Audit mode and level
+selection are implemented by `NUGET-004`; vulnerability endpoint discovery and
+advisory evaluation remain in `NUGET-007` and `RES-024`.
 
 ## Layout And Cost
 
