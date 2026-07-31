@@ -10,7 +10,7 @@ repository at the snapshot below. An unchecked item is required unless it is
 explicitly identified as a native `dv` addition. `REJECT` describes safe
 intermediate behavior for an unfinished compatibility row, not optional work.
 
-Snapshot: working tree on 2026-07-31, based on commit `b1b1b57`.
+Snapshot: working tree on 2026-07-31, based on commit `89cfd88`.
 
 ## Scope Contract
 
@@ -131,8 +131,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 9,021 nonblank source
-lines, and 57 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 12 Rust source files, 9,388 nonblank source
+lines, and 60 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -725,8 +725,8 @@ boundary, not final drop-in parity.
   convergence use an identity-ordered constraint table with stale-edge
   retraction and bounded non-convergence failure. The eShop-derived acceptance
   graph selects every one of the reference graph's 203 identities at the same
-  exact version; five additional framework-provided packages now expose
-  `RES-012` SDK pruning, and floating versions remain. `P1`
+  exact version after SDK-owned package pruning; floating versions remain.
+  `P1`
 - [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
@@ -739,8 +739,12 @@ boundary, not final drop-in parity.
   `buildTransitive` assets by TFM/RID and metadata. The massive acceptance
   fixture keeps `dv` at `TBI` until these asset families are handled without
   weakening build correctness. `P2`
-- [~] `RES-012` Implement compatible-framework reduction and framework
-  fallback rules using SDK-owned framework data. `P2`
+- [~] `RES-012` .NET 10 package pruning reads the selected SDK's
+  `PrunePackageData` or matching reference-pack `PackageOverrides.txt`, applies
+  the SDK's stable patch ceiling, retracts pruned graph edges, and fingerprints
+  the semantic table in lock schema 2. Generated .NET 9-and-earlier pruning
+  tables, compatible-framework reduction, and framework fallback remain.
+  `P2`
 - [x] `RES-013` Stream exact `.nupkg` content through SHA-512 into bounded
   temporary storage. `P1`
 - [x] `RES-014` Verify package identity, version, v2 source hash/size, ZIP

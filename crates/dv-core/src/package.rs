@@ -20,10 +20,12 @@ use sha2::{Digest, Sha512};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use zip::ZipArchive;
 
-use crate::{FrameworkFamily, ProjectSpec, TargetFramework};
+use crate::{FrameworkFamily, ProjectSpec, TargetFramework, discover_sdks};
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PRUNE_DATA_BYTES: u64 = 1024 * 1024;
+const MAX_PRUNE_PACKAGES: usize = 10_000;
 const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -34,7 +36,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 1;
+const LOCK_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TextSpan {
@@ -99,6 +101,7 @@ pub struct PackageResolution {
   lock_path: TextSpan,
   target_framework: TextSpan,
   source: TextSpan,
+  prune_fingerprint: TextSpan,
   source_protocol: NugetProtocol,
   packages: Box<[ResolvedPackage]>,
   package_assets: Box<[PackageAssets]>,
@@ -230,11 +233,13 @@ impl PackageResolution {
       && self.lock_path() == project.project_directory().join("dv.lock.json")
       && direct_count == project.package_references().len()
       && project.package_references().iter().all(|reference| {
-        let Ok(version) = normalize_version(project.package_version(*reference)) else {
+        let Ok(range) = VersionRange::parse(project.package_version(*reference)) else {
           return false;
         };
         self.packages.iter().copied().any(|package| {
-          package.direct && self.package_id(package).eq_ignore_ascii_case(project.package_id(*reference)) && self.package_version(package) == version
+          package.direct
+            && self.package_id(package).eq_ignore_ascii_case(project.package_id(*reference))
+            && PackageVersion::parse(self.package_version(package)).is_ok_and(|version| range.contains(&version))
         })
       })
   }
@@ -606,7 +611,52 @@ struct ResolutionContext<'a> {
   lock_path: &'a Path,
   target_framework: &'a str,
   source: &'a str,
+  prune_fingerprint: &'a str,
   source_protocol: NugetProtocol,
+}
+
+#[derive(Default)]
+struct PackagePruning {
+  text: Box<str>,
+  packages: Vec<PrunedPackage>,
+  fingerprint: String,
+}
+
+#[derive(Clone, Copy)]
+struct PrunedPackage {
+  lower_id: TextSpan,
+  upper_numbers: [u32; 4],
+  upper_prerelease: TextSpan,
+}
+
+const _: () = assert!(size_of::<PrunedPackage>() == 32);
+const _: () = assert!(align_of::<PrunedPackage>() == 4);
+
+struct ParsedPrunedPackage {
+  lower_id: String,
+  upper: PackageVersion,
+}
+
+impl PackagePruning {
+  fn contains(&self, lower_id: &str, version: &PackageVersion) -> bool {
+    self
+      .packages
+      .binary_search_by(|package| self.get(package.lower_id).cmp(lower_id))
+      .is_ok_and(|index| {
+        let package = self.packages[index];
+        version.numbers.cmp(&package.upper_numbers).then_with(|| {
+          compare_prerelease(
+            version.prerelease(),
+            (package.upper_prerelease.len != 0).then(|| self.get(package.upper_prerelease)),
+          )
+        }) != Ordering::Greater
+      })
+  }
+
+  fn get(&self, span: TextSpan) -> &str {
+    let start = span.start as usize;
+    &self.text[start..start + span.len as usize]
+  }
 }
 
 struct CachedPackage {
@@ -636,6 +686,7 @@ struct ConstraintNode {
   metadata_version: Option<PackageVersion>,
   dependencies: Vec<PackageRequirement>,
   available_versions: Option<Vec<PackageVersion>>,
+  pruned: bool,
   generation: u32,
 }
 
@@ -725,6 +776,8 @@ struct LockFile {
   target_framework: String,
   source: String,
   source_protocol: NugetProtocol,
+  #[serde(default)]
+  prune_fingerprint: String,
   direct: Vec<LockDirect>,
   packages: Vec<LockPackage>,
 }
@@ -769,7 +822,8 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   let direct = direct_requests(project)?;
   let target = project.target();
   let target_text = project.target_framework();
-  if let Some(resolution) = read_warm_lock(&lock_path, &config, &direct, target_text)? {
+  let pruning = discover_package_pruning(project.project_directory(), target)?;
+  if let Some(resolution) = read_warm_lock(&lock_path, &config, &direct, target_text, &pruning.fingerprint)? {
     return Ok(resolution);
   }
 
@@ -779,7 +833,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     .enable_all()
     .build()
     .map_err(|error| PackageError::new(PackageErrorKind::Io, "package scheduler", format!("failed to create async runtime: {error}")))?;
-  let graph = runtime.block_on(resolve_streaming_graph(&client, &direct, &config, options, target, target_text))?;
+  let graph = runtime.block_on(resolve_streaming_graph(&client, &direct, &config, options, target, target_text, &pruning))?;
   let resolved = graph.packages;
 
   validate_acyclic(&resolved)?;
@@ -799,6 +853,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       lock_path: &lock_path,
       target_framework: target_text,
       source: &source,
+      prune_fingerprint: &pruning.fingerprint,
       source_protocol,
     },
     &resolved,
@@ -838,6 +893,186 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, Pac
   direct.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id));
   direct.dedup_by(|left, right| left.lower_id == right.lower_id);
   Ok(direct)
+}
+
+fn discover_package_pruning(project_directory: &Path, target: TargetFramework) -> Result<PackagePruning, PackageError> {
+  if target.family() != FrameworkFamily::Net || target.major() < 10 {
+    return Ok(PackagePruning::default());
+  }
+
+  let inventory = discover_sdks(project_directory).map_err(|error| {
+    PackageError::new(
+      PackageErrorKind::Configuration,
+      project_directory.display().to_string(),
+      format!("failed to select the SDK needed for package pruning: {error}"),
+    )
+  })?;
+  let selected = inventory.selected();
+  let framework_version = target.framework_version();
+  let sdk_data = inventory
+    .installation_path(selected)
+    .join("PrunePackageData")
+    .join(&framework_version)
+    .join("Microsoft.NETCore.App")
+    .join("PackageOverrides.txt");
+  if sdk_data.is_file() {
+    return read_package_pruning(&sdk_data);
+  }
+
+  let pack_root = inventory.root(selected).join("packs").join("Microsoft.NETCore.App.Ref");
+  let pack = select_targeting_pack(&pack_root, target)?;
+  let pack_data = pack.join("data").join("PackageOverrides.txt");
+  if !pack_data.is_file() {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      pack_data.display().to_string(),
+      format!("selected SDK {} has no package-pruning data for net{}", selected.version, framework_version),
+    ));
+  }
+  read_package_pruning(&pack_data)
+}
+
+fn select_targeting_pack(root: &Path, target: TargetFramework) -> Result<PathBuf, PackageError> {
+  let entries = fs::read_dir(root).map_err(|error| package_io("enumerate targeting packs", root, error))?;
+  let mut selected = None::<(PackageVersion, PathBuf)>;
+  for entry in entries {
+    let entry = entry.map_err(|error| package_io("enumerate targeting packs", root, error))?;
+    if !entry
+      .file_type()
+      .map_err(|error| package_io("inspect targeting pack", &entry.path(), error))?
+      .is_dir()
+    {
+      continue;
+    }
+    let Some(value) = entry.file_name().to_str().map(str::to_owned) else {
+      continue;
+    };
+    let Ok(version) = PackageVersion::parse(&value) else {
+      continue;
+    };
+    if version.prerelease().is_some() || version.numbers[0] != u32::from(target.major()) || version.numbers[1] != u32::from(target.minor()) {
+      continue;
+    }
+    if selected.as_ref().is_none_or(|(current, _)| version > *current) {
+      selected = Some((version, entry.path()));
+    }
+  }
+  selected.map(|(_, path)| path).ok_or_else(|| {
+    PackageError::new(
+      PackageErrorKind::Configuration,
+      root.display().to_string(),
+      format!("selected SDK has no Microsoft.NETCore.App reference pack for net{}", target.framework_version()),
+    )
+  })
+}
+
+fn read_package_pruning(path: &Path) -> Result<PackagePruning, PackageError> {
+  let bytes = fs::read(path).map_err(|error| package_io("read package-pruning data", path, error))?;
+  if bytes.len() as u64 > MAX_PRUNE_DATA_BYTES {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      path.display().to_string(),
+      format!("package-pruning data exceeds {MAX_PRUNE_DATA_BYTES} bytes"),
+    ));
+  }
+  let text = std::str::from_utf8(&bytes).map_err(|error| {
+    PackageError::new(
+      PackageErrorKind::Configuration,
+      path.display().to_string(),
+      format!("package-pruning data is not UTF-8: {error}"),
+    )
+  })?;
+  let mut packages = Vec::with_capacity(text.lines().size_hint().0);
+  for (index, line) in text.lines().enumerate() {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+      continue;
+    }
+    if packages.len() >= MAX_PRUNE_PACKAGES {
+      return Err(PackageError::new(
+        PackageErrorKind::Configuration,
+        path.display().to_string(),
+        format!("package-pruning data exceeds {MAX_PRUNE_PACKAGES} entries"),
+      ));
+    }
+    let Some((id, version)) = line.split_once('|') else {
+      return Err(invalid_prune_line(path, index + 1));
+    };
+    if id.is_empty() || version.is_empty() || version.contains('|') {
+      return Err(invalid_prune_line(path, index + 1));
+    }
+    let mut upper = PackageVersion::parse(version).map_err(|error| {
+      PackageError::new(
+        PackageErrorKind::Configuration,
+        path.display().to_string(),
+        format!("invalid package-pruning version on line {}: {error}", index + 1),
+      )
+    })?;
+    if upper.prerelease().is_none() {
+      upper.numbers = [upper.numbers[0], upper.numbers[1], 32_767, 0];
+      upper.normalized = format!("{}.{}.32767", upper.numbers[0], upper.numbers[1]);
+    }
+    packages.push(ParsedPrunedPackage {
+      lower_id: normalize_id(id).map_err(|error| {
+        PackageError::new(
+          PackageErrorKind::Configuration,
+          path.display().to_string(),
+          format!("invalid package-pruning identity on line {}: {error}", index + 1),
+        )
+      })?,
+      upper,
+    });
+  }
+  compact_package_pruning(packages)
+}
+
+fn compact_package_pruning(mut packages: Vec<ParsedPrunedPackage>) -> Result<PackagePruning, PackageError> {
+  packages.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id).then_with(|| left.upper.cmp(&right.upper)));
+  let mut merged = Vec::<ParsedPrunedPackage>::with_capacity(packages.len());
+  for package in packages {
+    if let Some(previous) = merged.last_mut()
+      && previous.lower_id == package.lower_id
+    {
+      if package.upper > previous.upper {
+        previous.upper = package.upper;
+      }
+      continue;
+    }
+    merged.push(package);
+  }
+  let text_capacity = merged
+    .iter()
+    .map(|package| package.lower_id.len() + package.upper.prerelease().map_or(0, str::len))
+    .sum();
+  let mut text = TextTable::with_capacity(text_capacity);
+  let mut compact = Vec::with_capacity(merged.len());
+  let mut hasher = Sha512::new();
+  for package in merged {
+    hasher.update(package.lower_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(package.upper.normalized.as_bytes());
+    hasher.update([b'\n']);
+    let lower_id = text.push(&package.lower_id)?;
+    let upper_prerelease = text.push(package.upper.prerelease().unwrap_or(""))?;
+    compact.push(PrunedPackage {
+      lower_id,
+      upper_numbers: package.upper.numbers,
+      upper_prerelease,
+    });
+  }
+  Ok(PackagePruning {
+    text: text.text.into_boxed_str(),
+    packages: compact,
+    fingerprint: BASE64.encode(hasher.finalize()),
+  })
+}
+
+fn invalid_prune_line(path: &Path, line: usize) -> PackageError {
+  PackageError::new(
+    PackageErrorKind::Configuration,
+    path.display().to_string(),
+    format!("invalid package-pruning record on line {line}; expected Package.Id|version"),
+  )
 }
 
 fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
@@ -1095,6 +1330,7 @@ async fn resolve_streaming_graph(
   options: &PackageResolveOptions,
   target: TargetFramework,
   target_text: &str,
+  pruning: &PackagePruning,
 ) -> Result<ResolvedGraph, PackageError> {
   let mut nodes = BTreeMap::<String, ConstraintNode>::new();
   let mut dirty = BTreeSet::new();
@@ -1109,13 +1345,14 @@ async fn resolve_streaming_graph(
         metadata_version: None,
         dependencies: Vec::new(),
         available_versions: None,
+        pruned: false,
         generation: 0,
       },
     );
     dirty.insert(request.lower_id.clone());
   }
   let mut ready = BTreeSet::new();
-  stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready)?;
+  stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
   let mut endpoints: Option<Arc<[ServiceEndpoint]>> = None;
   let mut network_requests = 0;
   let mut downloaded_bytes = 0;
@@ -1125,7 +1362,11 @@ async fn resolve_streaming_graph(
 
   while !ready.is_empty() || !tasks.is_empty() {
     while tasks.len() < MAX_DOWNLOAD_WORKERS {
-      let Some(lower_id) = ready.iter().find(|id| !in_flight.contains(*id)).cloned() else {
+      let Some(lower_id) = ready
+        .iter()
+        .find(|id| !in_flight.contains(*id) && nodes.get(*id).is_some_and(|node| !node.pruned))
+        .cloned()
+      else {
         break;
       };
       ready.remove(&lower_id);
@@ -1173,7 +1414,9 @@ async fn resolve_streaming_graph(
     let result = match result {
       Ok(result) => result,
       Err(_) if stale => {
-        ready.insert(lower_id);
+        if nodes.get(&lower_id).is_some_and(|node| !node.pruned) {
+          ready.insert(lower_id);
+        }
         continue;
       },
       Err(error) => return Err(error),
@@ -1201,17 +1444,22 @@ async fn resolve_streaming_graph(
           metadata_packages.insert((lower_id.clone(), version), package);
         }
         if stale {
-          ready.insert(lower_id.clone());
+          if nodes.get(&lower_id).is_some_and(|node| !node.pruned) {
+            ready.insert(lower_id.clone());
+          }
         } else {
           install_node_dependencies(&lower_id, generation, dependencies, &mut nodes, &mut dirty)?;
         }
       },
     }
-    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready)?;
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
   }
 
   let mut exact = BTreeMap::new();
   for (lower_id, node) in &nodes {
+    if node.pruned {
+      continue;
+    }
     let version = node
       .selected
       .as_ref()
@@ -1326,6 +1574,7 @@ fn stabilize_constraint_nodes(
   nodes: &mut BTreeMap<String, ConstraintNode>,
   dirty: &mut BTreeSet<String>,
   ready: &mut BTreeSet<String>,
+  pruning: &PackagePruning,
 ) -> Result<(), PackageError> {
   while let Some(lower_id) = dirty.pop_first() {
     let Some(node) = nodes.get(&lower_id) else {
@@ -1347,19 +1596,27 @@ fn stabilize_constraint_nodes(
       NodeSelection::Version(version) => Some(version),
       NodeSelection::Enumerate => None,
     };
-    if next.is_some() && nodes.get(&lower_id).is_some_and(|node| node.selected == next) {
+    let pruned = next
+      .as_ref()
+      .is_some_and(|version| node.direct.is_none() && pruning.contains(&lower_id, version));
+    if next.is_some() && nodes.get(&lower_id).is_some_and(|node| node.selected == next && node.pruned == pruned) {
       continue;
     }
     let node = nodes.get_mut(&lower_id).expect("a checked node exists");
     let previous_dependencies = std::mem::take(&mut node.dependencies);
     node.selected = next;
+    node.pruned = pruned;
     node.metadata_version = None;
     node.generation = node
       .generation
       .checked_add(1)
       .filter(|generation| *generation <= MAX_GRAPH_REVISIONS)
       .ok_or_else(|| resolution_error(&node.id, "package dependency graph did not converge"))?;
-    ready.insert(lower_id.clone());
+    if pruned {
+      ready.remove(&lower_id);
+    } else {
+      ready.insert(lower_id.clone());
+    }
     for dependency in previous_dependencies {
       if let Some(child) = nodes.get_mut(&dependency.lower_id) {
         child.constraints.remove(&lower_id);
@@ -1408,6 +1665,7 @@ fn install_node_dependencies(
       metadata_version: None,
       dependencies: Vec::new(),
       available_versions: None,
+      pruned: false,
       generation: 0,
     });
     child.constraints.insert(lower_id.to_owned(), dependency.range);
@@ -1420,17 +1678,24 @@ fn concrete_dependencies(nodes: &BTreeMap<String, ConstraintNode>, lower_id: &st
   nodes[lower_id]
     .dependencies
     .iter()
-    .map(|dependency| {
-      let selected = nodes
-        .get(&dependency.lower_id)
-        .and_then(|node| node.selected.as_ref())
-        .ok_or_else(|| resolution_error(&dependency.id, "dependency graph has no selected package"))?;
-      Ok(PackageRequest {
+    .filter_map(|dependency| {
+      let node = match nodes.get(&dependency.lower_id) {
+        Some(node) => node,
+        None => return Some(Err(resolution_error(&dependency.id, "dependency graph has no selected package"))),
+      };
+      if node.pruned {
+        return None;
+      }
+      let selected = match node.selected.as_ref() {
+        Some(selected) => selected,
+        None => return Some(Err(resolution_error(&dependency.id, "dependency graph has no selected package"))),
+      };
+      Some(Ok(PackageRequest {
         id: dependency.id.clone(),
         lower_id: dependency.lower_id.clone(),
         version: selected.normalized.clone(),
         direct: false,
-      })
+      }))
     })
     .collect()
 }
@@ -2636,12 +2901,14 @@ fn materialize_resolution(
     + context.cache_root.as_os_str().len()
     + context.lock_path.as_os_str().len()
     + context.target_framework.len()
-    + context.source.len();
+    + context.source.len()
+    + context.prune_fingerprint.len();
   let mut table = TextTable::with_capacity(estimated);
   let cache_root_span = table.push_path(context.cache_root)?;
   let lock_path_span = table.push_path(context.lock_path)?;
   let target_framework_span = table.push(context.target_framework)?;
   let source_span = table.push(context.source)?;
+  let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
   let mut packages = Vec::with_capacity(work.len());
   let mut package_assets = Vec::with_capacity(work.len());
   let mut dependencies = Vec::new();
@@ -2689,6 +2956,7 @@ fn materialize_resolution(
     lock_path: lock_path_span,
     target_framework: target_framework_span,
     source: source_span,
+    prune_fingerprint: prune_fingerprint_span,
     source_protocol: context.source_protocol,
     packages: packages.into_boxed_slice(),
     package_assets: package_assets.into_boxed_slice(),
@@ -2725,6 +2993,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     lock_path: lock,
     target_framework,
     source: empty,
+    prune_fingerprint: empty,
     source_protocol: NugetProtocol::V3,
     packages: Box::new([]),
     package_assets: Box::new([]),
@@ -2744,6 +3013,7 @@ fn read_warm_lock(
   config: &NugetConfiguration,
   direct: &[PackageRequirement],
   target_text: &str,
+  prune_fingerprint: &str,
 ) -> Result<Option<PackageResolution>, PackageError> {
   let bytes = match fs::read(path) {
     Ok(bytes) => bytes,
@@ -2768,6 +3038,7 @@ fn read_warm_lock(
     });
   if lock.schema_version != LOCK_SCHEMA_VERSION
     || lock.target_framework != target_text
+    || lock.prune_fingerprint != prune_fingerprint
     || !direct_matches
     || !config
       .sources
@@ -2851,6 +3122,7 @@ fn read_warm_lock(
       lock_path: path,
       target_framework: target_text,
       source: &lock.source,
+      prune_fingerprint,
       source_protocol: lock.source_protocol,
     },
     &work,
@@ -2930,6 +3202,7 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
     target_framework: resolution.target_framework().into(),
     source: resolution.source().into(),
     source_protocol: resolution.source_protocol,
+    prune_fingerprint: resolution.get(resolution.prune_fingerprint).into(),
     direct,
     packages,
   };
@@ -3127,6 +3400,117 @@ mod tests {
   }
 
   #[test]
+  fn sdk_pruning_data_uses_the_framework_patch_ceiling() {
+    let temp = TempDirectory::new();
+    let path = temp.write(
+      "PackageOverrides.txt",
+      "System.IO.Pipelines|10.0.0\nSystem.Runtime.CompilerServices.Unsafe|7.0.0\n",
+    );
+
+    let pruning = read_package_pruning(&path).unwrap();
+
+    assert!(pruning.contains("system.io.pipelines", &PackageVersion::parse("10.0.32767").unwrap()));
+    assert!(!pruning.contains("system.io.pipelines", &PackageVersion::parse("10.0.32768").unwrap()));
+    assert!(pruning.contains("system.runtime.compilerservices.unsafe", &PackageVersion::parse("7.0.19").unwrap()));
+    assert_eq!(pruning.packages.len(), 2);
+    assert!(!pruning.fingerprint.is_empty());
+  }
+
+  #[test]
+  fn legacy_lock_without_a_pruning_fingerprint_is_a_cold_miss() {
+    let temp = TempDirectory::new();
+    let path = temp.write(
+      "dv.lock.json",
+      r#"{"schema_version":1,"target_framework":"net10.0","source":"https://api.nuget.org/v3/index.json","source_protocol":"v3","direct":[],"packages":[]}"#,
+    );
+    let config = NugetConfiguration {
+      cache_root: temp.0.join("packages"),
+      sources: vec![PackageSource {
+        url: DEFAULT_SOURCE.into(),
+        protocol: NugetProtocol::V3,
+      }],
+    };
+
+    let result = read_warm_lock(&path, &config, &[], "net10.0", "current-table").unwrap();
+
+    assert!(result.is_none());
+  }
+
+  #[test]
+  fn pruning_retracts_transitive_edges_but_never_removes_direct_packages() {
+    let pruning = compact_package_pruning(vec![
+      ParsedPrunedPackage {
+        lower_id: "direct.package".into(),
+        upper: PackageVersion::parse("10.0.32767").unwrap(),
+      },
+      ParsedPrunedPackage {
+        lower_id: "framework.package".into(),
+        upper: PackageVersion::parse("10.0.32767").unwrap(),
+      },
+    ])
+    .unwrap();
+    let grandchild = PackageRequirement {
+      id: "Grandchild.Package".into(),
+      lower_id: "grandchild.package".into(),
+      range: VersionRange::parse("1.0").unwrap(),
+      direct: false,
+    };
+    let mut nodes = BTreeMap::from([
+      (
+        "framework.package".into(),
+        ConstraintNode {
+          id: "Framework.Package".into(),
+          direct: None,
+          constraints: BTreeMap::from([("parent.package".into(), VersionRange::parse("10.0").unwrap())]),
+          selected: None,
+          metadata_version: None,
+          dependencies: vec![grandchild],
+          available_versions: None,
+          pruned: false,
+          generation: 0,
+        },
+      ),
+      (
+        "grandchild.package".into(),
+        ConstraintNode {
+          id: "Grandchild.Package".into(),
+          direct: None,
+          constraints: BTreeMap::from([("framework.package".into(), VersionRange::parse("1.0").unwrap())]),
+          selected: Some(PackageVersion::parse("1.0.0").unwrap()),
+          metadata_version: None,
+          dependencies: Vec::new(),
+          available_versions: None,
+          pruned: false,
+          generation: 1,
+        },
+      ),
+      (
+        "direct.package".into(),
+        ConstraintNode {
+          id: "Direct.Package".into(),
+          direct: Some(VersionRange::parse("10.0").unwrap()),
+          constraints: BTreeMap::new(),
+          selected: None,
+          metadata_version: None,
+          dependencies: Vec::new(),
+          available_versions: None,
+          pruned: false,
+          generation: 0,
+        },
+      ),
+    ]);
+    let mut dirty = BTreeSet::from(["framework.package".into(), "direct.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &pruning).unwrap();
+
+    assert!(nodes["framework.package"].pruned);
+    assert!(!nodes.contains_key("grandchild.package"));
+    assert!(!nodes["direct.package"].pruned);
+    assert_eq!(ready, BTreeSet::from(["direct.package".into()]));
+  }
+
+  #[test]
   fn cousin_constraints_choose_the_lowest_common_version() {
     let node = ConstraintNode {
       id: "Common.Package".into(),
@@ -3139,6 +3523,7 @@ mod tests {
       metadata_version: None,
       dependencies: Vec::new(),
       available_versions: None,
+      pruned: false,
       generation: 0,
     };
 
@@ -3158,6 +3543,7 @@ mod tests {
       metadata_version: None,
       dependencies: Vec::new(),
       available_versions: None,
+      pruned: false,
       generation: 0,
     };
 
@@ -3177,6 +3563,7 @@ mod tests {
       metadata_version: None,
       dependencies: Vec::new(),
       available_versions: Some(vec![PackageVersion::parse("1.1.0-beta.1").unwrap(), PackageVersion::parse("1.1.0").unwrap()]),
+      pruned: false,
       generation: 0,
     };
 
@@ -3205,6 +3592,7 @@ mod tests {
           metadata_version: Some(PackageVersion::parse("1.0.0").unwrap()),
           dependencies: vec![child_requirement],
           available_versions: None,
+          pruned: false,
           generation: 1,
         },
       ),
@@ -3218,6 +3606,7 @@ mod tests {
           metadata_version: None,
           dependencies: Vec::new(),
           available_versions: None,
+          pruned: false,
           generation: 1,
         },
       ),
@@ -3225,7 +3614,7 @@ mod tests {
     let mut dirty = BTreeSet::from(["parent.package".into()]);
     let mut ready = BTreeSet::new();
 
-    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready).unwrap();
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &PackagePruning::default()).unwrap();
 
     assert_eq!(nodes["parent.package"].selected.as_ref().unwrap().normalized, "2.0.0");
     assert!(!nodes.contains_key("child.package"));

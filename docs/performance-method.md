@@ -57,7 +57,7 @@ Invalid input behavior:
 | `restore_cold` | fresh fixture copy | restore |
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
-| `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload; `dv` remains `TBI` until its NuGet constraint and asset contracts cover the graph |
+| `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload; `dv` remains `TBI` until its asset contracts cover the graph |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |

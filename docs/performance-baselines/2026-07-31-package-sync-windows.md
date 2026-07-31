@@ -19,11 +19,13 @@ package identity, exact version, archive SHA-512, and compile assets.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 498.177 ms | 508.203 ms | 491.961 ms | 508.203 ms |
-| `dv` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 5.881 ms | 7.601 ms | 5.030 ms | 7.601 ms |
+| `dotnet` | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | 521.346 ms | 560.223 ms | 506.873 ms | 560.223 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 7.362 ms | 8.206 ms | 6.612 ms | 8.206 ms |
 
-Ten samples were retained after three warm-ups. The median ratio is `84.7x`.
+Ten samples were retained after three warm-ups. The median ratio is `70.8x`.
 The `dv` timing includes process startup and JSON event reporting.
+This run includes selected-SDK discovery, parsing and hashing its 272-entry
+package-pruning table, and matching that fingerprint against lock schema 2.
 
 Reproduce:
 
@@ -40,8 +42,8 @@ established the same exact dependency graph and selected compile assets.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 994.180 ms | 1048.203 ms | 971.725 ms | 1053.043 ms |
-| `dv` | `dv restore PackageConsole.csproj --packages .packages --json` | 400.814 ms | 634.719 ms | 375.208 ms | 732.690 ms |
+| `dotnet` | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 1028.951 ms | 1061.502 ms | 1014.746 ms | 1061.698 ms |
+| `dv` | `dv restore PackageConsole.csproj --packages .packages --json` | 417.981 ms | 469.712 ms | 399.442 ms | 493.282 ms |
 
 Thirty samples were retained after three warm-ups. The median ratio is `2.5x`.
 `dv` reported two HTTP requests and 2,441,966 downloaded payload bytes for
@@ -76,16 +78,16 @@ empty isolated packages directory; the reference HTTP cache was disabled.
 
 | Tool | Exact command | Median | P95 | Min | Max |
 |---|---|---:|---:|---:|---:|
-| `dotnet` | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 1350.559 ms | 1401.944 ms | 1318.197 ms | 1401.944 ms |
-| `dv` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 581.450 ms | 641.654 ms | 546.617 ms | 641.654 ms |
+| `dotnet` | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | 1425.299 ms | 1658.964 ms | 1396.018 ms | 1658.964 ms |
+| `dv` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 632.458 ms | 662.278 ms | 577.190 ms | 662.278 ms |
 
 Ten samples were retained after two warm-ups. The median ratio is `2.3x`.
 `dv` reported 50 downloaded packages, 51 HTTP requests, and 3,241,550 payload
 bytes in every retained sample. The reference command does not expose typed
 work counters.
 
-The modest payload spread across many small archives makes this a
-dependency-wave, request-scheduling, validation, extraction, and filesystem
+The modest payload spread across many small archives makes this a dependency
+discovery, request-scheduling, validation, extraction, and filesystem
 publication case rather than a raw download-throughput test. Network, DNS,
 TLS, CDN, Windows page-cache, and endpoint-security variance remain visible.
 The earlier scoped-worker implementation replaced global dependency-wave
@@ -157,14 +159,15 @@ Five samples were retained after one warm-up. `project.assets.json` contained
 downloaded package archives totaling 197,860,237 bytes; the reference command
 does not expose HTTP request count.
 
-`dv` currently stops on two correctness boundaries before this graph can be
-timed honestly:
+`dv` now converges all 203 reference-selected identities to the same exact
+versions and removes the five framework-owned packages using the selected
+.NET 10 SDK's pruning table. A fresh isolated probe reached the remaining
+`buildTransitive` rejection with no missing reference identity and no pruned
+`System.*` archive. Its cache also contained four speculative lower versions
+downloaded before convergence; these are not members of the final graph.
 
-- minimum dependency ranges such as `Microsoft.Extensions.Http >= 10.0.0`
-  and `>= 10.0.5` are treated as conflicting exact versions instead of
-  converging under NuGet's resolution rules;
-- packages containing `build`, `buildTransitive`, `buildMultiTargeting`, or
-  RID-specific `runtimes` assets remain outside the initial asset contract.
+Packages containing `build`, `buildTransitive`, `buildMultiTargeting`, or
+RID-specific `runtimes` assets remain outside the initial asset contract.
 
 The harness therefore prints the intended `dv restore` command and `TBI`
 rather than weakening the fixture or reporting partial-download time.

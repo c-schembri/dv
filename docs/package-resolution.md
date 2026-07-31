@@ -3,8 +3,9 @@
 ## Supported Input
 
 The initial resolver accepts a batch of evaluated SDK-style C# projects with
-exact `PackageReference` versions. The target framework comes from each
-`ProjectSpec`; package code does not contain a fixed current .NET version.
+exact, minimum, or bounded NuGet interval `PackageReference` versions. The
+target framework comes from each `ProjectSpec`; package code does not contain
+a fixed current .NET version.
 Modern `net5.0` through the latest captured stable generation are evaluated
 from the same parsed target descriptor. Recognized legacy families remain
 explicitly unsupported until their pack and compiler policies are captured.
@@ -48,12 +49,14 @@ asset nor a dependency remain incompatible.
 ```text
 ProjectSpec batch + resolve options
   -> merge typed source and cache configuration
+  -> select SDK-owned package-pruning data for the target framework
   -> validate a matching dv.lock.json and immutable cache entries
-  -> otherwise normalize exact direct references
-  -> seed a bounded queue with exact direct references
+  -> otherwise normalize direct version constraints
+  -> seed a bounded queue with direct package constraints
   -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
   -> merge dependency identities and conflicts through one deterministic owner
+  -> retract transitive packages supplied by the selected shared framework
   -> stream each package through SHA-512 into a bounded staging directory
   -> hand completed staging records to bounded blocking archive work
   -> validate ZIP paths, duplicates, links, sizes, and expansion bounds
@@ -64,9 +67,21 @@ ProjectSpec batch + resolve options
   -> write deterministic lock data when requested
 ```
 
-The warm locked path reads configuration, one lock, package markers and
-hashes, and selected asset metadata. It performs zero HTTP requests and never
-launches `dotnet`, MSBuild, or NuGet.
+For .NET 10 and later, pruning is driven by the selected SDK's versioned
+`PrunePackageData` first and the matching `Microsoft.NETCore.App.Ref`
+`PackageOverrides.txt` otherwise. The parsed identity table is sorted once,
+queried by binary search, and hashed canonically into lock schema 2. Its
+32-byte, 4-byte-aligned records contain text spans and fixed numeric version
+fields; the observed 272-entry table occupies 8,704 record bytes, or two
+records per assumed 64-byte cache line on the benchmark machine. Identity and
+prerelease text live once in a contiguous backing buffer. Stable package
+versions use the SDK's `major.minor.32767` upper bound. Direct package
+references remain explicit; only transitive nodes and their outgoing edges
+are pruned.
+
+The warm locked path reads configuration, selected SDK pruning data, one lock,
+package markers and hashes, and selected asset metadata. It performs zero HTTP
+requests and never launches `dotnet`, MSBuild, or NuGet.
 
 Network and archive data are externally sized, so staging paths, XML/JSON
 documents, graph work maps, and extraction buffers allocate dynamically.
@@ -138,16 +153,17 @@ them. `dv.lock.json` is project-owned persistent state.
 | Non-Unicode retained path | `DV0408` |
 | Compact range or text overflow | `DV0409` |
 
-Unsupported build targets, runtime-specific assets, signatures, general NuGet
-ranges, and advanced conflict rules fail instead of being approximated.
+Unsupported build targets, runtime-specific assets, signatures, floating
+versions, and advanced conflict rules fail instead of being approximated.
 
 ## Verification
 
 Unit and CLI tests cover typed v2/v3 configuration, real v2 Atom parsing,
-target-dependent asset selection, zero-request warm locking, cache reuse, and
-archive traversal rejection. Live verification downloads the same public
-package through both NuGet v2 and v3 and compares identity, archive SHA-512,
-size, and selected compile asset.
+target-dependent asset selection, SDK package-pruning bounds and edge
+retraction, zero-request warm locking, cache reuse, and archive traversal
+rejection. Live verification downloads the same public package through both
+NuGet v2 and v3 and compares identity, archive SHA-512, size, and selected
+compile asset.
 
 The benchmark preflight compares `dotnet restore` and `dv restore` complete
 package identity, exact-version, archive-SHA-512, target-framework, and
