@@ -1232,6 +1232,11 @@ struct PackageVersion {
   prerelease_start: Option<u32>,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<PackageVersion>() == 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<PackageVersion>() == align_of::<usize>());
+
 impl PackageVersion {
   fn parse(value: &str) -> Result<Self, PackageError> {
     if value.is_empty() || value.len() > 256 {
@@ -1383,7 +1388,84 @@ fn compare_prerelease_part(left: &str, right: &str) -> Ordering {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VersionBound {
   version: PackageVersion,
+  float_prefix_len: u16,
   inclusive: bool,
+  float_behavior: VersionFloatBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+enum VersionFloatBehavior {
+  #[default]
+  None,
+  Prerelease,
+  Revision,
+  Patch,
+  Minor,
+  Major,
+  AbsoluteLatest,
+  PrereleaseRevision,
+  PrereleasePatch,
+  PrereleaseMinor,
+  PrereleaseMajor,
+}
+
+impl VersionFloatBehavior {
+  fn includes_prerelease(self) -> bool {
+    matches!(
+      self,
+      Self::Prerelease | Self::AbsoluteLatest | Self::PrereleaseRevision | Self::PrereleasePatch | Self::PrereleaseMinor | Self::PrereleaseMajor
+    )
+  }
+}
+
+impl VersionBound {
+  fn new(version: PackageVersion, inclusive: bool) -> Self {
+    Self {
+      version,
+      float_prefix_len: 0,
+      inclusive,
+      float_behavior: VersionFloatBehavior::None,
+    }
+  }
+
+  fn floating(version: PackageVersion, inclusive: bool, float_behavior: VersionFloatBehavior, float_prefix_len: usize) -> Self {
+    Self {
+      version,
+      float_prefix_len: float_prefix_len as u16,
+      inclusive,
+      float_behavior,
+    }
+  }
+
+  fn float_prefix(&self) -> &str {
+    &self.version.prerelease().expect("prerelease floating bounds have a release label")[..usize::from(self.float_prefix_len)]
+  }
+
+  fn float_satisfies(&self, version: &PackageVersion) -> bool {
+    let stable = version.prerelease().is_none();
+    match self.float_behavior {
+      VersionFloatBehavior::None => false,
+      VersionFloatBehavior::AbsoluteLatest => true,
+      VersionFloatBehavior::Major => stable,
+      VersionFloatBehavior::Minor => stable && self.version.numbers[0] == version.numbers[0],
+      VersionFloatBehavior::Patch => stable && self.version.numbers[..2] == version.numbers[..2],
+      VersionFloatBehavior::Revision => stable && self.version.numbers[..3] == version.numbers[..3],
+      VersionFloatBehavior::Prerelease => {
+        self.version.numbers == version.numbers && (stable || version.prerelease().is_some_and(|release| release.starts_with(self.float_prefix())))
+      },
+      VersionFloatBehavior::PrereleaseMajor => stable || version.prerelease().is_some_and(|release| release.starts_with(self.float_prefix())),
+      VersionFloatBehavior::PrereleaseMinor => {
+        self.version.numbers[0] == version.numbers[0] && (stable || version.prerelease().is_some_and(|release| release.starts_with(self.float_prefix())))
+      },
+      VersionFloatBehavior::PrereleasePatch => {
+        self.version.numbers[..2] == version.numbers[..2] && (stable || version.prerelease().is_some_and(|release| release.starts_with(self.float_prefix())))
+      },
+      VersionFloatBehavior::PrereleaseRevision => {
+        self.version.numbers[..3] == version.numbers[..3] && (stable || version.prerelease().is_some_and(|release| release.starts_with(self.float_prefix())))
+      },
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1392,29 +1474,32 @@ struct VersionRange {
   upper: Option<VersionBound>,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<VersionBound>() == 56);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<VersionBound>() == align_of::<usize>());
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<VersionRange>() == 112);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<VersionRange>() == align_of::<usize>());
+
 impl VersionRange {
   #[cfg(test)]
   fn exact(version: PackageVersion) -> Self {
     Self {
-      lower: Some(VersionBound {
-        version: version.clone(),
-        inclusive: true,
-      }),
-      upper: Some(VersionBound { version, inclusive: true }),
+      lower: Some(VersionBound::new(version.clone(), true)),
+      upper: Some(VersionBound::new(version, true)),
     }
   }
 
   fn parse(value: &str) -> Result<Self, PackageError> {
     let value = value.trim();
-    if value.is_empty() || value.contains('*') {
+    if value.is_empty() {
       return Err(unsupported_version_range(value));
     }
     if !value.starts_with(['[', '(']) {
       return Ok(Self {
-        lower: Some(VersionBound {
-          version: PackageVersion::parse(value)?,
-          inclusive: true,
-        }),
+        lower: Some(parse_version_bound(value, true, true)?),
         upper: None,
       });
     }
@@ -1430,35 +1515,21 @@ impl VersionRange {
       }
       let version = PackageVersion::parse(body.trim())?;
       return Ok(Self {
-        lower: Some(VersionBound {
-          version: version.clone(),
-          inclusive: true,
-        }),
-        upper: Some(VersionBound { version, inclusive: true }),
+        lower: Some(VersionBound::new(version.clone(), true)),
+        upper: Some(VersionBound::new(version, true)),
       });
     }
     let (lower, upper) = body.split_once(',').expect("a checked range contains a comma");
     let lower = (!lower.trim().is_empty())
-      .then(|| {
-        Ok(VersionBound {
-          version: PackageVersion::parse(lower.trim())?,
-          inclusive: lower_inclusive,
-        })
-      })
+      .then(|| parse_version_bound(lower.trim(), lower_inclusive, true))
       .transpose()?;
     let upper = (!upper.trim().is_empty())
-      .then(|| {
-        Ok(VersionBound {
-          version: PackageVersion::parse(upper.trim())?,
-          inclusive: upper_inclusive,
-        })
-      })
+      .then(|| parse_version_bound(upper.trim(), upper_inclusive, false))
       .transpose()?;
     if lower.is_none() && upper.is_none() {
       return Err(unsupported_version_range(value));
     }
-    let range = Self { lower, upper };
-    if let (Some(lower), Some(upper)) = (&range.lower, &range.upper)
+    if let (Some(lower), Some(upper)) = (&lower, &upper)
       && (lower.version > upper.version || (lower.version == upper.version && (!lower.inclusive || !upper.inclusive)))
     {
       return Err(PackageError::new(
@@ -1467,7 +1538,7 @@ impl VersionRange {
         format!("dependency range {value:?} contains no versions"),
       ));
     }
-    Ok(range)
+    Ok(Self { lower, upper })
   }
 
   fn contains(&self, version: &PackageVersion) -> bool {
@@ -1482,9 +1553,114 @@ impl VersionRange {
   }
 
   fn allows_prerelease(&self) -> bool {
-    self.lower.as_ref().is_some_and(|bound| bound.version.prerelease().is_some())
+    self
+      .lower
+      .as_ref()
+      .is_some_and(|bound| bound.float_behavior.includes_prerelease() || bound.version.prerelease().is_some())
       || self.upper.as_ref().is_some_and(|bound| bound.version.prerelease().is_some())
   }
+
+  fn is_floating(&self) -> bool {
+    self.lower.as_ref().is_some_and(|bound| bound.float_behavior != VersionFloatBehavior::None)
+  }
+
+  #[cfg(test)]
+  fn floating_satisfies(&self, version: &PackageVersion) -> bool {
+    self.lower.as_ref().is_some_and(|bound| bound.float_satisfies(version))
+  }
+
+  fn is_better(&self, current: &PackageVersion, considering: &PackageVersion) -> bool {
+    let Some(lower) = self.lower.as_ref().filter(|bound| bound.float_behavior != VersionFloatBehavior::None) else {
+      return current > considering;
+    };
+    let current_floats = lower.float_satisfies(current);
+    let considering_floats = lower.float_satisfies(considering);
+    match (current_floats, considering_floats) {
+      (true, false) => false,
+      (false, true) => true,
+      (true, true) => current < considering,
+      (false, false) => match (current < &lower.version, considering < &lower.version) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => current > considering,
+        (true, true) => current < considering,
+      },
+    }
+  }
+}
+
+fn parse_version_bound(value: &str, inclusive: bool, allow_floating: bool) -> Result<VersionBound, PackageError> {
+  if !value.contains('*') {
+    return Ok(VersionBound::new(PackageVersion::parse(value)?, inclusive));
+  }
+  if !allow_floating {
+    return Err(unsupported_version_range(value));
+  }
+  let (version, behavior, prefix_len) = parse_floating_version(value)?;
+  Ok(VersionBound::floating(version, inclusive, behavior, prefix_len))
+}
+
+fn parse_floating_version(value: &str) -> Result<(PackageVersion, VersionFloatBehavior, usize), PackageError> {
+  if value.len() > 256 || value.contains('+') || !value.ends_with('*') {
+    return Err(unsupported_version_range(value));
+  }
+  if value == "*" {
+    return Ok((PackageVersion::parse("0.0.0")?, VersionFloatBehavior::Major, 0));
+  }
+  if value == "*-*" {
+    return Ok((PackageVersion::parse("0.0.0-0")?, VersionFloatBehavior::AbsoluteLatest, 0));
+  }
+
+  let first_star = value.find('*').expect("a floating version contains a wildcard");
+  let last_star = value.rfind('*').expect("a floating version contains a wildcard");
+  if first_star != last_star {
+    let dash = value.find('-').ok_or_else(|| unsupported_version_range(value))?;
+    if first_star + 1 != dash || last_star + 1 != value.len() {
+      return Err(unsupported_version_range(value));
+    }
+    let mut numeric = value[..first_star].to_owned();
+    numeric.push('0');
+    let behavior = match numeric.bytes().filter(|byte| *byte == b'.').count() + 1 {
+      1 => VersionFloatBehavior::PrereleaseMajor,
+      2 => VersionFloatBehavior::PrereleaseMinor,
+      3 => VersionFloatBehavior::PrereleasePatch,
+      4 => VersionFloatBehavior::PrereleaseRevision,
+      _ => return Err(unsupported_version_range(value)),
+    };
+    let prefix = &value[dash + 1..last_star];
+    let mut actual = numeric;
+    actual.push('-');
+    actual.push_str(prefix);
+    if prefix.is_empty() || prefix.ends_with('.') {
+      actual.push('0');
+    }
+    return Ok((
+      PackageVersion::parse(&actual).map_err(|_| unsupported_version_range(value))?,
+      behavior,
+      prefix.len(),
+    ));
+  }
+
+  let mut actual = value[..last_star].to_owned();
+  if let Some(dash) = value.find('-') {
+    let explicit_prefix = (dash == value.rfind('-').expect("a checked prerelease has a dash")).then_some(&value[dash + 1..last_star]);
+    if explicit_prefix.is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.')) {
+      actual.push('0');
+    }
+    let version = PackageVersion::parse(&actual).map_err(|_| unsupported_version_range(value))?;
+    let prefix_len = explicit_prefix.map_or_else(|| version.prerelease().map_or(0, str::len), str::len);
+    return Ok((version, VersionFloatBehavior::Prerelease, prefix_len));
+  }
+
+  actual.push('0');
+  let behavior = match actual.bytes().filter(|byte| *byte == b'.').count() + 1 {
+    1 => VersionFloatBehavior::None,
+    2 => VersionFloatBehavior::Minor,
+    3 => VersionFloatBehavior::Patch,
+    4 => VersionFloatBehavior::Revision,
+    _ => return Err(unsupported_version_range(value)),
+  };
+  Ok((PackageVersion::parse(&actual).map_err(|_| unsupported_version_range(value))?, behavior, 0))
 }
 
 fn unsupported_version_range(value: &str) -> PackageError {
@@ -5131,12 +5307,27 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
       )
   };
   if let Some(versions) = &node.available_versions {
-    return versions
-      .iter()
-      .find(|version| accepts(version))
+    let preference = node
+      .direct
+      .as_ref()
+      .filter(|range| range.is_floating())
+      .or_else(|| node.constraints.values().find(|range| range.is_floating()));
+    let mut selected = None;
+    for version in versions.iter().filter(|version| accepts(version)) {
+      if preference.is_none() {
+        return Ok(NodeSelection::Version(version.clone()));
+      }
+      if selected.is_none_or(|current| preference.expect("a checked preference exists").is_better(current, version)) {
+        selected = Some(version);
+      }
+    }
+    return selected
       .cloned()
       .map(NodeSelection::Version)
       .ok_or_else(|| resolution_error(&node.id, "no available package version satisfies the dependency constraints"));
+  }
+  if node.direct.as_ref().is_some_and(VersionRange::is_floating) || node.constraints.values().any(VersionRange::is_floating) {
+    return Ok(NodeSelection::Enumerate);
   }
   let mut candidate = None::<&PackageVersion>;
   if let Some(direct) = &node.direct {
@@ -7453,7 +7644,7 @@ fn collect_analyzers(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
 #[cfg(test)]
 fn minimum_version_from_range(range: &VersionRange) -> Result<PackageVersion, PackageError> {
   match &range.lower {
-    Some(lower) if lower.inclusive => Ok(lower.version.clone()),
+    Some(lower) if lower.inclusive && !range.is_floating() => Ok(lower.version.clone()),
     _ => Err(PackageError::new(
       PackageErrorKind::Resolution,
       "dependency range",
@@ -8348,6 +8539,121 @@ mod tests {
     assert!(!bounded.contains(&one_two));
     assert!(bounded.contains(&one_three));
     assert!(bounded.contains(&two));
+  }
+
+  #[test]
+  fn floating_ranges_match_nuget_numeric_and_prerelease_prefixes() {
+    let stable_any = VersionRange::parse("*").unwrap();
+    let stable_minor = VersionRange::parse("1.2.*").unwrap();
+    let absolute_latest = VersionRange::parse("*-*").unwrap();
+    let release_candidate = VersionRange::parse("1.2.0-rc.*").unwrap();
+    let patch_prerelease = VersionRange::parse("1.2.*-beta.*").unwrap();
+
+    assert!(stable_any.floating_satisfies(&PackageVersion::parse("99.0.0").unwrap()));
+    assert!(!stable_any.floating_satisfies(&PackageVersion::parse("99.0.0-preview.1").unwrap()));
+    assert!(stable_minor.floating_satisfies(&PackageVersion::parse("1.2.99").unwrap()));
+    assert!(!stable_minor.floating_satisfies(&PackageVersion::parse("1.3.0").unwrap()));
+    assert!(absolute_latest.floating_satisfies(&PackageVersion::parse("99.0.0-preview.1").unwrap()));
+    assert!(release_candidate.floating_satisfies(&PackageVersion::parse("1.2.0-rc.12").unwrap()));
+    assert!(release_candidate.floating_satisfies(&PackageVersion::parse("1.2.0").unwrap()));
+    assert!(!release_candidate.floating_satisfies(&PackageVersion::parse("1.2.0-beta.1").unwrap()));
+    assert!(patch_prerelease.floating_satisfies(&PackageVersion::parse("1.2.7-beta.3").unwrap()));
+    assert!(patch_prerelease.floating_satisfies(&PackageVersion::parse("1.2.8").unwrap()));
+    assert!(!patch_prerelease.floating_satisfies(&PackageVersion::parse("1.2.7-rc.1").unwrap()));
+  }
+
+  #[test]
+  fn nuget_floating_parser_accepts_numeric_prerelease_and_interval_forms() {
+    for value in [
+      "*",
+      "*-*",
+      "0*",
+      "1.*",
+      "1.2*",
+      "1.2.*",
+      "1.2.3.*",
+      "1.2.3-*",
+      "1.2.3-rc.*",
+      "1.2.*-*",
+      "1.2.*-preview.1.*",
+      "*-rc.*",
+      "[1.*,2.0)",
+      "[1.2.0-rc.*, )",
+    ] {
+      assert!(VersionRange::parse(value).is_ok(), "{value} did not parse");
+    }
+  }
+
+  #[test]
+  fn malformed_floating_ranges_fail_instead_of_becoming_approximate_ranges() {
+    for value in [
+      "[*]",
+      "1.2.*.3",
+      "[1.0,2.*)",
+      "1.2.*-beta",
+      "1.2.*-*.*",
+      "1.2.*+build",
+      "1.0.0.0.*",
+      "1.*.0",
+      "1.0.**",
+    ] {
+      assert!(VersionRange::parse(value).is_err(), "{value} unexpectedly parsed");
+    }
+  }
+
+  fn selected_version(range: &str, versions: &[&str]) -> Option<String> {
+    let node = ConstraintNode {
+      id: "Floating.Package".into(),
+      direct: Some(VersionRange::parse(range).unwrap()),
+      constraints: BTreeMap::new(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: Some(versions.iter().map(|version| PackageVersion::parse(version).unwrap()).collect()),
+      pruned: false,
+      generation: 0,
+    };
+    match select_node_version(&node) {
+      Ok(NodeSelection::Version(version)) => Some(version.normalized),
+      Ok(NodeSelection::Enumerate) | Err(_) => None,
+    }
+  }
+
+  #[test]
+  fn floating_selection_matches_nuget_best_match_fallback_rules() {
+    let versions = ["1.1.0", "1.2.0-rc.1", "1.2.0-rc.2", "2.0.0", "3.0.0-beta.1"];
+    assert_eq!(selected_version("*", &versions).as_deref(), Some("2.0.0"));
+    assert_eq!(selected_version("1.*", &versions).as_deref(), Some("1.1.0"));
+    assert_eq!(selected_version("1.2.0-*", &versions).as_deref(), Some("1.2.0-rc.2"));
+    assert_eq!(selected_version("*-*", &versions).as_deref(), Some("3.0.0-beta.1"));
+    assert_eq!(selected_version("1.*-*", &versions).as_deref(), Some("1.2.0-rc.2"));
+    assert_eq!(selected_version("1.*", &["2.0.0", "3.0.0"]).as_deref(), Some("2.0.0"));
+    assert_eq!(selected_version("[1.*,2.0)", &["1.1.0", "1.9.0", "2.0.0"]).as_deref(), Some("1.9.0"));
+  }
+
+  #[test]
+  fn floating_direct_dependencies_select_the_highest_matching_version() {
+    let node = ConstraintNode {
+      id: "Floating.Package".into(),
+      direct: Some(VersionRange::parse("1.2.*-rc.*").unwrap()),
+      constraints: BTreeMap::new(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: Some(
+        ["1.2.0-beta.1", "1.2.0-rc.1", "1.2.0", "1.2.1-rc.2", "1.2.1", "1.3.0"]
+          .into_iter()
+          .map(|version| PackageVersion::parse(version).unwrap())
+          .collect(),
+      ),
+      pruned: false,
+      generation: 0,
+    };
+
+    let NodeSelection::Version(selected) = select_node_version(&node).unwrap() else {
+      panic!("floating dependencies require an enumerated version");
+    };
+    assert_eq!(selected.normalized, "1.2.1");
   }
 
   #[test]
@@ -10577,6 +10883,64 @@ mod tests {
     assert_eq!(resolution.packages().len(), 1);
     assert_eq!(resolution.package_version(resolution.packages()[0]), "2.0.0");
     assert_eq!(resolution.network_requests(), 0);
+  }
+
+  #[test]
+  fn floating_project_versions_select_the_highest_stable_cache_match_cold_and_warm() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Floating.Package" Version="1.2.*" /></ItemGroup></Project>"#,
+    );
+    for version in ["1.2.0-beta.1", "1.2.0", "1.2.1-rc.1", "1.2.1", "1.3.0"] {
+      let root = format!("packages/floating.package/{version}");
+      temp.write(
+        &format!("{root}/floating.package.nuspec"),
+        format!(r#"<package><metadata><id>Floating.Package</id><version>{version}</version></metadata></package>"#),
+      );
+      temp.write(&format!("{root}/floating.package.{version}.nupkg"), []);
+      temp.write(&format!("{root}/floating.package.{version}.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+      temp.write(&format!("{root}/lib/net10.0/Floating.Package.dll"), []);
+    }
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
+      sources: Vec::new(),
+      offline: true,
+      write_lock: true,
+      ..PackageResolveOptions::default()
+    };
+
+    let cold = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    let warm = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+
+    assert_eq!(cold.package_version(cold.packages()[0]), "1.2.1");
+    assert_eq!(warm.package_version(warm.packages()[0]), "1.2.1");
+    assert_eq!(cold.network_requests(), 0);
+    assert_eq!(warm.network_requests(), 0);
+    assert_eq!(warm.cache_hits(), 1);
+  }
+
+  #[test]
+  fn floating_versions_in_package_metadata_remain_typed_for_transitive_resolution() {
+    let request = request();
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version><dependencies>
+<dependency id="Child.Package" version="1.*" /></dependencies></metadata></package>"#;
+
+    let requirements = parse_nuspec_requirements(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request,
+      TargetFramework::parse("net10.0").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(requirements.len(), 1);
+    assert!(requirements[0].range.is_floating());
   }
 
   #[test]

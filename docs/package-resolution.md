@@ -3,9 +3,18 @@
 ## Supported Input
 
 The initial resolver accepts a batch of evaluated SDK-style C# projects with
-exact, minimum, or bounded NuGet interval `PackageReference` versions. The
-target framework comes from each `ProjectSpec`; package code does not contain
-a fixed current .NET version.
+exact, minimum, bounded NuGet interval, or floating versions in both
+`PackageReference` and package dependency metadata. Stable forms (`*`, `1.*`,
+`1.2.*`, and `1.2.3.*`) prefer the highest matching stable version, then use
+NuGet's nearest in-range fallback when none match. A `-*` or prefixed
+prerelease wildcard admits matching prereleases as well as a matching stable
+release, with normal NuGet precedence; `*-*` admits every version. The same
+typed representation is retained if floating syntax appears in package
+metadata, so graph convergence does not approximate it as a plain minimum.
+Floating lower bounds may also carry an inclusive or exclusive interval upper
+bound; floating upper bounds are rejected like NuGet.Client. The target
+framework comes from each `ProjectSpec`; package code does not contain a fixed
+current .NET version.
 Modern `net5.0` through the latest captured stable generation are evaluated
 from the same parsed target descriptor. Recognized legacy families remain
 explicitly unsupported until their pack and compiler policies are captured.
@@ -112,6 +121,7 @@ ProjectSpec batch + resolve options
   -> select SDK-owned package-pruning data for the target framework
   -> validate a matching dv.lock.json and immutable cache entries
   -> otherwise normalize direct version constraints
+  -> enumerate floating constraints and linearly score NuGet best-match order
   -> seed a bounded queue with direct package constraints
   -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
@@ -127,6 +137,21 @@ ProjectSpec batch + resolve options
   -> compact graph indices, asset spans, and text into PackageResolution
   -> write deterministic lock data when requested
 ```
+
+Version selection scans each source/cache version batch linearly in ascending
+SemVer order. Non-floating constraints return on the first accepted version;
+floating constraints keep one candidate and apply NuGet's matching-first,
+highest-float, nearest-fallback ordering. Stable feeds make the prerelease
+branch predictable; prefixed prerelease floats take the rarer prefix path.
+`PackageVersion` is 48 bytes with 8-byte alignment. The 100,000-version input
+limit therefore caps its contiguous record working set at 4.8 MB, excluding
+the externally sized normalized text allocations. Float behavior and a
+prerelease-prefix length occupy existing `VersionBound` padding: the bound
+remains 56 bytes and `VersionRange` remains 112 bytes, both 8-byte aligned.
+No worker mutates these records, so extra cache-line alignment would consume
+memory without preventing false sharing. `ASSUMPTION: the benchmark host has
+64-byte data cache lines - affects layout analysis only; no correctness or
+alignment decision depends on it.`
 
 For .NET 10 and later, pruning is driven by the selected SDK's versioned
 `PrunePackageData` first and the matching `Microsoft.NETCore.App.Ref`
@@ -257,12 +282,15 @@ them. `dv.lock.json` is project-owned persistent state.
 | Package authentication or provider work cancelled | `DV0411` |
 | Uncached identity has no enabled winning source mapping | `DV0412` |
 
-Unsupported package build-target execution, signature enforcement, floating
-versions, and advanced conflict rules fail instead of being approximated.
+Unsupported package build-target execution, signature enforcement, and
+advanced conflict rules fail instead of being approximated.
 
 ## Verification
 
-Unit and CLI tests cover typed local/v2/v3 configuration, v2 Atom metadata and
+Unit and CLI tests cover typed floating and interval selection, malformed
+floating rejection, transitive typed retention, cold/warm cache behavior,
+local/v2/v3
+configuration, v2 Atom metadata and
 continuations, flat and hierarchical discovery, flat archive identity checks,
 hierarchical hash rejection, target-dependent asset selection, zero-request
 warm locking, cache reuse, and archive traversal rejection. Live verification
@@ -293,6 +321,19 @@ cargo bench-all --case nuget_source_telemetry --samples 30 --warmups 3
 
 The curated distribution is retained in the
 [source-telemetry baseline](performance-baselines/2026-08-01-nuget-source-telemetry-windows.md).
+
+The floating-version case prepares a local feed containing two real `13.*`
+archives outside timing. It starts each process with empty isolated package
+state, asks both tools to resolve `Newtonsoft.Json` `13.*`, and requires the
+same exact identity, version, archive SHA-512, target, asset batches, and zero
+HTTP work before timing:
+
+```powershell
+cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[floating-version baseline](performance-baselines/2026-08-01-nuget-floating-version-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties

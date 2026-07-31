@@ -227,7 +227,7 @@ prove that nothing changed.
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
 | Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
-| Package resolution and cache | Initial subset | version ranges, dependency-only meta-packages, bounded streaming resolution, local and NuGet v2/v3 HTTPS sources, official service-index capability discovery, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
+| Package resolution and cache | Initial subset | interval and NuGet floating versions, dependency-only meta-packages, bounded streaming resolution, local and NuGet v2/v3 HTTPS sources, official service-index capability discovery, verified atomic package cache, deterministic dv lock, and identical `restore`/`sync` commands |
 | Solution discovery and evaluation | Missing | no production types or commands |
 | Restore | Initial subset | exact package restore is implemented; most reference flags and graph cases remain |
 | Build execution, run, and test | Missing | build only plans inputs; run/test remain unsupported |
@@ -871,9 +871,12 @@ boundary, not final drop-in parity.
 
 - [x] `RES-001` Parse NuGet package identities case-insensitively while
   preserving display casing. `P1`
-- [~] `RES-002` NuGet SemVer 2 precedence, normalized numeric versions,
+- [x] `RES-002` NuGet SemVer 2 precedence, normalized numeric versions,
   prerelease identifiers, ignored build metadata, and inclusive/exclusive
-  interval ranges are typed and tested. Floating versions remain. `P1`
+  interval ranges are typed and tested. Numeric, prerelease, and interval
+  floating forms in project or package constraints retain NuGet's
+  matching-first/highest-float/nearest-fallback ordering; a Microsoft-oracled
+  cold benchmark covers exact identity, version, hash, and assets. `P1`
 - [x] `RES-003` Parse `PackageReference` version and metadata from attributes
   or child elements. `P1`
 - [ ] `RES-004` Support `IncludeAssets`, `ExcludeAssets`, `PrivateAssets`,
@@ -885,8 +888,8 @@ boundary, not final drop-in parity.
   convergence use an identity-ordered constraint table with stale-edge
   retraction and bounded non-convergence failure. The eShop-derived acceptance
   graph selects every one of the reference graph's 203 identities at the same
-  exact version after SDK-owned package pruning; floating versions remain.
-  `P1`
+  exact version after SDK-owned package pruning; advanced conflict behavior
+  remains. `P1`
 - [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and

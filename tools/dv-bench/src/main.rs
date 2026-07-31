@@ -46,6 +46,7 @@ enum CaseKind {
   NugetStoragePolicy,
   NugetCliOverrides,
   NugetLocalSources,
+  NugetFloatingVersion,
   NugetServiceIndex,
   NugetCredentials,
   NugetCredentialProvider,
@@ -80,6 +81,7 @@ struct Fixtures<'a> {
   nuget_storage_policy: &'a Path,
   nuget_cli_overrides: &'a Path,
   nuget_local_sources: &'a Path,
+  nuget_floating_version: &'a Path,
   nuget_service_index: &'a Path,
   nuget_credentials: &'a Path,
   nuget_credential_provider: &'a Path,
@@ -380,6 +382,22 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_floating_version",
+    kind: CaseKind::NugetFloatingVersion,
+    args: &[
+      "restore",
+      "FloatingVersion.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "nuget_service_index",
     kind: CaseKind::NugetServiceIndex,
     args: &["oracle/bin/Release/ServiceIndexOracle.dll", "https://api.nuget.org/v3/index.json"],
@@ -627,6 +645,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_floating_version",
+    kind: CaseKind::NugetFloatingVersion,
+    args: &["restore", "FloatingVersion.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_service_index",
     kind: CaseKind::NugetServiceIndex,
     args: &["project", "package-sources", "ServiceIndex.csproj", "--json"],
@@ -805,6 +829,7 @@ fn run() -> Result<()> {
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
   let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
+  let nuget_floating_version_fixture = repository.join("benchmarks/fixtures/nuget-floating-version");
   let nuget_service_index_fixture = repository.join("benchmarks/fixtures/nuget-service-index");
   let nuget_credentials_fixture = repository.join("benchmarks/fixtures/nuget-credentials");
   let nuget_credential_provider_fixture = repository.join("benchmarks/fixtures/nuget-credential-provider");
@@ -829,6 +854,7 @@ fn run() -> Result<()> {
     nuget_storage_policy: &nuget_storage_policy_fixture,
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
     nuget_local_sources: &nuget_local_sources_fixture,
+    nuget_floating_version: &nuget_floating_version_fixture,
     nuget_service_index: &nuget_service_index_fixture,
     nuget_credentials: &nuget_credentials_fixture,
     nuget_credential_provider: &nuget_credential_provider_fixture,
@@ -896,6 +922,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_local_sources") {
     verify_nuget_local_sources(&repository, &dv_executable, &nuget_local_sources_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_floating_version") {
+    verify_nuget_floating_version(&repository, &dv_executable, &nuget_floating_version_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_service_index") {
     verify_nuget_service_index(&repository, &dv_executable, &nuget_service_index_fixture)?;
@@ -1609,7 +1638,7 @@ fn verify_compiler_plan(repository: &Path, dv_executable: &Path, fixture: &Path)
 
 fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, project_file: &str, expected_packages: usize) -> Result<()> {
   let verification_name = project_file.trim_end_matches(".csproj").to_ascii_lowercase();
-  let root = repository.join(format!("target/benchmark-{verification_name}-verification"));
+  let root = repository.join(format!("target/benchmark-{verification_name}-verification-{}", std::process::id()));
   ensure_workspace_is_safe(repository, &root)?;
   let dotnet_workspace = root.join("dotnet");
   let dv_workspace = root.join("dv");
@@ -1842,6 +1871,71 @@ fn verify_package_sync(repository: &Path, dv_executable: &Path, fixture: &Path, 
     );
   }
   Ok(())
+}
+
+fn verify_nuget_floating_version(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let oracle_root = repository.join(format!("target/benchmark-floating-version-oracle-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &oracle_root)?;
+  reset_fixture(fixture, &oracle_root)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "build",
+      "oracle/FloatingVersionOracle.csproj",
+      "-c",
+      "Release",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &oracle_root,
+    "NuGet floating-version oracle build",
+  )?;
+  let patterns = [
+    "*",
+    "*-*",
+    "0*",
+    "1.*",
+    "1.2*",
+    "1.2.*",
+    "1.2.3.*",
+    "1.2.3-*",
+    "1.2.3-rc.*",
+    "1.2.*-*",
+    "1.2.*-preview.1.*",
+    "*-rc.*",
+    "[1.*,2.0)",
+    "[1.2.0-rc.*, )",
+    "[*]",
+    "[1.0,2.*)",
+  ];
+  let args = std::iter::once("oracle/bin/Release/net10.0/FloatingVersionOracle.dll")
+    .chain(patterns)
+    .collect::<Vec<_>>();
+  let reference = command_text(Path::new("dotnet"), &args, &oracle_root)?;
+  let expected = [
+    "*|0.0.0||Major|",
+    "*-*|0.0.0-0||AbsoluteLatest|",
+    "0*|0.0.0||None|",
+    "1.*|1.0.0||Minor|",
+    "1.2*|1.20.0||Minor|",
+    "1.2.*|1.2.0||Patch|",
+    "1.2.3.*|1.2.3||Revision|",
+    "1.2.3-*|1.2.3-0||Prerelease|",
+    "1.2.3-rc.*|1.2.3-rc.0||Prerelease|rc.",
+    "1.2.*-*|1.2.0-0||PrereleasePatch|",
+    "1.2.*-preview.1.*|1.2.0-preview.1.0||PrereleasePatch|preview.1.",
+    "*-rc.*|0.0.0-rc.0||PrereleaseMajor|rc.",
+    "[1.*,2.0)|1.0.0|2.0.0|Minor|",
+    "[1.2.0-rc.*, )|1.2.0-rc.0||Prerelease|rc.",
+    "[*]|invalid",
+    "[1.0,2.*)|invalid",
+  ];
+  if reference.lines().ne(expected) {
+    return Err(format!("selected SDK NuGet floating parser changed: {reference:?}").into());
+  }
+  prepare_nuget_floating_version(&oracle_root)?;
+  verify_package_sync(repository, dv_executable, &oracle_root, "FloatingVersion.csproj", 1)
 }
 
 fn verify_nuget_config_hierarchy(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -3498,6 +3592,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
+      | CaseKind::NugetFloatingVersion
       | CaseKind::NugetServiceIndex
       | CaseKind::NugetCredentials
       | CaseKind::NugetCredentialProvider
@@ -3758,6 +3853,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::NugetLocalSources) {
     prepare_nuget_local_sources(workspace)?;
   }
+  if matches!(case.kind, CaseKind::NugetFloatingVersion) {
+    prepare_nuget_floating_version(workspace)?;
+  }
   if matches!(case.kind, CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry) {
     prepare_nuget_request_budget(workspace)?;
   }
@@ -3954,6 +4052,60 @@ fn prepare_nuget_local_sources(workspace: &Path) -> Result<()> {
   )?;
   fs::remove_file(workspace.join(".seed.config"))?;
   reset_nuget_local_iteration(workspace)
+}
+
+fn prepare_nuget_floating_version(workspace: &Path) -> Result<()> {
+  for relative in [
+    "feeds",
+    ".seed",
+    ".seed-project",
+    ".packages",
+    "obj",
+    "dv.lock.json",
+    "packages.lock.json",
+    ".seed.config",
+  ] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  fs::write(
+    workspace.join(".seed.config"),
+    r#"<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" /></packageSources></configuration>"#,
+  )?;
+  for version in ["13.0.3", "13.0.4"] {
+    let project = format!(".seed-project/{version}/Seed.csproj");
+    let project_path = workspace.join(&project);
+    fs::create_dir_all(project_path.parent().expect("a seed project has a parent"))?;
+    fs::write(
+      &project_path,
+      format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="{version}" /></ItemGroup></Project>"#
+      ),
+    )?;
+    run_nuget_config_checked(
+      Path::new("dotnet"),
+      &[
+        "restore",
+        &project,
+        "--configfile",
+        ".seed.config",
+        "--packages",
+        ".seed",
+        "--no-http-cache",
+        "--disable-build-servers",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "NuGet floating-version package seed",
+    )?;
+    copy_with_parent(
+      &workspace.join(format!(".seed/newtonsoft.json/{version}/newtonsoft.json.{version}.nupkg")),
+      &workspace.join(format!("feeds/Newtonsoft.Json.{version}.nupkg")),
+    )?;
+  }
+  fs::remove_file(workspace.join(".seed.config"))?;
+  reset_nuget_floating_iteration(workspace)
 }
 
 fn prepare_nuget_request_budget(workspace: &Path) -> Result<()> {
@@ -4343,6 +4495,13 @@ fn reset_nuget_local_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_nuget_floating_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", "obj", "dv.lock.json", "packages.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn reset_nuget_request_budget_iteration(workspace: &Path) -> Result<()> {
   for relative in [".packages", ".http-cache", "obj", "dv.lock.json", "packages.lock.json"] {
     remove_generated_path(&workspace.join(relative))?;
@@ -4389,6 +4548,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
+    CaseKind::NugetFloatingVersion => reset_nuget_floating_iteration(workspace),
     CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => reset_nuget_request_budget_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
@@ -4461,6 +4621,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
+    CaseKind::NugetFloatingVersion => fixtures.nuget_floating_version,
     CaseKind::NugetServiceIndex => fixtures.nuget_service_index,
     CaseKind::NugetCredentials => fixtures.nuget_credentials,
     CaseKind::NugetCredentialProvider => fixtures.nuget_credential_provider,
@@ -4490,6 +4651,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
+    CaseKind::NugetFloatingVersion => Some("nuget-floating-version"),
     CaseKind::NugetServiceIndex => Some("nuget-service-index"),
     CaseKind::NugetCredentials => Some("nuget-credentials"),
     CaseKind::NugetCredentialProvider => Some("nuget-credential-provider"),
@@ -4552,6 +4714,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     && matches!(
       case.kind,
       CaseKind::PackageSyncCold
+        | CaseKind::NugetFloatingVersion
         | CaseKind::PackageGraphCold
         | CaseKind::PackageGraphMassive
         | CaseKind::PackageAssetPlan
@@ -4566,7 +4729,13 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetSourceTelemetry
     )
   {
-    Some(parse_work_evidence(&output.stdout)?)
+    let evidence = parse_work_evidence(&output.stdout)?;
+    if matches!(case.kind, CaseKind::NugetFloatingVersion)
+      && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(1) || evidence.resolved_packages != Some(1))
+    {
+      return Err(format!("floating-version sample did not perform one zero-network package acquisition: {evidence:?}").into());
+    }
+    Some(evidence)
   } else if !is_dotnet(executable)
     && matches!(
       case.kind,
@@ -5051,7 +5220,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     let source_path = entry.path();
     let destination_path = destination.join(entry.file_name());
     if entry.file_type()?.is_dir() {
-      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed"))
+      if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed" | ".seed-project"))
         || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
         || (local_sources_root && entry.file_name() == OsStr::new("feeds"))
       {
