@@ -19,8 +19,7 @@ NuGet sources are typed records containing URL and protocol generation:
 - `protocolVersion="2"` and `"3"` are authoritative; absent values infer v3
   only for a `/v3/index.json` URL and otherwise infer v2;
 - only HTTPS HTTP sources are accepted initially. Local folders,
-  authentication, source mapping, and proxies fail or remain outside the
-  supported subset.
+  authentication, and proxies fail or remain outside the supported subset.
 
 Configuration discovers machine fragments, additional-user fragments, the
 main .NET CLI user file, and one `NuGet.Config` from each drive-to-project
@@ -33,6 +32,16 @@ spellings are accepted for NuGet compatibility, while clear/remove re-enable.
 literal, and MSBuild `$()` syntax remains literal. The explicit
 `--packages` path wins over `NUGET_PACKAGES`, which wins over
 `globalPackagesFolder`, which wins over the platform default.
+
+`auditSources` uses the same keyed URL/protocol representation and precedence
+as package sources; audit execution remains a later policy feature.
+`packageSourceMapping` stores source rows with contiguous pattern ranges.
+Exact matches outrank prefix wildcards, longer prefixes outrank shorter ones,
+and equally specific matches may select multiple sources. Matching is
+case-insensitive and allocation-free during graph work. It currently filters
+package metadata/version and archive requests after service-index discovery;
+moving that filter ahead of every network request and diagnosing unmapped IDs
+is tracked by `NUGET-013`.
 
 `dv restore` and `dv sync` dispatch to the same package transform with
 identical options, cache behavior, lock behavior, diagnostics, and output

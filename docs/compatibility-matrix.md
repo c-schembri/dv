@@ -23,6 +23,7 @@ diagnostic rather than approximate Microsoft behavior.
 | Package references | one target, HTTPS NuGet v2/v3 source, exact versions first | Initial resolution, verified cache, lock, and nine family-partitioned asset ranges implemented |
 | NuGet configuration discovery | machine, additional-user, user, drive/repository, or one explicit file | Platform roots, filename casing, precedence, and explicit isolation implemented |
 | NuGet configuration merge | keyed sources, disabled sources, package folder, and `%NAME%` values | Case-insensitive add/replace/remove/clear and single-pass environment expansion implemented |
+| NuGet source policy | package/audit sources, v2/v3 metadata, and package-source mappings | Typed source batches and longest-pattern package routing implemented; pre-discovery filtering remains planned |
 | Configuration | `Debug` and `Release` | Implemented |
 | Generated inputs | global usings, assembly attributes, editor config | Paths planned; content generation planned |
 | Compiler inputs | framework references, SDK/pack analyzers, defines and core options | Initial immutable plan implemented |

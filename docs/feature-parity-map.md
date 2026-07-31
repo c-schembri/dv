@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 16 Rust source files, 15,997 nonblank source
-lines, and 96 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 16,625 nonblank source
+lines, and 100 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -730,8 +730,13 @@ boundary, not final drop-in parity.
   no allocation when no marker resolves. The four-level locked oracle
   measures `558.126 ms` for Microsoft versus `9.422 ms` for `dv` (`59.2x`)
   across 30 retained samples. `P1`
-- [~] `NUGET-003` Support `packageSources`, `disabledPackageSources`,
-  `packageSourceMapping`, `auditSources`, and source protocol version. `P2`
+- [x] `NUGET-003` Support typed `packageSources`,
+  `disabledPackageSources`, `packageSourceMapping`, `auditSources`, and source
+  protocol versions. Mapping groups retain contiguous pattern ranges and use
+  NuGet's allocation-free longest-pattern selection during package/version
+  requests. An official `NuGet.Configuration` oracle validates all effective
+  sections; the locked process benchmark measures `527.659 ms` for Microsoft
+  versus `5.850 ms` for `dv` (`90.2x`) across 30 retained samples. `P2`
 - [~] `NUGET-004` Support global-packages, HTTP cache, temp, fallback folders,
   signature-validation mode, restore audit mode/level, and proxy settings.
   `P2`
@@ -751,8 +756,9 @@ boundary, not final drop-in parity.
   timeout, rate-limit, and offline behavior. `P2`
 - [ ] `NUGET-012` Require explicit opt-in for insecure HTTP or disabled TLS
   validation and surface the security consequence. `P2`
-- [ ] `NUGET-013` Apply package source mapping before network requests and
-  diagnose unmapped identities. `P2`
+- [~] `NUGET-013` Mapping already filters package/version requests by the
+  longest effective pattern. Move filtering ahead of service-index discovery
+  and add a typed unmapped-identity diagnostic. `P2`
 - [~] `NUGET-014` Bound concurrent requests per source and globally; the
   current twenty-four-task Tokio set provides global backpressure and
   deterministic graph merge, while distinct per-source budgets remain. `P2`

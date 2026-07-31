@@ -47,6 +47,9 @@ dv restore (config stack)       5.651 ms median
 dotnet restore (config merge) 558.126 ms median
 dv restore (config merge)       9.422 ms median
 
+dotnet restore (source policy) 527.659 ms median
+dv restore (source policy)       5.850 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -89,6 +92,7 @@ The project is in the first implementation phase.
 | Actionable unavailable-pack diagnostics | Implemented |
 | Machine/user/repository/explicit NuGet config discovery | Implemented |
 | Keyed NuGet config merge and environment expansion | Implemented |
+| NuGet package/audit sources, protocols, and source mapping | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -221,9 +225,10 @@ Initial machine:
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
-  planning, NuGet configuration hierarchy, keyed configuration merge, and the
-  framework-reference plan, unavailable-pack diagnostic, 203-package asset
-  plan, and one-package cold case; compiler planning uses 5 warm-ups; 10
+  planning, NuGet configuration hierarchy, keyed configuration merge, source
+  policy sections, and the framework-reference plan, unavailable-pack
+  diagnostic, 203-package asset plan, and one-package cold case; compiler
+  planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -243,6 +248,7 @@ Initial machine:
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Validate a six-file NuGet configuration hierarchy | `dotnet restore ConfigHierarchy.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigHierarchy.csproj --offline --json` | 532.948 ms | 5.651 ms | 94.3x | 545.049 ms | 6.296 ms |
 | Merge keyed NuGet configuration | `dotnet restore ConfigMerge.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigMerge.csproj --offline --json` | 558.126 ms | 9.422 ms | 59.2x | 648.298 ms | 10.606 ms |
+| Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -269,7 +275,10 @@ repository source, protocol, package directory, package identity/version, and
 archive SHA-512 with zero timed network work. The keyed-merge case additionally
 exercises case-insensitive replacement, clear/remove operations, disabled
 sources, and `%NAME%` expansion across four precedence levels, then applies
-the same package and cache parity gate. The
+the same package and cache parity gate. The source-policy case uses the SDK's
+official `NuGet.Configuration` assembly to verify enabled and disabled package
+sources, audit sources, v2/v3 metadata, and longest-pattern mapping queries
+before applying the same package and cache parity gate. The
 unavailable-pack case uses an empty checked-in source and isolated package
 cache; both commands must fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -292,6 +301,7 @@ recorded in the curated
 [framework reference baseline](docs/performance-baselines/2026-08-01-framework-reference-windows.md),
 [NuGet configuration baseline](docs/performance-baselines/2026-08-01-nuget-config-discovery-windows.md),
 [NuGet keyed-merge baseline](docs/performance-baselines/2026-08-01-nuget-config-merge-windows.md),
+[NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 

@@ -965,11 +965,17 @@ struct PackageSource {
 
 #[derive(Clone)]
 enum ServiceEndpoint {
-  V2 { source: String, base: String },
-  V3 { source: String, package_base: String },
+  V2 { source: String, base: String, source_index: u32 },
+  V3 { source: String, package_base: String, source_index: u32 },
 }
 
 impl ServiceEndpoint {
+  const fn source_index(&self) -> u32 {
+    match self {
+      Self::V2 { source_index, .. } | Self::V3 { source_index, .. } => *source_index,
+    }
+  }
+
   fn source(&self) -> &str {
     match self {
       Self::V2 { source, .. } | Self::V3 { source, .. } => source,
@@ -986,7 +992,61 @@ impl ServiceEndpoint {
 
 struct NugetConfiguration {
   cache_root: PathBuf,
-  sources: Vec<PackageSource>,
+  sources: Vec<(String, PackageSource)>,
+  // Audit resolution consumes this batch without reopening configuration
+  // files once vulnerability endpoints are wired into restore.
+  #[allow(dead_code)]
+  audit_sources: Vec<(String, PackageSource)>,
+  source_mapping: Option<Arc<PackageSourceMapping>>,
+}
+
+#[derive(Default)]
+struct NugetConfigMerge {
+  sources: Vec<(String, PackageSource)>,
+  disabled: Vec<String>,
+  audit_sources: Vec<(String, PackageSource)>,
+  source_mapping: MergedSourceMapping,
+  global_packages: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct MergedSourceMapping {
+  sources: Vec<MergedSourceMappingEntry>,
+  patterns: Vec<String>,
+}
+
+struct MergedSourceMappingEntry {
+  source: String,
+  patterns: ItemRange,
+}
+
+#[derive(Default)]
+struct PackageSourceMapping {
+  text: Box<str>,
+  sources: Box<[SourceMappingEntry]>,
+  patterns: Box<[SourcePattern]>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceMappingEntry {
+  source_index: u32,
+  patterns: ItemRange,
+}
+
+#[derive(Clone, Copy)]
+struct SourcePattern {
+  text: TextSpan,
+  prefix: bool,
+}
+
+const _: () = assert!(size_of::<SourceMappingEntry>() == 12);
+const _: () = assert!(align_of::<SourceMappingEntry>() == 4);
+const _: () = assert!(size_of::<SourcePattern>() == 12);
+const _: () = assert!(align_of::<SourcePattern>() == 4);
+
+struct PendingSourceMapping {
+  source: String,
+  pattern_start: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1086,7 +1146,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     || {
       config.sources.first().map_or_else(
         || (DEFAULT_SOURCE.to_owned(), NugetProtocol::V3),
-        |source| (source.url.clone(), source.protocol),
+        |(_, source)| (source.url.clone(), source.protocol),
       )
     },
     |source| (source.url.clone(), source.protocol),
@@ -1324,26 +1384,28 @@ fn invalid_prune_line(path: &Path, line: usize) -> PackageError {
 fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path>, explicit_config: Option<&Path>) -> Result<NugetConfiguration, PackageError> {
   let config_paths = discover_config_paths(project_directory, explicit_config, &NugetConfigRoots::from_environment())?;
 
-  let mut sources = if config_paths.is_empty() {
-    vec![(
+  let mut merged = NugetConfigMerge::default();
+  if config_paths.is_empty() {
+    merged.sources.push((
       "nuget.org".to_owned(),
       PackageSource {
         url: DEFAULT_SOURCE.to_owned(),
         protocol: NugetProtocol::V3,
       },
-    )]
-  } else {
-    Vec::new()
-  };
-  let mut disabled = Vec::new();
-  let mut configured_cache = None;
+    ));
+  }
   for path in config_paths {
-    merge_config(&path, &mut sources, &mut disabled, &mut configured_cache)?;
+    merge_config(&path, &mut merged)?;
   }
-  for key in disabled {
-    sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
+  for key in merged.disabled {
+    merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
-  let sources: Vec<PackageSource> = sources.into_iter().map(|(_, source)| source).collect();
+  let source_mapping = if merged.source_mapping.sources.is_empty() {
+    None
+  } else {
+    Some(Arc::new(PackageSourceMapping::compile(merged.source_mapping, &merged.sources)?))
+  };
+  let sources = merged.sources;
   if sources.is_empty() {
     return Err(PackageError::new(
       PackageErrorKind::Configuration,
@@ -1354,7 +1416,7 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   let cache_root = explicit_cache
     .map(Path::to_owned)
     .or_else(|| env::var_os("NUGET_PACKAGES").map(PathBuf::from))
-    .or(configured_cache)
+    .or(merged.global_packages)
     .or_else(default_global_packages)
     .ok_or_else(|| {
       PackageError::new(
@@ -1363,7 +1425,12 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
         "could not determine the global package cache; set NUGET_PACKAGES",
       )
     })?;
-  Ok(NugetConfiguration { cache_root, sources })
+  Ok(NugetConfiguration {
+    cache_root,
+    sources,
+    audit_sources: merged.audit_sources,
+    source_mapping,
+  })
 }
 
 struct NugetConfigRoots {
@@ -1499,30 +1566,42 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
   discover_configuration(project_directory, None, None).map(|configuration| configuration.cache_root)
 }
 
-fn merge_config(
-  path: &Path,
-  sources: &mut Vec<(String, PackageSource)>,
-  disabled: &mut Vec<String>,
-  global_packages: &mut Option<PathBuf>,
-) -> Result<(), PackageError> {
+fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
   let bytes = fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?;
   let mut reader = Reader::from_reader(bytes.as_slice());
   reader.config_mut().trim_text(true);
   let mut section = ConfigSection::Other;
+  let mut pending_mapping = None::<PendingSourceMapping>;
+  let mut mapping_sources_in_file = Vec::<String>::new();
   loop {
     match reader.read_event() {
-      Ok(Event::Start(element)) => {
-        section = match local_name(element.name().as_ref()) {
-          b"packageSources" => ConfigSection::Sources,
-          b"disabledPackageSources" => ConfigSection::Disabled,
-          b"config" => ConfigSection::Config,
-          _ => section,
-        };
+      Ok(Event::Start(element)) => match local_name(element.name().as_ref()) {
+        b"packageSources" => section = ConfigSection::Sources,
+        b"disabledPackageSources" => section = ConfigSection::Disabled,
+        b"auditSources" => section = ConfigSection::AuditSources,
+        b"packageSourceMapping" => section = ConfigSection::SourceMapping,
+        b"config" => section = ConfigSection::Config,
+        b"packageSource" if matches!(section, ConfigSection::SourceMapping) => {
+          begin_source_mapping(
+            &reader,
+            &element,
+            path,
+            &merged.source_mapping,
+            &mut pending_mapping,
+            &mut mapping_sources_in_file,
+          )?;
+        },
+        b"package" if matches!(section, ConfigSection::SourceMapping) => {
+          append_source_pattern(&reader, &element, path, &mut merged.source_mapping, pending_mapping.as_ref())?;
+        },
+        _ => {},
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"clear" => match section {
-        ConfigSection::Sources => sources.clear(),
-        ConfigSection::Disabled => disabled.clear(),
-        ConfigSection::Config => *global_packages = None,
+        ConfigSection::Sources => merged.sources.clear(),
+        ConfigSection::Disabled => merged.disabled.clear(),
+        ConfigSection::AuditSources => merged.audit_sources.clear(),
+        ConfigSection::SourceMapping => merged.source_mapping.clear(),
+        ConfigSection::Config => merged.global_packages = None,
         ConfigSection::Other => {},
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"add" => {
@@ -1530,47 +1609,68 @@ fn merge_config(
         let value = config_attribute(&reader, &element, b"value", path)?.ok_or_else(|| config_error(path, "NuGet add element requires value"))?;
         let value = expand_config_value(value, path)?;
         match section {
-          ConfigSection::Sources => {
+          ConfigSection::Sources | ConfigSection::AuditSources => {
             let protocol = config_attribute(&reader, &element, b"protocolVersion", path)?;
             let source = PackageSource {
               protocol: NugetProtocol::parse(protocol.as_deref(), &value, path)?,
               url: value,
             };
-            if let Some((_, existing)) = sources.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case(&key)) {
-              *existing = source;
+            let sources = if matches!(section, ConfigSection::Sources) {
+              &mut merged.sources
             } else {
-              sources.push((key, source));
-            }
+              &mut merged.audit_sources
+            };
+            add_or_replace_source(sources, key, source);
           },
           ConfigSection::Disabled => {
             if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
               return Err(config_error(path, "disabled package-source values must be true or false"));
             }
-            disabled.retain(|name| !name.eq_ignore_ascii_case(&key));
-            disabled.push(key);
+            merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key));
+            merged.disabled.push(key);
           },
           ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => {
             let candidate = PathBuf::from(value);
-            *global_packages = Some(if candidate.is_absolute() {
+            merged.global_packages = Some(if candidate.is_absolute() {
               candidate
             } else {
               path.parent().unwrap_or(Path::new(".")).join(candidate)
             });
           },
-          ConfigSection::Other | ConfigSection::Config => {},
+          ConfigSection::Other | ConfigSection::SourceMapping | ConfigSection::Config => {},
         }
+      },
+      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"packageSource" && matches!(section, ConfigSection::SourceMapping) => {
+        return Err(config_error(path, "NuGet package-source mapping requires at least one package pattern"));
+      },
+      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"package" && matches!(section, ConfigSection::SourceMapping) => {
+        append_source_pattern(&reader, &element, path, &mut merged.source_mapping, pending_mapping.as_ref())?;
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"remove" => {
         let key = config_attribute(&reader, &element, b"key", path)?.ok_or_else(|| config_error(path, "NuGet remove element requires key"))?;
         match section {
-          ConfigSection::Sources => sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
-          ConfigSection::Disabled => disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
-          ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => *global_packages = None,
+          ConfigSection::Sources => merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::Disabled => merged.disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::AuditSources => merged.audit_sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::SourceMapping => merged.source_mapping.remove(&key),
+          ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => merged.global_packages = None,
           ConfigSection::Other | ConfigSection::Config => {},
         }
       },
-      Ok(Event::End(element)) if matches!(local_name(element.name().as_ref()), b"packageSources" | b"disabledPackageSources" | b"config") => {
-        section = ConfigSection::Other;
+      Ok(Event::End(element)) => match local_name(element.name().as_ref()) {
+        b"packageSource" if matches!(section, ConfigSection::SourceMapping) => {
+          let pending = pending_mapping
+            .take()
+            .ok_or_else(|| config_error(path, "NuGet package-source mapping ended without a source"))?;
+          merged.source_mapping.finish_source(pending, path)?;
+        },
+        b"packageSources" | b"disabledPackageSources" | b"auditSources" | b"packageSourceMapping" | b"config" => {
+          if pending_mapping.is_some() {
+            return Err(config_error(path, "NuGet package-source mapping did not close its source"));
+          }
+          section = ConfigSection::Other;
+        },
+        _ => {},
       },
       Ok(Event::Eof) => break,
       Ok(_) => {},
@@ -1580,11 +1680,195 @@ fn merge_config(
   Ok(())
 }
 
+fn add_or_replace_source(sources: &mut Vec<(String, PackageSource)>, key: String, source: PackageSource) {
+  if let Some((name, existing)) = sources.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case(&key)) {
+    *name = key;
+    *existing = source;
+  } else {
+    sources.push((key, source));
+  }
+}
+
+fn begin_source_mapping(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  mapping: &MergedSourceMapping,
+  pending: &mut Option<PendingSourceMapping>,
+  seen_in_file: &mut Vec<String>,
+) -> Result<(), PackageError> {
+  if pending.is_some() {
+    return Err(config_error(path, "NuGet package-source mappings cannot be nested"));
+  }
+  let source = config_attribute(reader, element, b"key", path)?.ok_or_else(|| config_error(path, "NuGet package-source mapping requires a key"))?;
+  if source.trim().is_empty() {
+    return Err(config_error(path, "NuGet package-source mapping key cannot be empty"));
+  }
+  if seen_in_file.iter().any(|seen| seen.eq_ignore_ascii_case(&source)) {
+    return Err(config_error(path, format!("NuGet package-source mapping contains duplicate source {source:?}")));
+  }
+  seen_in_file.push(source.clone());
+  *pending = Some(PendingSourceMapping {
+    source,
+    pattern_start: mapping.patterns.len(),
+  });
+  Ok(())
+}
+
+fn append_source_pattern(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  mapping: &mut MergedSourceMapping,
+  pending: Option<&PendingSourceMapping>,
+) -> Result<(), PackageError> {
+  if pending.is_none() {
+    return Err(config_error(path, "NuGet package pattern must be inside a packageSource mapping"));
+  }
+  let pattern = config_attribute(reader, element, b"pattern", path)?.ok_or_else(|| config_error(path, "NuGet package mapping requires a pattern"))?;
+  if pattern.trim().is_empty() || pattern.encode_utf16().count() > 100 {
+    return Err(config_error(path, "NuGet package mapping pattern must contain 1 to 100 UTF-16 code units"));
+  }
+  mapping.patterns.push(pattern);
+  Ok(())
+}
+
+impl MergedSourceMapping {
+  fn clear(&mut self) {
+    self.sources.clear();
+    self.patterns.clear();
+  }
+
+  fn remove(&mut self, key: &str) {
+    self.sources.retain(|source| !source.source.eq_ignore_ascii_case(key));
+  }
+
+  fn finish_source(&mut self, pending: PendingSourceMapping, path: &Path) -> Result<(), PackageError> {
+    let pattern_count = self.patterns.len().saturating_sub(pending.pattern_start);
+    if pattern_count == 0 {
+      return Err(config_error(
+        path,
+        format!("NuGet package-source mapping {:?} requires at least one package pattern", pending.source),
+      ));
+    }
+    let patterns = ItemRange {
+      start: u32_len(pending.pattern_start, "package-source mapping pattern index")?,
+      len: u32_len(pattern_count, "package-source mapping pattern count")?,
+    };
+    if let Some(existing) = self.sources.iter_mut().find(|source| source.source.eq_ignore_ascii_case(&pending.source)) {
+      existing.source = pending.source;
+      existing.patterns = patterns;
+    } else {
+      self.sources.push(MergedSourceMappingEntry {
+        source: pending.source,
+        patterns,
+      });
+    }
+    Ok(())
+  }
+
+  #[cfg(test)]
+  fn patterns_for(&self, key: &str) -> Option<&[String]> {
+    let source = self.sources.iter().find(|source| source.source.eq_ignore_ascii_case(key))?;
+    let start = source.patterns.start as usize;
+    Some(&self.patterns[start..start + source.patterns.len as usize])
+  }
+}
+
+impl PackageSourceMapping {
+  fn compile(merged: MergedSourceMapping, configured_sources: &[(String, PackageSource)]) -> Result<Self, PackageError> {
+    let pattern_capacity = merged.sources.iter().map(|source| source.patterns.len as usize).sum();
+    let text_capacity = merged
+      .sources
+      .iter()
+      .flat_map(|source| &merged.patterns[range(source.patterns)])
+      .map(|pattern| pattern.trim().find('*').unwrap_or(pattern.trim().len()))
+      .sum();
+    let mut text = TextTable::with_capacity(text_capacity);
+    let mut sources = Vec::with_capacity(merged.sources.len());
+    let mut patterns = Vec::with_capacity(pattern_capacity);
+    for source in merged.sources {
+      let source_index = match configured_sources.iter().position(|(name, _)| name.eq_ignore_ascii_case(&source.source)) {
+        Some(index) => {
+          let index = u32_len(index, "NuGet package-source index")?;
+          if index == u32::MAX {
+            return Err(PackageError::new(
+              PackageErrorKind::TextOverflow,
+              "NuGet package sources",
+              "NuGet package-source count reserves u32::MAX for an unavailable mapping",
+            ));
+          }
+          index
+        },
+        None => u32::MAX,
+      };
+      let start = patterns.len();
+      for pattern in &merged.patterns[range(source.patterns)] {
+        let pattern = pattern.trim();
+        let (pattern, prefix) = pattern.find('*').map_or((pattern, false), |star| (&pattern[..star], true));
+        patterns.push(SourcePattern {
+          text: text.push(pattern)?,
+          prefix,
+        });
+      }
+      sources.push(SourceMappingEntry {
+        source_index,
+        patterns: ItemRange {
+          start: u32_len(start, "NuGet package-source pattern index")?,
+          len: u32_len(patterns.len() - start, "NuGet package-source pattern count")?,
+        },
+      });
+    }
+    Ok(Self {
+      text: text.text.into_boxed_str(),
+      sources: sources.into_boxed_slice(),
+      patterns: patterns.into_boxed_slice(),
+    })
+  }
+
+  /// Mapping is parsed once, then queried for every graph identity. The query
+  /// scans only compact records and the shared text buffer; it never allocates.
+  fn allows(&self, source_index: u32, package_id: &str) -> bool {
+    let mut best = 0usize;
+    let mut source_best = 0usize;
+    for source in &self.sources {
+      let is_source = source.source_index == source_index;
+      for pattern in &self.patterns[range(source.patterns)] {
+        let Some(rank) = self.pattern_rank(*pattern, package_id) else {
+          continue;
+        };
+        best = best.max(rank);
+        if is_source {
+          source_best = source_best.max(rank);
+        }
+      }
+    }
+    best != 0 && source_best == best
+  }
+
+  fn pattern_rank(&self, pattern: SourcePattern, package_id: &str) -> Option<usize> {
+    let start = pattern.text.start as usize;
+    let text = &self.text[start..start + pattern.text.len as usize];
+    if pattern.prefix {
+      package_id
+        .get(..text.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(text))
+        .map(|_| text.len() + 1)
+    } else if text.eq_ignore_ascii_case(package_id) {
+      Some(usize::MAX)
+    } else {
+      None
+    }
+  }
+}
+
 #[derive(Clone, Copy)]
 enum ConfigSection {
   Other,
   Sources,
   Disabled,
+  AuditSources,
+  SourceMapping,
   Config,
 }
 
@@ -1654,10 +1938,11 @@ fn http_client() -> Result<reqwest::Client, PackageError> {
     .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
 }
 
-async fn discover_service_endpoints(client: &reqwest::Client, sources: &[PackageSource]) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
+async fn discover_service_endpoints(client: &reqwest::Client, sources: &[(String, PackageSource)]) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
   let mut endpoints = Vec::with_capacity(sources.len());
   let mut requests = 0;
-  for source in sources {
+  for (index, (_, source)) in sources.iter().enumerate() {
+    let source_index = u32_len(index, "NuGet package-source index")?;
     if !source.url.starts_with("https://") {
       return Err(PackageError::new(
         PackageErrorKind::Configuration,
@@ -1669,6 +1954,7 @@ async fn discover_service_endpoints(client: &reqwest::Client, sources: &[Package
       NugetProtocol::V2 => endpoints.push(ServiceEndpoint::V2 {
         source: source.url.clone(),
         base: with_trailing_slash(source.url.clone()),
+        source_index,
       }),
       NugetProtocol::V3 => {
         let document: serde_json::Value = get_json(client, &source.url).await?;
@@ -1676,6 +1962,7 @@ async fn discover_service_endpoints(client: &reqwest::Client, sources: &[Package
         endpoints.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
           package_base: package_base_from_service_index(&source.url, &document)?,
+          source_index,
         });
       },
     }
@@ -1786,12 +2073,22 @@ async fn resolve_streaming_graph(
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
       let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let task_source_mapping = config.source_mapping.clone();
       let generation = node.generation;
       let task_version = request.as_ref().map(|request| request.version.clone());
       let task_target = target;
       in_flight.insert(lower_id.clone());
       tasks.spawn(async move {
-        let result = load_node_metadata(&task_client, request.as_ref(), &lower_id, &task_cache_root, &task_endpoints, task_target).await;
+        let result = load_node_metadata(
+          &task_client,
+          request.as_ref(),
+          &lower_id,
+          &task_cache_root,
+          &task_endpoints,
+          task_source_mapping.as_deref(),
+          task_target,
+        )
+        .await;
         (lower_id, generation, task_version, result)
       });
     }
@@ -1889,9 +2186,19 @@ async fn resolve_streaming_graph(
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
       let task_endpoints = endpoints.clone().unwrap_or_else(|| Arc::from([]));
+      let task_source_mapping = config.source_mapping.clone();
       let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
       acquisition_tasks.spawn(async move {
-        let result = ensure_package(&task_client, &request, &task_cache_root, &task_endpoints, target, parallel_extract).await;
+        let result = ensure_package(
+          &task_client,
+          &request,
+          &task_cache_root,
+          &task_endpoints,
+          task_source_mapping.as_deref(),
+          target,
+          parallel_extract,
+        )
+        .await;
         (request, result)
       });
     }
@@ -2136,6 +2443,7 @@ async fn load_node_metadata(
   lower_id: &str,
   cache_root: &Path,
   endpoints: &[ServiceEndpoint],
+  source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
 ) -> Result<MetadataTaskResult, PackageError> {
   if request.is_none() && endpoints.is_empty() {
@@ -2174,7 +2482,7 @@ async fn load_node_metadata(
       }
     }
 
-    match ensure_package(client, request, cache_root, endpoints, target, false).await {
+    match ensure_package(client, request, cache_root, endpoints, source_mapping, target, false).await {
       Ok(cached) => {
         let dependencies = match &cached.dependencies {
           Some(dependencies) => dependencies.clone(),
@@ -2204,6 +2512,9 @@ async fn load_node_metadata(
   let mut requests = 0;
   let mut bytes = 0;
   for endpoint in endpoints {
+    if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), lower_id)) {
+      continue;
+    }
     if let ServiceEndpoint::V3 { package_base, .. } = endpoint {
       let url = format!("{package_base}{lower_id}/index.json");
       let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
@@ -2312,6 +2623,7 @@ async fn ensure_package(
   request: &PackageRequest,
   cache_root: &Path,
   endpoints: &[ServiceEndpoint],
+  source_mapping: Option<&PackageSourceMapping>,
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
@@ -2324,6 +2636,9 @@ async fn ensure_package(
   }
   let mut last_error = None;
   for endpoint in endpoints {
+    if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), &request.lower_id)) {
+      continue;
+    }
     match download_and_publish(client, request, cache_root, endpoint, target, parallel_extract).await {
       Ok(package) => return Ok(package),
       Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
@@ -3844,7 +4159,7 @@ fn read_warm_lock(
     || !config
       .sources
       .iter()
-      .any(|source| source.url == lock.source && source.protocol == lock.source_protocol)
+      .any(|(_, source)| source.url == lock.source && source.protocol == lock.source_protocol)
   {
     return Ok(None);
   }
@@ -4294,10 +4609,15 @@ mod tests {
     );
     let config = NugetConfiguration {
       cache_root: temp.0.join("packages"),
-      sources: vec![PackageSource {
-        url: DEFAULT_SOURCE.into(),
-        protocol: NugetProtocol::V3,
-      }],
+      sources: vec![(
+        "nuget.org".into(),
+        PackageSource {
+          url: DEFAULT_SOURCE.into(),
+          protocol: NugetProtocol::V3,
+        },
+      )],
+      audit_sources: Vec::new(),
+      source_mapping: None,
     };
 
     let result = read_warm_lock(&path, &config, &[], "net10.0", "current-table").unwrap();
@@ -4504,16 +4824,150 @@ mod tests {
 <add key="modern" value="https://packages.example.test/v3/index.json" protocolVersion="3" />
 </packageSources></configuration>"#,
     );
-    let mut sources = Vec::new();
-    let mut disabled = Vec::new();
-    let mut cache = None;
+    let mut merged = NugetConfigMerge::default();
 
-    merge_config(&path, &mut sources, &mut disabled, &mut cache).unwrap();
+    merge_config(&path, &mut merged).unwrap();
 
-    assert_eq!(sources[0].0, "legacy");
-    assert_eq!(sources[0].1.protocol, NugetProtocol::V2);
-    assert_eq!(sources[1].0, "modern");
-    assert_eq!(sources[1].1.protocol, NugetProtocol::V3);
+    assert_eq!(merged.sources[0].0, "legacy");
+    assert_eq!(merged.sources[0].1.protocol, NugetProtocol::V2);
+    assert_eq!(merged.sources[1].0, "modern");
+    assert_eq!(merged.sources[1].1.protocol, NugetProtocol::V3);
+  }
+
+  #[test]
+  fn nuget_audit_sources_and_source_mappings_merge_as_typed_batches() {
+    let temp = TempDirectory::new();
+    let lower = temp.write(
+      "lower.config",
+      r#"<configuration>
+<auditSources><clear /><add key="security" value="https://audit.example.test/v2" protocolVersion="2" /><add key="stale" value="https://stale.example.test/v3/index.json" /></auditSources>
+<packageSourceMapping>
+  <packageSource key="selected"><package pattern="Old.*" /></packageSource>
+  <packageSource key="internal"><package pattern="Company.*" /></packageSource>
+</packageSourceMapping>
+</configuration>"#,
+    );
+    let middle = temp.write(
+      "middle.config",
+      r#"<configuration>
+<auditSources><add key="SECURITY" value="https://audit.example.test/v3/index.json" protocolVersion="3" /><remove key="stale" /></auditSources>
+<packageSourceMapping>
+  <packageSource key="SELECTED"><package pattern="Newtonsoft.Json" /><package pattern="Newtonsoft.*" /></packageSource>
+</packageSourceMapping>
+</configuration>"#,
+    );
+    let higher = temp.write(
+      "higher.config",
+      r#"<configuration>
+<auditSources><clear /><add key="final" value="https://final.example.test/v3/index.json" protocolVersion="3" /></auditSources>
+<packageSourceMapping><clear /><packageSource key="selected"><package pattern="Newtonsoft.*" /></packageSource></packageSourceMapping>
+</configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+
+    merge_config(&lower, &mut merged).unwrap();
+    merge_config(&middle, &mut merged).unwrap();
+
+    assert_eq!(merged.audit_sources.len(), 1);
+    assert_eq!(merged.audit_sources[0].0, "SECURITY");
+    assert_eq!(merged.audit_sources[0].1.protocol, NugetProtocol::V3);
+    assert_eq!(merged.source_mapping.patterns_for("selected").unwrap(), ["Newtonsoft.Json", "Newtonsoft.*"]);
+    assert_eq!(merged.source_mapping.patterns_for("internal").unwrap(), ["Company.*"]);
+
+    merge_config(&higher, &mut merged).unwrap();
+
+    assert_eq!(merged.audit_sources.len(), 1);
+    assert_eq!(merged.audit_sources[0].0, "final");
+    assert_eq!(merged.audit_sources[0].1.protocol, NugetProtocol::V3);
+    assert_eq!(merged.source_mapping.sources.len(), 1);
+    assert_eq!(merged.source_mapping.patterns_for("selected").unwrap(), ["Newtonsoft.*"]);
+  }
+
+  #[test]
+  fn nuget_source_mapping_rejects_duplicate_or_empty_source_groups() {
+    let temp = TempDirectory::new();
+    let duplicate = temp.write(
+      "duplicate.config",
+      r#"<configuration><packageSourceMapping>
+<packageSource key="selected"><package pattern="A.*" /></packageSource>
+<packageSource key="SELECTED"><package pattern="B.*" /></packageSource>
+</packageSourceMapping></configuration>"#,
+    );
+    let empty = temp.write(
+      "empty.config",
+      r#"<configuration><packageSourceMapping><packageSource key="selected"></packageSource></packageSourceMapping></configuration>"#,
+    );
+
+    let duplicate_error = merge_config(&duplicate, &mut NugetConfigMerge::default()).unwrap_err();
+    let empty_error = merge_config(&empty, &mut NugetConfigMerge::default()).unwrap_err();
+
+    assert_eq!(duplicate_error.kind(), PackageErrorKind::Configuration);
+    assert!(duplicate_error.to_string().contains("duplicate source"));
+    assert_eq!(empty_error.kind(), PackageErrorKind::Configuration);
+    assert!(empty_error.to_string().contains("at least one package pattern"));
+  }
+
+  #[test]
+  fn nuget_source_mapping_uses_the_longest_case_insensitive_pattern() {
+    let temp = TempDirectory::new();
+    let path = temp.write(
+      "NuGet.Config",
+      r#"<configuration><packageSourceMapping>
+<packageSource key="fallback"><package pattern="*" /></packageSource>
+<packageSource key="family"><package pattern="Newtonsoft.*" /></packageSource>
+<packageSource key="exact-a"><package pattern="Newtonsoft.Json" /></packageSource>
+<packageSource key="exact-b"><package pattern="newtonsoft.json" /></packageSource>
+</packageSourceMapping></configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+
+    merge_config(&path, &mut merged).unwrap();
+    let sources = ["fallback", "family", "exact-a", "exact-b"]
+      .into_iter()
+      .map(|name| {
+        (
+          name.to_owned(),
+          PackageSource {
+            url: DEFAULT_SOURCE.to_owned(),
+            protocol: NugetProtocol::V3,
+          },
+        )
+      })
+      .collect::<Vec<_>>();
+    let mapping = PackageSourceMapping::compile(merged.source_mapping, &sources).unwrap();
+
+    assert!(mapping.allows(2, "newtonsoft.json"));
+    assert!(mapping.allows(3, "Newtonsoft.Json"));
+    assert!(!mapping.allows(1, "Newtonsoft.Json"));
+    assert!(!mapping.allows(0, "Newtonsoft.Json"));
+    assert!(mapping.allows(1, "Newtonsoft.Schema"));
+    assert!(!mapping.allows(0, "Newtonsoft.Schema"));
+    assert!(mapping.allows(0, "Other.Package"));
+  }
+
+  #[test]
+  fn unavailable_exact_mapping_does_not_fall_back_to_a_broader_source() {
+    let temp = TempDirectory::new();
+    let path = temp.write(
+      "NuGet.Config",
+      r#"<configuration><packageSourceMapping>
+<packageSource key="fallback"><package pattern="*" /></packageSource>
+<packageSource key="disabled"><package pattern="Private.Package" /></packageSource>
+</packageSourceMapping></configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+    merge_config(&path, &mut merged).unwrap();
+    let sources = vec![(
+      "fallback".to_owned(),
+      PackageSource {
+        url: DEFAULT_SOURCE.to_owned(),
+        protocol: NugetProtocol::V3,
+      },
+    )];
+    let mapping = PackageSourceMapping::compile(merged.source_mapping, &sources).unwrap();
+
+    assert!(!mapping.allows(0, "Private.Package"));
+    assert!(mapping.allows(0, "Public.Package"));
   }
 
   #[test]
@@ -4535,25 +4989,24 @@ mod tests {
 <disabledPackageSources><clear /><add key="selected" value="false" /><add key="removed" value="true" /><remove key="SELECTED" /><remove key="REMOVED" /></disabledPackageSources>
 </configuration>"#,
     );
-    let mut sources = vec![(
+    let mut merged = NugetConfigMerge::default();
+    merged.sources.push((
       "nuget.org".into(),
       PackageSource {
         url: DEFAULT_SOURCE.into(),
         protocol: NugetProtocol::V3,
       },
-    )];
-    let mut disabled = Vec::new();
-    let mut cache = None;
+    ));
 
-    merge_config(&lower, &mut sources, &mut disabled, &mut cache).unwrap();
-    merge_config(&higher, &mut sources, &mut disabled, &mut cache).unwrap();
+    merge_config(&lower, &mut merged).unwrap();
+    merge_config(&higher, &mut merged).unwrap();
 
-    assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].0, "selected");
-    assert_eq!(sources[0].1.url, "https://selected.example.test/v3/index.json");
-    assert_eq!(sources[0].1.protocol, NugetProtocol::V3);
-    assert!(disabled.is_empty());
-    assert_eq!(cache, Some(temp.0.join("higher-packages")));
+    assert_eq!(merged.sources.len(), 1);
+    assert_eq!(merged.sources[0].0, "SELECTED");
+    assert_eq!(merged.sources[0].1.url, "https://selected.example.test/v3/index.json");
+    assert_eq!(merged.sources[0].1.protocol, NugetProtocol::V3);
+    assert!(merged.disabled.is_empty());
+    assert_eq!(merged.global_packages, Some(temp.0.join("higher-packages")));
   }
 
   #[test]
