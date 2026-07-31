@@ -1,0 +1,123 @@
+# Performance Method
+
+Performance is a product contract. Measurements begin before implementation so
+the project cannot quietly redefine success around the result it happens to
+produce.
+
+## Benchmark Contract
+
+Input:
+
+- one immutable fixture directory;
+- a named tool and exact argument vector;
+- a warm-up count and sample count;
+- an isolated mutable workspace;
+- recorded OS, architecture, logical CPU count, tool version, and repository
+  commit when one exists.
+
+Transform:
+
+1. Build `dv` and verify that `dotnet --version` and `dv sdk current` select
+   identical SDK text outside the timed interval.
+2. Prepare fixture state outside the timed interval.
+3. Launch one process and wait for its terminal status.
+4. Reject non-zero status and retain its output in the failure message.
+5. Record elapsed monotonic nanoseconds.
+6. Repeat as a batch, discard warm-ups, sort a copy, and calculate min, median,
+   p95, and max while preserving raw samples.
+
+Output:
+
+- versioned JSON containing every raw sample, statistic, and explicit
+  `measured` or `tbi` status;
+- a console table for immediate comparison;
+- no benchmark files written into an immutable fixture.
+
+Ownership and lifetime:
+
+- checked-in fixtures are immutable and repository-owned;
+- `target/benchmark-work/` is disposable harness-owned state;
+- ignored `benchmarks/results/` files are machine-local evidence;
+- reviewed baselines under `docs/performance-baselines/` are project records.
+
+Invalid input behavior:
+
+- zero samples, unknown options, unsafe work paths, missing tools, setup
+  failures, command failures, and malformed counts fail the entire run;
+- measurements from a failed or partially prepared command are never reported.
+
+## Initial Cases
+
+| Case | State before timed interval | Timed work |
+|---|---|---|
+| `sdk_current` | no project state | process launch, SDK discovery, and selection |
+| `cli_version` | none | `dv` process launch and self-version output |
+| `restore_cold` | fresh fixture copy | restore |
+| `build_clean` | fresh restored fixture | build |
+| `build_noop` | already built fixture | no-op build proof |
+| `run_warm` | already built fixture | orchestration and application run |
+
+Cold OS page-cache state is not currently controlled. `restore_cold` means
+fresh project state, not a cold machine cache.
+
+`ASSUMPTION: repeated local samples are representative enough to expose gross
+startup and orchestration regressions - affects use of this harness for early
+directional decisions.`
+
+## Fixture Shapes
+
+| Fixture | Concrete data | Primary question | Status |
+|---|---|---|---|
+| `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
+| `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
+| `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | specification pending real sample |
+| `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
+| `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
+
+The last three fixtures are not fabricated. Their exact counts and
+distributions remain unresolved until representative repositories can be
+sampled; see `issues/`.
+
+## Measurement Rules
+
+- Compare tools and revisions on the same machine, power mode, fixture, command,
+  sample count, and cache state.
+- Measure debug correctness separately from optimized release performance.
+- Record latency and throughput separately.
+- Record peak memory, bytes read/written, process count, network requests,
+  allocation count, and CPU utilization as soon as those workflows exist.
+- Never time fixture copying or prerequisite restore when the named case is
+  build latency.
+- Keep warm-up output out of the raw sample batch.
+- Investigate distributions and outliers; do not select the most flattering
+  statistic.
+- Re-sample live inputs when optimization plateaus. A different distribution
+  may require a different representation or algorithm.
+
+## Commands
+
+Quick smoke run:
+
+```text
+cargo bench-all --quick
+```
+
+Standard reference run:
+
+```text
+cargo bench-all
+```
+
+This builds the release `dv` executable outside the timed interval, measures
+all implemented `dotnet` and `dv` cases, and prints `TBI` for `dv` cases that
+are not implemented. Supply a different `dv` executable when needed:
+
+```text
+cargo bench-all --dv target/release/dv
+```
+
+Measure only SDK selection:
+
+```text
+cargo bench-all --case sdk_current --dv target/release/dv
+```

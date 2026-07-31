@@ -1,0 +1,9 @@
+/target/
+/.idea/
+/.vscode/
+*.user
+*.suo
+
+# Benchmark output is machine-specific evidence, not source.
+/benchmarks/results/*
+!/benchmarks/results/.gitkeep

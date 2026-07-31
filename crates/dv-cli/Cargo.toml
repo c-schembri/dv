@@ -1,0 +1,15 @@
+[package]
+name = "dv-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dv"
+path = "src/main.rs"
+
+[dependencies]
+dv-core = { path = "../dv-core" }
+
+[lints]
+workspace = true

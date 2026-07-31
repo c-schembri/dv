@@ -1,0 +1,88 @@
+# Events And Diagnostics
+
+Human output and JSON output are views over the same typed event batch. Core
+logic never emits prose for another subsystem to scrape.
+
+## Event Batch Contract
+
+Input layout:
+
+- a contiguous slice of `Event`;
+- schema version `1`;
+- sequence numbers exactly `0..count`;
+- monotonic microseconds from one command-local clock.
+
+Output layout:
+
+- JSON Lines, one complete object per event;
+- tagged event payload flattened into the object;
+- stable snake-case enum values.
+
+Ownership and lifetime:
+
+- producers own events until the reporter call completes;
+- reporters borrow the whole batch;
+- JSON output owns no references to internal execution data.
+
+Range and failure behavior:
+
+- unsupported schema, sequence gaps, and elapsed-time regression reject the
+  whole batch before output;
+- empty batches are valid and write nothing;
+- writer failures return immediately;
+- durations saturate at `u64::MAX` microseconds at the clock conversion edge.
+
+The common path is one validation scan followed by one serialization scan.
+Events describe command- or batch-level transitions, not individual hot-loop
+items.
+
+## Event Types
+
+- `command_started`
+- `work_started`
+- `work_finished`
+- `cache_decision`
+- `sdk_selected`
+- `sdk_inventory`
+- `diagnostic`
+- `command_finished`
+
+New variants require a real consumer and a version-compatibility decision.
+
+## Diagnostic Contract
+
+Every diagnostic contains:
+
+- `DV` plus four digits as its stable code;
+- severity;
+- a short message;
+- ordered name/value context;
+- an ordered causal chain without wrapper duplication;
+- an optional next action.
+
+Malformed diagnostic identifiers are rejected at construction. Empty diagnostic
+messages are programmer errors. External malformed data becomes a normal
+diagnostic at the boundary where it is parsed.
+
+Initial codes:
+
+| Code | Meaning |
+|---|---|
+| `DV0001` | Unknown command |
+| `DV0002` | Invalid command-line text |
+| `DV0003` | Known but unsupported Phase 0 command |
+| `DV0100` | No .NET installation root |
+| `DV0101` | SDK discovery filesystem failure |
+| `DV0102` | Invalid `global.json` |
+| `DV0103` | Invalid SDK version |
+| `DV0104` | No compatible installed SDK |
+| `DV0105` | SDK path cannot be represented losslessly in JSON |
+
+Codes are never reused for a different meaning.
+
+## Layout Note
+
+The owned wire representation is cold output-edge data. Execution subsystems
+must not store one `Event` or `Diagnostic` per project node, source file, or
+package in hot state. They should keep compact indexed records and materialize
+ordered event batches only when reporting.
