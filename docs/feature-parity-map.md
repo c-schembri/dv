@@ -10,7 +10,7 @@ repository at the snapshot below. An unchecked item is required unless it is
 explicitly identified as a native `dv` addition. `REJECT` describes safe
 intermediate behavior for an unfinished compatibility row, not optional work.
 
-Snapshot: working tree on 2026-07-31, based on commit `89cfd88`.
+Snapshot: working tree on 2026-08-01.
 
 ## Scope Contract
 
@@ -117,12 +117,12 @@ Repository-owned representative input currently consists of:
 
 - raw OS argument vectors shaped like `dotnet`, MSBuild, NuGet, and VSTest
   invocations, although a checked-in compatibility corpus does not yet exist;
-- five SDK-style C# projects;
-- five C# source files;
+- ten SDK-style C# projects;
+- nine C# source files;
 - three project-reference edges;
-- one exact package reference;
-- two single-project console fixtures and one three-project acyclic fixture;
-- one observed Windows machine with three x64 SDK installations and 15 x64
+- 53 exact package references across single-package and real graph fixtures;
+- seven single-project fixtures and one three-project acyclic fixture;
+- one observed Windows machine with three x64 SDK installations and five x64
   shared-runtime directories.
 
 The initial compiler trace in `docs/roslyn-invocation.md` observed SDK
@@ -131,13 +131,13 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 12 Rust source files, 9,388 nonblank source
-lines, and 60 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 14 Rust source files, 12,296 nonblank source
+lines, and 77 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
-Current output is command-local human text or a schema-v1 JSON-lines event
+Current output is command-local human text or a schema-v5 JSON-lines event
 batch. Drop-in modes must also reproduce documented or observed
 machine-consumed text/JSON/XML/binary-log formats and tool-specific exit
 behavior. Future workflows must additionally own:
@@ -670,8 +670,13 @@ boundary, not final drop-in parity.
   precomputed breadth-first compatibility indices. Unknown keys remain opaque
   exact-only RIDs. A 30-sample official `NuGet.Packaging` oracle measures
   `36.217 ms` versus `6.049 ms` for `dv` (`6.0x`). `P2`
-- [ ] `PACKS-006` Select runtime packs, host packs, native assets, and apphost
-  templates for requested RID and architecture. `P2`
+- [x] `PACKS-006` Select runtime packs, host packs, native assets, and apphost
+  templates for requested RID and architecture. SDK manifest identities,
+  latest self-contained pack patches, and supported RID batches feed graph-only
+  fallback selection; `RuntimeList.xml` yields 172 managed and 15 native
+  `win-x64` assets in one compact span batch, and the installed host pack yields
+  the exact apphost template. A 30-sample MSBuild oracle measures `376.764 ms`
+  versus `8.030 ms` for `dv` (`46.9x`). `P2`
 - [ ] `PACKS-007` Resolve framework references and shared-framework versions,
   including runtime roll-forward policy. `P2`
 - [~] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and

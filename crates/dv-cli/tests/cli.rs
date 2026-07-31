@@ -77,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":4"));
+  assert!(lines[0].contains("\"schema_version\":5"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -315,4 +315,51 @@ fn build_plan_json_reports_framework_and_compiler_inputs() {
   assert!(stdout.contains("\"language_version\":\"14.0\""));
   assert!(stdout.contains("\"references\":["));
   assert!(stdout.contains("\"outcome\":\"succeeded\""));
+}
+
+#[test]
+fn runtime_pack_json_reports_manifest_selected_assets_and_apphost() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>child-x64</RuntimeIdentifier></PropertyGroup></Project>"#,
+  );
+  temp.write(
+    "sdk/10.0.100/Microsoft.NETCoreSdk.BundledVersions.props",
+    r#"<Project><ItemGroup>
+      <KnownFrameworkReference Include="Microsoft.NETCore.App" TargetFramework="net10.0" DefaultRuntimeFrameworkVersion="10.0.0" LatestRuntimeFrameworkVersion="10.0.7" RuntimePackNamePatterns="Runtime.**RID**" RuntimePackRuntimeIdentifiers="base-x64" />
+      <KnownAppHostPack Include="Microsoft.NETCore.App" TargetFramework="net10.0" AppHostPackNamePattern="Host.**RID**" AppHostPackVersion="10.0.7" AppHostRuntimeIdentifiers="base-x64" />
+    </ItemGroup></Project>"#,
+  );
+  temp.write(
+    "sdk/10.0.100/PortableRuntimeIdentifierGraph.json",
+    r##"{"runtimes":{"base-x64":{"#import":[]},"child-x64":{"#import":["base-x64"]}}}"##,
+  );
+  temp.write(
+    "packages/runtime.base-x64/10.0.7/data/RuntimeList.xml",
+    r#"<FileList TargetFrameworkVersion="10.0" FrameworkName="Microsoft.NETCore.App"><File Type="Managed" Path="runtimes/base-x64/lib/net10.0/Core.dll"/><File Type="Native" Path="runtimes/base-x64/native/core.dll"/></FileList>"#,
+  );
+  temp.write("packages/runtime.base-x64/10.0.7/runtimes/base-x64/lib/net10.0/Core.dll", "");
+  temp.write("packages/runtime.base-x64/10.0.7/runtimes/base-x64/native/core.dll", "");
+  temp.write("packs/Host.base-x64/10.0.7/runtimes/base-x64/native/apphost", "");
+  temp.write(&format!("dotnet{}", env::consts::EXE_SUFFIX), "not an executable");
+
+  let output = dv()
+    .args(["project", "runtime-packs", "App.csproj", "--packages", "packages", "--json"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"runtime_pack_plan_created\""));
+  assert!(stdout.contains("\"requested_runtime_identifier\":\"child-x64\""));
+  assert!(stdout.contains("\"runtime_identifier\":\"base-x64\""));
+  assert!(stdout.contains("\"runtime_pack_id\":\"Runtime.base-x64\""));
+  assert!(stdout.contains("\"runtime_pack_version\":\"10.0.7\""));
+  assert!(stdout.contains("Core.dll"));
+  assert!(stdout.contains("core.dll"));
+  assert!(stdout.contains("apphost"));
 }

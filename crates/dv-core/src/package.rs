@@ -1337,7 +1337,11 @@ fn user_config_path() -> Option<PathBuf> {
 fn default_global_packages() -> Option<PathBuf> {
   env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
     .map(PathBuf::from)
-    .map(|path| path.join(".nuget/packages"))
+    .map(|path| path.join(".nuget").join("packages"))
+}
+
+pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache: Option<&Path>) -> Result<PathBuf, PackageError> {
+  discover_configuration(project_directory, explicit_cache).map(|configuration| configuration.cache_root)
 }
 
 fn merge_config(

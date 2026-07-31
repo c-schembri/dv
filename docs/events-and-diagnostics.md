@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `4`;
+- schema version `5`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -45,6 +45,7 @@ items.
 - `sdk_selected`
 - `sdk_inventory`
 - `runtime_compatibility`
+- `runtime_pack_plan_created`
 - `project_evaluated`
 - `compiler_plan_created`
 - `package_resolution_created`
@@ -52,8 +53,9 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 4 adds `runtime_compatibility`; schema 3 added selected, plural, and
-materialized runtime-dimension fields to `project_evaluated`.
+Schema 5 adds `runtime_pack_plan_created`; schema 4 added
+`runtime_compatibility`; schema 3 added selected, plural, and materialized
+runtime-dimension fields to `project_evaluated`.
 
 ## Diagnostic Contract
 

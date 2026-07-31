@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 4;
+pub const EVENT_SCHEMA_VERSION: u16 = 5;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -177,6 +177,41 @@ pub enum EventPayload {
     edge_count: u32,
     /// Number of precomputed compatibility indices.
     compatibility_count: u32,
+  },
+  /// Runtime, host, native, and apphost inputs were selected for one RID.
+  RuntimePackPlanCreated {
+    /// Full project-file path.
+    project: String,
+    /// Selected SDK version.
+    sdk_version: String,
+    /// SDK manifest which supplied pack identities and versions.
+    manifest: String,
+    /// Evaluated target framework.
+    target_framework: String,
+    /// Runtime identifier requested by the project.
+    requested_runtime_identifier: String,
+    /// Nearest SDK-supported runtime-pack RID.
+    runtime_identifier: String,
+    /// Runtime-pack identity.
+    runtime_pack_id: String,
+    /// Runtime-pack version.
+    runtime_pack_version: String,
+    /// Resolved runtime-pack directory.
+    runtime_pack_root: String,
+    /// Nearest SDK-supported host-pack RID.
+    host_runtime_identifier: String,
+    /// Host-pack identity.
+    host_pack_id: String,
+    /// Host-pack version.
+    host_pack_version: String,
+    /// Resolved host-pack directory.
+    host_pack_root: String,
+    /// Selected platform apphost template.
+    apphost_template: String,
+    /// Managed runtime assets in pack-manifest order.
+    managed_assets: Vec<String>,
+    /// Native runtime assets in pack-manifest order.
+    native_assets: Vec<String>,
   },
   /// One SDK-style project was discovered and evaluated.
   ProjectEvaluated {

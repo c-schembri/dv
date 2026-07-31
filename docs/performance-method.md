@@ -56,6 +56,7 @@ Invalid input behavior:
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
+| `runtime_pack_plan` | restored immutable `runtime-pack-project` fixture and installed SDK packs | process launch, SDK/graph/manifest parsing, runtime and host pack selection, validation of 187 runtime assets, apphost selection, and JSON output |
 | `restore_cold` | fresh fixture copy | restore |
 | `package_sync_cold` | fresh `package-console` copy, empty isolated packages, reference HTTP cache bypassed | process launch, graph resolution, package download, verification, extraction, and dependency output |
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
@@ -84,6 +85,7 @@ directional decisions.`
 | `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
 | `rid-graph-oracle` | selected SDK graph, official `NuGet.Packaging` parser/expander, `linux-musl-x64` query | graph compatibility parity and one-shot latency | executable for both tools with exact sequence preflight |
 | `runtime-project` | 1 project, 1 selected RID, 3 ordered RID expansion values | compact target expansion and selected-index lookup | executable with property parity preflight |
+| `runtime-pack-project` | 1 `net10.0` executable, `win-x64`, 172 managed runtime assets, 15 native assets, and 1 apphost template | manifest-driven pack/RID/asset selection | executable for both tools with complete pack and asset parity preflight |
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
 | `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
@@ -157,6 +159,12 @@ Measure runtime target-dimension evaluation:
 
 ```text
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
+```
+
+Measure runtime, host, native-asset, and apphost planning:
+
+```text
+cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

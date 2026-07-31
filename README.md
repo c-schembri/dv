@@ -23,6 +23,9 @@ dv project inspect              3.846 ms median
 dotnet msbuild runtime query  321.215 ms median
 dv runtime project inspect      5.687 ms median
 
+dotnet msbuild runtime packs  376.764 ms median
+dv runtime pack plan             8.030 ms median
+
 dotnet msbuild compiler plan  368.952 ms median
 dv build --plan                 4.979 ms median
 
@@ -36,8 +39,9 @@ dotnet restore (warm locked)   552.265 ms median
 dv restore (warm locked)         7.019 ms median
 ```
 
-The benchmark preflight verifies the same selected SDK and the same evaluated
-project properties and source items before retaining samples.
+The benchmark preflight verifies the same selected SDK, evaluated project
+properties, source items, runtime packs, runtime assets, and apphost before
+retaining samples.
 
 ## Why dv
 
@@ -66,6 +70,7 @@ The project is in the first implementation phase.
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
 | Target-aware framework and compiler input planning | Implemented |
+| Runtime, host, native asset, and apphost planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
 | Exact package resolution, v2/v3 sources, verified cache, and lock | Initial implementation |
@@ -82,6 +87,12 @@ without launching `dotnet`.
 data and returns NuGet-compatible breadth-first fallbacks. The compiled graph
 stores 16-byte sorted nodes, contiguous 32-bit edges, and precomputed
 compatibility ranges; it never guesses compatibility by splitting RID text.
+
+`dv project runtime-packs` combines that graph with the selected SDK's bundled
+pack manifest, the restored runtime manifest, and the installed host pack. It
+selects manifest-defined identities and patch versions, separates managed and
+native runtime assets, and returns the exact platform apphost template without
+hard-coded SDK or package versions.
 
 Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting one
 modern unified .NET TFM, `Exe` and `Library` outputs, default source discovery,
@@ -136,6 +147,9 @@ cargo run -p dv-cli --release -- project inspect
 # Inspect an explicit project as structured events
 cargo run -p dv-cli --release -- project inspect path\to\App.csproj --json
 
+# Select runtime/host packs, native assets, and the apphost template
+cargo run -p dv-cli --release -- project runtime-packs path\to\App.csproj
+
 # Plan Roslyn inputs without compiling
 cargo run -p dv-cli --release -- build --plan path\to\App.csproj
 
@@ -171,7 +185,8 @@ Initial machine:
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
-  project evaluation, and the one-package cold case; compiler planning uses 5 warm-ups; 10
+  project evaluation, runtime evaluation, runtime-pack planning, and the
+  one-package cold case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; 10 retained
   samples after 3 warm-ups for warm locked restore; the massive graph uses 5
   retained samples after 1 warm-up
@@ -184,6 +199,7 @@ Initial machine:
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
+| Plan runtime and host packs | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --json` | 376.764 ms | 8.030 ms | 46.9x | 416.959 ms | 9.425 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
@@ -196,15 +212,19 @@ project property plus the ordered compile-item identities. The RID graph case
 compares the complete ordered expansion against the selected SDK's shipped
 `NuGet.Packaging` implementation; its tiny adapter is built outside timed
 intervals. The runtime project case also verifies the selected RID, ordered
-plural RID property, and unique target dimension batch. For package sync it
-also compares the complete package identity, exact-version, archive-SHA-512,
-and selected asset batches. The massive case additionally compares runtime,
-resource, content, analyzer, build, build-multitargeting, native, and RID
-runtime-target paths plus runtime-target metadata. Exact commands are printed in benchmark
-output and recorded in the curated
+plural RID property, and unique target dimension batch. The runtime-pack case
+compares the selected runtime and host RIDs, manifest-derived identities and
+versions, pack roots, all 172 managed and 15 native assets in order, and the
+apphost template. For package sync it also compares the complete package
+identity, exact-version, archive-SHA-512, and selected asset batches. The
+massive case additionally compares runtime, resource, content, analyzer,
+build, build-multitargeting, native, and RID runtime-target paths plus
+runtime-target metadata. Exact commands are printed in benchmark output and
+recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
-[runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md), and
+[runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
+[runtime pack baseline](docs/performance-baselines/2026-08-01-runtime-pack-windows.md), and
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md).
 
 The cold dependency result starts each timed process with a fresh project copy
@@ -244,6 +264,7 @@ cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
+cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
@@ -294,6 +315,7 @@ See:
 - [Data-oriented agent rules](AGENTS.md)
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Project evaluation contract](docs/project-evaluation.md)
+- [Runtime pack planning contract](docs/runtime-pack-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)
 - [Package resolution and cache contract](docs/package-resolution.md)
 - [Performance method](docs/performance-method.md)

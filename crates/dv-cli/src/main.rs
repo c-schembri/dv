@@ -10,8 +10,9 @@ use std::{
 use dv_core::{
   CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, PackageError,
   PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks,
-  evaluate_project, evaluate_project_path, load_portable_runtime_graph, plan_compiler_inputs_with_packages, resolve_package_inputs, write_json_lines,
+  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
+  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -51,6 +52,7 @@ Usage:
 const PROJECT_HELP: &str = "\
 Usage:
   dv project inspect [PROJECT] [--configuration Debug|Release]
+  dv project runtime-packs [PROJECT] [--packages PATH]
 ";
 
 const BUILD_HELP: &str = "\
@@ -607,9 +609,13 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   if project_args.is_empty()
     || matches!(project_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h"))
     || matches!(project_args, [inspect, argument] if inspect == "inspect" && matches!(argument.as_str(), "help" | "--help" | "-h"))
+    || matches!(project_args, [packs, argument] if packs == "runtime-packs" && matches!(argument.as_str(), "help" | "--help" | "-h"))
   {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
+  }
+  if project_args.first().map(String::as_str) == Some("runtime-packs") {
+    return project_runtime_packs(started, json, args, &project_args[1..]);
   }
   if project_args.first().map(String::as_str) != Some("inspect") {
     let subcommand = project_args.first().map_or("<missing>", String::as_str);
@@ -697,6 +703,99 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   succeed(started, "project inspect", args, payload)
 }
 
+fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+  let (requested_path, packages_directory) = match parse_runtime_pack_args(project_args) {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "project runtime-packs",
+        args,
+        diagnostic(
+          "DV0002",
+          problem,
+          None,
+          Some("Use `dv project runtime-packs --help` to inspect the accepted arguments."),
+        ),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "project runtime-packs",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "project runtime-packs", args, project_diagnostic(error)),
+  };
+  let inventory = match discover_sdks(project.project_directory()) {
+    Ok(inventory) => inventory,
+    Err(error) => {
+      let directory = project.project_directory();
+      return fail(started, json, "project runtime-packs", args, sdk_diagnostic(directory, error));
+    },
+  };
+  let plan = match plan_runtime_packs(&project, &inventory, packages_directory.as_deref()) {
+    Ok(plan) => plan,
+    Err(error) => return fail(started, json, "project runtime-packs", args, runtime_pack_diagnostic(error)),
+  };
+
+  if !json {
+    return write_runtime_pack_plan(&plan);
+  }
+  succeed(
+    started,
+    "project runtime-packs",
+    args,
+    EventPayload::RuntimePackPlanCreated {
+      project: plan.project().into(),
+      sdk_version: plan.sdk_version().into(),
+      manifest: plan.manifest().into(),
+      target_framework: plan.target_framework().into(),
+      requested_runtime_identifier: plan.requested_runtime_identifier().into(),
+      runtime_identifier: plan.runtime_identifier().into(),
+      runtime_pack_id: plan.runtime_pack_id().into(),
+      runtime_pack_version: plan.runtime_pack_version().into(),
+      runtime_pack_root: plan.runtime_pack_root().into(),
+      host_runtime_identifier: plan.host_runtime_identifier().into(),
+      host_pack_id: plan.host_pack_id().into(),
+      host_pack_version: plan.host_pack_version().into(),
+      host_pack_root: plan.host_pack_root().into(),
+      apphost_template: plan.apphost_template().into(),
+      managed_assets: plan.managed_assets().map(str::to_owned).collect(),
+      native_assets: plan.native_assets().map(str::to_owned).collect(),
+    },
+  )
+}
+
+fn parse_runtime_pack_args(arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+  let mut project = None;
+  let mut packages = None;
+  let mut index = 0;
+  while index < arguments.len() {
+    match arguments[index].as_str() {
+      "--packages" => {
+        index += 1;
+        packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
+      },
+      value if value.starts_with('-') => return Err(format!("unknown project runtime-packs option {value:?}")),
+      value if project.is_none() => project = Some(PathBuf::from(value)),
+      value => return Err(format!("unexpected project runtime-packs argument {value:?}")),
+    }
+    index += 1;
+  }
+  Ok((project, packages))
+}
+
 fn parse_project_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut configuration = ProjectConfiguration::Debug;
@@ -749,6 +848,30 @@ fn write_compiler_plan(plan: &CompilerPlan) -> ExitCode {
     .lock()
     .write_all(output.as_bytes())
     .expect("writing compiler plan to stdout succeeds");
+  ExitCode::SUCCESS
+}
+
+fn write_runtime_pack_plan(plan: &RuntimePackPlan) -> ExitCode {
+  let mut output = String::with_capacity(1024);
+  use std::fmt::Write as _;
+  writeln!(output, "Runtime pack plan").expect("writing a String succeeds");
+  writeln!(output, "  Project          {}", plan.project()).expect("writing a String succeeds");
+  writeln!(output, "  SDK              {}", plan.sdk_version()).expect("writing a String succeeds");
+  writeln!(output, "  Target           {}", plan.target_framework()).expect("writing a String succeeds");
+  writeln!(output, "  Requested RID    {}", plan.requested_runtime_identifier()).expect("writing a String succeeds");
+  writeln!(output, "  Runtime RID      {}", plan.runtime_identifier()).expect("writing a String succeeds");
+  writeln!(output, "  Runtime pack     {} {}", plan.runtime_pack_id(), plan.runtime_pack_version()).expect("writing a String succeeds");
+  writeln!(output, "  Runtime root     {}", plan.runtime_pack_root()).expect("writing a String succeeds");
+  writeln!(output, "  Managed assets   {}", plan.managed_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Native assets    {}", plan.native_assets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Host RID         {}", plan.host_runtime_identifier()).expect("writing a String succeeds");
+  writeln!(output, "  Host pack        {} {}", plan.host_pack_id(), plan.host_pack_version()).expect("writing a String succeeds");
+  writeln!(output, "  Host root        {}", plan.host_pack_root()).expect("writing a String succeeds");
+  writeln!(output, "  Apphost template {}", plan.apphost_template()).expect("writing a String succeeds");
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing runtime-pack plan to stdout succeeds");
   ExitCode::SUCCESS
 }
 
@@ -942,6 +1065,32 @@ fn runtime_graph_diagnostic(error: RuntimeGraphError) -> Diagnostic {
     RuntimeGraphErrorKind::Io => ("DV0111", None),
     RuntimeGraphErrorKind::InvalidJson | RuntimeGraphErrorKind::InvalidGraph => ("DV0112", Some("Repair or reinstall the selected .NET SDK.")),
     RuntimeGraphErrorKind::TextOverflow => ("DV0113", Some("Use an SDK with a valid bounded portable RID graph.")),
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    help,
+  )
+}
+
+fn runtime_pack_diagnostic(error: RuntimePackError) -> Diagnostic {
+  let (code, help) = match error.kind() {
+    RuntimePackErrorKind::Io => ("DV0120", None),
+    RuntimePackErrorKind::InvalidManifest => ("DV0121", Some("Repair or reinstall the selected .NET SDK or pack.")),
+    RuntimePackErrorKind::RuntimeRequired => ("DV0122", Some("Set one RuntimeIdentifier in the project.")),
+    RuntimePackErrorKind::UnsupportedRuntime => (
+      "DV0123",
+      Some("Choose a RID supported by the selected SDK's portable RID graph and pack manifest."),
+    ),
+    RuntimePackErrorKind::PackNotFound => ("DV0124", Some("Restore the required pack or install the matching SDK workload.")),
+    RuntimePackErrorKind::MissingAsset => ("DV0125", Some("Restore, repair, or reinstall the selected pack.")),
+    RuntimePackErrorKind::Configuration => ("DV0126", Some("Correct NuGet.Config or set NUGET_PACKAGES.")),
+    RuntimePackErrorKind::NonUnicodePath => ("DV0127", None),
+    RuntimePackErrorKind::TextOverflow => ("DV0128", Some("Use a bounded SDK and package installation.")),
   };
   diagnostic(
     code,

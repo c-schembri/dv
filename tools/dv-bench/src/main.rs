@@ -20,6 +20,7 @@ enum CaseKind {
   RidGraph,
   ProjectEvaluate,
   RuntimeEvaluate,
+  RuntimePackPlan,
   CompilerPlan,
   RestoreCold,
   PackageSyncCold,
@@ -42,6 +43,7 @@ struct Fixtures<'a> {
   small: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
+  runtime_pack: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
@@ -80,6 +82,21 @@ const DOTNET_CASES: &[Case] = &[
       "RuntimeProject.csproj",
       "--nologo",
       "-getProperty:TargetFramework,RuntimeIdentifier,RuntimeIdentifiers",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "runtime_pack_plan",
+    kind: CaseKind::RuntimePackPlan,
+    args: &[
+      "msbuild",
+      "RuntimePackProject.csproj",
+      "--nologo",
+      "-p:SelfContained=true",
+      "-p:UseAppHost=true",
+      "-t:ProcessFrameworkReferences;ResolveFrameworkReferences;ResolveRuntimePackAssets;_GetAppHostPaths",
+      "-getProperty:RuntimeIdentifier,AppHostSourcePath",
+      "-getItem:ResolvedRuntimePack,RuntimePackAsset,ResolvedAppHostPack",
     ],
     implemented: true,
   },
@@ -206,6 +223,12 @@ const DV_CASES: &[Case] = &[
     name: "runtime_evaluate",
     kind: CaseKind::RuntimeEvaluate,
     args: &["project", "inspect", "RuntimeProject.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "runtime_pack_plan",
+    kind: CaseKind::RuntimePackPlan,
+    args: &["project", "runtime-packs", "RuntimePackProject.csproj", "--json"],
     implemented: true,
   },
   Case {
@@ -356,6 +379,7 @@ fn run() -> Result<()> {
   let fixture = repository.join("benchmarks/fixtures/small-console");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
+  let runtime_pack_fixture = repository.join("benchmarks/fixtures/runtime-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
@@ -363,6 +387,7 @@ fn run() -> Result<()> {
     small: &fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
+    runtime_pack: &runtime_pack_fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
@@ -381,6 +406,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "runtime_evaluate") {
     verify_runtime_evaluation(&repository, &dv_executable, &runtime_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "runtime_pack_plan") {
+    verify_runtime_pack_plan(&repository, &dv_executable, &runtime_pack_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
     verify_compiler_plan(&repository, &dv_executable, &fixture)?;
@@ -575,6 +603,160 @@ fn verify_runtime_evaluation(repository: &Path, dv_executable: &Path, fixture: &
     return Err(format!("runtime target dimensions mismatch: expected={reference_dimensions:?}, dv={actual_dimensions:?}").into());
   }
   Ok(())
+}
+
+fn verify_runtime_pack_plan(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-runtime-pack-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  reset_fixture(fixture, &verification)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "RuntimePackProject.csproj",
+      "--nologo",
+      "-r",
+      "win-x64",
+      "-p:SelfContained=true",
+      "-p:UseAppHost=true",
+      "-p:NuGetAudit=false",
+      "--verbosity",
+      "quiet",
+    ],
+    &verification,
+    "runtime-pack verification restore",
+  )?;
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "RuntimePackProject.csproj",
+      "--nologo",
+      "-p:SelfContained=true",
+      "-p:UseAppHost=true",
+      "-t:ProcessFrameworkReferences;ResolveFrameworkReferences;ResolveRuntimePackAssets;_GetAppHostPaths",
+      "-getProperty:RuntimeIdentifier,AppHostSourcePath",
+      "-getItem:ResolvedRuntimePack,RuntimePackAsset,ResolvedAppHostPack",
+    ],
+    &verification,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(
+    dv_executable,
+    &["project", "runtime-packs", "RuntimePackProject.csproj", "--json"],
+    &verification,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("runtime_pack_plan_created"))
+    .ok_or("dv runtime-pack planning did not emit runtime_pack_plan_created")?;
+
+  let requested = dotnet.pointer("/Properties/RuntimeIdentifier").and_then(serde_json::Value::as_str);
+  if requested != dv.get("requested_runtime_identifier").and_then(serde_json::Value::as_str) {
+    return Err(
+      format!(
+        "requested runtime identifier mismatch: dotnet={requested:?} dv={:?}",
+        dv.get("requested_runtime_identifier")
+      )
+      .into(),
+    );
+  }
+  let runtime_pack_id = required_string(&dv, "runtime_pack_id")?;
+  let runtime_pack = dotnet
+    .pointer("/Items/ResolvedRuntimePack")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("MSBuild omitted ResolvedRuntimePack")?
+    .iter()
+    .find(|item| item.get("NuGetPackageId").and_then(serde_json::Value::as_str) == Some(runtime_pack_id))
+    .ok_or_else(|| format!("MSBuild did not resolve runtime pack {runtime_pack_id}"))?;
+  compare_text_field(runtime_pack, "NuGetPackageVersion", &dv, "runtime_pack_version")?;
+  compare_text_field(runtime_pack, "RuntimeIdentifier", &dv, "runtime_identifier")?;
+  compare_path_field(runtime_pack, "PackageDirectory", &dv, "runtime_pack_root")?;
+
+  let runtime_assets = dotnet
+    .pointer("/Items/RuntimePackAsset")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("MSBuild omitted RuntimePackAsset")?;
+  let reference_managed = runtime_assets
+    .iter()
+    .filter(|asset| asset.get("NuGetPackageId").and_then(serde_json::Value::as_str) == Some(runtime_pack_id))
+    .filter(|asset| asset.get("AssetType").and_then(serde_json::Value::as_str) == Some("runtime"))
+    .map(item_identity)
+    .collect::<Result<Vec<_>>>()?;
+  let reference_native = runtime_assets
+    .iter()
+    .filter(|asset| asset.get("NuGetPackageId").and_then(serde_json::Value::as_str) == Some(runtime_pack_id))
+    .filter(|asset| asset.get("AssetType").and_then(serde_json::Value::as_str) == Some("native"))
+    .map(item_identity)
+    .collect::<Result<Vec<_>>>()?;
+  compare_normalized_paths(&reference_managed, &string_array(&dv, "managed_assets")?, "managed runtime assets")?;
+  compare_normalized_paths(&reference_native, &string_array(&dv, "native_assets")?, "native runtime assets")?;
+
+  let apphost = dotnet.pointer("/Items/ResolvedAppHostPack/0").ok_or("MSBuild omitted ResolvedAppHostPack")?;
+  compare_text_field(apphost, "RuntimeIdentifier", &dv, "host_runtime_identifier")?;
+  compare_path_field(apphost, "PackageDirectory", &dv, "host_pack_root")?;
+  compare_path_field(apphost, "Path", &dv, "apphost_template")?;
+  let property_apphost = dotnet
+    .pointer("/Properties/AppHostSourcePath")
+    .and_then(serde_json::Value::as_str)
+    .ok_or("MSBuild omitted AppHostSourcePath")?;
+  if normalize_windows_path(property_apphost) != normalize_windows_path(required_string(&dv, "apphost_template")?) {
+    return Err("MSBuild AppHostSourcePath differs from the dv apphost template".into());
+  }
+  let expected_host_suffix = format!("\\{}\\{}", required_string(&dv, "host_pack_id")?, required_string(&dv, "host_pack_version")?);
+  if !normalize_windows_path(required_string(&dv, "host_pack_root")?).ends_with(&normalize_windows_path(&expected_host_suffix)) {
+    return Err("dv host pack identity/version do not match its MSBuild-selected directory".into());
+  }
+  Ok(())
+}
+
+fn required_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+  value
+    .get(field)
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| format!("JSON value omitted {field}").into())
+}
+
+fn item_identity(value: &serde_json::Value) -> Result<String> {
+  value
+    .get("Identity")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_owned)
+    .ok_or_else(|| "MSBuild item omitted Identity".into())
+}
+
+fn compare_text_field(reference: &serde_json::Value, reference_field: &str, actual: &serde_json::Value, actual_field: &str) -> Result<()> {
+  let reference = required_string(reference, reference_field)?;
+  let actual = required_string(actual, actual_field)?;
+  if reference != actual {
+    return Err(format!("{actual_field} mismatch: dotnet={reference:?} dv={actual:?}").into());
+  }
+  Ok(())
+}
+
+fn compare_path_field(reference: &serde_json::Value, reference_field: &str, actual: &serde_json::Value, actual_field: &str) -> Result<()> {
+  let reference = required_string(reference, reference_field)?;
+  let actual = required_string(actual, actual_field)?;
+  if normalize_windows_path(reference) != normalize_windows_path(actual) {
+    return Err(format!("{actual_field} mismatch: dotnet={reference:?} dv={actual:?}").into());
+  }
+  Ok(())
+}
+
+fn compare_normalized_paths(reference: &[String], actual: &[String], meaning: &str) -> Result<()> {
+  let reference = reference.iter().map(|path| normalize_windows_path(path)).collect::<Vec<_>>();
+  let actual = actual.iter().map(|path| normalize_windows_path(path)).collect::<Vec<_>>();
+  if reference != actual {
+    return Err(format!("{meaning} differ: dotnet={} dv={}", reference.len(), actual.len()).into());
+  }
+  Ok(())
+}
+
+fn normalize_windows_path(path: &str) -> String {
+  path.strip_prefix(r"\\?\").unwrap_or(path).replace('/', r"\").to_ascii_lowercase()
 }
 
 fn verify_compiler_plan(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -1134,6 +1316,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
     CaseKind::RidGraph
       | CaseKind::ProjectEvaluate
       | CaseKind::RuntimeEvaluate
+      | CaseKind::RuntimePackPlan
       | CaseKind::CompilerPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::BuildNoOp
@@ -1146,6 +1329,25 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
     run_checked(executable, &["restore", "--nologo", "--verbosity", "quiet"], workspace, "compiler plan restore")?;
+  }
+  if matches!(case.kind, CaseKind::RuntimePackPlan) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &[
+        "restore",
+        "RuntimePackProject.csproj",
+        "--nologo",
+        "-r",
+        "win-x64",
+        "-p:SelfContained=true",
+        "-p:UseAppHost=true",
+        "-p:NuGetAudit=false",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "runtime-pack plan restore",
+    )?;
   }
   if matches!(case.kind, CaseKind::PackageSyncWarm) {
     if is_dotnet(executable) {
@@ -1191,7 +1393,7 @@ fn prepare_rid_oracle(executable: &Path, workspace: &Path) -> Result<()> {
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::RidGraph | CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::CompilerPlan => Ok(()),
+    CaseKind::RidGraph | CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::RuntimePackPlan | CaseKind::CompilerPlan => Ok(()),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -1232,6 +1434,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
+    CaseKind::RuntimePackPlan => fixtures.runtime_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive => fixtures.package_graph_massive,
@@ -1244,6 +1447,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::Startup => None,
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
+    CaseKind::RuntimePackPlan => Some("runtime-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive => Some("massive-package-graph"),
@@ -1616,6 +1820,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
+    "runtime_pack_plan" => "Runtime pack plan",
     "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
@@ -1636,7 +1841,7 @@ fn write_command(output: &mut String, command: &[String]) {
       output.push(' ');
     }
 
-    if argument.is_empty() || argument.chars().any(|character| character.is_whitespace() || character == '"') {
+    if argument.is_empty() || argument.chars().any(|character| character.is_whitespace() || matches!(character, '"' | ';')) {
       output.push('"');
       for character in argument.chars() {
         if character == '"' {

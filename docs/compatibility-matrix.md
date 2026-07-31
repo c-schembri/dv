@@ -10,7 +10,8 @@ diagnostic rather than approximate Microsoft behavior.
 | SDK discovery | Native root enumeration and `global.json` selection | Implemented |
 | SDK declaration | `Microsoft.NET.Sdk` | Implemented |
 | Target frameworks | one installed modern unified .NET target; .NET 10 fixture baseline | Parsed dynamically and matching reference pack validated |
-| Runtime identifiers | selected SDK portable graph, opaque ordinal RID keys | Loaded into compact breadth-first compatibility ranges; concrete asset selection planned |
+| Runtime identifiers | selected SDK portable graph, opaque ordinal RID keys | Loaded into compact breadth-first compatibility ranges and used for manifest-declared pack selection |
+| Runtime and host packs | implicit `Microsoft.NETCore.App`, one active RID, restored runtime pack, installed/restored host pack | Managed/native runtime assets and exact apphost template planned and oracle-verified |
 | Output types | `Exe` and `Library` | Implemented |
 | Source items | default `**/*.cs`, excluding generated/output trees | Implemented |
 | Nullable | `enable` or omitted SDK default | Implemented |
