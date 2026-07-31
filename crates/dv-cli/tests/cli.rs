@@ -282,6 +282,31 @@ fn project_inspect_rejects_ambiguous_selection() {
 }
 
 #[test]
+fn restore_applies_the_selected_configuration_before_package_validation() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+  <ItemGroup><PackageReference Include="Debug.Only" Condition="'$(Configuration)' == 'Debug'" /></ItemGroup>
+</Project>"#,
+  );
+  temp.write("NuGet.Config", r#"<configuration><packageSources><clear /></packageSources></configuration>"#);
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--configuration=Release", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"package_resolution_created\""));
+  assert!(stdout.contains("\"packages\":[]"));
+  assert!(stdout.contains("\"network_requests\":0"));
+}
+
+#[test]
 fn sync_and_restore_share_the_verified_offline_operation() {
   let temp = TempDirectory::new();
   temp.write(

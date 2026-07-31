@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0' And '$(Configuration)' == 'Release'">
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Excluded.Runtime" Condition="'$(RuntimeIdentifier)' == 'linux-x64'" />
+    <ProjectReference Include="Library\Library.csproj" Condition="'$(TargetFramework)|$(RuntimeIdentifier)' == 'net10.0|win-x64'" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Humanizer.Core" Version="2.14.1" Condition="'$(RuntimeIdentifier)' == 'win-x64'" />
+    <PackageReference Include="Serilog" Version="4.3.0" Condition="'$(Configuration)' == 'Release' Or ('$(Configuration)' == 'Debug' And '$(RuntimeIdentifier)' == 'linux-x64')" />
+    <PackageReference Include="Excluded.Configuration" Condition="'$(Configuration)' == 'Debug'" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" Condition="!('$(Configuration)' == 'Debug')" />
+    <FrameworkReference Include="Excluded.Framework" Condition="'$(TargetFramework)' != 'net10.0'" />
+  </ItemGroup>
+</Project>

@@ -25,6 +25,7 @@ enum CaseKind {
   Startup,
   RidGraph,
   ProjectEvaluate,
+  PackageReferenceConditions,
   RuntimeEvaluate,
   RuntimePackPlan,
   RuntimePackInventoryCold,
@@ -75,6 +76,7 @@ struct Fixtures<'a> {
   unavailable_pack: &'a Path,
   package: &'a Path,
   package_reference_metadata: &'a Path,
+  package_reference_conditions: &'a Path,
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
   nuget_source_sections: &'a Path,
@@ -116,6 +118,19 @@ const DOTNET_CASES: &[Case] = &[
       "--nologo",
       "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
       "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_reference_conditions",
+    kind: CaseKind::PackageReferenceConditions,
+    args: &[
+      "msbuild",
+      "ConditionalReferences.csproj",
+      "--nologo",
+      "-p:Configuration=Release",
+      "-getProperty:TargetFramework,RuntimeIdentifier,Configuration",
+      "-getItem:PackageReference,ProjectReference,FrameworkReference",
     ],
     implemented: true,
   },
@@ -537,6 +552,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_reference_conditions",
+    kind: CaseKind::PackageReferenceConditions,
+    args: &["project", "inspect", "ConditionalReferences.csproj", "--configuration", "Release", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "runtime_evaluate",
     kind: CaseKind::RuntimeEvaluate,
     args: &["project", "inspect", "RuntimeProject.csproj", "--json"],
@@ -845,6 +866,7 @@ fn run() -> Result<()> {
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
+  let package_reference_conditions_fixture = repository.join("benchmarks/fixtures/package-reference-conditions");
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
@@ -871,6 +893,7 @@ fn run() -> Result<()> {
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
+    package_reference_conditions: &package_reference_conditions_fixture,
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
     nuget_source_sections: &nuget_source_sections_fixture,
@@ -900,6 +923,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_reference_conditions") {
+    verify_package_reference_conditions(&dv_executable, &package_reference_conditions_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "runtime_evaluate") {
     verify_runtime_evaluation(&repository, &dv_executable, &runtime_fixture)?;
@@ -991,7 +1017,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 19,
+    schema_version: 20,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -1097,6 +1123,100 @@ fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()>
   }
   if !dv.get("package_references").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
     return Err("dv small-console evaluation unexpectedly contains package references".into());
+  }
+  Ok(())
+}
+
+fn verify_package_reference_conditions(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "ConditionalReferences.csproj",
+      "--nologo",
+      "-p:Configuration=Release",
+      "-getProperty:TargetFramework,RuntimeIdentifier,Configuration",
+      "-getItem:PackageReference,ProjectReference,FrameworkReference",
+    ],
+    fixture,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(
+    dv_executable,
+    &["project", "inspect", "ConditionalReferences.csproj", "--configuration", "Release", "--json"],
+    fixture,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
+    .ok_or("dv conditional-reference inspection did not emit project_evaluated")?;
+
+  for (dotnet_name, dv_name) in [
+    ("TargetFramework", "target_framework"),
+    ("RuntimeIdentifier", "runtime_identifier"),
+    ("Configuration", "configuration"),
+  ] {
+    let reference = dotnet.pointer(&format!("/Properties/{dotnet_name}")).and_then(serde_json::Value::as_str);
+    let actual = dv.get(dv_name).and_then(serde_json::Value::as_str);
+    if reference != actual {
+      return Err(format!("conditional-reference property mismatch for {dotnet_name}: dotnet={reference:?}, dv={actual:?}").into());
+    }
+  }
+
+  let expected_packages = [("Newtonsoft.Json", "13.0.3"), ("Humanizer.Core", "2.14.1"), ("Serilog", "4.3.0")];
+  let dotnet_packages = dotnet
+    .pointer("/Items/PackageReference")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("Microsoft conditional-reference oracle omitted PackageReference items")?
+    .iter()
+    .map(|item| {
+      (
+        item.get("Identity").and_then(serde_json::Value::as_str).unwrap_or_default(),
+        item.get("Version").and_then(serde_json::Value::as_str).unwrap_or_default(),
+      )
+    })
+    .collect::<Vec<_>>();
+  let dv_packages = dv
+    .get("package_references")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv conditional-reference event omitted package_references")?
+    .iter()
+    .map(|item| {
+      (
+        item.get("id").and_then(serde_json::Value::as_str).unwrap_or_default(),
+        item.get("version").and_then(serde_json::Value::as_str).unwrap_or_default(),
+      )
+    })
+    .collect::<Vec<_>>();
+  if dotnet_packages != expected_packages || dv_packages != expected_packages {
+    return Err(format!("conditional package batch mismatch: expected={expected_packages:?}, dotnet={dotnet_packages:?}, dv={dv_packages:?}").into());
+  }
+
+  let dotnet_projects = item_identities(&dotnet, "ProjectReference")?
+    .into_iter()
+    .map(|path| path.replace('\\', "/"))
+    .collect::<Vec<_>>();
+  let dv_projects = string_array(&dv, "project_references")?;
+  if dotnet_projects != ["Library/Library.csproj"] || dv_projects != dotnet_projects {
+    return Err(format!("conditional project-reference batch mismatch: dotnet={dotnet_projects:?}, dv={dv_projects:?}").into());
+  }
+
+  let dotnet_frameworks = item_identities(&dotnet, "FrameworkReference")?;
+  let dv_frameworks = dv
+    .get("framework_references")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv conditional-reference event omitted framework_references")?
+    .iter()
+    .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+    .collect::<Vec<_>>();
+  if !dotnet_frameworks.iter().any(|id| id == "Microsoft.AspNetCore.App")
+    || dotnet_frameworks.iter().any(|id| id == "Excluded.Framework")
+    || dv_frameworks != ["Microsoft.AspNetCore.App"]
+  {
+    return Err(format!("conditional framework-reference batch mismatch: dotnet={dotnet_frameworks:?}, dv={dv_frameworks:?}").into());
   }
   Ok(())
 }
@@ -3740,6 +3860,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
     case.kind,
     CaseKind::RidGraph
       | CaseKind::ProjectEvaluate
+      | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
       | CaseKind::RuntimePackPlan
       | CaseKind::RuntimePackInventoryCold
@@ -4724,6 +4845,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
   match case.kind {
     CaseKind::RidGraph
     | CaseKind::ProjectEvaluate
+    | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
     | CaseKind::RuntimePackPlan
     | CaseKind::FrameworkReferencePlan
@@ -4807,6 +4929,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
+    CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
@@ -4838,6 +4961,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
+    CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
@@ -5658,6 +5782,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
+    "package_reference_conditions" => "Conditional references",
     "runtime_pack_plan" => "Runtime pack plan",
     "runtime_pack_inventory_cold" => "Cold runtime pack inventory",
     "framework_reference_plan" => "Framework reference plan",

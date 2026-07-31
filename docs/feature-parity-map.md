@@ -895,7 +895,25 @@ boundary, not final drop-in parity.
   samples measure `456.722 ms` for
   Microsoft versus `6.611 ms` for `dv` (`69.1x`) with one cache hit and zero
   timed network work. `P2`
-- [ ] `RES-005` Support conditional references per TFM/RID/configuration. `P2`
+- [x] `RES-005` Item-group and item conditions filter project, package, and
+  framework reference batches by `TargetFramework`, `RuntimeIdentifier`, and
+  `Configuration` before path or metadata validation. The bounded linear
+  evaluator supports case-insensitive equality/inequality, `And`/`Or`
+  precedence, parentheses, boolean negation, empty RID values, and compound
+  property interpolation without building an expression tree. Exact-property
+  comparisons allocate no evaluation storage; variable-sized compound
+  expansion is isolated to the uncommon path. Conditions are limited to 1,024
+  bytes, 32 comparisons, and eight nested expressions. Each parsed reference
+  carries two sentinel-backed `u32` indices in an asserted eight-byte row
+  rather than two 16-byte pointer-width options; selected conditions and raw
+  strings die with project materialization. Unsupported properties and
+  malformed or over-limit expressions fail explicitly, while conditions on
+  property groups remain outside the compatibility contract. Restore, sync,
+  package-source inspection, and project inspection accept the selected
+  Debug/Release configuration. Microsoft-oracled preflight compares the same
+  TFM, RID, configuration, three-package batch, project path, and explicit
+  framework row. Thirty warm Windows samples measure `288.983 ms` for
+  Microsoft versus `4.765 ms` for `dv` (`60.6x`). `P2`
 - [ ] `RES-006` Read `Directory.Packages.props` and implement central package
   versions, version overrides, global references, and transitive pinning. `P2`
 - [~] `RES-007` Lowest-applicable-version, direct-dependency-wins, and cousin

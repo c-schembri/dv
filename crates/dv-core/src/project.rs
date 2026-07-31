@@ -13,6 +13,10 @@ use crate::{BENCHMARK_CACHE_LINE_BYTES, TargetFramework};
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
+const MAX_REFERENCE_CONDITION_BYTES: usize = 1_024;
+const MAX_REFERENCE_CONDITION_OPERATORS: u8 = 32;
+const MAX_REFERENCE_CONDITION_DEPTH: u8 = 8;
+const NO_REFERENCE_CONDITION: u32 = u32::MAX;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
 
@@ -607,7 +611,7 @@ enum Element {
   Document,
   Project,
   PropertyGroup,
-  ItemGroup,
+  ItemGroup(u32),
   Property(Property),
   ProjectReference,
   PackageReference(usize),
@@ -634,9 +638,33 @@ struct RawProject {
   nuget_audit: Option<String>,
   nuget_audit_mode: Option<String>,
   nuget_audit_level: Option<String>,
-  project_references: Vec<String>,
+  conditions: Vec<String>,
+  project_references: Vec<RawProjectReference>,
   package_references: Vec<RawPackageReference>,
   framework_references: Vec<RawFrameworkReference>,
+}
+
+#[derive(Clone, Copy)]
+struct RawReferenceConditions {
+  group: u32,
+  item: u32,
+}
+
+impl Default for RawReferenceConditions {
+  fn default() -> Self {
+    Self {
+      group: NO_REFERENCE_CONDITION,
+      item: NO_REFERENCE_CONDITION,
+    }
+  }
+}
+
+const _: () = assert!(size_of::<RawReferenceConditions>() == 8);
+const _: () = assert!(align_of::<RawReferenceConditions>() == 4);
+
+struct RawProjectReference {
+  path: String,
+  conditions: RawReferenceConditions,
 }
 
 struct RawPackageReference {
@@ -648,6 +676,7 @@ struct RawPackageReference {
   no_warn: Option<String>,
   aliases: Option<String>,
   generate_path_property: Option<String>,
+  conditions: RawReferenceConditions,
 }
 
 struct RawFrameworkReference {
@@ -655,6 +684,7 @@ struct RawFrameworkReference {
   runtime_version: Option<String>,
   targeting_pack_version: Option<String>,
   target_latest_runtime_patch: Option<String>,
+  conditions: RawReferenceConditions,
 }
 
 struct TextTable {
@@ -870,8 +900,9 @@ fn start_element(
       Ok(Element::PropertyGroup)
     },
     Element::Project if name == "ItemGroup" => {
-      validate_attributes(path, reader, element, &["Label"])?;
-      Ok(Element::ItemGroup)
+      validate_attributes(path, reader, element, &["Label", "Condition"])?;
+      let condition = store_condition(path, reader, element, raw)?;
+      Ok(Element::ItemGroup(condition))
     },
     Element::Project if matches!(name, "Import" | "Target" | "UsingTask" | "Sdk") => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
@@ -882,12 +913,16 @@ fn start_element(
       validate_attributes(path, reader, element, &[])?;
       Ok(Element::Property(property(path, name)?))
     },
-    Element::ItemGroup if name == "ProjectReference" => {
-      let include = required_attribute(path, reader, element, "Include", &[])?;
-      raw.project_references.push(normalize_project_reference(path, &include)?);
+    Element::ItemGroup(group) if name == "ProjectReference" => {
+      let include = required_attribute(path, reader, element, "Include", &["Condition"])?;
+      let conditions = RawReferenceConditions {
+        group,
+        item: store_condition(path, reader, element, raw)?,
+      };
+      raw.project_references.push(RawProjectReference { path: include, conditions });
       Ok(Element::ProjectReference)
     },
-    Element::ItemGroup if name == "PackageReference" => {
+    Element::ItemGroup(group) if name == "PackageReference" => {
       const METADATA: &[&str] = &[
         "Version",
         "IncludeAssets",
@@ -896,9 +931,14 @@ fn start_element(
         "NoWarn",
         "Aliases",
         "GeneratePathProperty",
+        "Condition",
       ];
       let include = required_attribute(path, reader, element, "Include", METADATA)?;
       let version = optional_attribute(path, reader, element, "Version")?;
+      let conditions = RawReferenceConditions {
+        group,
+        item: store_condition(path, reader, element, raw)?,
+      };
       let index = raw.package_references.len();
       raw.package_references.push(RawPackageReference {
         id: include,
@@ -909,23 +949,29 @@ fn start_element(
         no_warn: optional_attribute(path, reader, element, "NoWarn")?,
         aliases: optional_attribute(path, reader, element, "Aliases")?,
         generate_path_property: optional_attribute(path, reader, element, "GeneratePathProperty")?,
+        conditions,
       });
       Ok(Element::PackageReference(index))
     },
-    Element::ItemGroup if name == "FrameworkReference" => {
+    Element::ItemGroup(group) if name == "FrameworkReference" => {
       let include = required_attribute(
         path,
         reader,
         element,
         "Include",
-        &["RuntimeFrameworkVersion", "TargetingPackVersion", "TargetLatestRuntimePatch"],
+        &["RuntimeFrameworkVersion", "TargetingPackVersion", "TargetLatestRuntimePatch", "Condition"],
       )?;
+      let conditions = RawReferenceConditions {
+        group,
+        item: store_condition(path, reader, element, raw)?,
+      };
       let index = raw.framework_references.len();
       raw.framework_references.push(RawFrameworkReference {
         id: include,
         runtime_version: optional_attribute(path, reader, element, "RuntimeFrameworkVersion")?,
         targeting_pack_version: optional_attribute(path, reader, element, "TargetingPackVersion")?,
         target_latest_runtime_patch: optional_attribute(path, reader, element, "TargetLatestRuntimePatch")?,
+        conditions,
       });
       Ok(Element::FrameworkReference(index))
     },
@@ -1175,6 +1221,30 @@ fn materialize_project(
     ));
   }
 
+  let condition_context = ReferenceConditionContext {
+    target_framework: &target_framework,
+    runtime_identifier: selected_runtime,
+    configuration: configuration.as_str(),
+  };
+  let mut project_references = Vec::with_capacity(raw.project_references.len());
+  for reference in raw.project_references {
+    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+      project_references.push(normalize_project_reference(&project_path, &reference.path)?);
+    }
+  }
+  let mut selected_package_references = Vec::with_capacity(raw.package_references.len());
+  for reference in raw.package_references {
+    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+      selected_package_references.push(reference);
+    }
+  }
+  let mut selected_framework_references = Vec::with_capacity(raw.framework_references.len());
+  for reference in raw.framework_references {
+    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+      selected_framework_references.push(reference);
+    }
+  }
+
   let sources = collect_sources(project_directory, &project_path)?;
   let project_path_text = unicode_path(&project_path, &project_path)?;
   let project_directory_text = unicode_path(project_directory, &project_path)?;
@@ -1185,9 +1255,8 @@ fn materialize_project(
     + root_namespace.len()
     + runtime_dimensions.iter().map(|value| value.len()).sum::<usize>()
     + sources.iter().map(String::len).sum::<usize>()
-    + raw.project_references.iter().map(String::len).sum::<usize>()
-    + raw
-      .package_references
+    + project_references.iter().map(String::len).sum::<usize>()
+    + selected_package_references
       .iter()
       .map(|package| {
         package.id.len()
@@ -1197,8 +1266,7 @@ fn materialize_project(
       })
       .sum::<usize>()
     + raw.runtime_framework_version.as_ref().map_or(0, String::len)
-    + raw
-      .framework_references
+    + selected_framework_references
       .iter()
       .map(|reference| {
         reference.id.len() + reference.runtime_version.as_ref().map_or(0, String::len) + reference.targeting_pack_version.as_ref().map_or(0, String::len)
@@ -1215,13 +1283,12 @@ fn materialize_project(
     .map(|value| table.push(value, &project_path))
     .collect::<Result<Box<_>, _>>()?;
   let source_spans = sources.iter().map(|source| table.push(source, &project_path)).collect::<Result<Box<_>, _>>()?;
-  let reference_spans = raw
-    .project_references
+  let reference_spans = project_references
     .iter()
     .map(|reference| table.push(reference, &project_path))
     .collect::<Result<Box<_>, _>>()?;
-  let mut package_references = Vec::with_capacity(raw.package_references.len());
-  for package in raw.package_references {
+  let mut package_references = Vec::with_capacity(selected_package_references.len());
+  for package in selected_package_references {
     let version = package.version.ok_or_else(|| {
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
@@ -1273,8 +1340,8 @@ fn materialize_project(
     Some(version) => table.push(version, &project_path)?,
     None => NO_TEXT,
   };
-  let mut framework_references = Vec::with_capacity(raw.framework_references.len());
-  for reference in raw.framework_references {
+  let mut framework_references = Vec::with_capacity(selected_framework_references.len());
+  for reference in selected_framework_references {
     if reference.id.is_empty() || reference.id.contains("$(") {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
@@ -1453,6 +1520,294 @@ fn parse_runtime_identifiers<'a>(path: &Path, value: Option<&'a str>) -> Result<
   Ok(identifiers)
 }
 
+// Reference conditions are a transient linear transform: borrowed condition
+// text plus three stable dimensions becomes one selection bit. The common
+// exact-property path allocates no evaluation storage; compound property
+// interpolation alone needs a temporary variable-sized string.
+struct ReferenceConditionContext<'a> {
+  target_framework: &'a str,
+  runtime_identifier: Option<&'a str>,
+  configuration: &'a str,
+}
+
+struct ReferenceConditionParser<'a, 'context> {
+  input: &'a str,
+  position: usize,
+  comparisons: u8,
+  depth: u8,
+  context: &'context ReferenceConditionContext<'context>,
+  path: &'context Path,
+}
+
+enum ReferenceConditionValue<'input, 'context> {
+  Input(&'input str),
+  Context(&'context str),
+  Expanded(String),
+}
+
+impl ReferenceConditionValue<'_, '_> {
+  fn as_str(&self) -> &str {
+    match self {
+      Self::Input(value) => value,
+      Self::Context(value) => value,
+      Self::Expanded(value) => value,
+    }
+  }
+}
+
+impl<'a, 'context> ReferenceConditionParser<'a, 'context> {
+  fn evaluate(path: &'context Path, input: &'a str, context: &'context ReferenceConditionContext<'context>) -> Result<bool, ProjectError> {
+    if input.len() > MAX_REFERENCE_CONDITION_BYTES {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        path,
+        format!("reference Condition exceeds the {MAX_REFERENCE_CONDITION_BYTES}-byte evaluation limit"),
+      ));
+    }
+    if !input.is_ascii() {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        path,
+        "reference Condition must use ASCII syntax and dimension values",
+      ));
+    }
+    let mut parser = Self {
+      input,
+      position: 0,
+      comparisons: 0,
+      depth: 0,
+      context,
+      path,
+    };
+    let value = parser.parse_or()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+      return Err(parser.unsupported("contains syntax outside equality, inequality, And, Or, !, and parentheses"));
+    }
+    Ok(value)
+  }
+
+  fn parse_or(&mut self) -> Result<bool, ProjectError> {
+    let mut value = self.parse_and()?;
+    while self.consume_keyword("Or") {
+      let right = self.parse_and()?;
+      value |= right;
+    }
+    Ok(value)
+  }
+
+  fn parse_and(&mut self) -> Result<bool, ProjectError> {
+    let mut value = self.parse_unary()?;
+    while self.consume_keyword("And") {
+      let right = self.parse_unary()?;
+      value &= right;
+    }
+    Ok(value)
+  }
+
+  fn parse_unary(&mut self) -> Result<bool, ProjectError> {
+    self.skip_whitespace();
+    if self.consume_byte(b'!') {
+      self.enter_nested()?;
+      let value = self.parse_unary()?;
+      self.depth -= 1;
+      return Ok(!value);
+    }
+    if self.consume_byte(b'(') {
+      self.enter_nested()?;
+      let value = self.parse_or()?;
+      self.depth -= 1;
+      self.skip_whitespace();
+      if !self.consume_byte(b')') {
+        return Err(self.invalid("has an unclosed parenthesized expression"));
+      }
+      return Ok(value);
+    }
+    self.parse_comparison()
+  }
+
+  fn parse_comparison(&mut self) -> Result<bool, ProjectError> {
+    if self.comparisons == MAX_REFERENCE_CONDITION_OPERATORS {
+      return Err(self.unsupported(&format!("contains more than {MAX_REFERENCE_CONDITION_OPERATORS} comparisons")));
+    }
+    self.comparisons += 1;
+    let left = self.parse_operand()?;
+    self.skip_whitespace();
+    let equal = if self.consume_text("==") {
+      true
+    } else if self.consume_text("!=") {
+      false
+    } else if left.as_str().eq_ignore_ascii_case("true") {
+      return Ok(true);
+    } else if left.as_str().eq_ignore_ascii_case("false") {
+      return Ok(false);
+    } else {
+      return Err(self.unsupported("must compare dimension values with == or !="));
+    };
+    let right = self.parse_operand()?;
+    let matches = left.as_str().eq_ignore_ascii_case(right.as_str());
+    Ok(if equal { matches } else { !matches })
+  }
+
+  fn parse_operand(&mut self) -> Result<ReferenceConditionValue<'a, 'context>, ProjectError> {
+    self.skip_whitespace();
+    let Some(first) = self.input.as_bytes().get(self.position).copied() else {
+      return Err(self.invalid("ends before a comparison value"));
+    };
+    let value = if matches!(first, b'\'' | b'"') {
+      self.position += 1;
+      let start = self.position;
+      let Some(offset) = self.input[start..].bytes().position(|byte| byte == first) else {
+        return Err(self.invalid("contains an unterminated quoted value"));
+      };
+      self.position = start + offset + 1;
+      &self.input[start..start + offset]
+    } else {
+      let start = self.position;
+      while self.position < self.input.len() {
+        if self.input[self.position..].starts_with("$(") {
+          let Some(close) = self.input[self.position + 2..].find(')') else {
+            return Err(self.invalid("contains an unterminated property reference"));
+          };
+          self.position += close + 3;
+          continue;
+        }
+        let byte = self.input.as_bytes()[self.position];
+        if byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'!' | b'=') {
+          break;
+        }
+        self.position += 1;
+      }
+      if self.position == start {
+        return Err(self.invalid("is missing a comparison value"));
+      }
+      &self.input[start..self.position]
+    };
+    self.expand_operand(value)
+  }
+
+  fn expand_operand(&self, value: &'a str) -> Result<ReferenceConditionValue<'a, 'context>, ProjectError> {
+    let Some(first) = value.find("$(") else {
+      return Ok(ReferenceConditionValue::Input(value));
+    };
+    if first == 0
+      && let Some(close) = value[2..].find(')')
+      && close + 3 == value.len()
+    {
+      return self.property_value(&value[2..close + 2]).map(ReferenceConditionValue::Context);
+    }
+    let mut expanded = String::with_capacity(value.len() + 16);
+    let mut remaining = value;
+    let mut offset = first;
+    loop {
+      expanded.push_str(&remaining[..offset]);
+      let property_start = offset + 2;
+      let Some(close) = remaining[property_start..].find(')') else {
+        return Err(self.invalid("contains an unterminated property reference"));
+      };
+      let property_end = property_start + close;
+      let property = &remaining[property_start..property_end];
+      expanded.push_str(self.property_value(property)?);
+      remaining = &remaining[property_end + 1..];
+      let Some(next) = remaining.find("$(") else {
+        expanded.push_str(remaining);
+        break;
+      };
+      offset = next;
+    }
+    Ok(ReferenceConditionValue::Expanded(expanded))
+  }
+
+  fn enter_nested(&mut self) -> Result<(), ProjectError> {
+    if self.depth == MAX_REFERENCE_CONDITION_DEPTH {
+      return Err(self.unsupported(&format!("exceeds the {MAX_REFERENCE_CONDITION_DEPTH}-level nesting limit")));
+    }
+    self.depth += 1;
+    Ok(())
+  }
+
+  fn property_value(&self, property: &str) -> Result<&'context str, ProjectError> {
+    if property.eq_ignore_ascii_case("TargetFramework") {
+      Ok(self.context.target_framework)
+    } else if property.eq_ignore_ascii_case("RuntimeIdentifier") {
+      Ok(self.context.runtime_identifier.unwrap_or(""))
+    } else if property.eq_ignore_ascii_case("Configuration") {
+      Ok(self.context.configuration)
+    } else {
+      Err(self.unsupported(&format!("references unsupported property $({property})")))
+    }
+  }
+
+  fn consume_keyword(&mut self, keyword: &str) -> bool {
+    let original = self.position;
+    self.skip_whitespace();
+    let end = self.position + keyword.len();
+    let matches = self.input.get(self.position..end).is_some_and(|value| value.eq_ignore_ascii_case(keyword))
+      && self.input.as_bytes().get(end).is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+    if matches {
+      self.position = end;
+    } else {
+      self.position = original;
+    }
+    matches
+  }
+
+  fn consume_text(&mut self, value: &str) -> bool {
+    if self.input[self.position..].starts_with(value) {
+      self.position += value.len();
+      true
+    } else {
+      false
+    }
+  }
+
+  fn consume_byte(&mut self, value: u8) -> bool {
+    if self.input.as_bytes().get(self.position) == Some(&value) {
+      self.position += 1;
+      true
+    } else {
+      false
+    }
+  }
+
+  fn skip_whitespace(&mut self) {
+    while self.input.as_bytes().get(self.position).is_some_and(u8::is_ascii_whitespace) {
+      self.position += 1;
+    }
+  }
+
+  fn invalid(&self, message: &str) -> ProjectError {
+    ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      self.path,
+      format!("reference Condition {:?} {message}", self.input),
+    )
+  }
+
+  fn unsupported(&self, message: &str) -> ProjectError {
+    ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      self.path,
+      format!("reference Condition {:?} {message}", self.input),
+    )
+  }
+}
+
+fn reference_conditions_match(
+  path: &Path,
+  conditions: &[String],
+  selected: RawReferenceConditions,
+  context: &ReferenceConditionContext<'_>,
+) -> Result<bool, ProjectError> {
+  if selected.group != NO_REFERENCE_CONDITION && !ReferenceConditionParser::evaluate(path, &conditions[selected.group as usize], context)? {
+    return Ok(false);
+  }
+  if selected.item != NO_REFERENCE_CONDITION && !ReferenceConditionParser::evaluate(path, &conditions[selected.item as usize], context)? {
+    return Ok(false);
+  }
+  Ok(true)
+}
+
 fn required_property(path: &Path, name: &str, value: Option<String>) -> Result<String, ProjectError> {
   value
     .filter(|value| !value.is_empty() && !value.contains("$("))
@@ -1490,7 +1845,7 @@ fn validate_attributes(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart
   for attribute in element.attributes() {
     let attribute = attribute.map_err(|error| ProjectError::new(ProjectErrorKind::InvalidXml, path, format!("invalid XML attribute: {error}")))?;
     let name = element_name(path, attribute.key.as_ref())?;
-    if name == "Condition" {
+    if name == "Condition" && !allowed.contains(&name) {
       return Err(ProjectError::new(
         ProjectErrorKind::Unsupported,
         path,
@@ -1516,7 +1871,7 @@ fn required_attribute(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<
   for attribute in element.attributes() {
     let attribute = attribute.map_err(|error| ProjectError::new(ProjectErrorKind::InvalidXml, path, format!("invalid XML attribute: {error}")))?;
     let name = element_name(path, attribute.key.as_ref())?;
-    if name == "Condition" {
+    if name == "Condition" && !additional.contains(&name) {
       return Err(ProjectError::new(
         ProjectErrorKind::Unsupported,
         path,
@@ -1556,6 +1911,30 @@ fn optional_attribute(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<
     }
   }
   Ok(None)
+}
+
+fn store_condition(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<'_>, raw: &mut RawProject) -> Result<u32, ProjectError> {
+  let Some(condition) = optional_attribute(path, reader, element, "Condition")? else {
+    return Ok(NO_REFERENCE_CONDITION);
+  };
+  if condition.trim().is_empty() {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      "reference Condition must not be empty",
+    ));
+  }
+  if condition.len() > MAX_REFERENCE_CONDITION_BYTES {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      path,
+      format!("reference Condition exceeds the {MAX_REFERENCE_CONDITION_BYTES}-byte evaluation limit"),
+    ));
+  }
+  let index = u32::try_from(raw.conditions.len())
+    .map_err(|_| ProjectError::new(ProjectErrorKind::Unsupported, path, "project contains more than 4 billion reference conditions"))?;
+  raw.conditions.push(condition);
+  Ok(index)
 }
 
 fn append_reference(path: &Path, reference: &BytesRef<'_>, output: &mut String) -> Result<(), ProjectError> {
@@ -2013,6 +2392,121 @@ mod tests {
   }
 
   #[test]
+  fn filters_reference_batches_by_framework_runtime_and_configuration() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeIdentifier>win-x64</RuntimeIdentifier>",
+        r#"<ItemGroup Condition="'$(TargetFramework)' == 'net10.0' And '$(Configuration)' == 'Release'">
+          <PackageReference Include="Selected.Group" Version="1.0.0" />
+          <PackageReference Include="Excluded.Runtime" Condition="'$(RuntimeIdentifier)' == 'linux-x64'" />
+          <ProjectReference Include="Selected\Library.csproj" Condition="'$(TargetFramework)|$(RuntimeIdentifier)' == 'net10.0|win-x64'" />
+        </ItemGroup>
+        <ItemGroup>
+          <FrameworkReference Include="Microsoft.AspNetCore.App" Condition="('$(Configuration)' == 'Debug') Or ('$(RuntimeIdentifier)' == 'win-x64')" />
+          <PackageReference Include="Excluded.Configuration" Condition="'$(Configuration)' == 'Debug'" />
+        </ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap();
+
+    assert_eq!(result.project_references().collect::<Vec<_>>(), ["Selected/Library.csproj"]);
+    assert_eq!(result.package_references().len(), 1);
+    assert_eq!(result.package_id(result.package_references()[0]), "Selected.Group");
+    assert_eq!(result.framework_references().len(), 1);
+    assert_eq!(result.framework_reference_id(result.framework_references()[0]), "Microsoft.AspNetCore.App");
+  }
+
+  #[test]
+  fn applies_and_before_or_and_supports_boolean_negation() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeIdentifier>win-x64</RuntimeIdentifier>",
+        r#"<ItemGroup>
+          <PackageReference Include="Selected.Precedence" Version="1.0.0" Condition="'$(Configuration)' == 'Release' Or '$(Configuration)' == 'Debug' And '$(RuntimeIdentifier)' == 'linux-x64'" />
+          <PackageReference Include="Excluded.Precedence" Version="1.0.0" Condition="'$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release' And '$(RuntimeIdentifier)' == 'linux-x64'" />
+          <PackageReference Include="Selected.Negation" Version="1.0.0" Condition="!('$(Configuration)' == 'Debug')" />
+          <PackageReference Include="Selected.Debug" Version="1.0.0" Condition="'$(Configuration)' == 'Debug'" />
+        </ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap();
+    let ids = result
+      .package_references()
+      .iter()
+      .map(|reference| result.package_id(*reference))
+      .collect::<Vec<_>>();
+
+    assert_eq!(ids, ["Selected.Precedence", "Selected.Negation"]);
+
+    let debug = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let debug_ids = debug
+      .package_references()
+      .iter()
+      .map(|reference| debug.package_id(*reference))
+      .collect::<Vec<_>>();
+    assert_eq!(debug_ids, ["Excluded.Precedence", "Selected.Debug"]);
+  }
+
+  #[test]
+  fn treats_an_unselected_runtime_identifier_as_empty_text() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Portable" Version="1.0.0" Condition="'$(RuntimeIdentifier)' == ''" /></ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap();
+
+    assert_eq!(result.package_references().len(), 1);
+    assert_eq!(result.package_id(result.package_references()[0]), "Portable");
+  }
+
+  #[test]
+  fn rejects_unbounded_or_unknown_reference_conditions() {
+    let temp = TempDirectory::new();
+    let too_many = std::iter::repeat_n("'$(Configuration)' == 'Release'", MAX_REFERENCE_CONDITION_OPERATORS as usize + 1)
+      .collect::<Vec<_>>()
+      .join(" Or ");
+    let too_long = "x".repeat(MAX_REFERENCE_CONDITION_BYTES + 1);
+    let too_deep = format!(
+      "{}true{}",
+      "!(".repeat(MAX_REFERENCE_CONDITION_DEPTH as usize + 1),
+      ")".repeat(MAX_REFERENCE_CONDITION_DEPTH as usize + 1)
+    );
+    let cases = [
+      ("Unknown.csproj", "'$(Unknown)' == 'value'", ProjectErrorKind::Unsupported),
+      ("Unterminated.csproj", "'$(Configuration)", ProjectErrorKind::InvalidProperty),
+      ("Empty.csproj", "", ProjectErrorKind::InvalidProperty),
+      ("Long.csproj", &too_long, ProjectErrorKind::Unsupported),
+      ("Wide.csproj", &too_many, ProjectErrorKind::Unsupported),
+      ("Deep.csproj", &too_deep, ProjectErrorKind::Unsupported),
+    ];
+
+    for (name, condition, expected) in cases {
+      let project = temp.write(
+        name,
+        &project_xml(
+          "",
+          &format!(r#"<ItemGroup><PackageReference Include="Example" Version="1.0.0" Condition="{condition}" /></ItemGroup>"#),
+        ),
+      );
+
+      let error = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap_err();
+      assert_eq!(error.kind(), expected, "{name}: {error}");
+      assert!(error.to_string().contains("Condition"), "{name}: {error}");
+    }
+  }
+
+  #[test]
   fn materializes_package_reference_policy_from_attributes_and_children() {
     let temp = TempDirectory::new();
     temp.write("Program.cs", "");
@@ -2073,6 +2567,65 @@ mod tests {
     assert_eq!(result.package_no_warn(defaulted), None);
     assert_eq!(result.package_aliases(defaulted), None);
     assert!(!result.package_generate_path_property(defaulted));
+  }
+
+  #[test]
+  fn selects_reference_batches_by_target_runtime_and_configuration() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeIdentifier>win-x64</RuntimeIdentifier>",
+        r#"<ItemGroup Condition="'$(TargetFramework)|$(RuntimeIdentifier)' == 'NET10.0|WIN-X64' And !('$(Configuration)' != 'Release')">
+          <ProjectReference Include="Lib/Release.csproj" Condition="true" />
+          <PackageReference Include="Release.Package" Version="1.0.0" Condition="'$(Configuration)' == 'release'" />
+          <FrameworkReference Include="Microsoft.AspNetCore.App" Condition="'$(RuntimeIdentifier)' != 'linux-x64'" />
+        </ItemGroup>
+        <ItemGroup Condition="'$(Configuration)' == 'Debug' Or '$(TargetFramework)' == 'net9.0'">
+          <ProjectReference Include="Lib/Debug.csproj" />
+          <PackageReference Include="Debug.Package" Version="2.0.0" />
+        </ItemGroup>
+        <ItemGroup Condition="false">
+          <ProjectReference Include="$(InvalidProject)" />
+          <PackageReference Include="Invalid.Package" />
+          <FrameworkReference Include="$(InvalidFramework)" />
+        </ItemGroup>"#,
+      ),
+    );
+
+    let release = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap();
+    assert_eq!(release.project_references().collect::<Vec<_>>(), ["Lib/Release.csproj"]);
+    assert_eq!(release.package_references().len(), 1);
+    assert_eq!(release.package_id(release.package_references()[0]), "Release.Package");
+    assert_eq!(release.framework_references().len(), 1);
+    assert_eq!(release.framework_reference_id(release.framework_references()[0]), "Microsoft.AspNetCore.App");
+
+    let debug = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(debug.project_references().collect::<Vec<_>>(), ["Lib/Debug.csproj"]);
+    assert_eq!(debug.package_references().len(), 1);
+    assert_eq!(debug.package_id(debug.package_references()[0]), "Debug.Package");
+    assert!(debug.framework_references().is_empty());
+  }
+
+  #[test]
+  fn rejects_reference_conditions_outside_the_bounded_dimension_grammar() {
+    let temp = TempDirectory::new();
+    for (index, condition) in ["'$(Other)' == 'value'", "'$(Configuration)' &lt; 'Release'", "Exists('other.props')"]
+      .into_iter()
+      .enumerate()
+    {
+      let project = temp.write(
+        &format!("Unsupported{index}.csproj"),
+        &project_xml(
+          "",
+          &format!(r#"<ItemGroup><PackageReference Include="Example" Version="1.0.0" Condition="{condition}" /></ItemGroup>"#),
+        ),
+      );
+      let error = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap_err();
+      assert_eq!(error.kind(), ProjectErrorKind::Unsupported, "unexpected error for {condition}");
+      assert!(error.to_string().contains("Condition"));
+    }
   }
 
   #[test]

@@ -20,6 +20,9 @@ dv sdk compatible-rids          6.049 ms median
 dotnet msbuild project query  282.186 ms median
 dv project inspect              3.846 ms median
 
+dotnet conditional references 288.983 ms median
+dv conditional references       4.765 ms median
+
 dotnet msbuild runtime query  321.215 ms median
 dv runtime project inspect      5.687 ms median
 
@@ -124,6 +127,7 @@ The project is in the first implementation phase.
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
+| TFM/RID/configuration conditional references | Implemented |
 | Target-aware framework and compiler input planning | Implemented |
 | Framework references and shared-runtime roll-forward | Implemented |
 | Runtime, host, native asset, and apphost planning | Implemented |
@@ -332,7 +336,7 @@ Initial machine:
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
-  project evaluation, runtime evaluation, warm and cold runtime-pack inventory
+  project evaluation, conditional references, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
@@ -353,6 +357,7 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 60.637 ms | 3.798 ms | 16.0x | 61.595 ms | 4.322 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
+| Evaluate TFM/RID/configuration conditional references | `dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release` property/item query | `dv project inspect ConditionalReferences.csproj --configuration Release --json` | 288.983 ms | 4.765 ms | 60.6x | 321.422 ms | 6.209 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan runtime and host packs from a warm inventory | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --packages .packages --json` | 360.550 ms | 6.403 ms | 56.3x | 370.695 ms | 8.218 ms |
 | Build a cold runtime-pack inventory | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --packages .packages --json` | 368.322 ms | 11.118 ms | 33.1x | 380.190 ms | 12.636 ms |
@@ -440,7 +445,14 @@ outside timing, then asks both tools for the highest stable `Newtonsoft.Json`
 `13.*` version from empty isolated package state. Preflight requires the same
 exact identity, selected version, archive hash, target, and asset batches; this
 run selected `13.0.4`, with `dv` publishing one 2,484,726-byte archive and
-making zero HTTP requests in every sample. The
+making zero HTTP requests in every sample. The conditional-reference case
+evaluates the same `net10.0`/`win-x64` Release project through MSBuild and
+`dv`, then compares the selected TFM, RID, configuration, three package rows,
+one project row, and one explicit framework row before retaining samples.
+False branches deliberately contain incomplete or unsupported references so
+the parity gate also proves they leave the batch before metadata validation.
+The measured medians are `288.983 ms` for Microsoft and `4.765 ms` for `dv`
+(`60.6x`). The
 PackageReference metadata case applies all six policy fields to the same warm
 locked `Newtonsoft.Json` graph. Preflight compares Microsoft
 `project.assets.json` include/suppress-parent fields, warning codes, compile
@@ -503,6 +515,7 @@ recorded in the curated
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
 [NuGet floating-version baseline](docs/performance-baselines/2026-08-01-nuget-floating-version-windows.md),
+[conditional-reference baseline](docs/performance-baselines/2026-08-01-package-reference-conditions-windows.md),
 [PackageReference metadata baseline](docs/performance-baselines/2026-08-01-package-reference-metadata-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
@@ -549,6 +562,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
+cargo bench-all --case package_reference_conditions --samples 30 --warmups 3
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3
 cargo bench-all --case runtime_pack_inventory_cold --samples 30 --warmups 3

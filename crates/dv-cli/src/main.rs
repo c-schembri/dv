@@ -56,9 +56,12 @@ const PROJECT_HELP: &str = "\
 Usage:
   dv project inspect [PROJECT] [--configuration Debug|Release]
   dv project frameworks [PROJECT] [--packages PATH]
+                        [--configuration Debug|Release]
   dv project runtime-packs [PROJECT] [--packages PATH]
+                           [--configuration Debug|Release]
   dv project package-sources [PROJECT] [-s|--source SOURCE]...
                              [--configfile PATH] [--offline] [--interactive]
+                             [--configuration Debug|Release]
                              [--probe-credentials]
 ";
 
@@ -71,8 +74,10 @@ const PACKAGE_HELP: &str = "\
 Usage:
   dv restore [PROJECT] [-s|--source SOURCE]... [--packages PATH]
              [--configfile PATH] [--offline] [--interactive]
+             [--configuration Debug|Release]
   dv sync [PROJECT] [-s|--source SOURCE]... [--packages PATH]
           [--configfile PATH] [--offline] [--interactive]
+          [--configuration Debug|Release]
 ";
 
 fn main() -> ExitCode {
@@ -203,7 +208,8 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
       );
     },
   };
-  let project = match load_project(&current_directory, options.project.as_deref(), ProjectConfiguration::Debug) {
+  let configuration = options.configuration.unwrap_or(ProjectConfiguration::Debug);
+  let project = match load_project(&current_directory, options.project.as_deref(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
   };
@@ -260,6 +266,7 @@ fn install_credential_provider_cancellation() -> Result<Option<PackageCancellati
 
 struct PackageCommandOptions {
   project: Option<PathBuf>,
+  configuration: Option<ProjectConfiguration>,
   packages_directory: Option<PathBuf>,
   config_file: Option<PathBuf>,
   sources: Vec<String>,
@@ -271,6 +278,7 @@ struct PackageCommandOptions {
 fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageCommandOptions, String> {
   let mut options = PackageCommandOptions {
     project: None,
+    configuration: None,
     packages_directory: None,
     config_file: None,
     sources: Vec::new(),
@@ -281,6 +289,19 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].as_str() {
+      "--configuration" if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      "--configuration" => {
+        index += 1;
+        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+        options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+      },
+      value if value.starts_with("--configuration=") => {
+        if options.configuration.is_some() {
+          return Err("--configuration cannot be specified more than once".into());
+        }
+        let value = &value["--configuration=".len()..];
+        options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+      },
       "--packages" if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
       "--packages" => {
         index += 1;
@@ -971,7 +992,8 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
       );
     },
   };
-  let project = match load_project(&current_directory, parsed.project.as_deref(), ProjectConfiguration::Debug) {
+  let configuration = parsed.configuration.unwrap_or(ProjectConfiguration::Debug);
+  let project = match load_project(&current_directory, parsed.project.as_deref(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, json, "project package-sources", args, project_diagnostic(error)),
   };
@@ -1088,7 +1110,7 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
 }
 
 fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
-  let (requested_path, packages_directory) = match parse_pack_plan_args(project_args, "frameworks") {
+  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -1117,7 +1139,7 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, json, "project frameworks", args, project_diagnostic(error)),
   };
@@ -1169,7 +1191,7 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
 }
 
 fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
-  let (requested_path, packages_directory) = match parse_pack_plan_args(project_args, "runtime-packs") {
+  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -1198,7 +1220,7 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, json, "project runtime-packs", args, project_diagnostic(error)),
   };
@@ -1242,9 +1264,10 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
   )
 }
 
-fn parse_pack_plan_args(arguments: &[String], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+fn parse_pack_plan_args(arguments: &[String], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut packages = None;
+  let mut configuration = None;
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].as_str() {
@@ -1252,13 +1275,26 @@ fn parse_pack_plan_args(arguments: &[String], command: &str) -> Result<(Option<P
         index += 1;
         packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
       },
+      "--configuration" if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      "--configuration" => {
+        index += 1;
+        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+        configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+      },
+      value if value.starts_with("--configuration=") => {
+        if configuration.is_some() {
+          return Err("--configuration cannot be specified more than once".into());
+        }
+        let value = &value["--configuration=".len()..];
+        configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+      },
       value if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
       value if project.is_none() => project = Some(PathBuf::from(value)),
       value => return Err(format!("unexpected project {command} argument {value:?}")),
     }
     index += 1;
   }
-  Ok((project, packages))
+  Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
 fn parse_project_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {

@@ -99,8 +99,9 @@ work.
 
 `dv restore` and `dv sync` dispatch to the same package transform with
 identical options, cache behavior, lock behavior, diagnostics, and output
-payload. Structured command lifecycle events retain the spelling invoked by
-the caller.
+payload. `--configuration Debug|Release` selects conditional project, package,
+and framework references before resolution; Debug remains the default.
+Structured command lifecycle events retain the spelling invoked by the caller.
 
 Exact `Newtonsoft.Json` `13.0.3` is the representative package. Its 2,441,966
 byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`

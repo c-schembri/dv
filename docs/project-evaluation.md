@@ -28,10 +28,18 @@ The supported property and item subset is:
 - `Deterministic` set to `true`, `false`, or omitted;
 - default recursive `.cs` source discovery excluding `bin` and `obj`;
 - literal C# `ProjectReference` paths;
-- `PackageReference` items with exact literal versions.
+- `PackageReference` items with exact, interval, or floating literal versions;
+- explicit `FrameworkReference` items;
+- conditions on reference `ItemGroup` elements and individual project,
+  package, or framework references, evaluated against `TargetFramework`,
+  `RuntimeIdentifier`, and `Configuration`.
 
-Conditions, multi-targeting, explicit compile items, custom imports, targets,
-tasks, property expansion, wildcard references, and non-C# projects fail
+Reference conditions support case-insensitive equality and inequality,
+`And`/`Or` precedence, `!`, parentheses, boolean literals, and compound values
+such as `$(TargetFramework)|$(RuntimeIdentifier)`. Conditions on properties or
+other item types, unknown properties, relational operators, functions,
+multi-targeting, explicit compile items, custom imports, targets, tasks,
+general property expansion, wildcard references, and non-C# projects fail
 explicitly. The evaluator does not approximate those behaviors.
 
 ## Transform
@@ -41,6 +49,8 @@ directory or project path
   -> select exactly one .csproj
   -> read project bytes once
   -> stream XML events through a fixed-depth state machine
+  -> evaluate bounded reference conditions against the selected dimensions
+  -> discard false branches before reference metadata validation
   -> scan source directories once
   -> sort relative source paths
   -> compact text, item, and target-dimension batches
@@ -53,7 +63,10 @@ data, so temporary owned buffers are necessary at this boundary. The completed
 `ProjectSpec` compacts all retained UTF-8 text into one immutable buffer.
 
 Source and project-reference batches contain 8-byte `(offset, length)` spans.
-Package references contain two spans and are 16 bytes with 4-byte alignment.
+Package references contain four spans plus inline asset policy and are 36 bytes
+with 4-byte alignment. Framework references are 28 bytes. Raw references retain
+an 8-byte pair of condition indexes; the common exact-property comparison
+borrows XML and dimension text without allocating evaluation storage.
 Runtime target dimensions use the same 8-byte spans in one contiguous batch.
 Two 32-bit values mark the plural-property prefix and selected-RID index; the
 selected RID reuses its plural span when present, and duplicate plural values
@@ -127,3 +140,15 @@ The gate compares the TFM, selected RID, ordered plural RID property, and the
 unique target-dimension batch. The maintained 30-sample Windows baseline is
 `321.215 ms` for the Microsoft query and `5.687 ms` for `dv`, a `56.5x`
 median improvement.
+
+Conditional references have a separate parity gate and timed case:
+
+```text
+dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release -getProperty:TargetFramework,RuntimeIdentifier,Configuration -getItem:PackageReference,ProjectReference,FrameworkReference
+dv project inspect ConditionalReferences.csproj --configuration Release --json
+```
+
+It compares all three dimensions plus the selected package identities and
+versions, normalized project path, and framework identity before sampling. The
+30-sample Windows medians are `288.983 ms` for Microsoft and `4.765 ms` for
+`dv`, a `60.6x` improvement.
