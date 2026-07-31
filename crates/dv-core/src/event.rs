@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 11;
+pub const EVENT_SCHEMA_VERSION: u16 = 12;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +67,10 @@ pub struct PackageSourceCapabilityEvent {
   pub protocol: String,
   /// `none` or `basic`; never contains a username, password, or token.
   pub authentication: String,
+  /// Whether this source explicitly permits unencrypted HTTP transport.
+  pub allow_insecure_connections: bool,
+  /// Whether TLS peer and hostname validation is disabled for this source.
+  pub disable_tls_certificate_validation: bool,
   /// Capability-ordered endpoint batch.
   pub endpoints: Vec<PackageServiceEndpointEvent>,
 }
@@ -100,7 +104,9 @@ pub struct PackageHttpPolicyEvent {
   pub offline: bool,
   /// TLS peer and hostname validation is enabled.
   pub tls_validation: bool,
-  /// Maximum secure redirects; redirects to non-HTTPS targets are rejected.
+  /// Whether at least one source explicitly permits unencrypted HTTP transport.
+  pub allow_insecure_connections: bool,
+  /// Maximum redirects; HTTP targets require a per-source opt-in.
   pub max_redirects: u8,
 }
 

@@ -54,8 +54,9 @@ per-resource object hierarchy is retained.
 
 - The service-index schema major must be `3` and `resources` must be an array.
 - Unknown resource types and malformed unrelated rows are ignored.
-- Selected endpoints must be absolute HTTPS URLs without embedded credentials.
-- Insecure HTTP fails explicitly until `NUGET-012` defines an opt-in contract.
+- Selected endpoints must be absolute HTTP(S) URLs without embedded
+  credentials. HTTP requires `allowInsecureConnections=true` on the
+  originating source.
 - Resource and response sizes are bounded before allocation or parsing.
 - A v3 restore source must advertise package content; inspection may report an
   otherwise valid source with any optional capability absent.

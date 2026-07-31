@@ -823,8 +823,15 @@ boundary, not final drop-in parity.
   SDK-shipped NuGet.Configuration/Protocol oracle verifies the redacted policy;
   the offline process benchmark measures `78.286 ms` for Microsoft versus
   `6.934 ms` for `dv` (`11.3x`) across 30 retained samples. `P2`
-- [ ] `NUGET-012` Require explicit opt-in for insecure HTTP or disabled TLS
-  validation and surface the security consequence. `P2`
+- [x] `NUGET-012` Require explicit per-source opt-in for insecure HTTP or
+  disabled TLS validation and surface the security consequence. Missing,
+  invalid, and false flags preserve HTTPS validation; exact CLI source matches
+  inherit configured policy while arbitrary HTTP remains rejected. Dedicated
+  clients contain unsafe policy to one source across redirects, v2 derived
+  URLs, and v3 resources without forwarding credentials across origins. Event
+  schema 12 reports redacted per-source and aggregate consequences. The
+  SDK-shipped NuGet.Configuration oracle measures `71.416 ms` for Microsoft
+  versus `5.742 ms` for `dv` (`12.4x`) across 30 retained offline samples. `P2`
 - [~] `NUGET-013` Mapping already filters package/version requests by the
   longest effective pattern. Move filtering ahead of service-index discovery
   and add a typed unmapped-identity diagnostic. `P2`

@@ -43,6 +43,7 @@ enum CaseKind {
   NugetCredentialProvider,
   NugetClientCertificates,
   NugetHttpPolicy,
+  NugetSourceSecurity,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -74,6 +75,7 @@ struct Fixtures<'a> {
   nuget_credential_provider: &'a Path,
   nuget_client_certificates: &'a Path,
   nuget_http_policy: &'a Path,
+  nuget_source_security: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -350,6 +352,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_source_security",
+    kind: CaseKind::NugetSourceSecurity,
+    args: &["oracle/bin/Release/SourceSecurityOracle.dll", "."],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -580,6 +588,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_source_security",
+    kind: CaseKind::NugetSourceSecurity,
+    args: &["project", "package-sources", "SecurityProject.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -718,6 +732,7 @@ fn run() -> Result<()> {
   let nuget_credential_provider_fixture = repository.join("benchmarks/fixtures/nuget-credential-provider");
   let nuget_client_certificates_fixture = repository.join("benchmarks/fixtures/nuget-client-certificates");
   let nuget_http_policy_fixture = repository.join("benchmarks/fixtures/nuget-http-policy");
+  let nuget_source_security_fixture = repository.join("benchmarks/fixtures/nuget-source-security");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -739,6 +754,7 @@ fn run() -> Result<()> {
     nuget_credential_provider: &nuget_credential_provider_fixture,
     nuget_client_certificates: &nuget_client_certificates_fixture,
     nuget_http_policy: &nuget_http_policy_fixture,
+    nuget_source_security: &nuget_source_security_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -813,6 +829,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_http_policy") {
     verify_nuget_http_policy(&repository, &dv_executable, &nuget_http_policy_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_source_security") {
+    verify_nuget_source_security(&repository, &dv_executable, &nuget_source_security_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -832,7 +851,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 15,
+    schema_version: 16,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2792,12 +2811,81 @@ fn verify_nuget_http_policy(repository: &Path, dv_executable: &Path, fixture: &P
   }
   if actual.get("offline").and_then(serde_json::Value::as_bool) != Some(true)
     || actual.get("tls_validation").and_then(serde_json::Value::as_bool) != Some(true)
+    || actual.get("allow_insecure_connections").and_then(serde_json::Value::as_bool) != Some(false)
     || actual.get("max_redirects").and_then(serde_json::Value::as_u64) != Some(10)
   {
     return Err(format!("dv HTTP-policy security/offline fields are invalid: {actual}").into());
   }
   if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) {
     return Err("offline HTTP-policy verification performed network work".into());
+  }
+  Ok(())
+}
+
+fn verify_nuget_source_security(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let workspace = repository.join(format!("target/benchmark-nuget-source-security-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &workspace)?;
+  reset_fixture(fixture, &workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "build",
+      "oracle/SourceSecurityOracle.csproj",
+      "-c",
+      "Release",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &workspace,
+    "NuGet source-security oracle build",
+  )?;
+  let oracle: serde_json::Value = serde_json::from_str(&nuget_config_command_text(
+    Path::new("dotnet"),
+    &["oracle/bin/Release/SourceSecurityOracle.dll", "."],
+    &workspace,
+  )?)?;
+  let dv_text = nuget_config_command_text(
+    dv_executable,
+    &["project", "package-sources", "SecurityProject.csproj", "--offline", "--json"],
+    &workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_sources_inspected"))
+    .ok_or("dv source-security verification omitted package_sources_inspected")?;
+  let expected = oracle.as_array().ok_or("source-security oracle did not return an array")?;
+  let actual = dv
+    .get("sources")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv source-security verification omitted sources")?;
+  if expected.len() != 3 || actual.len() != expected.len() {
+    return Err(format!("source-security source count differs: oracle={} dv={}", expected.len(), actual.len()).into());
+  }
+  for (expected, actual) in expected.iter().zip(actual) {
+    for field in ["name", "location", "protocol"] {
+      if required_string(expected, field)? != required_string(actual, field)? {
+        return Err(format!("source-security field {field} differs: oracle={expected} dv={actual}").into());
+      }
+    }
+    for (oracle_field, dv_field) in [
+      ("allowInsecureConnections", "allow_insecure_connections"),
+      ("disableTlsCertificateValidation", "disable_tls_certificate_validation"),
+    ] {
+      if expected.get(oracle_field) != actual.get(dv_field) {
+        return Err(format!("source-security field {dv_field} differs: oracle={expected} dv={actual}").into());
+      }
+    }
+  }
+  let policy = dv.get("http_policy").ok_or("dv source-security verification omitted http_policy")?;
+  if policy.get("allow_insecure_connections").and_then(serde_json::Value::as_bool) != Some(true)
+    || policy.get("tls_validation").and_then(serde_json::Value::as_bool) != Some(false)
+    || dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0)
+  {
+    return Err(format!("dv source-security aggregate or offline evidence is invalid: {dv}").into());
   }
   Ok(())
 }
@@ -3239,6 +3327,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetCredentialProvider
       | CaseKind::NugetClientCertificates
       | CaseKind::NugetHttpPolicy
+      | CaseKind::NugetSourceSecurity
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -3301,6 +3390,22 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       &["build", "oracle/HttpPolicyOracle.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
       workspace,
       "NuGet HTTP-policy oracle build",
+    )?;
+  }
+  if matches!(case.kind, CaseKind::NugetSourceSecurity) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &[
+        "build",
+        "oracle/SourceSecurityOracle.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "NuGet source-security oracle build",
     )?;
   }
   if matches!(case.kind, CaseKind::CompilerPlan) && is_dotnet(executable) {
@@ -3721,7 +3826,11 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
-    CaseKind::NugetCredentials | CaseKind::NugetCredentialProvider | CaseKind::NugetClientCertificates | CaseKind::NugetHttpPolicy => Ok(()),
+    CaseKind::NugetCredentials
+    | CaseKind::NugetCredentialProvider
+    | CaseKind::NugetClientCertificates
+    | CaseKind::NugetHttpPolicy
+    | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
@@ -3794,6 +3903,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetCredentialProvider => fixtures.nuget_credential_provider,
     CaseKind::NugetClientCertificates => fixtures.nuget_client_certificates,
     CaseKind::NugetHttpPolicy => fixtures.nuget_http_policy,
+    CaseKind::NugetSourceSecurity => fixtures.nuget_source_security,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -3820,6 +3930,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetCredentialProvider => Some("nuget-credential-provider"),
     CaseKind::NugetClientCertificates => Some("nuget-client-certificates"),
     CaseKind::NugetHttpPolicy => Some("nuget-http-policy"),
+    CaseKind::NugetSourceSecurity => Some("nuget-source-security"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -3843,6 +3954,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetCredentialProvider
       | CaseKind::NugetClientCertificates
       | CaseKind::NugetHttpPolicy
+      | CaseKind::NugetSourceSecurity
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd)?;
   }
@@ -3880,6 +3992,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetCredentialProvider
         | CaseKind::NugetClientCertificates
         | CaseKind::NugetHttpPolicy
+        | CaseKind::NugetSourceSecurity
     )
   {
     Some(parse_source_work_evidence(&output.stdout)?)
@@ -4397,6 +4510,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_credential_provider"
           | "nuget_client_certificates"
           | "nuget_http_policy"
+          | "nuget_source_security"
       )
     })
     .collect::<Vec<_>>();
@@ -4534,6 +4648,7 @@ fn case_label(case: &str) -> &str {
     "nuget_credential_provider" => "NuGet credential provider",
     "nuget_client_certificates" => "NuGet client certificates",
     "nuget_http_policy" => "NuGet HTTP policy",
+    "nuget_source_security" => "NuGet source security",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -4617,7 +4732,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 15,
+      schema_version: 16,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -4681,7 +4796,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 15,
+      schema_version: 16,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

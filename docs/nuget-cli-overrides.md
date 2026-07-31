@@ -44,8 +44,9 @@ of an exact duplicate value wins.
 - Repeated `--packages` and `--configfile` options fail before project I/O.
 - Missing or empty option values fail as CLI argument errors.
 - A missing explicit config file fails instead of falling back to discovery.
-- HTTPS v2/v3, `file://`, and local folder sources are accepted. Insecure HTTP
-  remains explicit `NUGET-012` work rather than a silent guess.
+- HTTPS v2/v3, `file://`, and local folder sources are accepted. An HTTP
+  override must exactly match a configured source with
+  `allowInsecureConnections=true`; ad hoc HTTP remains rejected.
 - Unsupported or malformed policy fails before network access.
 
 The common path performs no filesystem or network work beyond the config and

@@ -74,6 +74,9 @@ dv client certificates           30.003 ms median
 dotnet NuGet HTTP policy          78.286 ms median
 dv NuGet HTTP policy               6.934 ms median
 
+dotnet NuGet source security      71.416 ms median
+dv NuGet source security            5.742 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -125,6 +128,7 @@ The project is in the first implementation phase.
 | NuGet V2 credential-provider authentication | Implemented |
 | NuGet PFX and Windows-store client certificates | Implemented |
 | NuGet proxy, retry, timeout, redirect, rate-limit, and offline policy | Implemented |
+| Explicit per-source HTTP and TLS-validation security policy | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -339,6 +343,7 @@ Initial machine:
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
 | Select PFX and Windows-store client certificates | `dotnet oracle/bin/Release/ClientCertificateOracle.dll query .` | `dv project package-sources ClientCertificateProject.csproj --offline --json` | 89.254 ms | 30.003 ms | 3.0x | 91.690 ms | 31.361 ms |
 | Select NuGet HTTP transport policy | `dotnet oracle/bin/Release/HttpPolicyOracle.dll .` | `dv project package-sources HttpPolicyProject.csproj --offline --json` | 78.286 ms | 6.934 ms | 11.3x | 81.730 ms | 8.059 ms |
+| Select explicit NuGet source security policy | `dotnet oracle/bin/Release/SourceSecurityOracle.dll .` | `dv project package-sources SecurityProject.csproj --offline --json` | 71.416 ms | 5.742 ms | 12.4x | 73.370 ms | 6.878 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -403,7 +408,12 @@ and `dv` must publish the same two redacted source rows, select one certificate
 per source, expose no fixture password, and perform zero timed network work.
 The timing therefore measures config merge, PFX decode, store lookup,
 private-key acquisition, and TLS-client construction rather than network
-latency. The massive case additionally compares runtime, resource,
+latency. The source-security case uses the same three-source configuration for
+both tools and compares ordered source identity, protocol, explicit HTTP
+permission, and disabled TLS validation through the SDK's official
+NuGet.Configuration assembly. It is offline, so the timing measures policy
+discovery, source-specific client construction, and structured reporting with
+zero network requests. The massive case additionally compares runtime, resource,
 content, analyzer, build, build-multitargeting, native, and RID runtime-target
 paths plus runtime-target metadata. The warm asset-plan case retains that
 exact parity gate, then measures locked planning over the populated
@@ -431,6 +441,7 @@ recorded in the curated
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
 [NuGet client-certificate baseline](docs/performance-baselines/2026-08-01-nuget-client-certificates-windows.md),
 [NuGet HTTP-policy baseline](docs/performance-baselines/2026-08-01-nuget-http-policy-windows.md),
+[NuGet source-security baseline](docs/performance-baselines/2026-08-01-nuget-source-security-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -548,6 +559,7 @@ See:
 - [NuGet credential-provider contract](docs/nuget-credential-providers.md)
 - [NuGet client-certificate contract](docs/nuget-client-certificates.md)
 - [NuGet HTTP transport policy contract](docs/nuget-http-policy.md)
+- [NuGet source security contract](docs/nuget-source-security.md)
 - [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)

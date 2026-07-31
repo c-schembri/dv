@@ -80,6 +80,7 @@ Invalid input behavior:
 | `nuget_credential_provider` | one private v3 source, one prebuilt self-contained provider, prebuilt official NuGet.Protocol oracle | process launch, provider launch, symmetric handshake, monitor/initialize/claims/authentication requests, secret-free result, provider close, and zero network work |
 | `nuget_client_certificates` | two v3 sources, one PFX and one Windows-store certificate, prebuilt official NuGet.Configuration oracle | process launch, bounded PFX/store selection, source-specific native TLS-client construction, redacted output, and zero network work |
 | `nuget_http_policy` | one v3 source, explicit proxy/bypass/rate limit, five enhanced-retry environment values, prebuilt official NuGet.Configuration/Protocol oracle | process launch, project/config discovery, proxy/client construction, compact policy materialization, redacted output, and zero network work |
+| `nuget_source_security` | one opted-in HTTP source, one TLS-validation-disabled HTTPS source, one secure HTTPS source, prebuilt official NuGet.Configuration oracle | process launch, project/config discovery, per-source policy materialization, exceptional client construction, redacted output, and zero network work |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -118,6 +119,7 @@ directional decisions.`
 | `nuget-credential-provider` | 1 project, 1 HTTPS v3 source, 1 self-contained provider, 1 Basic credential, 2 secret strings | NuGet V2 handshake/lifecycle, authentication claim, noninteractive flags, timeout cancellation, redacted output, and offline probe latency | executable for both tools with official NuGet.Protocol plugin manager, trace-policy, timeout, and plaintext-containment preflight |
 | `nuget-client-certificates` | 1 project, 2 HTTPS v3 sources, 1 relative PFX, 1 `CurrentUser\\My` thumbprint binding | bounded certificate loading, private-key selection, native TLS-client construction, source containment, and redacted output | executable for both tools with official NuGet.Configuration selection and zero-network preflight |
 | `nuget-http-policy` | 1 project, 1 HTTPS v3 source, proxy/bypass configuration, per-source limit 7, custom enhanced retry values | proxy and policy selection, secure transport invariants, offline suppression, and setup latency | executable for both tools with exact SDK-shipped NuGet.Configuration/Protocol policy parity preflight |
+| `nuget-source-security` | 1 project, 3 v3 sources covering opted-in HTTP, disabled TLS validation, and secure defaults | source-local exception containment, explicit risk reporting, and offline setup latency | executable for both tools with exact SDK-shipped NuGet.Configuration source-policy parity preflight |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | package workload captured; project-graph shape still pending |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
@@ -277,6 +279,13 @@ official plugin manager and `dv`, without network variance:
 
 ```text
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3
+```
+
+Measure explicit HTTP and TLS-validation source flags against the selected
+SDK's official configuration implementation, with network work disabled:
+
+```text
+cargo bench-all --case nuget_source_security --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

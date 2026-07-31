@@ -348,11 +348,12 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
 }
 
 fn validate_command_source(source: &str) -> Result<(), String> {
-  if source.starts_with("http://") {
-    return Err("--source rejects insecure HTTP until the explicit NUGET-012 policy is implemented".into());
-  }
-  if source.contains("://") && !source.starts_with("https://") && !source.starts_with("file://") {
-    return Err("--source requires HTTPS, file://, or a local folder path".into());
+  if source.contains("://")
+    && !source.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    && !source.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    && !source.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+  {
+    return Err("--source requires HTTP, HTTPS, file://, or a local folder path".into());
   }
   Ok(())
 }
@@ -928,6 +929,8 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
       location: inventory.source_location(source).to_owned(),
       protocol: inventory.source_protocol(source).to_owned(),
       authentication: inventory.source_authentication(source).as_str().to_owned(),
+      allow_insecure_connections: inventory.source_allows_insecure_connections(source),
+      disable_tls_certificate_validation: !inventory.source_tls_validation(source),
       endpoints: inventory
         .source_endpoints(source)
         .map(|endpoint| PackageServiceEndpointEvent {
@@ -959,6 +962,7 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
         no_proxy_configured: policy.no_proxy_configured(),
         offline: policy.offline(),
         tls_validation: policy.tls_validation(),
+        allow_insecure_connections: policy.allows_insecure_connections(),
         max_redirects: policy.max_redirects(),
       },
       network_requests: inventory.network_requests(),
@@ -973,7 +977,7 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   let policy = inventory.http_policy();
   writeln!(
     output,
-    "HTTP: tries={}, delay={}ms, timeout={}s/{}s, per-source={}, proxy={}, proxy-auth={}, no-proxy={}, offline={}",
+    "HTTP: tries={}, delay={}ms, timeout={}s/{}s, per-source={}, proxy={}, proxy-auth={}, no-proxy={}, offline={}, insecure-http={}, tls-validation={}",
     policy.max_tries(),
     policy.retry_delay_ms(),
     policy.request_timeout_seconds(),
@@ -982,16 +986,20 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
     policy.proxy_configured(),
     policy.proxy_authenticated(),
     policy.no_proxy_configured(),
-    policy.offline()
+    policy.offline(),
+    policy.allows_insecure_connections(),
+    policy.tls_validation()
   )
   .expect("writing a String succeeds");
   for source in inventory.sources() {
     writeln!(
       output,
-      "{} ({}, {})",
+      "{} ({}, {}, insecure-http={}, tls-validation={})",
       inventory.source_name(source),
       inventory.source_protocol(source),
-      inventory.source_authentication(source).as_str()
+      inventory.source_authentication(source).as_str(),
+      inventory.source_allows_insecure_connections(source),
+      inventory.source_tls_validation(source)
     )
     .expect("writing a String succeeds");
     for endpoint in inventory.source_endpoints(source) {

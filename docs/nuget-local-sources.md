@@ -53,7 +53,8 @@ archive workers, while final graph and output ordering remain deterministic.
 
 - Missing or inaccessible folders fail explicitly; they are never interpreted
   as remote endpoints.
-- Insecure HTTP remains rejected until `NUGET-012` defines explicit opt-in.
+- HTTP is a remote source and requires the explicit per-source opt-in described
+  by `NUGET-012`; it is never interpreted as a local path.
 - Unknown URI schemes fail instead of becoming filesystem guesses.
 - Flat package identity and normalized version come from the archive nuspec,
   not only its filename.

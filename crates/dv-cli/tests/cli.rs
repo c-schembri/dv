@@ -77,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":11"));
+  assert!(lines[0].contains("\"schema_version\":12"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -110,6 +110,35 @@ fn package_source_inspection_reports_the_effective_offline_batch() {
   assert!(stdout.contains("\"endpoints\":[]"));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"downloaded_bytes\":0"));
+}
+
+#[test]
+fn package_source_inspection_surfaces_explicit_transport_risks() {
+  let temp = TempDirectory::new();
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear />
+<add key="http" value="http://packages.example.test/v3/index.json" protocolVersion="3" allowInsecureConnections="true" />
+<add key="tls" value="https://private.example.test/v3/index.json" protocolVersion="3" disableTLSCertificateValidation="true" />
+</packageSources></configuration>"#,
+  );
+
+  let output = dv()
+    .args(["project", "package-sources", "App.csproj", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"allow_insecure_connections\":true"));
+  assert!(stdout.contains("\"disable_tls_certificate_validation\":true"));
+  assert!(stdout.contains("\"tls_validation\":false"));
+  assert!(stdout.contains("\"network_requests\":0"));
 }
 
 #[test]
@@ -493,12 +522,12 @@ fn restore_rejects_repeated_single_value_overrides() {
 #[test]
 fn restore_rejects_unsupported_cli_sources_before_project_io() {
   let output = dv()
-    .args(["restore", "missing.csproj", "--source", "http://insecure.example.test/v2"])
+    .args(["restore", "missing.csproj", "--source", "ftp://unsupported.example.test/v2"])
     .output()
     .unwrap();
 
   assert_eq!(output.status.code(), Some(2));
-  assert!(String::from_utf8(output.stderr).unwrap().contains("rejects insecure HTTP"));
+  assert!(String::from_utf8(output.stderr).unwrap().contains("requires HTTP, HTTPS, file://"));
 }
 
 #[test]

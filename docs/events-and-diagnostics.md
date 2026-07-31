@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `11`;
+- schema version `12`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -55,7 +55,9 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 11 adds the redacted effective HTTP retry, timeout, concurrency, proxy,
+Schema 12 adds per-source insecure-HTTP and disabled-TLS-validation flags plus
+their aggregate security consequence; URL credentials and unredacted transport
+configuration remain forbidden. Schema 11 added the redacted effective HTTP retry, timeout, concurrency, proxy,
 TLS, redirect, and offline policy to `package_sources_inspected`; proxy
 addresses, bypass entries, and credentials are never event data. Schema 10
 extends the redacted authentication kind with `client_certificate`

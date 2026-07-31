@@ -76,6 +76,11 @@ const HTTP_PROXY_CONFIGURED: u8 = 1 << 2;
 const HTTP_PROXY_AUTHENTICATED: u8 = 1 << 3;
 const HTTP_NO_PROXY_CONFIGURED: u8 = 1 << 4;
 const HTTP_OFFLINE: u8 = 1 << 5;
+const HTTP_TLS_VALIDATION: u8 = 1 << 6;
+const HTTP_INSECURE_CONNECTIONS: u8 = 1 << 7;
+
+const SOURCE_ALLOW_INSECURE_CONNECTIONS: u8 = 1 << 0;
+const SOURCE_DISABLE_TLS_VALIDATION: u8 = 1 << 1;
 
 /// Compact immutable NuGet transport policy selected from config and environment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +101,7 @@ const DEFAULT_HTTP_POLICY: PackageHttpPolicy = PackageHttpPolicy {
   download_timeout_seconds: 60,
   max_requests_per_source: DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE,
   max_tries: 6,
-  flags: HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER,
+  flags: HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER | HTTP_TLS_VALIDATION,
 };
 
 const _: () = assert!(size_of::<PackageHttpPolicy>() == 16);
@@ -163,9 +168,14 @@ impl PackageHttpPolicy {
     self.flags & HTTP_OFFLINE != 0
   }
 
-  /// TLS peer and hostname validation is always enabled for this policy.
+  /// Whether every configured HTTPS source validates TLS peers and hostnames.
   pub const fn tls_validation(self) -> bool {
-    true
+    self.flags & HTTP_TLS_VALIDATION != 0
+  }
+
+  /// Whether at least one configured source explicitly permits HTTP.
+  pub const fn allows_insecure_connections(self) -> bool {
+    self.flags & HTTP_INSECURE_CONNECTIONS != 0
   }
 
   /// Maximum redirects for the general HTTP client.
@@ -187,6 +197,16 @@ impl PackageHttpPolicy {
       self.flags |= HTTP_OFFLINE;
     } else {
       self.flags &= !HTTP_OFFLINE;
+    }
+    self
+  }
+
+  fn with_source_security(mut self, sources: &[(String, PackageSource)]) -> Self {
+    if sources.iter().any(|(_, source)| source.allow_insecure_connections()) {
+      self.flags |= HTTP_INSECURE_CONNECTIONS;
+    }
+    if sources.iter().any(|(_, source)| !source.tls_validation()) {
+      self.flags &= !HTTP_TLS_VALIDATION;
     }
     self
   }
@@ -493,6 +513,7 @@ struct PackageSourceRecord {
   endpoints: ItemRange,
   protocol: NugetProtocol,
   authentication: PackageSourceAuthentication,
+  security_flags: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -548,6 +569,16 @@ impl PackageSourceInventory {
   /// Returns the selected source authentication policy without exposing credentials.
   pub fn source_authentication(&self, source: usize) -> PackageSourceAuthentication {
     self.sources[source].authentication
+  }
+
+  /// Returns whether this source explicitly permits insecure HTTP transport.
+  pub const fn source_allows_insecure_connections(&self, source: usize) -> bool {
+    self.sources[source].security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0
+  }
+
+  /// Returns whether this source validates TLS peers and hostnames.
+  pub const fn source_tls_validation(&self, source: usize) -> bool {
+    self.sources[source].security_flags & SOURCE_DISABLE_TLS_VALIDATION == 0
   }
 
   /// Returns the effective redacted transport policy used by source discovery.
@@ -1418,17 +1449,30 @@ impl NugetProtocol {
 struct PackageSource {
   url: String,
   protocol: NugetProtocol,
+  security_flags: u8,
 }
 
+const _: () = assert!(size_of::<PackageSource>() == 32);
+const _: () = assert!(align_of::<PackageSource>() == 8);
+
 impl PackageSource {
-  fn parse(value: String, protocol: Option<&str>, context: &Path, relative_to: &Path) -> Result<Self, PackageError> {
+  fn parse(
+    value: String,
+    protocol: Option<&str>,
+    allow_insecure_connections: bool,
+    disable_tls_validation: bool,
+    context: &Path,
+    relative_to: &Path,
+  ) -> Result<Self, PackageError> {
     if value.trim().is_empty() {
       return Err(config_error(context, "package source cannot be empty"));
     }
-    if value.starts_with("https://") {
-      let parsed = reqwest::Url::parse(&value).map_err(|error| config_error(context, format!("invalid HTTPS package source {value:?}: {error}")))?;
+    let is_https = value.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+    let is_http = value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    if is_https || is_http {
+      let parsed = reqwest::Url::parse(&value).map_err(|error| config_error(context, format!("invalid HTTP package source {value:?}: {error}")))?;
       if !parsed.has_host() {
-        return Err(config_error(context, format!("HTTPS package source {value:?} must include a host")));
+        return Err(config_error(context, format!("HTTP package source {value:?} must include a host")));
       }
       if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(config_error(
@@ -1436,16 +1480,17 @@ impl PackageSource {
           "package-source URLs must not embed credentials; use packageSourceCredentials or NuGetPackageSourceCredentials_{name}",
         ));
       }
+      if is_http && !allow_insecure_connections {
+        return Err(config_error(
+          context,
+          format!("insecure HTTP package source {value:?} requires allowInsecureConnections=true"),
+        ));
+      }
       return Ok(Self {
         protocol: NugetProtocol::parse_http(protocol, &value, context)?,
         url: value,
+        security_flags: source_security_flags(allow_insecure_connections, disable_tls_validation),
       });
-    }
-    if value.starts_with("http://") {
-      return Err(config_error(
-        context,
-        format!("insecure HTTP package source {value:?} requires the explicit policy tracked by NUGET-012"),
-      ));
     }
     if let Some(version) = protocol
       && version != "2"
@@ -1456,7 +1501,7 @@ impl PackageSource {
         format!("local package source {value:?} has unsupported protocolVersion {version:?}; expected 2 or 3"),
       ));
     }
-    let path = if value.starts_with("file://") {
+    let path = if value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://")) {
       reqwest::Url::parse(&value)
         .map_err(|error| config_error(context, format!("invalid local package-source URI {value:?}: {error}")))?
         .to_file_path()
@@ -1465,7 +1510,7 @@ impl PackageSource {
       if value.contains("://") {
         return Err(config_error(
           context,
-          format!("package source {value:?} must be HTTPS, file://, or a local folder path"),
+          format!("package source {value:?} must be HTTP, HTTPS, file://, or a local folder path"),
         ));
       }
       let path = PathBuf::from(&value);
@@ -1481,8 +1526,21 @@ impl PackageSource {
     Ok(Self {
       url: value.to_owned(),
       protocol: NugetProtocol::Local,
+      security_flags: source_security_flags(allow_insecure_connections, disable_tls_validation),
     })
   }
+
+  const fn allow_insecure_connections(&self) -> bool {
+    self.security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0
+  }
+
+  const fn tls_validation(&self) -> bool {
+    self.security_flags & SOURCE_DISABLE_TLS_VALIDATION == 0
+  }
+}
+
+const fn source_security_flags(allow_insecure_connections: bool, disable_tls_validation: bool) -> u8 {
+  (if allow_insecure_connections { SOURCE_ALLOW_INSECURE_CONNECTIONS } else { 0 }) | if disable_tls_validation { SOURCE_DISABLE_TLS_VALIDATION } else { 0 }
 }
 
 enum StoredCredentialPassword {
@@ -1533,11 +1591,13 @@ struct PendingSourceCredential {
 
 struct SourceCredential {
   authorization: Option<HeaderValue>,
-  origin: HttpsOrigin,
+  origin: HttpOrigin,
   provider: Option<Box<SourceProviderCredential>>,
   client: Option<reqwest::Client>,
+  transport_client: Option<reqwest::Client>,
   limiter: Option<Arc<Semaphore>>,
   http_policy: PackageHttpPolicy,
+  security_flags: u8,
 }
 
 struct SourceProviderCredential {
@@ -1556,9 +1616,9 @@ struct ProviderCredentialState {
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-  assert!(size_of::<HttpsOrigin>() == 24);
-  assert!(align_of::<HttpsOrigin>() == 8);
-  assert!(size_of::<SourceCredential>() == 104);
+  assert!(size_of::<HttpOrigin>() == 24);
+  assert!(align_of::<HttpOrigin>() == 8);
+  assert!(size_of::<SourceCredential>() == 120);
   assert!(align_of::<SourceCredential>() == 8);
 };
 
@@ -1612,20 +1672,25 @@ impl SourceCredential {
 }
 
 #[derive(Eq, PartialEq)]
-struct HttpsOrigin {
+struct HttpOrigin {
   host: Box<str>,
   port: u16,
+  secure: bool,
 }
 
-impl HttpsOrigin {
+impl HttpOrigin {
   fn parse(url: &str, context: &Path) -> Result<Self, PackageError> {
-    let url = reqwest::Url::parse(url).map_err(|error| config_error(context, format!("invalid HTTPS package source {url:?}: {error}")))?;
+    let url = reqwest::Url::parse(url).map_err(|error| config_error(context, format!("invalid HTTP package source {url:?}: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+      return Err(config_error(context, format!("package source {url:?} must use HTTP or HTTPS")));
+    }
     let host = url
       .host_str()
-      .ok_or_else(|| config_error(context, format!("HTTPS package source {url:?} must include a host")))?;
+      .ok_or_else(|| config_error(context, format!("HTTP package source {url:?} must include a host")))?;
     Ok(Self {
       host: host.to_ascii_lowercase().into_boxed_str(),
-      port: url.port_or_known_default().expect("HTTPS has a known default port"),
+      port: url.port_or_known_default().expect("HTTP and HTTPS have known default ports"),
+      secure: url.scheme() == "https",
     })
   }
 
@@ -1633,7 +1698,9 @@ impl HttpsOrigin {
     let Ok(url) = reqwest::Url::parse(url) else {
       return false;
     };
-    url.scheme() == "https" && url.host_str().is_some_and(|host| host.eq_ignore_ascii_case(&self.host)) && url.port_or_known_default() == Some(self.port)
+    url.scheme() == if self.secure { "https" } else { "http" }
+      && url.host_str().is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+      && url.port_or_known_default() == Some(self.port)
   }
 }
 
@@ -2007,6 +2074,7 @@ async fn inspect_source_batch(
       },
       protocol: source.protocol,
       authentication: credentials.authentication(index),
+      security_flags: source.security_flags,
     });
   }
   Ok(PackageSourceInventory {
@@ -2334,6 +2402,7 @@ fn discover_configuration(
       PackageSource {
         url: DEFAULT_SOURCE.to_owned(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     ));
   }
@@ -2347,9 +2416,10 @@ fn discover_configuration(
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
   let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
+  let http_policy = http_policy.with_source_security(&sources);
   let mut credentials = resolve_source_credentials(&sources, merged.credentials, project_directory, provider_options)?;
   attach_client_certificates(&sources, merged.client_certificates, proxy.as_ref(), project_directory, &mut credentials)?;
-  attach_http_policy(&sources, http_policy, project_directory, &mut credentials)?;
+  attach_http_policy(&sources, http_policy, proxy.as_ref(), project_directory, &mut credentials)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -2410,15 +2480,18 @@ fn command_line_sources(
     if value.is_empty() {
       return Err(config_error(Path::new("--source"), "command-line package source cannot be empty"));
     }
-    let parsed = PackageSource::parse(value.clone(), None, Path::new("--source"), project_directory)?;
-    if sources.iter().any(|(_, source): &(String, PackageSource)| source.url == parsed.url) {
+    let selected = if let Some((name, source)) = configured.iter().rev().find(|(_, source)| source.url == *value) {
+      (name.clone(), source.clone())
+    } else {
+      (
+        value.clone(),
+        PackageSource::parse(value.clone(), None, false, false, Path::new("--source"), project_directory)?,
+      )
+    };
+    if sources.iter().any(|(_, source): &(String, PackageSource)| source.url == selected.1.url) {
       continue;
     }
-    if let Some((name, source)) = configured.iter().rev().find(|(_, source)| source.url == parsed.url) {
-      sources.push((name.clone(), source.clone()));
-    } else {
-      sources.push((value.clone(), parsed));
-    }
+    sources.push(selected);
   }
   Ok(sources)
 }
@@ -2474,11 +2547,13 @@ fn resolve_source_credentials_with(
     let credential = if authorization.is_some() || provider.is_some() {
       Some(Arc::new(SourceCredential {
         authorization,
-        origin: HttpsOrigin::parse(&source.url, context)?,
+        origin: HttpOrigin::parse(&source.url, context)?,
         provider,
         client: None,
+        transport_client: None,
         limiter: None,
         http_policy: DEFAULT_HTTP_POLICY,
+        security_flags: source.security_flags,
       }))
     } else {
       None
@@ -2530,7 +2605,7 @@ fn attach_client_certificates(
     let Some(certificate) = certificates.iter().find(|certificate| certificate.source() == name) else {
       continue;
     };
-    let client = client_certificate_http_client(certificate, proxy, context)?;
+    let client = client_certificate_http_client(certificate, proxy, source.security_flags, context)?;
     if let Some(credential) = entries[source_index].as_mut() {
       Arc::get_mut(credential)
         .expect("source authentication is uniquely owned during configuration")
@@ -2538,11 +2613,13 @@ fn attach_client_certificates(
     } else {
       entries[source_index] = Some(Arc::new(SourceCredential {
         authorization: None,
-        origin: HttpsOrigin::parse(&source.url, context)?,
+        origin: HttpOrigin::parse(&source.url, context)?,
         provider: None,
         client: Some(client),
+        transport_client: None,
         limiter: None,
         http_policy: DEFAULT_HTTP_POLICY,
+        security_flags: source.security_flags,
       }));
     }
   }
@@ -2553,15 +2630,17 @@ fn attach_client_certificates(
 fn attach_http_policy(
   sources: &[(String, PackageSource)],
   policy: PackageHttpPolicy,
+  proxy: Option<&ProxySettings>,
   context: &Path,
   credentials: &mut SourceCredentialBatch,
 ) -> Result<(), PackageError> {
   let runtime_changed = policy.max_tries != DEFAULT_HTTP_POLICY.max_tries
     || policy.retry_delay_ms != DEFAULT_HTTP_POLICY.retry_delay_ms
     || policy.max_retry_after_seconds != DEFAULT_HTTP_POLICY.max_retry_after_seconds
-    || policy.flags & (HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER) != DEFAULT_HTTP_POLICY.flags
+    || (policy.flags ^ DEFAULT_HTTP_POLICY.flags) & (HTTP_RETRY_429 | HTTP_OBSERVE_RETRY_AFTER) != 0
     || policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS;
-  if credentials.entries.is_empty() && !runtime_changed {
+  let source_security_changed = sources.iter().any(|(_, source)| source.security_flags != 0);
+  if credentials.entries.is_empty() && !runtime_changed && !source_security_changed {
     return Ok(());
   }
 
@@ -2571,19 +2650,28 @@ fn attach_http_policy(
     if source.protocol == NugetProtocol::Local {
       continue;
     }
+    let transport_client = if source.security_flags == 0 {
+      None
+    } else {
+      Some(source_http_client(proxy, source.security_flags)?)
+    };
     let limiter = (policy.effective_request_limit() < MAX_DOWNLOAD_WORKERS).then(|| Arc::new(Semaphore::new(policy.effective_request_limit())));
     if let Some(credential) = entries[source_index].as_mut() {
       let credential = Arc::get_mut(credential).expect("source policy is uniquely owned during configuration");
       credential.http_policy = policy;
       credential.limiter = limiter;
-    } else if runtime_changed {
+      credential.security_flags = source.security_flags;
+      credential.transport_client = transport_client;
+    } else if runtime_changed || source.security_flags != 0 {
       entries[source_index] = Some(Arc::new(SourceCredential {
         authorization: None,
-        origin: HttpsOrigin::parse(&source.url, context)?,
+        origin: HttpOrigin::parse(&source.url, context)?,
         provider: None,
         client: None,
+        transport_client,
         limiter,
         http_policy: policy,
+        security_flags: source.security_flags,
       }));
     }
   }
@@ -2594,6 +2682,7 @@ fn attach_http_policy(
 fn client_certificate_http_client(
   certificate: &MergedClientCertificate,
   proxy: Option<&ProxySettings>,
+  security_flags: u8,
   context: &Path,
 ) -> Result<reqwest::Client, PackageError> {
   let identity = match certificate {
@@ -2619,7 +2708,7 @@ fn client_certificate_http_client(
       find_value,
     } => platform_store_identity(source, location, name, find_by, find_value, context)?,
   };
-  configured_http_client_builder(proxy)?
+  configured_http_client_builder(proxy, security_flags)?
     .tls_backend_native()
     .redirect(reqwest::redirect::Policy::none())
     .identity(identity)
@@ -3294,7 +3383,24 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         match section {
           ConfigSection::Sources | ConfigSection::AuditSources => {
             let protocol = config_attribute(&reader, &element, b"protocolVersion", path)?;
-            let source = PackageSource::parse(value, protocol.as_deref(), path, path.parent().unwrap_or(Path::new(".")))?;
+            let allow_insecure_connections = config_attribute(&reader, &element, b"allowInsecureConnections", path)?
+              .map(|value| expand_config_value(value, path))
+              .transpose()?
+              .as_deref()
+              .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+            let disable_tls_validation = config_attribute(&reader, &element, b"disableTLSCertificateValidation", path)?
+              .map(|value| expand_config_value(value, path))
+              .transpose()?
+              .as_deref()
+              .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+            let source = PackageSource::parse(
+              value,
+              protocol.as_deref(),
+              allow_insecure_connections,
+              disable_tls_validation,
+              path,
+              path.parent().unwrap_or(Path::new(".")),
+            )?;
             let sources = if matches!(section, ConfigSection::Sources) {
               &mut merged.sources
             } else {
@@ -3924,17 +4030,28 @@ fn config_error(path: &Path, message: impl Into<String>) -> PackageError {
 }
 
 fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, PackageError> {
-  configured_http_client_builder(proxy)?
+  configured_http_client_builder(proxy, 0)?
     .tls_backend_rustls()
     .build()
     .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
 }
 
-fn configured_http_client_builder(proxy: Option<&ProxySettings>) -> Result<reqwest::ClientBuilder, PackageError> {
+fn source_http_client(proxy: Option<&ProxySettings>, security_flags: u8) -> Result<reqwest::Client, PackageError> {
+  configured_http_client_builder(proxy, security_flags)?
+    .tls_backend_rustls()
+    .build()
+    .map_err(|error| network_error("package-source HTTP client", format!("failed to create HTTP client: {error}")))
+}
+
+fn configured_http_client_builder(proxy: Option<&ProxySettings>, security_flags: u8) -> Result<reqwest::ClientBuilder, PackageError> {
+  let allow_insecure = security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0;
+  let disable_tls_validation = security_flags & SOURCE_DISABLE_TLS_VALIDATION != 0;
   let mut builder = reqwest::Client::builder()
-    .https_only(true)
+    .https_only(!allow_insecure)
+    .tls_danger_accept_invalid_certs(disable_tls_validation)
+    .tls_danger_accept_invalid_hostnames(disable_tls_validation)
     .timeout(Duration::from_secs(DEFAULT_HTTP_POLICY.request_timeout_seconds as u64))
-    .redirect(secure_redirect_policy());
+    .redirect(source_redirect_policy(allow_insecure));
   if let Some(settings) = proxy {
     let mut configured =
       reqwest::Proxy::all(&settings.url).map_err(|error| config_error(Path::new("http_proxy"), format!("invalid NuGet proxy address: {error}")))?;
@@ -3947,13 +4064,13 @@ fn configured_http_client_builder(proxy: Option<&ProxySettings>) -> Result<reqwe
   Ok(builder)
 }
 
-fn secure_redirect_policy() -> reqwest::redirect::Policy {
-  reqwest::redirect::Policy::custom(|attempt| {
+fn source_redirect_policy(allow_insecure: bool) -> reqwest::redirect::Policy {
+  reqwest::redirect::Policy::custom(move |attempt| {
     if attempt.previous().len() >= 10 {
       return attempt.error("NuGet redirect limit exceeded");
     }
-    if attempt.url().scheme() != "https" {
-      return attempt.error("NuGet redirects must preserve HTTPS");
+    if attempt.url().scheme() != "https" && !(allow_insecure && attempt.url().scheme() == "http") {
+      return attempt.error("NuGet redirects must use HTTPS unless allowInsecureConnections is true");
     }
     attempt.follow()
   })
@@ -4096,11 +4213,12 @@ async fn fetch_v3_service_index(
   let bytes = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index").await?;
   let document: serde_json::Value =
     serde_json::from_slice(&bytes).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
-  let endpoints = parse_v3_service_index(source, &document)?;
+  let security_flags = credential.map_or(0, |credential| credential.security_flags);
+  let endpoints = parse_v3_service_index(source, &document, security_flags)?;
   Ok((endpoints, bytes.len() as u64))
 }
 
-fn parse_v3_service_index(source: &str, document: &serde_json::Value) -> Result<NugetServiceEndpoints, PackageError> {
+fn parse_v3_service_index(source: &str, document: &serde_json::Value, security_flags: u8) -> Result<NugetServiceEndpoints, PackageError> {
   let schema = document
     .get("version")
     .and_then(serde_json::Value::as_str)
@@ -4135,7 +4253,14 @@ fn parse_v3_service_index(source: &str, document: &serde_json::Value) -> Result<
     ServiceCapability::PackagePublish,
   ] {
     let start = u32_len(endpoints.len(), "NuGet service endpoint range")?;
-    append_selected_service_endpoints(resources, service_types(capability), &supported_client, &mut text, &mut endpoints)?;
+    append_selected_service_endpoints(
+      resources,
+      service_types(capability),
+      &supported_client,
+      security_flags,
+      &mut text,
+      &mut endpoints,
+    )?;
     ranges[capability as usize] = ItemRange {
       start,
       len: u32_len(endpoints.len() - start as usize, "NuGet service endpoint range")?,
@@ -4152,6 +4277,7 @@ fn append_selected_service_endpoints(
   resources: &[serde_json::Value],
   ordered_types: &[&str],
   supported_client: &PackageVersion,
+  security_flags: u8,
   text: &mut TextTable,
   endpoints: &mut Vec<TextSpan>,
 ) -> Result<(), PackageError> {
@@ -4179,10 +4305,10 @@ fn append_selected_service_endpoints(
           format!("NuGet service resource {resource_type} must not embed credentials in its URL"),
         ));
       }
-      if url.scheme() != "https" {
+      if url.scheme() != "https" && !(url.scheme() == "http" && security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0) {
         return Err(network_error(
           location,
-          format!("NuGet service resource {resource_type} uses insecure HTTP; explicit opt-in remains tracked by NUGET-012"),
+          format!("NuGet service resource {resource_type} uses insecure HTTP; set allowInsecureConnections=true on its package source to opt in"),
         ));
       }
       endpoints.push(text.push(location)?);
@@ -4851,6 +4977,7 @@ async fn enumerate_v2_versions(
   base: &str,
   lower_id: &str,
 ) -> Result<VersionBatch, PackageError> {
+  let security_flags = credential.map_or(0, |credential| credential.security_flags);
   let mut url = format!("{base}FindPackagesById()?id='{lower_id}'&semVerLevel=2.0.0");
   let mut visited = HashSet::new();
   let mut versions = Vec::new();
@@ -4883,8 +5010,14 @@ async fn enumerate_v2_versions(
     let continuation = current
       .join(&next)
       .map_err(|error| network_error(&url, format!("invalid NuGet v2 continuation URL {next:?}: {error}")))?;
-    if continuation.scheme() != "https" {
-      return Err(network_error(continuation.as_str(), "NuGet v2 continuation URL must use HTTPS"));
+    if !continuation.username().is_empty() || continuation.password().is_some() {
+      return Err(network_error(continuation.as_str(), "NuGet v2 continuation URL must not embed credentials"));
+    }
+    if continuation.scheme() != "https" && !(continuation.scheme() == "http" && security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0) {
+      return Err(network_error(
+        continuation.as_str(),
+        "NuGet v2 continuation URL must use HTTPS unless allowInsecureConnections is true",
+      ));
     }
     url = continuation.into();
   }
@@ -5506,6 +5639,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
   cached.origin = Some(PackageSource {
     url: downloaded.endpoint.source().to_owned(),
     protocol: downloaded.endpoint.protocol(),
+    security_flags: 0,
   });
   Ok(cached)
 }
@@ -5545,10 +5679,11 @@ async fn v2_package_metadata(
 ) -> Result<PackageMetadata, PackageError> {
   let metadata_url = format!("{base}Packages(Id='{}',Version='{}')", request.id, request.version);
   let bytes = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
-  parse_v2_package_metadata(request, &metadata_url, &bytes)
+  let security_flags = credential.map_or(0, |credential| credential.security_flags);
+  parse_v2_package_metadata(request, &metadata_url, &bytes, security_flags)
 }
 
-fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes: &[u8]) -> Result<PackageMetadata, PackageError> {
+fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes: &[u8], security_flags: u8) -> Result<PackageMetadata, PackageError> {
   let mut reader = Reader::from_reader(bytes);
   reader.config_mut().trim_text(true);
   let mut current = V2MetadataText::None;
@@ -5617,11 +5752,32 @@ fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes
     ));
   }
   let content_url = content_url.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no package content URL"))?;
-  if !content_url.starts_with("https://") {
+  let parsed_content = reqwest::Url::parse(&content_url).map_err(|error| {
+    PackageError::new(
+      PackageErrorKind::Integrity,
+      &content_url,
+      format!("invalid NuGet v2 package content URL: {error}"),
+    )
+  })?;
+  if !parsed_content.has_host() {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
       &content_url,
-      "NuGet v2 package content URL must use HTTPS",
+      "NuGet v2 package content URL must include a host",
+    ));
+  }
+  if !parsed_content.username().is_empty() || parsed_content.password().is_some() {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      &content_url,
+      "NuGet v2 package content URL must not embed credentials",
+    ));
+  }
+  if parsed_content.scheme() != "https" && !(parsed_content.scheme() == "http" && security_flags & SOURCE_ALLOW_INSECURE_CONNECTIONS != 0) {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      &content_url,
+      "NuGet v2 package content URL must use HTTPS unless allowInsecureConnections is true",
     ));
   }
   Ok(PackageMetadata {
@@ -5714,8 +5870,13 @@ async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredentia
 
 #[cfg(test)]
 fn authenticated_get(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str) -> reqwest::RequestBuilder {
-  let credential = credential.filter(|credential| credential.origin.matches(url));
-  let request = credential.and_then(|credential| credential.client.as_ref()).unwrap_or(client).get(url);
+  let source = credential;
+  let credential = source.filter(|credential| credential.origin.matches(url));
+  let selected_client = credential
+    .and_then(|credential| credential.client.as_ref())
+    .or_else(|| source.and_then(|credential| credential.transport_client.as_ref()))
+    .unwrap_or(client);
+  let request = selected_client.get(url);
   match credential.and_then(SourceCredential::authorization) {
     Some(authorization) => request.header(AUTHORIZATION, authorization.clone()),
     None => request,
@@ -5730,7 +5891,10 @@ async fn send_authenticated(
 ) -> Result<AuthenticatedResponse, PackageError> {
   let source = credential;
   let credential = source.filter(|credential| credential.origin.matches(url));
-  let client = credential.and_then(|credential| credential.client.as_ref()).unwrap_or(client);
+  let client = credential
+    .and_then(|credential| credential.client.as_ref())
+    .or_else(|| source.and_then(|credential| credential.transport_client.as_ref()))
+    .unwrap_or(client);
   let policy = source.map_or(DEFAULT_HTTP_POLICY, |credential| credential.http_policy);
   let permit = match source.and_then(|credential| credential.limiter.as_ref()) {
     Some(limiter) => Some(
@@ -7587,6 +7751,7 @@ mod tests {
         PackageSource {
           url: DEFAULT_SOURCE.into(),
           protocol: NugetProtocol::V3,
+          security_flags: 0,
         },
       )],
       credentials: SourceCredentialBatch::default(),
@@ -7812,10 +7977,68 @@ mod tests {
   }
 
   #[test]
+  fn package_source_security_requires_explicit_http_opt_in_and_keeps_flags_per_source() {
+    let temp = TempDirectory::new();
+    let rejected = temp.write(
+      "rejected.config",
+      r#"<configuration><packageSources><clear />
+<add key="rejected" value="http://packages.example.test/v3/index.json" protocolVersion="3" />
+</packageSources></configuration>"#,
+    );
+    let error = merge_config(&rejected, &mut NugetConfigMerge::default()).unwrap_err();
+    assert_eq!(error.kind(), PackageErrorKind::Configuration);
+    assert!(error.to_string().contains("allowInsecureConnections=true"));
+
+    let accepted = temp.write(
+      "accepted.config",
+      r#"<configuration><packageSources><clear />
+<add key="http" value="HTTP://packages.example.test/v3/index.json" protocolVersion="3" allowInsecureConnections=" TRUE " />
+<add key="tls" value="https://private.example.test/v3/index.json" protocolVersion="3" disableTLSCertificateValidation="true" />
+<add key="invalid" value="https://secure.example.test/v3/index.json" protocolVersion="3" allowInsecureConnections="not-a-bool" disableTLSCertificateValidation="false" />
+</packageSources></configuration>"#,
+    );
+    let mut merged = NugetConfigMerge::default();
+    merge_config(&accepted, &mut merged).unwrap();
+
+    assert!(merged.sources[0].1.allow_insecure_connections());
+    assert!(merged.sources[0].1.tls_validation());
+    assert!(!merged.sources[1].1.allow_insecure_connections());
+    assert!(!merged.sources[1].1.tls_validation());
+    assert_eq!(merged.sources[2].1.security_flags, 0);
+    assert_eq!(size_of::<PackageSourceRecord>(), 28);
+    assert_eq!(align_of::<PackageSourceRecord>(), 4);
+  }
+
+  #[test]
+  fn command_line_http_source_must_match_an_opted_in_configured_source() {
+    let configured = vec![(
+      "private".to_owned(),
+      PackageSource {
+        url: "http://packages.example.test/v3/index.json".to_owned(),
+        protocol: NugetProtocol::V3,
+        security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+      },
+    )];
+    let selected = command_line_sources(&["http://packages.example.test/v3/index.json".to_owned()], configured, Path::new(".")).unwrap();
+    assert_eq!(selected[0].0, "private");
+    assert!(selected[0].1.allow_insecure_connections());
+
+    let error = command_line_sources(&["http://other.example.test/v3/index.json".to_owned()], Vec::new(), Path::new("."))
+      .err()
+      .unwrap();
+    assert!(error.to_string().contains("allowInsecureConnections=true"));
+
+    let origin = HttpOrigin::parse("http://packages.example.test:80/v3/index.json", Path::new("NuGet.Config")).unwrap();
+    assert!(!origin.matches("ftp://packages.example.test:80/archive"));
+  }
+
+  #[test]
   fn package_source_rejects_embedded_credentials_before_reporting() {
     let error = PackageSource::parse(
       "https://user:secret@packages.example.test/v3/index.json".into(),
       Some("3"),
+      false,
+      false,
       Path::new("NuGet.Config"),
       Path::new("."),
     )
@@ -7940,6 +8163,7 @@ mod tests {
       PackageSource {
         url: DEFAULT_SOURCE.to_owned(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     )];
 
@@ -7955,6 +8179,7 @@ mod tests {
       PackageSource {
         url: "https://packages.example.test/v3/index.json".into(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     )];
     let configured = vec![MergedSourceCredential {
@@ -7992,6 +8217,7 @@ mod tests {
     let source = PackageSource {
       url: "https://packages.example.test/v3/index.json".into(),
       protocol: NugetProtocol::V3,
+      security_flags: 0,
     };
     let sources = vec![("private".to_owned(), source.clone())];
     let configured = vec![MergedSourceCredential {
@@ -8136,6 +8362,7 @@ mod tests {
           PackageSource {
             url: DEFAULT_SOURCE.to_owned(),
             protocol: NugetProtocol::V3,
+            security_flags: 0,
           },
         )
       })
@@ -8168,6 +8395,7 @@ mod tests {
       PackageSource {
         url: DEFAULT_SOURCE.to_owned(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     )];
     let mapping = PackageSourceMapping::compile(merged.source_mapping, &sources).unwrap();
@@ -8201,6 +8429,7 @@ mod tests {
       PackageSource {
         url: DEFAULT_SOURCE.into(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     ));
 
@@ -8500,7 +8729,7 @@ mod tests {
       let _ = stream.read(&mut request).unwrap();
       stream.write_all(response.as_bytes()).unwrap();
     });
-    let client = reqwest::Client::builder().redirect(secure_redirect_policy()).build().unwrap();
+    let client = reqwest::Client::builder().redirect(source_redirect_policy(false)).build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
     let error = runtime.block_on(client.get(format!("http://{address}/start")).send()).unwrap_err();
@@ -8510,12 +8739,58 @@ mod tests {
   }
 
   #[test]
+  fn opted_in_redirect_policy_follows_http_without_relaxing_other_schemes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+      for response in [
+        format!("HTTP/1.1 302 Found\r\nLocation: http://{address}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned(),
+      ] {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+      }
+    });
+    let client = reqwest::Client::builder().redirect(source_redirect_policy(true)).build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let response = runtime.block_on(client.get(format!("http://{address}/start")).send()).unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn opted_in_source_allocates_one_source_scoped_transport_client() {
+    let sources = vec![(
+      "insecure".into(),
+      PackageSource {
+        url: "http://packages.example.test/v3/index.json".into(),
+        protocol: NugetProtocol::V3,
+        security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS | SOURCE_DISABLE_TLS_VALIDATION,
+      },
+    )];
+    let mut credentials = SourceCredentialBatch::default();
+    let policy = DEFAULT_HTTP_POLICY.with_source_security(&sources);
+
+    attach_http_policy(&sources, policy, None, Path::new("NuGet.Config"), &mut credentials).unwrap();
+
+    let source = credentials.get(0).unwrap();
+    assert!(source.transport_client.is_some());
+    assert_eq!(source.security_flags, SOURCE_ALLOW_INSECURE_CONNECTIONS | SOURCE_DISABLE_TLS_VALIDATION);
+    assert!(!policy.tls_validation());
+    assert!(policy.allows_insecure_connections());
+  }
+
+  #[test]
   fn source_rate_limit_is_bounded_and_shared_by_all_source_requests() {
     let sources = vec![(
       "limited".into(),
       PackageSource {
         url: "https://packages.example.test/v3/index.json".into(),
         protocol: NugetProtocol::V3,
+        security_flags: 0,
       },
     )];
     let mut credentials = SourceCredentialBatch::default();
@@ -8524,7 +8799,7 @@ mod tests {
       ..DEFAULT_HTTP_POLICY
     };
 
-    attach_http_policy(&sources, policy, Path::new("NuGet.Config"), &mut credentials).unwrap();
+    attach_http_policy(&sources, policy, None, Path::new("NuGet.Config"), &mut credentials).unwrap();
 
     let source = credentials.get(0).unwrap();
     assert_eq!(source.limiter.as_ref().unwrap().available_permits(), 2);
@@ -8689,11 +8964,25 @@ mod tests {
 <d:PackageHashAlgorithm>SHA512</d:PackageHashAlgorithm><d:PackageSize>42</d:PackageSize>
 </m:properties></entry>"#;
 
-    let parsed = parse_v2_package_metadata(&request(), "https://packages.example.test/api/v2/Packages(...)", metadata).unwrap();
+    let parsed = parse_v2_package_metadata(&request(), "https://packages.example.test/api/v2/Packages(...)", metadata, 0).unwrap();
 
     assert_eq!(parsed.content_url, "https://packages.example.test/api/v2/package/Sample.Package/1.2.3");
     assert_eq!(parsed.expected_size, Some(42));
     assert_eq!(parsed.requests, 1);
+
+    let insecure = String::from_utf8(metadata.to_vec()).unwrap().replace("https://packages", "http://packages");
+    let error = parse_v2_package_metadata(&request(), "http://packages.example.test/api/v2/Packages(...)", insecure.as_bytes(), 0)
+      .err()
+      .unwrap();
+    assert!(error.to_string().contains("allowInsecureConnections is true"));
+    let parsed = parse_v2_package_metadata(
+      &request(),
+      "http://packages.example.test/api/v2/Packages(...)",
+      insecure.as_bytes(),
+      SOURCE_ALLOW_INSECURE_CONNECTIONS,
+    )
+    .unwrap();
+    assert!(parsed.content_url.starts_with("http://"));
   }
 
   #[test]
@@ -8710,6 +8999,30 @@ mod tests {
       ["1.2.0", "2.0.0-beta.1"]
     );
     assert_eq!(parsed.next.as_deref(), Some("?page=2&semVerLevel=2.0.0"));
+  }
+
+  #[test]
+  fn rejects_embedded_credentials_in_v2_continuations() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = format!(r#"<feed><link rel="next" href="http://user:secret@{address}/next" /></feed>"#);
+    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let worker = thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0u8; 1024];
+      let _ = stream.read(&mut request).unwrap();
+      stream.write_all(response.as_bytes()).unwrap();
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+    let error = runtime
+      .block_on(enumerate_v2_versions(&client, None, &format!("http://{address}/"), "sample.package"))
+      .err()
+      .unwrap();
+
+    assert!(error.to_string().contains("must not embed credentials"));
+    worker.join().unwrap();
   }
 
   #[test]
@@ -8733,7 +9046,7 @@ mod tests {
         "@type": ["PackageBaseAddress/3.0.0", "Other/1.0.0"]
       }]
     });
-    let services = parse_v3_service_index("https://feed.example.test/custom-index", &service_index).unwrap();
+    let services = parse_v3_service_index("https://feed.example.test/custom-index", &service_index, 0).unwrap();
     let package_base = services.package_base_address().unwrap();
 
     let metadata = v3_package_metadata(&request(), package_base);
@@ -8767,7 +9080,7 @@ mod tests {
       ]
     });
 
-    let services = parse_v3_service_index("https://feed.test/index.json", &document).unwrap();
+    let services = parse_v3_service_index("https://feed.test/index.json", &document, 0).unwrap();
 
     assert_eq!(services.package_base_address(), Some("https://feed.test/content/"));
     assert_eq!(
@@ -8791,7 +9104,7 @@ mod tests {
   #[test]
   fn service_index_rejects_unsupported_schema_and_insecure_selected_resources() {
     let schema = serde_json::json!({ "version": "4.0.0", "resources": [] });
-    let error = parse_v3_service_index("https://feed.test/index.json", &schema).err().unwrap();
+    let error = parse_v3_service_index("https://feed.test/index.json", &schema, 0).err().unwrap();
     assert_eq!(error.kind(), PackageErrorKind::Network);
     assert!(error.to_string().contains("expected major version 3"));
 
@@ -8799,9 +9112,12 @@ mod tests {
       "version": "3.0.0",
       "resources": [{ "@id": "http://feed.test/content/", "@type": "PackageBaseAddress/3.0.0" }]
     });
-    let error = parse_v3_service_index("https://feed.test/index.json", &insecure).err().unwrap();
+    let error = parse_v3_service_index("https://feed.test/index.json", &insecure, 0).err().unwrap();
     assert_eq!(error.kind(), PackageErrorKind::Network);
-    assert!(error.to_string().contains("NUGET-012"));
+    assert!(error.to_string().contains("allowInsecureConnections=true"));
+
+    let services = parse_v3_service_index("http://feed.test/index.json", &insecure, SOURCE_ALLOW_INSECURE_CONNECTIONS).unwrap();
+    assert_eq!(services.package_base_address(), Some("http://feed.test/content/"));
   }
 
   #[test]
