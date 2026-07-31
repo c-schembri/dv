@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `5`;
+- schema version `6`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -46,6 +46,7 @@ items.
 - `sdk_inventory`
 - `runtime_compatibility`
 - `runtime_pack_plan_created`
+- `framework_reference_plan_created`
 - `project_evaluated`
 - `compiler_plan_created`
 - `package_resolution_created`
@@ -53,7 +54,9 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 5 adds `runtime_pack_plan_created`; schema 4 added
+Schema 6 adds framework-reference metadata to `project_evaluated` and the
+`framework_reference_plan_created` event. Schema 5 added
+`runtime_pack_plan_created`; schema 4 added
 `runtime_compatibility`; schema 3 added selected, plural, and materialized
 runtime-dimension fields to `project_evaluated`.
 
@@ -89,6 +92,24 @@ Initial codes:
 | `DV0111` | Portable RID graph filesystem failure |
 | `DV0112` | Invalid portable RID graph JSON or data |
 | `DV0113` | Portable RID graph compact range overflow |
+| `DV0120` | Runtime-pack filesystem failure |
+| `DV0121` | Invalid SDK/runtime-pack manifest |
+| `DV0122` | Runtime-pack planning requires a selected RID |
+| `DV0123` | No compatible manifest-declared pack RID |
+| `DV0124` | Required runtime or host pack missing |
+| `DV0125` | Selected runtime/host asset missing |
+| `DV0126` | Runtime-pack NuGet configuration failure |
+| `DV0127` | Runtime-pack path is not Unicode |
+| `DV0128` | Runtime-pack compact range overflow |
+| `DV0130` | Framework-reference filesystem failure |
+| `DV0131` | Invalid SDK framework manifest |
+| `DV0132` | Unknown framework reference for selected TFM |
+| `DV0133` | Invalid runtime or targeting-pack version |
+| `DV0134` | Required targeting pack missing |
+| `DV0135` | No shared framework satisfies roll-forward |
+| `DV0136` | Framework-plan NuGet configuration failure |
+| `DV0137` | Framework-plan path is not Unicode |
+| `DV0138` | Framework-plan compact range overflow |
 | `DV0200` | No project found |
 | `DV0201` | Ambiguous implicit project selection |
 | `DV0202` | Project filesystem failure |

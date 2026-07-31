@@ -117,13 +117,14 @@ Repository-owned representative input currently consists of:
 
 - raw OS argument vectors shaped like `dotnet`, MSBuild, NuGet, and VSTest
   invocations, although a checked-in compatibility corpus does not yet exist;
-- ten SDK-style C# projects;
-- nine C# source files;
+- eleven SDK-style C# projects;
+- ten C# source files;
 - three project-reference edges;
 - 53 exact package references across single-package and real graph fixtures;
-- seven single-project fixtures and one three-project acyclic fixture;
-- one observed Windows machine with three x64 SDK installations and five x64
-  shared-runtime directories.
+- eight single-project fixtures and one three-project acyclic fixture;
+- one observed Windows machine with three x64 SDK installations and five
+  installed versions in each of the Core, ASP.NET Core, and Windows Desktop
+  shared-framework families.
 
 The initial compiler trace in `docs/roslyn-invocation.md` observed SDK
 `10.0.100`, 164 reference arguments, eight analyzer/generator arguments, three
@@ -131,13 +132,13 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 14 Rust source files, 12,296 nonblank source
-lines, and 77 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 15 Rust source files, 13,943 nonblank source
+lines, and 84 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
 
-Current output is command-local human text or a schema-v5 JSON-lines event
+Current output is command-local human text or a schema-v6 JSON-lines event
 batch. Drop-in modes must also reproduce documented or observed
 machine-consumed text/JSON/XML/binary-log formats and tool-specific exit
 behavior. Future workflows must additionally own:
@@ -222,7 +223,7 @@ prove that nothing changed.
 | SDK current/list human output | Implemented | CLI integration tests |
 | Versioned JSON event stream | Implemented | event/reporter unit tests |
 | Structured diagnostics | Foundation only | codes and ordered fields exist |
-| Benchmark process harness | Foundation only | startup, SDK, and project-evaluation cases measured |
+| Benchmark process harness | Foundation only | startup, SDK, project, package, pack, and framework-plan cases measured |
 | Single C# project discovery | Initial subset | explicit/one-directory selection and ambiguity diagnostics |
 | Project evaluation | Initial subset | parsed single modern .NET TFM, base-SDK properties/items, and `project inspect` |
 | Compiler input planning | Initial subset | target-selected reference pack, Roslyn/analyzers, options, packages, and `build --plan` |
@@ -677,8 +678,14 @@ boundary, not final drop-in parity.
   `win-x64` assets in one compact span batch, and the installed host pack yields
   the exact apphost template. A 30-sample MSBuild oracle measures `376.764 ms`
   versus `8.030 ms` for `dv` (`46.9x`). `P2`
-- [ ] `PACKS-007` Resolve framework references and shared-framework versions,
-  including runtime roll-forward policy. `P2`
+- [x] `PACKS-007` Resolve framework references and shared-framework versions,
+  including runtime roll-forward policy. The selected SDK manifest supplies
+  implicit/explicit runtime and targeting-pack identities and versions;
+  `Disable`, `LatestPatch`, `Minor`, `Major`, `LatestMinor`, and `LatestMajor`
+  select installed shared versions without hard-coded .NET generations. The
+  .NET 10 Core + ASP.NET fixture matches MSBuild items and an actual host
+  launch. A 30-sample MSBuild oracle measures `352.715 ms` versus `5.585 ms`
+  for `dv` (`63.2x`). `P2`
 - [~] `PACKS-008` Separate compile, runtime, native, resource, analyzer, and
   build assets in the plan. `P1`
 - [~] `PACKS-009` Diagnose unavailable TFM/RID/platform combinations with the

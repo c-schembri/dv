@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 5;
+pub const EVENT_SCHEMA_VERSION: u16 = 6;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +88,42 @@ pub struct ProjectPackageEvent {
   pub id: String,
   /// Exact package version.
   pub version: String,
+}
+
+/// One explicit project framework reference at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectFrameworkReferenceEvent {
+  /// Framework-reference identity.
+  pub id: String,
+  /// Per-reference runtime version override.
+  pub runtime_version: Option<String>,
+  /// Per-reference targeting-pack version override.
+  pub targeting_pack_version: Option<String>,
+  /// Per-reference latest-runtime-patch preference.
+  pub target_latest_runtime_patch: Option<bool>,
+}
+
+/// One resolved framework-reference row at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedFrameworkReferenceEvent {
+  /// Project-facing framework-reference identity.
+  pub reference: String,
+  /// Runtimeconfig/shared-directory framework name.
+  pub runtime_name: String,
+  /// Minimum runtime version selected from project and SDK data.
+  pub requested_version: String,
+  /// Installed version selected by roll-forward, absent for self-contained projects.
+  pub selected_version: Option<String>,
+  /// Installed shared-framework directory, absent for self-contained projects.
+  pub shared_root: Option<String>,
+  /// Targeting-pack NuGet identity.
+  pub targeting_pack_id: String,
+  /// Targeting-pack version.
+  pub targeting_pack_version: String,
+  /// Installed or restored targeting-pack directory.
+  pub targeting_pack_root: String,
+  /// Optional framework profile.
+  pub profile: Option<String>,
 }
 
 /// One resolved package materialized at the reporter boundary.
@@ -213,6 +249,23 @@ pub enum EventPayload {
     /// Native runtime assets in pack-manifest order.
     native_assets: Vec<String>,
   },
+  /// Framework references, targeting packs, and shared runtimes were selected.
+  FrameworkReferencePlanCreated {
+    /// Full project-file path.
+    project: String,
+    /// Selected SDK version.
+    sdk_version: String,
+    /// SDK manifest which supplied framework and pack versions.
+    manifest: String,
+    /// Evaluated target framework.
+    target_framework: String,
+    /// Effective runtime-host roll-forward policy.
+    roll_forward: String,
+    /// Whether the project carries its runtime.
+    self_contained: bool,
+    /// Ordered implicit and explicit framework-reference batch.
+    frameworks: Vec<ResolvedFrameworkReferenceEvent>,
+  },
   /// One SDK-style project was discovered and evaluated.
   ProjectEvaluated {
     /// Full project-file path.
@@ -247,6 +300,16 @@ pub enum EventPayload {
     project_references: Vec<String>,
     /// Ordered exact package references.
     package_references: Vec<ProjectPackageEvent>,
+    /// Ordered explicit framework references.
+    framework_references: Vec<ProjectFrameworkReferenceEvent>,
+    /// Project-wide runtime framework version override.
+    runtime_framework_version: Option<String>,
+    /// Explicit latest-runtime-patch preference.
+    target_latest_runtime_patch: Option<bool>,
+    /// Effective runtime-host roll-forward policy.
+    roll_forward: String,
+    /// Whether deployment includes its runtime.
+    self_contained: bool,
   },
   /// A complete framework and Roslyn input plan was materialized.
   CompilerPlanCreated {

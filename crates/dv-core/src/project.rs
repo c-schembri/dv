@@ -14,6 +14,7 @@ use crate::TargetFramework;
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
+const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
 
 /// A supported build configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +84,68 @@ pub struct PackageReference {
 const _: () = assert!(size_of::<PackageReference>() == 16);
 const _: () = assert!(align_of::<PackageReference>() == 4);
 
+/// One explicit shared-framework dependency and its supported version overrides.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameworkReference {
+  id: TextSpan,
+  runtime_version: TextSpan,
+  targeting_pack_version: TextSpan,
+  target_latest_runtime_patch: Option<bool>,
+}
+
+const _: () = assert!(size_of::<FrameworkReference>() == 28);
+const _: () = assert!(align_of::<FrameworkReference>() == 4);
+
+/// Runtime host roll-forward policy written to the generated runtime config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeRollForward {
+  /// Use only the requested version.
+  Disable,
+  /// Use the highest patch in the requested major/minor band.
+  LatestPatch,
+  /// Prefer the requested minor, then the nearest higher minor in the same major.
+  Minor,
+  /// Prefer the requested major, then the nearest higher major.
+  Major,
+  /// Use the highest minor in the requested major.
+  LatestMinor,
+  /// Use the highest installed major, minor, and patch.
+  LatestMajor,
+}
+
+impl RuntimeRollForward {
+  /// Parses the project/runtimeconfig spelling case-insensitively.
+  pub fn parse(value: &str) -> Option<Self> {
+    if value.eq_ignore_ascii_case("Disable") {
+      Some(Self::Disable)
+    } else if value.eq_ignore_ascii_case("LatestPatch") {
+      Some(Self::LatestPatch)
+    } else if value.eq_ignore_ascii_case("Minor") {
+      Some(Self::Minor)
+    } else if value.eq_ignore_ascii_case("Major") {
+      Some(Self::Major)
+    } else if value.eq_ignore_ascii_case("LatestMinor") {
+      Some(Self::LatestMinor)
+    } else if value.eq_ignore_ascii_case("LatestMajor") {
+      Some(Self::LatestMajor)
+    } else {
+      None
+    }
+  }
+
+  /// Returns the canonical runtimeconfig spelling.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Disable => "Disable",
+      Self::LatestPatch => "LatestPatch",
+      Self::Minor => "Minor",
+      Self::Major => "Major",
+      Self::LatestMinor => "LatestMinor",
+      Self::LatestMajor => "LatestMajor",
+    }
+  }
+}
+
 /// One evaluated SDK-style project.
 ///
 /// Variable text is stored once in `text`; source and reference batches contain
@@ -99,6 +162,8 @@ pub struct ProjectSpec {
   sources: Box<[TextSpan]>,
   project_references: Box<[TextSpan]>,
   package_references: Box<[PackageReference]>,
+  framework_references: Box<[FrameworkReference]>,
+  runtime_framework_version: TextSpan,
   runtime_identifier_index: u32,
   runtime_identifiers_len: u32,
   configuration: ProjectConfiguration,
@@ -106,6 +171,9 @@ pub struct ProjectSpec {
   nullable: bool,
   implicit_usings: bool,
   deterministic: bool,
+  self_contained: bool,
+  target_latest_runtime_patch: Option<bool>,
+  roll_forward: RuntimeRollForward,
   target_framework: TargetFramework,
 }
 
@@ -212,9 +280,58 @@ impl ProjectSpec {
     self.text(package.version)
   }
 
+  /// Returns the compact batch of explicit framework references.
+  pub fn framework_references(&self) -> &[FrameworkReference] {
+    &self.framework_references
+  }
+
+  /// Returns a framework-reference identity.
+  pub fn framework_reference_id(&self, reference: FrameworkReference) -> &str {
+    self.text(reference.id)
+  }
+
+  /// Returns a per-reference runtime version override.
+  pub fn framework_runtime_version(&self, reference: FrameworkReference) -> Option<&str> {
+    self.optional_text(reference.runtime_version)
+  }
+
+  /// Returns a per-reference targeting-pack version override.
+  pub fn framework_targeting_pack_version(&self, reference: FrameworkReference) -> Option<&str> {
+    self.optional_text(reference.targeting_pack_version)
+  }
+
+  /// Returns a per-reference latest-patch override.
+  pub fn framework_target_latest_runtime_patch(&self, reference: FrameworkReference) -> Option<bool> {
+    reference.target_latest_runtime_patch
+  }
+
+  /// Returns the project-wide runtime framework version override.
+  pub fn runtime_framework_version(&self) -> Option<&str> {
+    self.optional_text(self.runtime_framework_version)
+  }
+
+  /// Returns whether deployment includes the selected runtime.
+  pub fn self_contained(&self) -> bool {
+    self.self_contained
+  }
+
+  /// Returns the explicit project-wide latest-patch preference.
+  pub fn target_latest_runtime_patch(&self) -> Option<bool> {
+    self.target_latest_runtime_patch
+  }
+
+  /// Returns the effective runtime-host roll-forward policy.
+  pub fn roll_forward(&self) -> RuntimeRollForward {
+    self.roll_forward
+  }
+
   fn text(&self, span: TextSpan) -> &str {
     let start = span.start as usize;
     &self.text[start..start + span.len as usize]
+  }
+
+  fn optional_text(&self, span: TextSpan) -> Option<&str> {
+    (span != NO_TEXT).then(|| self.text(span))
   }
 }
 
@@ -285,6 +402,17 @@ enum Property {
   AssemblyName,
   RootNamespace,
   Deterministic,
+  RuntimeFrameworkVersion,
+  TargetLatestRuntimePatch,
+  RollForward,
+  SelfContained,
+}
+
+#[derive(Clone, Copy)]
+enum FrameworkMetadata {
+  RuntimeFrameworkVersion,
+  TargetingPackVersion,
+  TargetLatestRuntimePatch,
 }
 
 #[derive(Clone, Copy)]
@@ -297,6 +425,8 @@ enum Element {
   ProjectReference,
   PackageReference(usize),
   PackageVersion(usize),
+  FrameworkReference(usize),
+  FrameworkMetadata(usize, FrameworkMetadata),
 }
 
 #[derive(Default)]
@@ -310,13 +440,25 @@ struct RawProject {
   assembly_name: Option<String>,
   root_namespace: Option<String>,
   deterministic: Option<String>,
+  runtime_framework_version: Option<String>,
+  target_latest_runtime_patch: Option<String>,
+  roll_forward: Option<String>,
+  self_contained: Option<String>,
   project_references: Vec<String>,
   package_references: Vec<RawPackageReference>,
+  framework_references: Vec<RawFrameworkReference>,
 }
 
 struct RawPackageReference {
   id: String,
   version: Option<String>,
+}
+
+struct RawFrameworkReference {
+  id: String,
+  runtime_version: Option<String>,
+  targeting_pack_version: Option<String>,
+  target_latest_runtime_patch: Option<String>,
 }
 
 struct TextTable {
@@ -417,7 +559,7 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
         if depth == MAX_XML_DEPTH {
           return Err(ProjectError::new(ProjectErrorKind::Unsupported, path, "project XML nesting is too deep"));
         }
-        if matches!(next, Element::Property(_) | Element::PackageVersion(_)) {
+        if matches!(next, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
           text.clear();
         }
         stack[depth] = next;
@@ -436,7 +578,7 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
       },
       Ok(Event::Text(value)) => {
         let current = stack[depth - 1];
-        if matches!(current, Element::Property(_) | Element::PackageVersion(_)) {
+        if matches!(current, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
           text.push_str(
             &value
               .xml10_content()
@@ -452,7 +594,7 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
       },
       Ok(Event::GeneralRef(value)) => {
         let current = stack[depth - 1];
-        if !matches!(current, Element::Property(_) | Element::PackageVersion(_)) {
+        if !matches!(current, Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _)) {
           return Err(ProjectError::new(
             ProjectErrorKind::Unsupported,
             path,
@@ -550,16 +692,49 @@ fn start_element(
       raw.package_references.push(RawPackageReference { id: include, version });
       Ok(Element::PackageReference(index))
     },
+    Element::ItemGroup if name == "FrameworkReference" => {
+      let include = required_attribute(
+        path,
+        reader,
+        element,
+        "Include",
+        &["RuntimeFrameworkVersion", "TargetingPackVersion", "TargetLatestRuntimePatch"],
+      )?;
+      let index = raw.framework_references.len();
+      raw.framework_references.push(RawFrameworkReference {
+        id: include,
+        runtime_version: optional_attribute(path, reader, element, "RuntimeFrameworkVersion")?,
+        targeting_pack_version: optional_attribute(path, reader, element, "TargetingPackVersion")?,
+        target_latest_runtime_patch: optional_attribute(path, reader, element, "TargetLatestRuntimePatch")?,
+      });
+      Ok(Element::FrameworkReference(index))
+    },
     Element::PackageReference(index) if name == "Version" => {
       validate_attributes(path, reader, element, &[])?;
       Ok(Element::PackageVersion(index))
+    },
+    Element::FrameworkReference(index) => {
+      validate_attributes(path, reader, element, &[])?;
+      let metadata = match name {
+        "RuntimeFrameworkVersion" => FrameworkMetadata::RuntimeFrameworkVersion,
+        "TargetingPackVersion" => FrameworkMetadata::TargetingPackVersion,
+        "TargetLatestRuntimePatch" => FrameworkMetadata::TargetLatestRuntimePatch,
+        _ => {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            format!("framework-reference metadata element {name} is not supported here"),
+          ));
+        },
+      };
+      Ok(Element::FrameworkMetadata(index, metadata))
     },
     Element::ProjectReference | Element::PackageReference(_) => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
       format!("metadata element {name} is not supported here"),
     )),
-    Element::Property(_) | Element::PackageVersion(_) => Err(ProjectError::new(
+    Element::Property(_) | Element::PackageVersion(_) | Element::FrameworkMetadata(_, _) => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
       format!("nested element {name} is not supported in a property value"),
@@ -591,6 +766,10 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::AssemblyName => raw.assembly_name = Some(text.to_owned()),
       Property::RootNamespace => raw.root_namespace = Some(text.to_owned()),
       Property::Deterministic => raw.deterministic = Some(text.to_owned()),
+      Property::RuntimeFrameworkVersion => raw.runtime_framework_version = Some(text.to_owned()),
+      Property::TargetLatestRuntimePatch => raw.target_latest_runtime_patch = Some(text.to_owned()),
+      Property::RollForward => raw.roll_forward = Some(text.to_owned()),
+      Property::SelfContained => raw.self_contained = Some(text.to_owned()),
     },
     Element::PackageVersion(index) => {
       let package = &mut raw.package_references[index];
@@ -602,6 +781,22 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
         ));
       }
       package.version = Some(text.to_owned());
+    },
+    Element::FrameworkMetadata(index, metadata) => {
+      let reference = &mut raw.framework_references[index];
+      let (slot, name) = match metadata {
+        FrameworkMetadata::RuntimeFrameworkVersion => (&mut reference.runtime_version, "RuntimeFrameworkVersion"),
+        FrameworkMetadata::TargetingPackVersion => (&mut reference.targeting_pack_version, "TargetingPackVersion"),
+        FrameworkMetadata::TargetLatestRuntimePatch => (&mut reference.target_latest_runtime_patch, "TargetLatestRuntimePatch"),
+      };
+      if slot.is_some() {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          path,
+          format!("framework reference {:?} declares {name} more than once", reference.id),
+        ));
+      }
+      *slot = Some(text.to_owned());
     },
     _ => {},
   }
@@ -639,6 +834,23 @@ fn materialize_project(
   let nullable = parse_toggle(&project_path, "Nullable", raw.nullable.as_deref(), false, true)?;
   let implicit_usings = parse_toggle(&project_path, "ImplicitUsings", raw.implicit_usings.as_deref(), false, false)?;
   let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
+  let self_contained = parse_bool(&project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
+  let target_latest_runtime_patch = raw
+    .target_latest_runtime_patch
+    .as_deref()
+    .map(|value| parse_bool(&project_path, "TargetLatestRuntimePatch", Some(value), false))
+    .transpose()?;
+  let roll_forward = match raw.roll_forward.as_deref() {
+    Some(value) => RuntimeRollForward::parse(value).ok_or_else(|| {
+      ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        &project_path,
+        format!("RollForward value {value:?} is unsupported"),
+      )
+    })?,
+    None => RuntimeRollForward::Minor,
+  };
+  validate_optional_version(&project_path, "RuntimeFrameworkVersion", raw.runtime_framework_version.as_deref())?;
   let selected_runtime = parse_runtime_identifier(&project_path, raw.runtime_identifier.as_deref())?;
   let mut runtime_dimensions = parse_runtime_identifiers(&project_path, raw.runtime_identifiers.as_deref())?;
   let runtime_identifiers_len = u32::try_from(runtime_dimensions.len()).map_err(|_| {
@@ -708,6 +920,14 @@ fn materialize_project(
       .package_references
       .iter()
       .map(|package| package.id.len() + package.version.as_ref().map_or(0, String::len))
+      .sum::<usize>()
+    + raw.runtime_framework_version.as_ref().map_or(0, String::len)
+    + raw
+      .framework_references
+      .iter()
+      .map(|reference| {
+        reference.id.len() + reference.runtime_version.as_ref().map_or(0, String::len) + reference.targeting_pack_version.as_ref().map_or(0, String::len)
+      })
       .sum::<usize>();
   let mut table = TextTable::with_capacity(estimated_text);
   let project_path_span = table.push(project_path_text, &project_path)?;
@@ -746,6 +966,50 @@ fn materialize_project(
       version: table.push(&version, &project_path)?,
     });
   }
+  let runtime_framework_version_span = match raw.runtime_framework_version.as_deref() {
+    Some(version) => table.push(version, &project_path)?,
+    None => NO_TEXT,
+  };
+  let mut framework_references = Vec::with_capacity(raw.framework_references.len());
+  for reference in raw.framework_references {
+    if reference.id.is_empty() || reference.id.contains("$(") {
+      return Err(ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        &project_path,
+        "FrameworkReference Include must be a non-empty literal",
+      ));
+    }
+    if framework_references.iter().any(|existing: &FrameworkReference| {
+      let start = existing.id.start as usize;
+      let existing_id = &table.text[start..start + existing.id.len as usize];
+      existing_id.eq_ignore_ascii_case(&reference.id)
+    }) {
+      return Err(ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        &project_path,
+        format!("framework reference {:?} is declared more than once", reference.id),
+      ));
+    }
+    validate_optional_version(&project_path, "RuntimeFrameworkVersion", reference.runtime_version.as_deref())?;
+    validate_optional_version(&project_path, "TargetingPackVersion", reference.targeting_pack_version.as_deref())?;
+    let target_latest_runtime_patch = reference
+      .target_latest_runtime_patch
+      .as_deref()
+      .map(|value| parse_bool(&project_path, "TargetLatestRuntimePatch", Some(value), false))
+      .transpose()?;
+    framework_references.push(FrameworkReference {
+      id: table.push(&reference.id, &project_path)?,
+      runtime_version: match reference.runtime_version.as_deref() {
+        Some(version) => table.push(version, &project_path)?,
+        None => NO_TEXT,
+      },
+      targeting_pack_version: match reference.targeting_pack_version.as_deref() {
+        Some(version) => table.push(version, &project_path)?,
+        None => NO_TEXT,
+      },
+      target_latest_runtime_patch,
+    });
+  }
 
   Ok(ProjectSpec {
     text: table.text.into_boxed_str(),
@@ -758,6 +1022,8 @@ fn materialize_project(
     sources: source_spans,
     project_references: reference_spans,
     package_references: package_references.into_boxed_slice(),
+    framework_references: framework_references.into_boxed_slice(),
+    runtime_framework_version: runtime_framework_version_span,
     runtime_identifier_index,
     runtime_identifiers_len,
     configuration,
@@ -765,6 +1031,9 @@ fn materialize_project(
     nullable,
     implicit_usings,
     deterministic,
+    self_contained,
+    target_latest_runtime_patch,
+    roll_forward,
     target_framework: parsed_target,
   })
 }
@@ -830,6 +1099,17 @@ fn parse_bool(path: &Path, property: &str, value: Option<&str>, default: bool) -
   }
 }
 
+fn validate_optional_version(path: &Path, property: &str, value: Option<&str>) -> Result<(), ProjectError> {
+  if value.is_some_and(|value| value.is_empty() || value.contains("$(")) {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      format!("{property} must be a non-empty literal version"),
+    ));
+  }
+  Ok(())
+}
+
 fn parse_runtime_identifier<'a>(path: &Path, value: Option<&'a str>) -> Result<Option<&'a str>, ProjectError> {
   let Some(value) = value.filter(|value| !value.is_empty()) else {
     return Ok(None);
@@ -885,6 +1165,10 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
     "AssemblyName" => Ok(Property::AssemblyName),
     "RootNamespace" => Ok(Property::RootNamespace),
     "Deterministic" => Ok(Property::Deterministic),
+    "RuntimeFrameworkVersion" => Ok(Property::RuntimeFrameworkVersion),
+    "TargetLatestRuntimePatch" => Ok(Property::TargetLatestRuntimePatch),
+    "RollForward" => Ok(Property::RollForward),
+    "SelfContained" => Ok(Property::SelfContained),
     _ => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
@@ -1173,6 +1457,30 @@ mod tests {
     assert_eq!(result.runtime_dimensions().collect::<Vec<_>>(), ["win-x64", "linux-x64", "osx-arm64"]);
     assert_eq!(result.text.matches("win-x64").count(), 1);
     assert_eq!(result.text.matches("osx-arm64").count(), 1);
+  }
+
+  #[test]
+  fn captures_framework_reference_versions_and_runtime_policy() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<RuntimeFrameworkVersion>10.0.1</RuntimeFrameworkVersion><TargetLatestRuntimePatch>false</TargetLatestRuntimePatch><RollForward>LatestMinor</RollForward>",
+        r#"<ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" TargetingPackVersion="10.0.2"><RuntimeFrameworkVersion>10.0.3</RuntimeFrameworkVersion><TargetLatestRuntimePatch>true</TargetLatestRuntimePatch></FrameworkReference></ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let reference = result.framework_references()[0];
+
+    assert_eq!(result.framework_reference_id(reference), "Microsoft.AspNetCore.App");
+    assert_eq!(result.framework_runtime_version(reference), Some("10.0.3"));
+    assert_eq!(result.framework_targeting_pack_version(reference), Some("10.0.2"));
+    assert_eq!(result.framework_target_latest_runtime_patch(reference), Some(true));
+    assert_eq!(result.runtime_framework_version(), Some("10.0.1"));
+    assert_eq!(result.target_latest_runtime_patch(), Some(false));
+    assert_eq!(result.roll_forward(), RuntimeRollForward::LatestMinor);
+    assert!(!result.self_contained());
   }
 
   #[test]

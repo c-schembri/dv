@@ -77,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":5"));
+  assert!(lines[0].contains("\"schema_version\":6"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -362,4 +362,43 @@ fn runtime_pack_json_reports_manifest_selected_assets_and_apphost() {
   assert!(stdout.contains("Core.dll"));
   assert!(stdout.contains("core.dll"));
   assert!(stdout.contains("apphost"));
+}
+
+#[test]
+fn framework_plan_json_resolves_explicit_reference_and_shared_runtime() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><RollForward>LatestPatch</RollForward></PropertyGroup><ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "sdk/10.0.100/Microsoft.NETCoreSdk.BundledVersions.props",
+    r#"<Project><ItemGroup>
+      <KnownFrameworkReference Include="Microsoft.NETCore.App" TargetFramework="net10.0" RuntimeFrameworkName="Microsoft.NETCore.App" DefaultRuntimeFrameworkVersion="10.0.0" LatestRuntimeFrameworkVersion="10.0.1" TargetingPackName="Microsoft.NETCore.App.Ref" TargetingPackVersion="10.0.1" />
+      <KnownFrameworkReference Include="Microsoft.AspNetCore.App" TargetFramework="net10.0" RuntimeFrameworkName="Microsoft.AspNetCore.App" DefaultRuntimeFrameworkVersion="10.0.0" LatestRuntimeFrameworkVersion="10.0.1" TargetingPackName="Microsoft.AspNetCore.App.Ref" TargetingPackVersion="10.0.1" />
+    </ItemGroup></Project>"#,
+  );
+  fs::create_dir_all(temp.0.join("packs/Microsoft.NETCore.App.Ref/10.0.1")).unwrap();
+  fs::create_dir_all(temp.0.join("packs/Microsoft.AspNetCore.App.Ref/10.0.1")).unwrap();
+  fs::create_dir_all(temp.0.join("shared/Microsoft.NETCore.App/10.0.7")).unwrap();
+  fs::create_dir_all(temp.0.join("shared/Microsoft.AspNetCore.App/10.0.7")).unwrap();
+  fs::create_dir_all(temp.0.join("packages")).unwrap();
+  temp.write(&format!("dotnet{}", env::consts::EXE_SUFFIX), "not an executable");
+
+  let output = dv()
+    .args(["project", "frameworks", "App.csproj", "--packages", "packages", "--json"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"framework_reference_plan_created\""));
+  assert!(stdout.contains("\"reference\":\"Microsoft.NETCore.App\""));
+  assert!(stdout.contains("\"reference\":\"Microsoft.AspNetCore.App\""));
+  assert!(stdout.contains("\"requested_version\":\"10.0.0\""));
+  assert!(stdout.contains("\"selected_version\":\"10.0.7\""));
+  assert!(stdout.contains("\"roll_forward\":\"LatestPatch\""));
 }

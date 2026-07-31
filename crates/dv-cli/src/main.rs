@@ -8,11 +8,12 @@ use std::{
 };
 
 use dv_core::{
-  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, PackageError,
-  PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent, ProjectSpec,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
-  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, FrameworkReferenceError,
+  FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, ProjectConfiguration,
+  ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
+  RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
+  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
+  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -52,6 +53,7 @@ Usage:
 const PROJECT_HELP: &str = "\
 Usage:
   dv project inspect [PROJECT] [--configuration Debug|Release]
+  dv project frameworks [PROJECT] [--packages PATH]
   dv project runtime-packs [PROJECT] [--packages PATH]
 ";
 
@@ -609,6 +611,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   if project_args.is_empty()
     || matches!(project_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h"))
     || matches!(project_args, [inspect, argument] if inspect == "inspect" && matches!(argument.as_str(), "help" | "--help" | "-h"))
+    || matches!(project_args, [frameworks, argument] if frameworks == "frameworks" && matches!(argument.as_str(), "help" | "--help" | "-h"))
     || matches!(project_args, [packs, argument] if packs == "runtime-packs" && matches!(argument.as_str(), "help" | "--help" | "-h"))
   {
     print!("{PROJECT_HELP}");
@@ -616,6 +619,9 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   }
   if project_args.first().map(String::as_str) == Some("runtime-packs") {
     return project_runtime_packs(started, json, args, &project_args[1..]);
+  }
+  if project_args.first().map(String::as_str) == Some("frameworks") {
+    return project_frameworks(started, json, args, &project_args[1..]);
   }
   if project_args.first().map(String::as_str) != Some("inspect") {
     let subcommand = project_args.first().map_or("<missing>", String::as_str);
@@ -682,6 +688,16 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
       version: project.package_version(*package).into(),
     })
     .collect();
+  let frameworks = project
+    .framework_references()
+    .iter()
+    .map(|reference| ProjectFrameworkReferenceEvent {
+      id: project.framework_reference_id(*reference).into(),
+      runtime_version: project.framework_runtime_version(*reference).map(str::to_owned),
+      targeting_pack_version: project.framework_targeting_pack_version(*reference).map(str::to_owned),
+      target_latest_runtime_patch: project.framework_target_latest_runtime_patch(*reference),
+    })
+    .collect();
   let payload = EventPayload::ProjectEvaluated {
     project: project.project_path().display().to_string(),
     sdk: project.sdk().into(),
@@ -699,12 +715,98 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     sources: project.sources().map(str::to_owned).collect(),
     project_references: project.project_references().map(str::to_owned).collect(),
     package_references: packages,
+    framework_references: frameworks,
+    runtime_framework_version: project.runtime_framework_version().map(str::to_owned),
+    target_latest_runtime_patch: project.target_latest_runtime_patch(),
+    roll_forward: project.roll_forward().as_str().into(),
+    self_contained: project.self_contained(),
   };
   succeed(started, "project inspect", args, payload)
 }
 
+fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+  let (requested_path, packages_directory) = match parse_pack_plan_args(project_args, "frameworks") {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "project frameworks",
+        args,
+        diagnostic(
+          "DV0002",
+          problem,
+          None,
+          Some("Use `dv project frameworks --help` to inspect the accepted arguments."),
+        ),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "project frameworks",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, requested_path.as_deref(), ProjectConfiguration::Debug) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "project frameworks", args, project_diagnostic(error)),
+  };
+  let inventory = match discover_sdks(project.project_directory()) {
+    Ok(inventory) => inventory,
+    Err(error) => {
+      let directory = project.project_directory();
+      return fail(started, json, "project frameworks", args, sdk_diagnostic(directory, error));
+    },
+  };
+  let plans = match plan_framework_references(&[&project], &inventory, packages_directory.as_deref()) {
+    Ok(plans) => plans,
+    Err(error) => return fail(started, json, "project frameworks", args, framework_reference_diagnostic(error)),
+  };
+  let plan = &plans[0];
+
+  if !json {
+    return write_framework_reference_plan(plan);
+  }
+  let frameworks = plan
+    .frameworks()
+    .iter()
+    .map(|framework| ResolvedFrameworkReferenceEvent {
+      reference: plan.reference(*framework).into(),
+      runtime_name: plan.runtime_name(*framework).into(),
+      requested_version: plan.requested_version(*framework).into(),
+      selected_version: plan.selected_version(*framework).map(str::to_owned),
+      shared_root: plan.shared_root(*framework).map(str::to_owned),
+      targeting_pack_id: plan.targeting_pack_id(*framework).into(),
+      targeting_pack_version: plan.targeting_pack_version(*framework).into(),
+      targeting_pack_root: plan.targeting_pack_root(*framework).into(),
+      profile: plan.profile(*framework).map(str::to_owned),
+    })
+    .collect();
+  succeed(
+    started,
+    "project frameworks",
+    args,
+    EventPayload::FrameworkReferencePlanCreated {
+      project: plan.project().into(),
+      sdk_version: plan.sdk_version().into(),
+      manifest: plan.manifest().into(),
+      target_framework: plan.target_framework().into(),
+      roll_forward: plan.roll_forward().as_str().into(),
+      self_contained: plan.self_contained(),
+      frameworks,
+    },
+  )
+}
+
 fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
-  let (requested_path, packages_directory) = match parse_runtime_pack_args(project_args) {
+  let (requested_path, packages_directory) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -777,7 +879,7 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
   )
 }
 
-fn parse_runtime_pack_args(arguments: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+fn parse_pack_plan_args(arguments: &[String], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
   let mut project = None;
   let mut packages = None;
   let mut index = 0;
@@ -787,9 +889,9 @@ fn parse_runtime_pack_args(arguments: &[String]) -> Result<(Option<PathBuf>, Opt
         index += 1;
         packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
       },
-      value if value.starts_with('-') => return Err(format!("unknown project runtime-packs option {value:?}")),
+      value if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
       value if project.is_none() => project = Some(PathBuf::from(value)),
-      value => return Err(format!("unexpected project runtime-packs argument {value:?}")),
+      value => return Err(format!("unexpected project {command} argument {value:?}")),
     }
     index += 1;
   }
@@ -875,6 +977,51 @@ fn write_runtime_pack_plan(plan: &RuntimePackPlan) -> ExitCode {
   ExitCode::SUCCESS
 }
 
+fn write_framework_reference_plan(plan: &FrameworkReferencePlan) -> ExitCode {
+  let mut output = String::with_capacity(1536);
+  use std::fmt::Write as _;
+  writeln!(output, "Framework reference plan").expect("writing a String succeeds");
+  writeln!(output, "  Project          {}", plan.project()).expect("writing a String succeeds");
+  writeln!(output, "  SDK              {}", plan.sdk_version()).expect("writing a String succeeds");
+  writeln!(output, "  Target           {}", plan.target_framework()).expect("writing a String succeeds");
+  writeln!(output, "  Roll forward     {}", plan.roll_forward().as_str()).expect("writing a String succeeds");
+  writeln!(output, "  Self-contained   {}", plan.self_contained()).expect("writing a String succeeds");
+  writeln!(output, "  Frameworks       {}", plan.frameworks().len()).expect("writing a String succeeds");
+  for framework in plan.frameworks() {
+    writeln!(output).expect("writing a String succeeds");
+    writeln!(output, "{}", plan.reference(*framework)).expect("writing a String succeeds");
+    writeln!(
+      output,
+      "  Runtime          {} {}",
+      plan.runtime_name(*framework),
+      plan.requested_version(*framework)
+    )
+    .expect("writing a String succeeds");
+    if let Some(selected) = plan.selected_version(*framework) {
+      writeln!(output, "  Selected         {selected}").expect("writing a String succeeds");
+    }
+    if let Some(root) = plan.shared_root(*framework) {
+      writeln!(output, "  Shared root      {root}").expect("writing a String succeeds");
+    }
+    writeln!(
+      output,
+      "  Targeting pack   {} {}",
+      plan.targeting_pack_id(*framework),
+      plan.targeting_pack_version(*framework)
+    )
+    .expect("writing a String succeeds");
+    writeln!(output, "  Targeting root   {}", plan.targeting_pack_root(*framework)).expect("writing a String succeeds");
+    if let Some(profile) = plan.profile(*framework) {
+      writeln!(output, "  Profile          {profile}").expect("writing a String succeeds");
+    }
+  }
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing framework-reference plan to stdout succeeds");
+  ExitCode::SUCCESS
+}
+
 fn load_project(directory: &Path, requested: Option<&Path>, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
   let Some(requested) = requested else {
     return evaluate_project(directory, configuration);
@@ -898,6 +1045,8 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
   writeln!(output, "SDK                 {}", project.sdk()).expect("writing a String succeeds");
   writeln!(output, "Target              {}", project.target_framework()).expect("writing a String succeeds");
   writeln!(output, "Runtime             {}", project.runtime_identifier().unwrap_or("portable")).expect("writing a String succeeds");
+  writeln!(output, "Roll forward        {}", project.roll_forward().as_str()).expect("writing a String succeeds");
+  writeln!(output, "Self-contained      {}", project.self_contained()).expect("writing a String succeeds");
   writeln!(output, "Runtime dimensions  {}", project.runtime_dimensions().len()).expect("writing a String succeeds");
   for runtime in project.runtime_dimensions() {
     writeln!(output, "  {runtime}").expect("writing a String succeeds");
@@ -920,6 +1069,10 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
   writeln!(output, "Package references  {}", project.package_references().len()).expect("writing a String succeeds");
   for package in project.package_references() {
     writeln!(output, "  {} {}", project.package_id(*package), project.package_version(*package)).expect("writing a String succeeds");
+  }
+  writeln!(output, "Framework references {}", project.framework_references().len()).expect("writing a String succeeds");
+  for reference in project.framework_references() {
+    writeln!(output, "  {}", project.framework_reference_id(*reference)).expect("writing a String succeeds");
   }
   io::stdout()
     .lock()
@@ -1091,6 +1244,35 @@ fn runtime_pack_diagnostic(error: RuntimePackError) -> Diagnostic {
     RuntimePackErrorKind::Configuration => ("DV0126", Some("Correct NuGet.Config or set NUGET_PACKAGES.")),
     RuntimePackErrorKind::NonUnicodePath => ("DV0127", None),
     RuntimePackErrorKind::TextOverflow => ("DV0128", Some("Use a bounded SDK and package installation.")),
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    help,
+  )
+}
+
+fn framework_reference_diagnostic(error: FrameworkReferenceError) -> Diagnostic {
+  let (code, help) = match error.kind() {
+    FrameworkReferenceErrorKind::Io => ("DV0130", None),
+    FrameworkReferenceErrorKind::InvalidManifest => ("DV0131", Some("Repair or reinstall the selected .NET SDK.")),
+    FrameworkReferenceErrorKind::UnknownFramework => (
+      "DV0132",
+      Some("Choose a FrameworkReference supported by the selected SDK and target framework."),
+    ),
+    FrameworkReferenceErrorKind::InvalidVersion => ("DV0133", Some("Use a valid three-part .NET runtime or targeting-pack version.")),
+    FrameworkReferenceErrorKind::TargetingPackNotFound => ("DV0134", Some("Restore the required targeting pack or install the matching SDK.")),
+    FrameworkReferenceErrorKind::SharedFrameworkNotFound => (
+      "DV0135",
+      Some("Install a compatible shared framework or adjust the project's RollForward policy."),
+    ),
+    FrameworkReferenceErrorKind::Configuration => ("DV0136", Some("Correct NuGet.Config or set NUGET_PACKAGES.")),
+    FrameworkReferenceErrorKind::NonUnicodePath => ("DV0137", None),
+    FrameworkReferenceErrorKind::TextOverflow => ("DV0138", Some("Use a bounded SDK and framework installation.")),
   };
   diagnostic(
     code,

@@ -32,9 +32,11 @@ Transform:
    host RID.
 
 For default self-contained acquisition, the runtime pack uses
-`LatestRuntimeFrameworkVersion`. The runtime framework version used in a
-runtime configuration can remain the default version; that separate
-roll-forward contract belongs to `PACKS-007`. This mirrors the SDK's
+`LatestRuntimeFrameworkVersion`. Explicit per-reference or project
+`RuntimeFrameworkVersion` and `TargetLatestRuntimePatch` values override that
+default using the framework plan's version precedence. The requested runtime
+framework version may remain the default while a future self-contained
+deployment acquires the latest pack. This mirrors the SDK's
 [`ProcessFrameworkReferences` version precedence](https://github.com/dotnet/sdk/blob/main/src/Tasks/Microsoft.NET.Build.Tasks/ProcessFrameworkReferences.cs).
 
 Output:
@@ -78,9 +80,11 @@ dv project runtime-packs path\to\App.csproj
 dv project runtime-packs path\to\App.csproj --packages path\to\packages --json
 ```
 
-The current vertical slice plans the implicit `Microsoft.NETCore.App` runtime
-for one project RID. Explicit and transitive framework references, runtime
-framework overrides, and roll-forward policy are the next `PACKS-007` scope.
+This command plans the implicit `Microsoft.NETCore.App` runtime pack for one
+project RID. `dv project frameworks` separately materializes explicit
+framework references, targeting packs, and installed shared-framework
+roll-forward; runtime-pack planning consumes Core version overrides from the
+same evaluated project data.
 
 ## Parity Gate
 

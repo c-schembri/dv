@@ -215,6 +215,7 @@ impl Error for RuntimePackError {}
 
 struct PackDefinitions {
   runtime_pattern: String,
+  default_runtime_version: String,
   runtime_version: String,
   runtime_identifiers: String,
   host_pattern: String,
@@ -251,6 +252,7 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
   let sdk_root = inventory.installation_path(selected);
   let manifest = sdk_root.join(BUNDLED_VERSIONS_FILE);
   let definitions = read_pack_definitions(&manifest, project.target_framework())?;
+  let runtime_pack_version = selected_runtime_pack_version(project, &definitions);
   let graph = load_portable_runtime_graph(inventory).map_err(|error| {
     RuntimePackError::new(
       RuntimePackErrorKind::InvalidManifest,
@@ -277,7 +279,7 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
     )
   })?;
   let dotnet_root = inventory.root(selected);
-  let runtime_pack_root = locate_pack(dotnet_root, &global_packages, &runtime_pack_id, &definitions.runtime_version)?;
+  let runtime_pack_root = locate_pack(dotnet_root, &global_packages, &runtime_pack_id, runtime_pack_version)?;
   let host_pack_root = locate_pack(dotnet_root, &global_packages, &host_pack_id, &definitions.host_version)?;
   let runtime_manifest = runtime_pack_root.join(RUNTIME_LIST_FILE);
   let framework_version = project.target().framework_version();
@@ -291,7 +293,7 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
     requested_runtime_identifier,
     runtime_identifier,
     &runtime_pack_id,
-    &definitions.runtime_version,
+    runtime_pack_version,
     &runtime_pack_root,
     host_runtime_identifier,
     &host_pack_id,
@@ -323,6 +325,7 @@ fn read_pack_definitions(path: &Path, target_framework: &str) -> Result<PackDefi
           }
           runtime = Some((
             required_attribute(&reader, &element, b"RuntimePackNamePatterns", path)?,
+            required_attribute(&reader, &element, b"DefaultRuntimeFrameworkVersion", path)?,
             required_attribute(&reader, &element, b"LatestRuntimeFrameworkVersion", path)?,
             required_attribute(&reader, &element, b"RuntimePackRuntimeIdentifiers", path)?,
           ));
@@ -351,7 +354,7 @@ fn read_pack_definitions(path: &Path, target_framework: &str) -> Result<PackDefi
     }
   }
 
-  let (runtime_pattern, runtime_version, runtime_identifiers) = runtime.ok_or_else(|| {
+  let (runtime_pattern, default_runtime_version, runtime_version, runtime_identifiers) = runtime.ok_or_else(|| {
     invalid_manifest(
       path,
       format!("SDK pack manifest has no {IMPLICIT_FRAMEWORK_REFERENCE} runtime definition for {target_framework}"),
@@ -365,12 +368,34 @@ fn read_pack_definitions(path: &Path, target_framework: &str) -> Result<PackDefi
   })?;
   Ok(PackDefinitions {
     runtime_pattern,
+    default_runtime_version,
     runtime_version,
     runtime_identifiers,
     host_pattern,
     host_version,
     host_identifiers,
   })
+}
+
+fn selected_runtime_pack_version<'a>(project: &'a ProjectSpec, definitions: &'a PackDefinitions) -> &'a str {
+  let core_reference = project
+    .framework_references()
+    .iter()
+    .copied()
+    .find(|reference| project.framework_reference_id(*reference).eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE));
+  if let Some(version) = core_reference.and_then(|reference| project.framework_runtime_version(reference)) {
+    return version;
+  }
+  if let Some(version) = project.runtime_framework_version() {
+    return version;
+  }
+  match core_reference
+    .and_then(|reference| project.framework_target_latest_runtime_patch(reference))
+    .or(project.target_latest_runtime_patch())
+  {
+    Some(false) => &definitions.default_runtime_version,
+    Some(true) | None => &definitions.runtime_version,
+  }
 }
 
 fn select_pack_runtime_identifier<'a>(

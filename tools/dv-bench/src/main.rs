@@ -21,6 +21,7 @@ enum CaseKind {
   ProjectEvaluate,
   RuntimeEvaluate,
   RuntimePackPlan,
+  FrameworkReferencePlan,
   CompilerPlan,
   RestoreCold,
   PackageSyncCold,
@@ -44,6 +45,7 @@ struct Fixtures<'a> {
   rid_graph: &'a Path,
   runtime: &'a Path,
   runtime_pack: &'a Path,
+  framework_reference: &'a Path,
   package: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
@@ -97,6 +99,19 @@ const DOTNET_CASES: &[Case] = &[
       "-t:ProcessFrameworkReferences;ResolveFrameworkReferences;ResolveRuntimePackAssets;_GetAppHostPaths",
       "-getProperty:RuntimeIdentifier,AppHostSourcePath",
       "-getItem:ResolvedRuntimePack,RuntimePackAsset,ResolvedAppHostPack",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "framework_reference_plan",
+    kind: CaseKind::FrameworkReferencePlan,
+    args: &[
+      "msbuild",
+      "FrameworkReferenceProject.csproj",
+      "--nologo",
+      "-t:ResolveTargetingPackAssets",
+      "-getProperty:TargetFramework,RollForward,SelfContained",
+      "-getItem:RuntimeFramework,ResolvedFrameworkReference",
     ],
     implemented: true,
   },
@@ -229,6 +244,12 @@ const DV_CASES: &[Case] = &[
     name: "runtime_pack_plan",
     kind: CaseKind::RuntimePackPlan,
     args: &["project", "runtime-packs", "RuntimePackProject.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "framework_reference_plan",
+    kind: CaseKind::FrameworkReferencePlan,
+    args: &["project", "frameworks", "FrameworkReferenceProject.csproj", "--json"],
     implemented: true,
   },
   Case {
@@ -380,6 +401,7 @@ fn run() -> Result<()> {
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
   let runtime_pack_fixture = repository.join("benchmarks/fixtures/runtime-pack-project");
+  let framework_reference_fixture = repository.join("benchmarks/fixtures/framework-reference-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
@@ -388,6 +410,7 @@ fn run() -> Result<()> {
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
     runtime_pack: &runtime_pack_fixture,
+    framework_reference: &framework_reference_fixture,
     package: &package_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
@@ -409,6 +432,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "runtime_pack_plan") {
     verify_runtime_pack_plan(&repository, &dv_executable, &runtime_pack_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "framework_reference_plan") {
+    verify_framework_reference_plan(&repository, &dv_executable, &framework_reference_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "compiler_plan") {
     verify_compiler_plan(&repository, &dv_executable, &fixture)?;
@@ -435,7 +461,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 5,
+    schema_version: 6,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -709,6 +735,142 @@ fn verify_runtime_pack_plan(repository: &Path, dv_executable: &Path, fixture: &P
   let expected_host_suffix = format!("\\{}\\{}", required_string(&dv, "host_pack_id")?, required_string(&dv, "host_pack_version")?);
   if !normalize_windows_path(required_string(&dv, "host_pack_root")?).ends_with(&normalize_windows_path(&expected_host_suffix)) {
     return Err("dv host pack identity/version do not match its MSBuild-selected directory".into());
+  }
+  Ok(())
+}
+
+fn verify_framework_reference_plan(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let verification = repository.join("target/benchmark-framework-reference-verification");
+  ensure_workspace_is_safe(repository, &verification)?;
+  reset_fixture(fixture, &verification)?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "FrameworkReferenceProject.csproj",
+      "--nologo",
+      "-p:NuGetAudit=false",
+      "--verbosity",
+      "quiet",
+    ],
+    &verification,
+    "framework-reference verification restore",
+  )?;
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "FrameworkReferenceProject.csproj",
+      "--nologo",
+      "-t:ResolveTargetingPackAssets",
+      "-getProperty:TargetFramework,RollForward,SelfContained",
+      "-getItem:RuntimeFramework,ResolvedFrameworkReference",
+    ],
+    &verification,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(
+    dv_executable,
+    &["project", "frameworks", "FrameworkReferenceProject.csproj", "--json"],
+    &verification,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("framework_reference_plan_created"))
+    .ok_or("dv framework planning did not emit framework_reference_plan_created")?;
+
+  for (dotnet_name, dv_name) in [("TargetFramework", "target_framework"), ("RollForward", "roll_forward")] {
+    let reference = dotnet.pointer(&format!("/Properties/{dotnet_name}")).and_then(serde_json::Value::as_str);
+    let actual = dv.get(dv_name).and_then(serde_json::Value::as_str);
+    if reference != actual {
+      return Err(format!("framework plan mismatch for {dotnet_name}: dotnet={reference:?}, dv={actual:?}").into());
+    }
+  }
+  let reference_self_contained = dotnet.pointer("/Properties/SelfContained").and_then(serde_json::Value::as_str) == Some("true");
+  if dv.get("self_contained").and_then(serde_json::Value::as_bool) != Some(reference_self_contained) {
+    return Err("framework plan SelfContained mismatch".into());
+  }
+
+  let frameworks = dv
+    .get("frameworks")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv framework plan omitted frameworks")?;
+  let resolved = dotnet
+    .pointer("/Items/ResolvedFrameworkReference")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("MSBuild omitted ResolvedFrameworkReference")?;
+  let runtimes = dotnet
+    .pointer("/Items/RuntimeFramework")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("MSBuild omitted RuntimeFramework")?;
+  if frameworks.len() != resolved.len() || frameworks.len() != runtimes.len() {
+    return Err(
+      format!(
+        "framework count mismatch: MSBuild resolved={} runtime={} dv={}",
+        resolved.len(),
+        runtimes.len(),
+        frameworks.len()
+      )
+      .into(),
+    );
+  }
+  for framework in frameworks {
+    let reference_name = required_string(framework, "reference")?;
+    let resolved_framework = resolved
+      .iter()
+      .find(|item| item.get("Identity").and_then(serde_json::Value::as_str) == Some(reference_name))
+      .ok_or_else(|| format!("MSBuild did not resolve framework reference {reference_name}"))?;
+    compare_text_field(resolved_framework, "TargetingPackName", framework, "targeting_pack_id")?;
+    compare_text_field(resolved_framework, "TargetingPackVersion", framework, "targeting_pack_version")?;
+    compare_path_field(resolved_framework, "TargetingPackPath", framework, "targeting_pack_root")?;
+
+    let runtime = runtimes
+      .iter()
+      .find(|item| item.get("FrameworkName").and_then(serde_json::Value::as_str) == Some(reference_name))
+      .ok_or_else(|| format!("MSBuild did not emit runtime framework for {reference_name}"))?;
+    compare_text_field(runtime, "Identity", framework, "runtime_name")?;
+    compare_text_field(runtime, "Version", framework, "requested_version")?;
+    let expected_profile = runtime.get("Profile").and_then(serde_json::Value::as_str).filter(|profile| !profile.is_empty());
+    let actual_profile = framework.get("profile").and_then(serde_json::Value::as_str);
+    if expected_profile != actual_profile {
+      return Err(format!("framework profile mismatch for {reference_name}: MSBuild={expected_profile:?} dv={actual_profile:?}").into());
+    }
+  }
+
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "build",
+      "FrameworkReferenceProject.csproj",
+      "-c",
+      "Release",
+      "--no-restore",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &verification,
+    "framework-reference host oracle build",
+  )?;
+  let host_output = command_text(Path::new("dotnet"), &["bin/Release/net10.0/FrameworkReferenceProject.dll"], &verification)?;
+  let selected = host_output
+    .lines()
+    .filter_map(|assembly| {
+      let version = Path::new(assembly).parent()?.file_name()?.to_str()?;
+      let runtime_name = Path::new(assembly).parent()?.parent()?.file_name()?.to_str()?;
+      Some((runtime_name, version))
+    })
+    .collect::<Vec<_>>();
+  for framework in frameworks {
+    let runtime_name = required_string(framework, "runtime_name")?;
+    let actual = framework.get("selected_version").and_then(serde_json::Value::as_str);
+    let reference = selected.iter().find_map(|(name, version)| (*name == runtime_name).then_some(*version));
+    if reference != actual {
+      return Err(format!("installed shared-framework selection mismatch for {runtime_name}: host={reference:?} dv={actual:?}").into());
+    }
   }
   Ok(())
 }
@@ -1317,6 +1479,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::ProjectEvaluate
       | CaseKind::RuntimeEvaluate
       | CaseKind::RuntimePackPlan
+      | CaseKind::FrameworkReferencePlan
       | CaseKind::CompilerPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::BuildNoOp
@@ -1347,6 +1510,21 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       ],
       workspace,
       "runtime-pack plan restore",
+    )?;
+  }
+  if matches!(case.kind, CaseKind::FrameworkReferencePlan) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &[
+        "restore",
+        "FrameworkReferenceProject.csproj",
+        "--nologo",
+        "-p:NuGetAudit=false",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "framework-reference plan restore",
     )?;
   }
   if matches!(case.kind, CaseKind::PackageSyncWarm) {
@@ -1393,7 +1571,12 @@ fn prepare_rid_oracle(executable: &Path, workspace: &Path) -> Result<()> {
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::RidGraph | CaseKind::ProjectEvaluate | CaseKind::RuntimeEvaluate | CaseKind::RuntimePackPlan | CaseKind::CompilerPlan => Ok(()),
+    CaseKind::RidGraph
+    | CaseKind::ProjectEvaluate
+    | CaseKind::RuntimeEvaluate
+    | CaseKind::RuntimePackPlan
+    | CaseKind::FrameworkReferencePlan
+    | CaseKind::CompilerPlan => Ok(()),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -1435,6 +1618,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan => fixtures.runtime_pack,
+    CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive => fixtures.package_graph_massive,
@@ -1448,6 +1632,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan => Some("runtime-pack-project"),
+    CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive => Some("massive-package-graph"),
@@ -1821,6 +2006,7 @@ fn case_label(case: &str) -> &str {
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "runtime_pack_plan" => "Runtime pack plan",
+    "framework_reference_plan" => "Framework reference plan",
     "compiler_plan" => "Compiler input plan",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
@@ -1911,7 +2097,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 5,
+      schema_version: 6,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -1975,7 +2161,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 5,
+      schema_version: 6,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
