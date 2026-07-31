@@ -44,6 +44,9 @@ dv restore (warm locked)         7.019 ms median
 dotnet restore (config stack) 532.948 ms median
 dv restore (config stack)       5.651 ms median
 
+dotnet restore (config merge) 558.126 ms median
+dv restore (config merge)       9.422 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -85,6 +88,7 @@ The project is in the first implementation phase.
 | Fingerprinted immutable SDK pack inventory cache | Implemented |
 | Actionable unavailable-pack diagnostics | Implemented |
 | Machine/user/repository/explicit NuGet config discovery | Implemented |
+| Keyed NuGet config merge and environment expansion | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -217,7 +221,7 @@ Initial machine:
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
-  planning, NuGet configuration hierarchy, and the
+  planning, NuGet configuration hierarchy, keyed configuration merge, and the
   framework-reference plan, unavailable-pack diagnostic, 203-package asset
   plan, and one-package cold case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
@@ -238,6 +242,7 @@ Initial machine:
 | Plan framework references and shared runtimes | `dotnet msbuild FrameworkReferenceProject.csproj -t:ResolveTargetingPackAssets` framework item query | `dv project frameworks FrameworkReferenceProject.csproj --json` | 352.715 ms | 5.585 ms | 63.2x | 390.432 ms | 6.530 ms |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` property/item query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x | 374.293 ms | 6.027 ms |
 | Validate a six-file NuGet configuration hierarchy | `dotnet restore ConfigHierarchy.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigHierarchy.csproj --offline --json` | 532.948 ms | 5.651 ms | 94.3x | 545.049 ms | 6.296 ms |
+| Merge keyed NuGet configuration | `dotnet restore ConfigMerge.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore ConfigMerge.csproj --offline --json` | 558.126 ms | 9.422 ms | 59.2x | 648.298 ms | 10.606 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -261,7 +266,10 @@ identity, exact-version, archive-SHA-512, and selected asset batches. The
 configuration-hierarchy case additionally injects machine and user roots,
 checks Microsoft's exact six-path priority order, then compares the effective
 repository source, protocol, package directory, package identity/version, and
-archive SHA-512 with zero timed network work. The
+archive SHA-512 with zero timed network work. The keyed-merge case additionally
+exercises case-insensitive replacement, clear/remove operations, disabled
+sources, and `%NAME%` expansion across four precedence levels, then applies
+the same package and cache parity gate. The
 unavailable-pack case uses an empty checked-in source and isolated package
 cache; both commands must fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -283,6 +291,7 @@ recorded in the curated
 [unavailable pack diagnostic baseline](docs/performance-baselines/2026-08-01-pack-diagnostic-windows.md),
 [framework reference baseline](docs/performance-baselines/2026-08-01-framework-reference-windows.md),
 [NuGet configuration baseline](docs/performance-baselines/2026-08-01-nuget-config-discovery-windows.md),
+[NuGet keyed-merge baseline](docs/performance-baselines/2026-08-01-nuget-config-merge-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -329,6 +338,7 @@ cargo bench-all --case pack_diagnostic --samples 30 --warmups 3
 cargo bench-all --case framework_reference_plan --samples 30 --warmups 3
 cargo bench-all --case compiler_plan --samples 30 --warmups 5
 cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
+cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
@@ -382,6 +392,7 @@ See:
 - [Runtime pack planning contract](docs/runtime-pack-planning.md)
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)
 - [NuGet configuration discovery contract](docs/nuget-config-discovery.md)
+- [NuGet keyed configuration merge contract](docs/nuget-config-merge.md)
 - [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)

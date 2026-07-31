@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 16 Rust source files, 15,714 nonblank source
-lines, and 94 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 15,997 nonblank source
+lines, and 96 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -724,8 +724,12 @@ boundary, not final drop-in parity.
   `--configfile` validates and isolates one file. The six-file locked oracle
   measures `532.948 ms` for Microsoft versus `5.651 ms` for `dv` (`94.3x`)
   across 30 retained samples. `P1`
-- [~] `NUGET-002` Merge keyed sections with `<clear>`, add, remove, disabled
-  sources, and environment-variable expansion. `P1`
+- [x] `NUGET-002` Merge keyed sections with case-insensitive replacement,
+  `<clear>`, add, remove, disabled-source membership, and single-pass `%NAME%`
+  environment expansion. Unknown variables remain literal and expansion adds
+  no allocation when no marker resolves. The four-level locked oracle
+  measures `558.126 ms` for Microsoft versus `9.422 ms` for `dv` (`59.2x`)
+  across 30 retained samples. `P1`
 - [~] `NUGET-003` Support `packageSources`, `disabledPackageSources`,
   `packageSourceMapping`, `auditSources`, and source protocol version. `P2`
 - [~] `NUGET-004` Support global-packages, HTTP cache, temp, fallback folders,

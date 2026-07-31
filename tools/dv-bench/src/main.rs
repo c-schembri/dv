@@ -32,6 +32,7 @@ enum CaseKind {
   PackageAssetPlan,
   PackageSyncWarm,
   NugetConfigHierarchy,
+  NugetConfigMerge,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -53,6 +54,7 @@ struct Fixtures<'a> {
   unavailable_pack: &'a Path,
   package: &'a Path,
   nuget_config: &'a Path,
+  nuget_config_merge: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -220,6 +222,21 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_config_merge",
+    kind: CaseKind::NugetConfigMerge,
+    args: &[
+      "restore",
+      "ConfigMerge.csproj",
+      "--locked-mode",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -372,6 +389,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_config_merge",
+    kind: CaseKind::NugetConfigMerge,
+    args: &["restore", "ConfigMerge.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -500,6 +523,7 @@ fn run() -> Result<()> {
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
+  let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -511,6 +535,7 @@ fn run() -> Result<()> {
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     nuget_config: &nuget_config_fixture,
+    nuget_config_merge: &nuget_config_merge_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
@@ -555,6 +580,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_config_hierarchy") {
     verify_nuget_config_hierarchy(&repository, &dv_executable, &nuget_config_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_config_merge") {
+    verify_nuget_config_merge(&repository, &dv_executable, &nuget_config_merge_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -574,7 +602,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 7,
+    schema_version: 8,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -1561,6 +1589,103 @@ fn verify_nuget_config_hierarchy(repository: &Path, dv_executable: &Path, fixtur
   Ok(())
 }
 
+fn verify_nuget_config_merge(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join("target/benchmark-nuget-merge-verification");
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+
+  let dotnet_args = [
+    "restore",
+    "ConfigMerge.csproj",
+    "--use-lock-file",
+    "--no-http-cache",
+    "-p:NuGetAudit=false",
+    "--nologo",
+    "--verbosity",
+    "quiet",
+  ];
+  run_nuget_config_checked(
+    Path::new("dotnet"),
+    &dotnet_args,
+    &dotnet_workspace,
+    "NuGet configuration merge verification restore",
+  )?;
+  let dv_text = nuget_config_command_text(dv_executable, &["restore", "ConfigMerge.csproj", "--json"], &dv_workspace)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv configuration merge restore did not emit package_resolution_created")?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let reference_sources = assets
+    .pointer("/project/restore/sources")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("dotnet configuration merge assets omitted restore sources")?;
+  if !reference_sources.contains_key("https://api.nuget.org/v3/index.json") {
+    return Err("dotnet configuration merge did not select the environment-expanded source".into());
+  }
+  for removed in [
+    "https://machine.example.test/v3/index.json",
+    "https://transient.example.test/v3/index.json",
+    "https://disabled.example.test/v3/index.json",
+  ] {
+    if reference_sources.contains_key(removed) {
+      return Err(format!("dotnet configuration merge retained disabled or cleared source {removed}").into());
+    }
+  }
+  if required_string(&dv, "source")? != "https://api.nuget.org/v3/index.json" || required_string(&dv, "source_protocol")? != "v3" {
+    return Err("dv configuration merge did not select the environment-expanded NuGet v3 source".into());
+  }
+
+  let package_folders = assets
+    .get("packageFolders")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("dotnet configuration merge assets omitted packageFolders")?;
+  if package_folders.len() != 1 {
+    return Err(format!("dotnet configuration merge selected {} package folders instead of one", package_folders.len()).into());
+  }
+  let reference_cache = package_folders.keys().next().ok_or("dotnet configuration merge omitted its package folder")?;
+  let actual_cache = required_string(&dv, "cache_root")?;
+  let reference_cache = fs::canonicalize(reference_cache)?;
+  let actual_cache = fs::canonicalize(actual_cache)?;
+  let reference_relative = reference_cache.strip_prefix(fs::canonicalize(&dotnet_workspace)?)?;
+  let actual_relative = actual_cache.strip_prefix(fs::canonicalize(&dv_workspace)?)?;
+  if normalize_windows_path(&reference_relative.to_string_lossy()) != normalize_windows_path(&actual_relative.to_string_lossy()) {
+    return Err(format!("NuGet configuration merge cache mismatch: dotnet={reference_cache:?} dv={actual_cache:?}").into());
+  }
+
+  let reference_library = assets
+    .get("libraries")
+    .and_then(serde_json::Value::as_object)
+    .and_then(|libraries| libraries.get("Newtonsoft.Json/13.0.3"))
+    .ok_or("dotnet configuration merge did not resolve Newtonsoft.Json 13.0.3")?;
+  if reference_library.get("type").and_then(serde_json::Value::as_str) != Some("package") {
+    return Err("dotnet configuration merge resolved Newtonsoft.Json as a non-package library".into());
+  }
+  let package = dv
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|packages| {
+      packages
+        .iter()
+        .find(|package| package.get("id").and_then(serde_json::Value::as_str) == Some("Newtonsoft.Json"))
+    })
+    .ok_or("dv configuration merge did not resolve Newtonsoft.Json")?;
+  if package.get("version").and_then(serde_json::Value::as_str) != Some("13.0.3") {
+    return Err("dv configuration merge selected a different Newtonsoft.Json version".into());
+  }
+  let reference_hash = fs::read_to_string(dotnet_workspace.join(".packages/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512"))?;
+  if package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash.trim()) {
+    return Err("NuGet configuration merge package hash differs between dotnet and dv".into());
+  }
+  Ok(())
+}
+
 fn compare_package_asset_family(
   target: &serde_json::Map<String, serde_json::Value>,
   dv: &serde_json::Value,
@@ -1818,6 +1943,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::NugetConfigHierarchy
+      | CaseKind::NugetConfigMerge
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -1939,6 +2065,32 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       )?;
     }
   }
+  if matches!(case.kind, CaseKind::NugetConfigMerge) {
+    if is_dotnet(executable) {
+      run_nuget_config_checked(
+        executable,
+        &[
+          "restore",
+          "ConfigMerge.csproj",
+          "--use-lock-file",
+          "--no-http-cache",
+          "-p:NuGetAudit=false",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "NuGet configuration merge setup",
+      )?;
+    } else {
+      run_nuget_config_checked(
+        executable,
+        &["restore", "ConfigMerge.csproj", "--json"],
+        workspace,
+        "NuGet configuration merge setup",
+      )?;
+    }
+  }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
     if is_dotnet(executable) {
       run_checked(
@@ -1991,7 +2143,8 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::FrameworkReferencePlan
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan
-    | CaseKind::NugetConfigHierarchy => Ok(()),
+    | CaseKind::NugetConfigHierarchy
+    | CaseKind::NugetConfigMerge => Ok(()),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
       reset_fixture(fixture, workspace)
@@ -2048,6 +2201,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
+    CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -2064,6 +2218,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
+    CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -2074,7 +2229,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let started = Instant::now();
   let mut command = Command::new(executable);
   command.args(case.args).current_dir(cwd);
-  if matches!(case.kind, CaseKind::NugetConfigHierarchy) {
+  if matches!(case.kind, CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge) {
     apply_nuget_config_environment(&mut command, cwd);
   }
   let output = command.output()?;
@@ -2096,6 +2251,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageSyncWarm
         | CaseKind::NugetConfigHierarchy
+        | CaseKind::NugetConfigMerge
     ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
@@ -2231,6 +2387,8 @@ fn apply_nuget_config_environment(command: &mut Command, cwd: &Path) {
     .env("PROGRAMFILES(X86)", cwd.join("scopes/machine"))
     .env("PROGRAMFILES", cwd.join("scopes/machine"))
     .env("APPDATA", cwd.join("scopes/user"))
+    .env("DV_CONFIG_SOURCE", "https://api.nuget.org/v3/index.json")
+    .env("DV_CONFIG_PACKAGES", cwd.join(".packages"))
     .env_remove("NUGET_PACKAGES");
 }
 
@@ -2386,7 +2544,13 @@ fn render_summary(report: &Report, color: bool) -> String {
     .filter(|run| {
       matches!(
         run.case.as_str(),
-        "package_sync_cold" | "package_graph_cold" | "package_graph_massive" | "package_asset_plan" | "package_sync_warm" | "nuget_config_hierarchy"
+        "package_sync_cold"
+          | "package_graph_cold"
+          | "package_graph_massive"
+          | "package_asset_plan"
+          | "package_sync_warm"
+          | "nuget_config_hierarchy"
+          | "nuget_config_merge"
       )
     })
     .collect::<Vec<_>>();
@@ -2510,6 +2674,7 @@ fn case_label(case: &str) -> &str {
     "package_asset_plan" => "Warm package asset plan",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
+    "nuget_config_merge" => "NuGet.Config keyed merge",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -2593,7 +2758,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 7,
+      schema_version: 8,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -2657,7 +2822,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 6,
+      schema_version: 8,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

@@ -70,6 +70,7 @@ Invalid input behavior:
 | `package_asset_plan` | unchanged `massive-package-graph`, populated isolated packages, matching tool-native lock | process launch, 203-package locked validation, family-partitioned asset-plan materialization, and output |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `nuget_config_hierarchy` | six machine/user/repository configs, populated isolated package cache, matching native lock | process launch, platform config discovery/merge, project evaluation, one-package locked validation, and output |
+| `nuget_config_merge` | four machine/user/repository configs with keyed overrides and environment values, populated isolated package cache, matching native lock | process launch, config discovery, keyed merge/expansion, one-package locked validation, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -99,6 +100,7 @@ directional decisions.`
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
 | `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
+| `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | package workload captured; project-graph shape still pending |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
@@ -201,6 +203,13 @@ one-package locked restore:
 
 ```text
 cargo bench-all --case nuget_config_hierarchy --samples 30 --warmups 3
+```
+
+Measure keyed NuGet config merge and environment expansion through the same
+warm, one-package locked boundary:
+
+```text
+cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

@@ -19,14 +19,18 @@ NuGet sources are typed records containing URL and protocol generation:
 - `protocolVersion="2"` and `"3"` are authoritative; absent values infer v3
   only for a `/v3/index.json` URL and otherwise infer v2;
 - only HTTPS HTTP sources are accepted initially. Local folders,
-  authentication, source mapping, proxies, and environment expansion fail or
-  remain outside the supported subset.
+  authentication, source mapping, and proxies fail or remain outside the
+  supported subset.
 
 Configuration discovers machine fragments, additional-user fragments, the
 main .NET CLI user file, and one `NuGet.Config` from each drive-to-project
 ancestor in precedence order. `--configfile` selects only its validated file.
-`packageSources` supports add, remove, and clear;
-`disabledPackageSources` supports clear and Boolean add values. The explicit
+Keyed `packageSources`, `disabledPackageSources`, and
+`globalPackagesFolder` values merge case-insensitively with add, remove, and
+clear operations. A disabled-source key disables by presence; both Boolean
+spellings are accepted for NuGet compatibility, while clear/remove re-enable.
+`%NAME%` environment references expand once in add values, unknown names remain
+literal, and MSBuild `$()` syntax remains literal. The explicit
 `--packages` path wins over `NUGET_PACKAGES`, which wins over
 `globalPackagesFolder`, which wins over the platform default.
 

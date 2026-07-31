@@ -1335,7 +1335,7 @@ fn discover_configuration(project_directory: &Path, explicit_cache: Option<&Path
   } else {
     Vec::new()
   };
-  let mut disabled = BTreeSet::new();
+  let mut disabled = Vec::new();
   let mut configured_cache = None;
   for path in config_paths {
     merge_config(&path, &mut sources, &mut disabled, &mut configured_cache)?;
@@ -1502,7 +1502,7 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
 fn merge_config(
   path: &Path,
   sources: &mut Vec<(String, PackageSource)>,
-  disabled: &mut BTreeSet<String>,
+  disabled: &mut Vec<String>,
   global_packages: &mut Option<PathBuf>,
 ) -> Result<(), PackageError> {
   let bytes = fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?;
@@ -1522,14 +1522,13 @@ fn merge_config(
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"clear" => match section {
         ConfigSection::Sources => sources.clear(),
         ConfigSection::Disabled => disabled.clear(),
-        ConfigSection::Other | ConfigSection::Config => {},
+        ConfigSection::Config => *global_packages = None,
+        ConfigSection::Other => {},
       },
       Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"add" => {
         let key = config_attribute(&reader, &element, b"key", path)?.ok_or_else(|| config_error(path, "NuGet add element requires key"))?;
         let value = config_attribute(&reader, &element, b"value", path)?.ok_or_else(|| config_error(path, "NuGet add element requires value"))?;
-        if value.contains('%') || value.contains("$(") {
-          return Err(config_error(path, "environment expansion in NuGet.Config is not supported yet"));
-        }
+        let value = expand_config_value(value, path)?;
         match section {
           ConfigSection::Sources => {
             let protocol = config_attribute(&reader, &element, b"protocolVersion", path)?;
@@ -1544,13 +1543,11 @@ fn merge_config(
             }
           },
           ConfigSection::Disabled => {
-            if value.eq_ignore_ascii_case("true") {
-              disabled.insert(key);
-            } else if value.eq_ignore_ascii_case("false") {
-              disabled.retain(|name| !name.eq_ignore_ascii_case(&key));
-            } else {
+            if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
               return Err(config_error(path, "disabled package-source values must be true or false"));
             }
+            disabled.retain(|name| !name.eq_ignore_ascii_case(&key));
+            disabled.push(key);
           },
           ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => {
             let candidate = PathBuf::from(value);
@@ -1563,9 +1560,14 @@ fn merge_config(
           ConfigSection::Other | ConfigSection::Config => {},
         }
       },
-      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"remove" && matches!(section, ConfigSection::Sources) => {
+      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"remove" => {
         let key = config_attribute(&reader, &element, b"key", path)?.ok_or_else(|| config_error(path, "NuGet remove element requires key"))?;
-        sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
+        match section {
+          ConfigSection::Sources => sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::Disabled => disabled.retain(|name| !name.eq_ignore_ascii_case(&key)),
+          ConfigSection::Config if key.eq_ignore_ascii_case("globalPackagesFolder") => *global_packages = None,
+          ConfigSection::Other | ConfigSection::Config => {},
+        }
       },
       Ok(Event::End(element)) if matches!(local_name(element.name().as_ref()), b"packageSources" | b"disabledPackageSources" | b"config") => {
         section = ConfigSection::Other;
@@ -1597,6 +1599,47 @@ fn config_attribute(reader: &Reader<&[u8]>, element: &quick_xml::events::BytesSt
     }
   }
   Ok(None)
+}
+
+fn expand_config_value(value: String, path: &Path) -> Result<String, PackageError> {
+  expand_config_value_with(value, path, |name| env::var_os(name))
+}
+
+fn expand_config_value_with(value: String, path: &Path, mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Result<String, PackageError> {
+  let bytes = value.as_bytes();
+  let Some(mut marker) = bytes.iter().position(|byte| *byte == b'%') else {
+    return Ok(value);
+  };
+  let mut copied = 0usize;
+  let mut expanded = None::<String>;
+  while marker + 1 < bytes.len() {
+    let Some(end_offset) = bytes[marker + 1..].iter().position(|byte| *byte == b'%') else {
+      break;
+    };
+    let end = marker + 1 + end_offset;
+    if end > marker + 1 {
+      let name = &value[marker + 1..end];
+      if let Some(replacement) = lookup(name) {
+        let replacement = replacement
+          .to_str()
+          .ok_or_else(|| config_error(path, format!("NuGet environment variable {name:?} is not valid Unicode")))?;
+        let output = expanded.get_or_insert_with(|| String::with_capacity(value.len().saturating_add(replacement.len())));
+        output.push_str(&value[copied..marker]);
+        output.push_str(replacement);
+        copied = end + 1;
+      }
+    }
+    marker = match bytes[end + 1..].iter().position(|byte| *byte == b'%') {
+      Some(next) => end + 1 + next,
+      None => break,
+    };
+  }
+  if let Some(mut output) = expanded {
+    output.push_str(&value[copied..]);
+    Ok(output)
+  } else {
+    Ok(value)
+  }
 }
 
 fn config_error(path: &Path, message: impl Into<String>) -> PackageError {
@@ -4462,7 +4505,7 @@ mod tests {
 </packageSources></configuration>"#,
     );
     let mut sources = Vec::new();
-    let mut disabled = BTreeSet::new();
+    let mut disabled = Vec::new();
     let mut cache = None;
 
     merge_config(&path, &mut sources, &mut disabled, &mut cache).unwrap();
@@ -4471,6 +4514,65 @@ mod tests {
     assert_eq!(sources[0].1.protocol, NugetProtocol::V2);
     assert_eq!(sources[1].0, "modern");
     assert_eq!(sources[1].1.protocol, NugetProtocol::V3);
+  }
+
+  #[test]
+  fn nuget_keyed_sections_merge_clear_add_remove_and_disabled_sources() {
+    let temp = TempDirectory::new();
+    let lower = temp.write(
+      "lower.config",
+      r#"<configuration>
+<config><add key="globalPackagesFolder" value="lower-packages" /></config>
+<packageSources><clear /><add key="selected" value="https://old.example.test/v2" /><add key="removed" value="https://removed.example.test/v2" /></packageSources>
+<disabledPackageSources><add key="selected" value="true" /><add key="removed" value="true" /></disabledPackageSources>
+</configuration>"#,
+    );
+    let higher = temp.write(
+      "higher.config",
+      r#"<configuration>
+<config><clear /><add key="globalPackagesFolder" value="higher-packages" /></config>
+<packageSources><add key="SELECTED" value="https://selected.example.test/v3/index.json" protocolVersion="3" /><remove key="removed" /></packageSources>
+<disabledPackageSources><clear /><add key="selected" value="false" /><add key="removed" value="true" /><remove key="SELECTED" /><remove key="REMOVED" /></disabledPackageSources>
+</configuration>"#,
+    );
+    let mut sources = vec![(
+      "nuget.org".into(),
+      PackageSource {
+        url: DEFAULT_SOURCE.into(),
+        protocol: NugetProtocol::V3,
+      },
+    )];
+    let mut disabled = Vec::new();
+    let mut cache = None;
+
+    merge_config(&lower, &mut sources, &mut disabled, &mut cache).unwrap();
+    merge_config(&higher, &mut sources, &mut disabled, &mut cache).unwrap();
+
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].0, "selected");
+    assert_eq!(sources[0].1.url, "https://selected.example.test/v3/index.json");
+    assert_eq!(sources[0].1.protocol, NugetProtocol::V3);
+    assert!(disabled.is_empty());
+    assert_eq!(cache, Some(temp.0.join("higher-packages")));
+  }
+
+  #[test]
+  fn nuget_environment_expansion_is_single_pass_and_preserves_unknown_values() {
+    let path = Path::new("NuGet.Config");
+    let expanded = expand_config_value_with("before/%ROOT%/%UNKNOWN%/%CHAIN%/after".into(), path, |name| match name {
+      "ROOT" => Some(std::ffi::OsString::from("packages")),
+      "CHAIN" => Some(std::ffi::OsString::from("%ROOT%")),
+      _ => None,
+    })
+    .unwrap();
+
+    assert_eq!(expanded, "before/packages/%UNKNOWN%/%ROOT%/after");
+    let unchanged = String::from("100% unchanged");
+    let original_allocation = unchanged.as_ptr();
+    let unchanged = expand_config_value_with(unchanged, path, |_| None).unwrap();
+    assert_eq!(unchanged, "100% unchanged");
+    assert_eq!(unchanged.as_ptr(), original_allocation);
+    assert_eq!(expand_config_value_with("%%".into(), path, |_| None).unwrap(), "%%");
   }
 
   #[test]
