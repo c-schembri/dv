@@ -20,12 +20,13 @@ diagnostic rather than approximate Microsoft behavior.
 | Nullable | `enable` or omitted SDK default | Implemented |
 | Implicit usings | `enable` or `disable` | Implemented |
 | Project references | acyclic SDK-style references | Paths captured; graph validation planned |
-| Package references | one target, HTTPS NuGet v2/v3 source, exact versions first | Initial resolution, verified cache, lock, and nine family-partitioned asset ranges implemented |
+| Package references | one target, HTTPS NuGet v2/v3 or local flat/hierarchical source, exact versions first | Initial resolution, verified cache, lock, and nine family-partitioned asset ranges implemented |
 | NuGet configuration discovery | machine, additional-user, user, drive/repository, or one explicit file | Platform roots, filename casing, precedence, and explicit isolation implemented |
 | NuGet configuration merge | keyed sources, disabled sources, package folder, and `%NAME%` values | Case-insensitive add/replace/remove/clear and single-pass environment expansion implemented |
-| NuGet source policy | package/audit sources, v2/v3 metadata, and package-source mappings | Typed source batches and longest-pattern package routing implemented; pre-discovery filtering remains planned |
+| NuGet source policy | package/audit sources, local/v2/v3 metadata, and package-source mappings | Typed source batches, v2 Atom version enumeration, and longest-pattern package routing implemented; pre-discovery filtering remains planned |
 | NuGet storage and restore policy | global packages, HTTP cache, scratch, fallback folders, signature/audit modes, and proxy | Microsoft-compatible precedence, fallback lookup, scratch staging, atomic publication, and proxy construction are implemented; unimplemented HTTP reuse, signature verification, and advisory execution fail or remain explicitly tracked |
-| NuGet CLI restore overrides | repeatable HTTPS source, one explicit config, and one packages folder | Source replacement, config isolation, working-directory path normalization, and config/environment precedence implemented for `restore` and `sync` |
+| NuGet CLI restore overrides | repeatable HTTPS or local source, one explicit config, and one packages folder | Source replacement, config isolation, working-directory path normalization, and config/environment precedence implemented for `restore` and `sync` |
+| NuGet local sources | config/CLI paths and `file://`, flat or hierarchical package layout | One-time layout detection, offline range lookup, nuspec/hash verification, and atomic global-cache publication implemented |
 | Configuration | `Debug` and `Release` | Implemented |
 | Generated inputs | global usings, assembly attributes, editor config | Paths planned; content generation planned |
 | Compiler inputs | framework references, SDK/pack analyzers, defines and core options | Initial immutable plan implemented |

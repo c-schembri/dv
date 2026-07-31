@@ -56,6 +56,9 @@ dv restore (storage policy)       5.370 ms median
 dotnet restore (CLI overrides)  524.597 ms median
 dv restore (CLI overrides)        5.103 ms median
 
+dotnet restore (local sources)  670.534 ms median
+dv restore (local sources)       64.522 ms median
+
 dotnet locked asset plan       702.904 ms median
 dv locked asset plan           107.385 ms median
 ```
@@ -101,6 +104,7 @@ The project is in the first implementation phase.
 | NuGet package/audit sources, protocols, and source mapping | Implemented |
 | NuGet storage, fallback, signature, proxy, and audit policy | Implemented |
 | NuGet CLI source, config, and package-folder overrides | Implemented |
+| NuGet flat and hierarchical local sources | Implemented |
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
@@ -243,7 +247,8 @@ Initial machine:
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
-  policy sections, storage policy, CLI overrides, the framework-reference plan,
+  policy sections, storage policy, CLI overrides, local sources, the
+  framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; compiler planning uses 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
@@ -268,6 +273,7 @@ Initial machine:
 | Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
 | Resolve NuGet storage and restore policy | `dotnet restore StoragePolicy.csproj --locked-mode --no-http-cache --nologo --verbosity quiet` | `dv restore StoragePolicy.csproj --offline --json` | 523.051 ms | 5.370 ms | 97.4x | 605.407 ms | 6.526 ms |
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
+| Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
 | Resolve dependencies from cold caches | `dotnet restore PackageConsole.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --json` | 1028.951 ms | 417.981 ms | 2.5x | 1061.502 ms | 469.712 ms |
 | Resolve a cold 50-package graph | `dotnet restore LargePackageGraph.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LargePackageGraph.csproj --packages .packages --json` | 1425.299 ms | 632.458 ms | 2.3x | 1658.964 ms | 662.278 ms |
 | Resolve a cold 203-package solution graph | `dotnet restore MassivePackageGraph.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore MassivePackageGraph.csproj --packages .packages --json` | 9977.524 ms | 4325.957 ms | 2.3x | 10416.603 ms | 4852.974 ms |
@@ -305,7 +311,10 @@ with empty global roots and zero timed network work. The CLI-override case
 conflicts implicit-config, explicit-config, environment,
 and command-line values; both tools must select only the explicit config, CLI
 source, and CLI package folder while resolving the same package and hash with
-zero timed network work. The unavailable-pack case
+zero timed network work. The local-source case maps one package to a flat feed
+and one to a hierarchical feed, clears the global cache and restore outputs
+before every sample, then requires matching identities, versions, hashes, and zero HTTP
+requests. The unavailable-pack case
 uses an empty checked-in source and isolated package cache; both commands must
 fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -331,6 +340,7 @@ recorded in the curated
 [NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
 [NuGet storage-policy baseline](docs/performance-baselines/2026-08-01-nuget-storage-policy-windows.md),
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
+[NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
 [package baseline](docs/performance-baselines/2026-08-01-package-assets-windows.md), and
 [warm package asset-plan baseline](docs/performance-baselines/2026-08-01-package-asset-plan-windows.md).
 
@@ -381,6 +391,7 @@ cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
 cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
+cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 cargo bench-all --case package_sync_cold --samples 30 --warmups 3
 cargo bench-all --case package_graph_cold --samples 10 --warmups 2
 cargo bench-all --case package_graph_massive --samples 5 --warmups 1
@@ -437,6 +448,7 @@ See:
 - [NuGet keyed configuration merge contract](docs/nuget-config-merge.md)
 - [NuGet storage and restore policy contract](docs/nuget-storage-policy.md)
 - [NuGet CLI override contract](docs/nuget-cli-overrides.md)
+- [NuGet local source contract](docs/nuget-local-sources.md)
 - [Unavailable pack diagnostic contract](docs/pack-diagnostics.md)
 - [Framework reference planning contract](docs/framework-reference-planning.md)
 - [Compiler input planning contract](docs/compiler-input-planning.md)

@@ -7,7 +7,8 @@ use std::{
   io::{self, IsTerminal},
   path::{Path, PathBuf},
   process::{Command, Output},
-  time::{Instant, SystemTime, UNIX_EPOCH},
+  thread,
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -36,6 +37,7 @@ enum CaseKind {
   NugetSourceSections,
   NugetStoragePolicy,
   NugetCliOverrides,
+  NugetLocalSources,
   BuildClean,
   BuildNoOp,
   RunWarm,
@@ -61,6 +63,7 @@ struct Fixtures<'a> {
   nuget_source_sections: &'a Path,
   nuget_storage_policy: &'a Path,
   nuget_cli_overrides: &'a Path,
+  nuget_local_sources: &'a Path,
   package_graph: &'a Path,
   package_graph_massive: &'a Path,
 }
@@ -292,6 +295,21 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_local_sources",
+    kind: CaseKind::NugetLocalSources,
+    args: &[
+      "restore",
+      "LocalSources.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &[
@@ -479,6 +497,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_local_sources",
+    kind: CaseKind::NugetLocalSources,
+    args: &["restore", "LocalSources.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_graph_cold",
     kind: CaseKind::PackageGraphCold,
     args: &["restore", "LargePackageGraph.csproj", "--packages", ".packages", "--json"],
@@ -611,6 +635,7 @@ fn run() -> Result<()> {
   let nuget_source_sections_fixture = repository.join("benchmarks/fixtures/nuget-source-sections");
   let nuget_storage_policy_fixture = repository.join("benchmarks/fixtures/nuget-storage-policy");
   let nuget_cli_overrides_fixture = repository.join("benchmarks/fixtures/nuget-cli-overrides");
+  let nuget_local_sources_fixture = repository.join("benchmarks/fixtures/nuget-local-sources");
   let package_graph_fixture = repository.join("benchmarks/fixtures/large-package-graph");
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
@@ -626,10 +651,11 @@ fn run() -> Result<()> {
     nuget_source_sections: &nuget_source_sections_fixture,
     nuget_storage_policy: &nuget_storage_policy_fixture,
     nuget_cli_overrides: &nuget_cli_overrides_fixture,
+    nuget_local_sources: &nuget_local_sources_fixture,
     package_graph: &package_graph_fixture,
     package_graph_massive: &massive_package_graph_fixture,
   };
-  let workspace = repository.join("target/benchmark-work");
+  let workspace = repository.join(format!("target/benchmark-work-{}", std::process::id()));
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
   if options.case.as_deref().is_none_or(|case| case == "sdk_current") {
@@ -682,6 +708,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "nuget_cli_overrides") {
     verify_nuget_cli_overrides(&repository, &dv_executable, &nuget_cli_overrides_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "nuget_local_sources") {
+    verify_nuget_local_sources(&repository, &dv_executable, &nuget_local_sources_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "package_graph_cold") {
     verify_package_sync(&repository, &dv_executable, &package_graph_fixture, "LargePackageGraph.csproj", 50)?;
   }
@@ -701,7 +730,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 11,
+    schema_version: 12,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2224,6 +2253,100 @@ fn verify_nuget_cli_overrides(repository: &Path, dv_executable: &Path, fixture: 
   Ok(())
 }
 
+fn verify_nuget_local_sources(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-nuget-local-sources-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  prepare_nuget_local_sources(&dotnet_workspace)?;
+  prepare_nuget_local_sources(&dv_workspace)?;
+
+  run_nuget_config_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "LocalSources.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &dotnet_workspace,
+    "NuGet local-source verification",
+  )?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("obj/project.assets.json"))?)?;
+  let restore = assets
+    .get("project")
+    .and_then(|project| project.get("restore"))
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft local-source assets omitted project.restore")?;
+  let mut sources = restore
+    .get("sources")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft local-source assets omitted sources")?
+    .keys()
+    // .NET 10 injects its installation-wide library-packs source even after
+    // packageSources/clear. It is not eligible for either mapped test package.
+    .filter(|path| !normalize_windows_path(path).ends_with(r"\dotnet\library-packs"))
+    .map(|path| relative_policy_path(path, &dotnet_workspace))
+    .collect::<Result<Vec<_>>>()?;
+  sources.sort_unstable();
+  if sources != ["feeds/flat", "feeds/hierarchical"] {
+    return Err(format!("Microsoft local-source paths differ: {sources:?}").into());
+  }
+
+  let dv_text = nuget_config_command_text(
+    dv_executable,
+    &["restore", "LocalSources.csproj", "--packages", ".packages", "--offline", "--json"],
+    &dv_workspace,
+  )?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv local-source verification omitted package_resolution_created")?;
+  if required_string(&dv, "source_protocol")? != "local" || relative_policy_path(required_string(&dv, "cache_root")?, &dv_workspace)? != ".packages" {
+    return Err(format!("dv local-source policy differs: {dv}").into());
+  }
+  if dv.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) || dv.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(2) {
+    return Err("dv local-source verification did not publish two packages with zero HTTP requests".into());
+  }
+  let packages = dv
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv local-source verification omitted packages")?;
+  for (id, lower_id, version) in [("Humanizer.Core", "humanizer.core", "2.14.1"), ("Newtonsoft.Json", "newtonsoft.json", "13.0.3")] {
+    let package = packages
+      .iter()
+      .find(|package| {
+        package
+          .get("id")
+          .and_then(serde_json::Value::as_str)
+          .is_some_and(|value| value.eq_ignore_ascii_case(id))
+      })
+      .ok_or_else(|| format!("dv local-source verification omitted {id}"))?;
+    let reference_hash = fs::read_to_string(
+      dotnet_workspace
+        .join(".packages")
+        .join(lower_id)
+        .join(version)
+        .join(format!("{lower_id}.{version}.nupkg.sha512")),
+    )?;
+    if package.get("version").and_then(serde_json::Value::as_str) != Some(version)
+      || package.get("sha512").and_then(serde_json::Value::as_str) != Some(reference_hash.trim())
+    {
+      return Err(format!("local-source identity, version, or hash differs for {id}").into());
+    }
+  }
+  Ok(())
+}
+
 fn assert_relative_policy_path(value: &serde_json::Value, field: &str, workspace: &Path, expected: &str) -> Result<()> {
   let path = value
     .get(field)
@@ -2504,6 +2627,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetSourceSections
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
+      | CaseKind::NugetLocalSources
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -2683,6 +2807,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::NugetCliOverrides) {
     prepare_nuget_cli_overrides(executable, workspace)?;
   }
+  if matches!(case.kind, CaseKind::NugetLocalSources) {
+    prepare_nuget_local_sources(workspace)?;
+  }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
     if is_dotnet(executable) {
       run_checked(
@@ -2831,6 +2958,88 @@ fn prepare_nuget_cli_overrides(executable: &Path, workspace: &Path) -> Result<()
   }
 }
 
+fn prepare_nuget_local_sources(workspace: &Path) -> Result<()> {
+  for relative in ["feeds", ".seed", ".packages", "obj", "dv.lock.json", ".seed.config"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  fs::write(
+    workspace.join(".seed.config"),
+    r#"<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" /></packageSources></configuration>"#,
+  )?;
+  run_nuget_config_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "LocalSources.csproj",
+      "--configfile",
+      ".seed.config",
+      "--packages",
+      ".seed",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    workspace,
+    "NuGet local-source package seed",
+  )?;
+
+  copy_with_parent(
+    &workspace.join(".seed/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"),
+    &workspace.join("feeds/flat/Newtonsoft.Json.13.0.3.nupkg"),
+  )?;
+  let hierarchical = workspace.join("feeds/hierarchical/humanizer.core/2.14.1");
+  copy_with_parent(
+    &workspace.join(".seed/humanizer.core/2.14.1/humanizer.core.2.14.1.nupkg"),
+    &hierarchical.join("humanizer.core.2.14.1.nupkg"),
+  )?;
+  copy_with_parent(
+    &workspace.join(".seed/humanizer.core/2.14.1/humanizer.core.nuspec"),
+    &hierarchical.join("humanizer.core.nuspec"),
+  )?;
+  copy_with_parent(
+    &workspace.join(".seed/humanizer.core/2.14.1/humanizer.core.2.14.1.nupkg.sha512"),
+    &hierarchical.join("humanizer.core.2.14.1.nupkg.sha512"),
+  )?;
+  fs::remove_file(workspace.join(".seed.config"))?;
+  reset_nuget_local_iteration(workspace)
+}
+
+fn copy_with_parent(source: &Path, destination: &Path) -> Result<()> {
+  let parent = destination
+    .parent()
+    .ok_or_else(|| format!("generated package path {} has no parent", destination.display()))?;
+  fs::create_dir_all(parent)?;
+  fs::copy(source, destination)?;
+  Ok(())
+}
+
+fn reset_nuget_local_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", "obj", "dv.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
+fn remove_generated_path(path: &Path) -> Result<()> {
+  const RETRIES: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(200),
+    Duration::from_secs(1),
+  ];
+  for delay in RETRIES.into_iter().map(Some).chain([None]) {
+    let result = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    match result {
+      Ok(()) => return Ok(()),
+      Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+      Err(_) if delay.is_some() => thread::sleep(delay.expect("retry has a delay")),
+      Err(error) => return Err(format!("remove generated benchmark path {}: {error}", path.display()).into()),
+    }
+  }
+  unreachable!("the final generated-path removal attempt returns")
+}
+
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::RidGraph
@@ -2845,6 +3054,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
+    CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold | CaseKind::PackageSyncCold | CaseKind::PackageGraphCold | CaseKind::PackageGraphMassive | CaseKind::PackDiagnostic => {
       reset_fixture(fixture, workspace)
@@ -2905,6 +3115,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
+    CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
     CaseKind::PackageGraphCold => fixtures.package_graph,
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => fixtures.package_graph_massive,
     _ => fixtures.small,
@@ -2925,6 +3136,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
+    CaseKind::NugetLocalSources => Some("nuget-local-sources"),
     CaseKind::PackageGraphCold => Some("large-package-graph"),
     CaseKind::PackageGraphMassive | CaseKind::PackageAssetPlan => Some("massive-package-graph"),
     _ => Some("small-console"),
@@ -2937,7 +3149,12 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   command.args(case.args).current_dir(cwd);
   if matches!(
     case.kind,
-    CaseKind::NugetConfigHierarchy | CaseKind::NugetConfigMerge | CaseKind::NugetSourceSections | CaseKind::NugetStoragePolicy | CaseKind::NugetCliOverrides
+    CaseKind::NugetConfigHierarchy
+      | CaseKind::NugetConfigMerge
+      | CaseKind::NugetSourceSections
+      | CaseKind::NugetStoragePolicy
+      | CaseKind::NugetCliOverrides
+      | CaseKind::NugetLocalSources
   ) {
     apply_case_nuget_environment(&mut command, case.kind, cwd);
   }
@@ -2964,6 +3181,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetSourceSections
         | CaseKind::NugetStoragePolicy
         | CaseKind::NugetCliOverrides
+        | CaseKind::NugetLocalSources
     ) {
     Some(parse_work_evidence(&output.stdout)?)
   } else if is_dotnet(executable) && matches!(case.kind, CaseKind::PackageGraphMassive) {
@@ -3218,6 +3436,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
   fs::create_dir_all(destination)?;
   let storage_policy_root = source.join("StoragePolicy.csproj").is_file();
   let generated_policy_root = storage_policy_root || source.join("CliOverrides.csproj").is_file();
+  let local_sources_root = source.join("LocalSources.csproj").is_file();
   for entry in fs::read_dir(source)? {
     let entry = entry?;
     let source_path = entry.path();
@@ -3225,12 +3444,13 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     if entry.file_type()?.is_dir() {
       if matches!(entry.file_name().to_str(), Some("obj" | "bin" | ".packages" | ".seed"))
         || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
+        || (local_sources_root && entry.file_name() == OsStr::new("feeds"))
       {
         continue;
       }
       copy_directory(&source_path, &destination_path)?;
     } else {
-      if generated_policy_root && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
+      if (generated_policy_root || local_sources_root) && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
         continue;
       }
       fs::copy(source_path, destination_path)?;
@@ -3337,6 +3557,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_source_sections"
           | "nuget_storage_policy"
           | "nuget_cli_overrides"
+          | "nuget_local_sources"
       )
     })
     .collect::<Vec<_>>();
@@ -3464,6 +3685,7 @@ fn case_label(case: &str) -> &str {
     "nuget_source_sections" => "NuGet source sections",
     "nuget_storage_policy" => "NuGet storage policy",
     "nuget_cli_overrides" => "NuGet CLI overrides",
+    "nuget_local_sources" => "NuGet local sources",
     "build_clean" => "Clean build",
     "build_noop" => "No-op build",
     "run_warm" => "Warm run",
@@ -3547,7 +3769,7 @@ mod tests {
   #[test]
   fn summary_is_aligned_and_readable_without_terminal_escape_codes() {
     let report = Report {
-      schema_version: 11,
+      schema_version: 12,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",
@@ -3611,7 +3833,7 @@ mod tests {
   #[test]
   fn summary_reports_package_work_evidence() {
     let report = Report {
-      schema_version: 11,
+      schema_version: 12,
       generated_unix_seconds: 0,
       environment: Environment {
         os: "windows",

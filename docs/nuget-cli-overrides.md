@@ -32,18 +32,20 @@ and repository discovery applies. `--source` replaces every configured
 package source, while the selected config still supplies non-source policy
 such as signature validation and proxy settings.
 
-When an override URI exactly matches a configured source, its source name and
+When an override value exactly matches a configured source, its source name and
 explicit protocol version are retained so package-source mappings remain
-usable. Otherwise `.../v3/index.json` selects v3 and other HTTPS URIs select
-v2. The first occurrence of an exact duplicate URI wins.
+usable. Otherwise `.../v3/index.json` selects v3, other HTTPS URIs select v2,
+and filesystem paths or `file://` values select a local source. Relative local
+paths resolve once against the process working directory. The first occurrence
+of an exact duplicate value wins.
 
 ## Boundaries
 
 - Repeated `--packages` and `--configfile` options fail before project I/O.
 - Missing or empty option values fail as CLI argument errors.
 - A missing explicit config file fails instead of falling back to discovery.
-- Only HTTPS v2/v3 sources are currently accepted. Local folders and insecure
-  HTTP remain explicit `NUGET-006`/`NUGET-012` work rather than silent guesses.
+- HTTPS v2/v3, `file://`, and local folder sources are accepted. Insecure HTTP
+  remains explicit `NUGET-012` work rather than a silent guess.
 - Unsupported or malformed policy fails before network access.
 
 The common path performs no filesystem or network work beyond the config and

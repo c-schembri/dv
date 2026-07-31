@@ -757,8 +757,15 @@ boundary, not final drop-in parity.
   oracle measures `524.597 ms` for Microsoft versus `5.103 ms` for `dv`
   (`102.8x`) across 30 retained samples with one resolved package and zero
   timed HTTP requests or downloads. `P1`
-- [~] `NUGET-006` Support local folder sources and NuGet v2/v3 HTTP service
-  contracts. `P1`
+- [x] `NUGET-006` Support local folder sources and NuGet v2/v3 HTTP service
+  contracts. Configuration-relative, CLI-relative, absolute, and `file://`
+  local sources support flat and hierarchical layouts, offline range
+  enumeration, nuspec identity checks, hierarchical SHA-512 verification, and
+  atomic cache publication. HTTPS v2 range resolution follows bounded
+  `FindPackagesById` continuation pages while v3 retains service-index and
+  flat-container discovery. The cold two-package local-feed oracle measures
+  `670.534 ms` for Microsoft versus `64.522 ms` for `dv` (`10.4x`) across 30
+  retained samples with 2,980,145 source bytes and zero HTTP requests. `P1`
 - [~] `NUGET-007` Resolve registration, flat-container, search, vulnerability,
   and package-publish endpoints from service-index resources. `P2`
 - [ ] `NUGET-008` Support Basic/PAT credentials from config and environment

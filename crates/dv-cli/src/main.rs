@@ -209,7 +209,11 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     config_file: options
       .config_file
       .map(|path| if path.is_absolute() { path } else { current_directory.join(path) }),
-    sources: options.sources,
+    sources: options
+      .sources
+      .into_iter()
+      .map(|source| normalize_command_source(source, &current_directory))
+      .collect(),
     offline: options.offline,
     write_lock: true,
   };
@@ -287,9 +291,7 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         if source.is_empty() {
           return Err("--source requires a package source".into());
         }
-        if !source.starts_with("https://") {
-          return Err("--source currently requires an HTTPS NuGet v2 or v3 source".into());
-        }
+        validate_command_source(source)?;
         options.sources.push(source.clone());
       },
       value if value.starts_with("--source=") || value.starts_with("-s=") => {
@@ -297,9 +299,7 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         if source.is_empty() {
           return Err("--source requires a package source".into());
         }
-        if !source.starts_with("https://") {
-          return Err("--source currently requires an HTTPS NuGet v2 or v3 source".into());
-        }
+        validate_command_source(source)?;
         options.sources.push(source.to_owned());
       },
       "--offline" => options.offline = true,
@@ -310,6 +310,28 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
     index += 1;
   }
   Ok(options)
+}
+
+fn validate_command_source(source: &str) -> Result<(), String> {
+  if source.starts_with("http://") {
+    return Err("--source rejects insecure HTTP until the explicit NUGET-012 policy is implemented".into());
+  }
+  if source.contains("://") && !source.starts_with("https://") && !source.starts_with("file://") {
+    return Err("--source requires HTTPS, file://, or a local folder path".into());
+  }
+  Ok(())
+}
+
+fn normalize_command_source(source: String, current_directory: &Path) -> String {
+  if source.contains("://") {
+    return source;
+  }
+  let path = PathBuf::from(&source);
+  if path.is_absolute() {
+    source
+  } else {
+    current_directory.join(path).to_string_lossy().into_owned()
+  }
 }
 
 fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
@@ -1249,7 +1271,7 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
   };
   let help = match error.kind() {
     PackageErrorKind::OfflineMiss => Some("Populate the global package cache or rerun without --offline."),
-    PackageErrorKind::Configuration => Some("Use an HTTPS NuGet v2 or v3 source and the supported NuGet.Config subset."),
+    PackageErrorKind::Configuration => Some("Use an HTTPS NuGet v2/v3 source, a local folder source, and the supported NuGet.Config subset."),
     PackageErrorKind::Incompatible => Some("Use a package with compatible lib or ref assets and no unsupported build/runtime assets."),
     PackageErrorKind::Network => Some("Check source availability, proxy settings, and package identity/version."),
     PackageErrorKind::Integrity | PackageErrorKind::Archive => Some("Remove the corrupt cache entry and retry from a trusted source."),

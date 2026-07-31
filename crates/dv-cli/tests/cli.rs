@@ -468,7 +468,20 @@ fn restore_rejects_unsupported_cli_sources_before_project_io() {
     .unwrap();
 
   assert_eq!(output.status.code(), Some(2));
-  assert!(String::from_utf8(output.stderr).unwrap().contains("requires an HTTPS NuGet v2 or v3 source"));
+  assert!(String::from_utf8(output.stderr).unwrap().contains("rejects insecure HTTP"));
+}
+
+#[test]
+fn restore_accepts_a_relative_local_cli_source() {
+  let temp = TempDirectory::new();
+  let output = dv()
+    .args(["restore", "missing.csproj", "--source", "relative-feed"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(String::from_utf8(output.stderr).unwrap().contains("missing.csproj does not exist"));
 }
 
 #[test]

@@ -74,6 +74,7 @@ Invalid input behavior:
 | `nuget_source_sections` | four config levels with package/audit sources, protocols, disabled state, and nested mappings; populated isolated package cache and matching native lock | process launch, typed source-policy merge, mapping construction, one-package locked validation, and output |
 | `nuget_storage_policy` | machine/user/repository policy, fallback-only package, empty global cache, matching native lock, reference HTTP cache bypassed | process launch, typed storage/signature/audit/proxy merge, fallback lookup, one-package locked validation, and output |
 | `nuget_cli_overrides` | conflicting implicit/config/environment values, explicit config/source/packages, populated CLI cache, matching native lock | process launch, explicit-config parse, CLI precedence transform, one-package locked validation, and output |
+| `nuget_local_sources` | mapped flat and hierarchical local feeds, empty global cache and restore outputs | process launch, local layout discovery, two-package graph resolution, 2,980,145 source bytes, hash/ZIP validation, extraction, atomic publication, and output |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
 | `run_warm` | already built fixture | orchestration and application run |
@@ -106,6 +107,7 @@ directional decisions.`
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-storage-policy` | 1 project, 3 config levels, 1 fallback-only package, isolated global/HTTP/scratch roots | storage precedence, fallback consumption, typed signature/audit policy, and proxy redaction | executable for both tools with official NuGet/MSBuild and package parity preflight |
+| `nuget-local-sources` | 1 project, 2 mapped local feeds, 1 flat package, 1 hierarchical package, 2,980,145 archive bytes | offline layout detection, local range/exact lookup, integrity validation, and cold cache publication | executable for both tools with source/package/hash parity preflight |
 | `large-solution` | many projects with shared dependency layers | memory scaling and parallel scheduling | package workload captured; project-graph shape still pending |
 | `test-heavy` | many test cases and adapter metadata | discovery and execution overhead | specification pending real sample |
 | `multiple-sources` | public, private, and local package sources | auth, concurrency, cache behavior | specification pending sanitized sample |
@@ -237,6 +239,13 @@ precedence through the same warm locked boundary:
 
 ```text
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
+```
+
+Measure cold local-feed discovery and publication from flat and hierarchical
+layouts with all network work disabled:
+
+```text
+cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 ```
 
 Measure first dependency readiness with a fresh package cache and no NuGet HTTP

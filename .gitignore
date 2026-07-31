@@ -19,3 +19,7 @@
 /benchmarks/fixtures/nuget-cli-overrides/policy/
 /benchmarks/fixtures/nuget-cli-overrides/dv.lock.json
 /benchmarks/fixtures/nuget-cli-overrides/packages.lock.json
+/benchmarks/fixtures/nuget-local-sources/.packages/
+/benchmarks/fixtures/nuget-local-sources/.seed/
+/benchmarks/fixtures/nuget-local-sources/feeds/
+/benchmarks/fixtures/nuget-local-sources/dv.lock.json

@@ -5,7 +5,7 @@ use std::{
   error::Error,
   fmt::{self, Write as _},
   fs,
-  io::{self, Write},
+  io::{self, Read, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
   sync::Arc,
@@ -1019,12 +1019,13 @@ enum MetadataTaskResult {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum NugetProtocol {
+  Local,
   V2,
   V3,
 }
 
 impl NugetProtocol {
-  fn parse(value: Option<&str>, source: &str, context: &Path) -> Result<Self, PackageError> {
+  fn parse_http(value: Option<&str>, source: &str, context: &Path) -> Result<Self, PackageError> {
     match value {
       Some("2") => Ok(Self::V2),
       Some("3") => Ok(Self::V3),
@@ -1039,6 +1040,7 @@ impl NugetProtocol {
 
   const fn as_str(self) -> &'static str {
     match self {
+      Self::Local => "local",
       Self::V2 => "v2",
       Self::V3 => "v3",
     }
@@ -1051,27 +1053,106 @@ struct PackageSource {
   protocol: NugetProtocol,
 }
 
+impl PackageSource {
+  fn parse(value: String, protocol: Option<&str>, context: &Path, relative_to: &Path) -> Result<Self, PackageError> {
+    if value.trim().is_empty() {
+      return Err(config_error(context, "package source cannot be empty"));
+    }
+    if value.starts_with("https://") {
+      return Ok(Self {
+        protocol: NugetProtocol::parse_http(protocol, &value, context)?,
+        url: value,
+      });
+    }
+    if value.starts_with("http://") {
+      return Err(config_error(
+        context,
+        format!("insecure HTTP package source {value:?} requires the explicit policy tracked by NUGET-012"),
+      ));
+    }
+    if let Some(version) = protocol
+      && version != "2"
+      && version != "3"
+    {
+      return Err(config_error(
+        context,
+        format!("local package source {value:?} has unsupported protocolVersion {version:?}; expected 2 or 3"),
+      ));
+    }
+    let path = if value.starts_with("file://") {
+      reqwest::Url::parse(&value)
+        .map_err(|error| config_error(context, format!("invalid local package-source URI {value:?}: {error}")))?
+        .to_file_path()
+        .map_err(|()| config_error(context, format!("local package-source URI {value:?} does not identify a filesystem path")))?
+    } else {
+      if value.contains("://") {
+        return Err(config_error(
+          context,
+          format!("package source {value:?} must be HTTPS, file://, or a local folder path"),
+        ));
+      }
+      let path = PathBuf::from(&value);
+      if path.is_absolute() { path } else { relative_to.join(path) }
+    };
+    let value = path.to_str().ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::NonUnicodePath,
+        path.display().to_string(),
+        "local package-source path is not valid Unicode",
+      )
+    })?;
+    Ok(Self {
+      url: value.to_owned(),
+      protocol: NugetProtocol::Local,
+    })
+  }
+}
+
 #[derive(Clone)]
 enum ServiceEndpoint {
-  V2 { source: String, base: String, source_index: u32 },
-  V3 { source: String, package_base: String, source_index: u32 },
+  Local {
+    source: String,
+    root: PathBuf,
+    layout: LocalFeedLayout,
+    source_index: u32,
+  },
+  V2 {
+    source: String,
+    base: String,
+    source_index: u32,
+  },
+  V3 {
+    source: String,
+    package_base: String,
+    source_index: u32,
+  },
+}
+
+/// Local layout is detected once per source. Flat archive paths are retained
+/// contiguously so graph workers never repeat directory enumeration.
+#[derive(Clone)]
+enum LocalFeedLayout {
+  Unknown,
+  Flat(Arc<[PathBuf]>),
+  Hierarchical,
 }
 
 impl ServiceEndpoint {
   const fn source_index(&self) -> u32 {
     match self {
-      Self::V2 { source_index, .. } | Self::V3 { source_index, .. } => *source_index,
+      Self::Local { source_index, .. } | Self::V2 { source_index, .. } | Self::V3 { source_index, .. } => *source_index,
     }
   }
 
   fn source(&self) -> &str {
     match self {
-      Self::V2 { source, .. } | Self::V3 { source, .. } => source,
+      Self::Local { source, .. } | Self::V2 { source, .. } | Self::V3 { source, .. } => source,
     }
   }
 
   const fn protocol(&self) -> NugetProtocol {
     match self {
+      Self::Local { .. } => NugetProtocol::Local,
       Self::V2 { .. } => NugetProtocol::V2,
       Self::V3 { .. } => NugetProtocol::V3,
     }
@@ -1552,7 +1633,7 @@ fn discover_configuration(
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
-  let sources = command_line_sources(explicit_sources, merged.sources)?;
+  let sources = command_line_sources(explicit_sources, merged.sources, project_directory)?;
   let source_mapping = if merged.source_mapping.sources.is_empty() {
     None
   } else {
@@ -1598,7 +1679,11 @@ fn discover_configuration(
   })
 }
 
-fn command_line_sources(overrides: &[String], configured: Vec<(String, PackageSource)>) -> Result<Vec<(String, PackageSource)>, PackageError> {
+fn command_line_sources(
+  overrides: &[String],
+  configured: Vec<(String, PackageSource)>,
+  project_directory: &Path,
+) -> Result<Vec<(String, PackageSource)>, PackageError> {
   if overrides.is_empty() {
     return Ok(configured);
   }
@@ -1607,26 +1692,14 @@ fn command_line_sources(overrides: &[String], configured: Vec<(String, PackageSo
     if value.is_empty() {
       return Err(config_error(Path::new("--source"), "command-line package source cannot be empty"));
     }
-    if !value.starts_with("https://") {
-      return Err(PackageError::new(
-        PackageErrorKind::Configuration,
-        value,
-        format!("package resolution supports HTTPS NuGet v2 and v3 sources; {value:?} is unsupported"),
-      ));
-    }
-    if sources.iter().any(|(_, source): &(String, PackageSource)| source.url == *value) {
+    let parsed = PackageSource::parse(value.clone(), None, Path::new("--source"), project_directory)?;
+    if sources.iter().any(|(_, source): &(String, PackageSource)| source.url == parsed.url) {
       continue;
     }
-    if let Some((name, source)) = configured.iter().rev().find(|(_, source)| source.url == *value) {
+    if let Some((name, source)) = configured.iter().rev().find(|(_, source)| source.url == parsed.url) {
       sources.push((name.clone(), source.clone()));
     } else {
-      sources.push((
-        value.clone(),
-        PackageSource {
-          url: value.clone(),
-          protocol: NugetProtocol::parse(None, value, Path::new("--source"))?,
-        },
-      ));
+      sources.push((value.clone(), parsed));
     }
   }
   Ok(sources)
@@ -1906,10 +1979,7 @@ fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), Packag
         match section {
           ConfigSection::Sources | ConfigSection::AuditSources => {
             let protocol = config_attribute(&reader, &element, b"protocolVersion", path)?;
-            let source = PackageSource {
-              protocol: NugetProtocol::parse(protocol.as_deref(), &value, path)?,
-              url: value,
-            };
+            let source = PackageSource::parse(value, protocol.as_deref(), path, path.parent().unwrap_or(Path::new(".")))?;
             let sources = if matches!(section, ConfigSection::Sources) {
               &mut merged.sources
             } else {
@@ -2311,36 +2381,115 @@ fn http_client(proxy: Option<&ProxySettings>) -> Result<reqwest::Client, Package
     .map_err(|error| network_error("HTTP client", format!("failed to create HTTP client: {error}")))
 }
 
-async fn discover_service_endpoints(client: &reqwest::Client, sources: &[(String, PackageSource)]) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
-  let mut endpoints = Vec::with_capacity(sources.len());
+async fn discover_service_endpoints(
+  client: &reqwest::Client,
+  sources: &[(String, PackageSource)],
+  allow_network: bool,
+) -> Result<(Vec<ServiceEndpoint>, u32), PackageError> {
+  let mut local = Vec::with_capacity(sources.len());
+  let mut remote = Vec::with_capacity(sources.len());
   let mut requests = 0;
   for (index, (_, source)) in sources.iter().enumerate() {
     let source_index = u32_len(index, "NuGet package-source index")?;
-    if !source.url.starts_with("https://") {
-      return Err(PackageError::new(
-        PackageErrorKind::Configuration,
-        &source.url,
-        format!("package resolution supports HTTPS NuGet v2 and v3 sources; {:?} is unsupported", source.url),
-      ));
-    }
     match source.protocol {
-      NugetProtocol::V2 => endpoints.push(ServiceEndpoint::V2 {
+      NugetProtocol::Local => {
+        let root = PathBuf::from(&source.url);
+        local.push(ServiceEndpoint::Local {
+          source: source.url.clone(),
+          layout: detect_local_feed_layout(&root)?,
+          root,
+          source_index,
+        });
+      },
+      NugetProtocol::V2 if allow_network => remote.push(ServiceEndpoint::V2 {
         source: source.url.clone(),
         base: with_trailing_slash(source.url.clone()),
         source_index,
       }),
-      NugetProtocol::V3 => {
+      NugetProtocol::V3 if allow_network => {
         let document: serde_json::Value = get_json(client, &source.url).await?;
         requests += 1;
-        endpoints.push(ServiceEndpoint::V3 {
+        remote.push(ServiceEndpoint::V3 {
           source: source.url.clone(),
           package_base: package_base_from_service_index(&source.url, &document)?,
           source_index,
         });
       },
+      NugetProtocol::V2 | NugetProtocol::V3 => {},
     }
   }
-  Ok((endpoints, requests))
+  local.extend(remote);
+  Ok((local, requests))
+}
+
+fn detect_local_feed_layout(root: &Path) -> Result<LocalFeedLayout, PackageError> {
+  let entries = match fs::read_dir(root) {
+    Ok(entries) => entries,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LocalFeedLayout::Unknown),
+    Err(error) => return Err(package_io("enumerate local package source", root, error)),
+  };
+  let mut flat = Vec::new();
+  let mut identity_roots = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|error| package_io("enumerate local package source", root, error))?;
+    let file_type = entry
+      .file_type()
+      .map_err(|error| package_io("inspect local package source entry", &entry.path(), error))?;
+    if file_type.is_file() && has_nupkg_extension(&entry.path()) {
+      flat.push(entry.path());
+    } else if file_type.is_dir() {
+      identity_roots.push(entry.path());
+    }
+  }
+
+  let mut hierarchical = false;
+  for identity_root in identity_roots {
+    let entries = fs::read_dir(&identity_root).map_err(|error| package_io("enumerate local package-source identity", &identity_root, error))?;
+    for entry in entries {
+      let entry = entry.map_err(|error| package_io("enumerate local package-source identity", &identity_root, error))?;
+      let file_type = entry
+        .file_type()
+        .map_err(|error| package_io("inspect local package-source identity entry", &entry.path(), error))?;
+      if file_type.is_file() && has_nupkg_extension(&entry.path()) {
+        flat.push(entry.path());
+      } else if file_type.is_dir() && hierarchical_source_entry_exists(&identity_root, &entry.path()) {
+        hierarchical = true;
+      }
+    }
+  }
+  if !flat.is_empty() {
+    flat.sort_unstable();
+    return Ok(LocalFeedLayout::Flat(flat.into()));
+  }
+  Ok(if hierarchical {
+    LocalFeedLayout::Hierarchical
+  } else {
+    LocalFeedLayout::Unknown
+  })
+}
+
+fn has_nupkg_extension(path: &Path) -> bool {
+  path
+    .extension()
+    .and_then(|extension| extension.to_str())
+    .is_some_and(|extension| extension.eq_ignore_ascii_case("nupkg"))
+}
+
+fn hierarchical_source_entry_exists(identity_root: &Path, version_root: &Path) -> bool {
+  let Some(id) = identity_root.file_name().and_then(|value| value.to_str()) else {
+    return false;
+  };
+  let Some(version) = version_root.file_name().and_then(|value| value.to_str()) else {
+    return false;
+  };
+  let Ok(version) = PackageVersion::parse(version) else {
+    return false;
+  };
+  let lower_id = id.to_ascii_lowercase();
+  let stem = format!("{lower_id}.{}", version.normalized);
+  version_root.join(format!("{stem}.nupkg")).is_file()
+    && version_root.join(format!("{lower_id}.nuspec")).is_file()
+    && version_root.join(format!("{stem}.nupkg.sha512")).is_file()
 }
 
 fn package_base_from_service_index(source: &str, document: &serde_json::Value) -> Result<String, PackageError> {
@@ -2436,11 +2585,11 @@ async fn resolve_streaming_graph(
       let cache_miss = request
         .as_ref()
         .is_none_or(|request| find_package_root(&config.cache_root, &config.fallback_roots, request).is_none());
-      if cache_miss && !options.offline && endpoints.is_none() {
+      if cache_miss && endpoints.is_none() {
         if !config.cache_root.is_dir() {
           fs::create_dir_all(&config.cache_root).map_err(|error| package_io("create package cache", &config.cache_root, error))?;
         }
-        let (discovered, requests) = discover_service_endpoints(client, &config.sources).await?;
+        let (discovered, requests) = discover_service_endpoints(client, &config.sources, !options.offline).await?;
         network_requests += requests;
         endpoints = Some(discovered.into());
       }
@@ -2909,29 +3058,45 @@ async fn load_node_metadata(
     ));
   }
 
-  let mut versions = Vec::new();
-  let mut requests = 0;
-  let mut bytes = 0;
+  // NuGet considers the global packages folder alongside enabled sources for
+  // floating/ranged requests. Local sources must not hide already cached
+  // versions merely because they remain available in offline mode.
+  let mut versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
+  let mut requests = 0u32;
+  let mut bytes = 0u64;
   for endpoint in endpoints {
     if source_mapping.is_some_and(|mapping| !mapping.allows(endpoint.source_index(), lower_id)) {
       continue;
     }
-    if let ServiceEndpoint::V3 { package_base, .. } = endpoint {
-      let url = format!("{package_base}{lower_id}/index.json");
-      let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
+    match endpoint {
+      ServiceEndpoint::Local { .. } => versions.extend(enumerate_local_versions(endpoint, lower_id)?),
+      ServiceEndpoint::V3 { package_base, .. } => {
+        let url = format!("{package_base}{lower_id}/index.json");
+        let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
+          requests += 1;
+          continue;
+        };
         requests += 1;
-        continue;
-      };
-      requests += 1;
-      bytes += body.len() as u64;
-      let document: V3VersionIndex =
-        serde_json::from_slice(&body).map_err(|error| network_error(&url, format!("invalid NuGet package version index: {error}")))?;
-      if document.versions.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(network_error(&url, "NuGet package version index exceeds the version count limit"));
-      }
-      for version in document.versions {
-        versions.push(PackageVersion::parse(&version)?);
-      }
+        bytes += body.len() as u64;
+        let document: V3VersionIndex =
+          serde_json::from_slice(&body).map_err(|error| network_error(&url, format!("invalid NuGet package version index: {error}")))?;
+        if document.versions.len() > MAX_ARCHIVE_ENTRIES {
+          return Err(network_error(&url, "NuGet package version index exceeds the version count limit"));
+        }
+        for version in document.versions {
+          versions.push(PackageVersion::parse(&version)?);
+        }
+      },
+      ServiceEndpoint::V2 { base, .. } => {
+        let batch = enumerate_v2_versions(client, base, lower_id).await?;
+        versions.extend(batch.versions);
+        requests = requests
+          .checked_add(batch.requests)
+          .ok_or_else(|| network_error(base, "NuGet v2 request count overflow"))?;
+        bytes = bytes
+          .checked_add(batch.bytes)
+          .ok_or_else(|| network_error(base, "NuGet v2 response byte count overflow"))?;
+      },
     }
   }
   versions.sort_unstable();
@@ -2949,6 +3114,115 @@ async fn load_node_metadata(
 #[derive(Deserialize)]
 struct V3VersionIndex {
   versions: Vec<String>,
+}
+
+struct VersionBatch {
+  versions: Vec<PackageVersion>,
+  requests: u32,
+  bytes: u64,
+}
+
+async fn enumerate_v2_versions(client: &reqwest::Client, base: &str, lower_id: &str) -> Result<VersionBatch, PackageError> {
+  let mut url = format!("{base}FindPackagesById()?id='{lower_id}'&semVerLevel=2.0.0");
+  let mut visited = HashSet::new();
+  let mut versions = Vec::new();
+  let mut requests = 0u32;
+  let mut bytes = 0u64;
+  loop {
+    if !visited.insert(url.clone()) {
+      return Err(network_error(&url, "NuGet v2 version enumeration contains a continuation cycle"));
+    }
+    if visited.len() > MAX_ARCHIVE_ENTRIES {
+      return Err(network_error(&url, "NuGet v2 version enumeration exceeds the page count limit"));
+    }
+    let Some(body) = get_optional_bytes(client, &url, MAX_JSON_BYTES, "NuGet v2 version page").await? else {
+      requests = requests.checked_add(1).ok_or_else(|| network_error(&url, "NuGet v2 request count overflow"))?;
+      break;
+    };
+    requests = requests.checked_add(1).ok_or_else(|| network_error(&url, "NuGet v2 request count overflow"))?;
+    bytes = bytes
+      .checked_add(body.len() as u64)
+      .ok_or_else(|| network_error(&url, "NuGet v2 response byte count overflow"))?;
+    let page = parse_v2_version_page(&url, &body)?;
+    if versions.len().checked_add(page.versions.len()).is_none_or(|count| count > MAX_ARCHIVE_ENTRIES) {
+      return Err(network_error(&url, "NuGet v2 version enumeration exceeds the version count limit"));
+    }
+    versions.extend(page.versions);
+    let Some(next) = page.next else {
+      break;
+    };
+    let current = reqwest::Url::parse(&url).map_err(|error| network_error(&url, format!("invalid NuGet v2 page URL: {error}")))?;
+    let continuation = current
+      .join(&next)
+      .map_err(|error| network_error(&url, format!("invalid NuGet v2 continuation URL {next:?}: {error}")))?;
+    if continuation.scheme() != "https" {
+      return Err(network_error(continuation.as_str(), "NuGet v2 continuation URL must use HTTPS"));
+    }
+    url = continuation.into();
+  }
+  Ok(VersionBatch { versions, requests, bytes })
+}
+
+struct V2VersionPage {
+  versions: Vec<PackageVersion>,
+  next: Option<String>,
+}
+
+fn parse_v2_version_page(url: &str, bytes: &[u8]) -> Result<V2VersionPage, PackageError> {
+  let mut reader = Reader::from_reader(bytes);
+  reader.config_mut().trim_text(true);
+  let mut reading_version = false;
+  let mut versions = Vec::new();
+  let mut next = None;
+  loop {
+    match reader.read_event() {
+      Ok(Event::Start(element)) => {
+        reading_version = local_name(element.name().as_ref()) == b"Version";
+        if local_name(element.name().as_ref()) == b"link" && network_attribute(&reader, &element, b"rel", url)?.as_deref() == Some("next") {
+          let href = network_attribute(&reader, &element, b"href", url)?.ok_or_else(|| network_error(url, "NuGet v2 continuation link has no href"))?;
+          if next.replace(href).is_some() {
+            return Err(network_error(url, "NuGet v2 version page has multiple continuation links"));
+          }
+        }
+      },
+      Ok(Event::Empty(element)) if local_name(element.name().as_ref()) == b"link" => {
+        if network_attribute(&reader, &element, b"rel", url)?.as_deref() == Some("next") {
+          let href = network_attribute(&reader, &element, b"href", url)?.ok_or_else(|| network_error(url, "NuGet v2 continuation link has no href"))?;
+          if next.replace(href).is_some() {
+            return Err(network_error(url, "NuGet v2 version page has multiple continuation links"));
+          }
+        }
+      },
+      Ok(Event::Text(text)) if reading_version => {
+        let value = text
+          .xml_content(XmlVersion::Implicit1_0)
+          .map_err(|error| network_error(url, format!("invalid NuGet v2 version text: {error}")))?;
+        versions.push(PackageVersion::parse(&value).map_err(|error| network_error(url, format!("invalid NuGet v2 package version {value:?}: {error}")))?);
+      },
+      Ok(Event::End(element)) => {
+        if local_name(element.name().as_ref()) == b"Version" {
+          reading_version = false;
+        }
+      },
+      Ok(Event::Eof) => break,
+      Ok(_) => {},
+      Err(error) => return Err(network_error(url, format!("invalid NuGet v2 version XML: {error}"))),
+    }
+  }
+  Ok(V2VersionPage { versions, next })
+}
+
+fn network_attribute(reader: &Reader<&[u8]>, element: &quick_xml::events::BytesStart<'_>, name: &[u8], url: &str) -> Result<Option<String>, PackageError> {
+  for attribute in element.attributes() {
+    let attribute = attribute.map_err(|error| network_error(url, format!("invalid NuGet v2 attribute: {error}")))?;
+    if local_name(attribute.key.as_ref()) == name {
+      return attribute
+        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+        .map(|value| Some(value.into_owned()))
+        .map_err(|error| network_error(url, format!("invalid NuGet v2 attribute value: {error}")));
+    }
+  }
+  Ok(None)
 }
 
 fn read_cached_requirements(root: &Path, request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequirement>, PackageError> {
@@ -2988,6 +3262,182 @@ fn append_cached_versions(cache_root: &Path, lower_id: &str, versions: &mut Vec<
     }
   }
   Ok(())
+}
+
+fn local_package_path(endpoint: &ServiceEndpoint, request: &PackageRequest) -> Result<Option<PathBuf>, PackageError> {
+  let ServiceEndpoint::Local { root, layout, .. } = endpoint else {
+    return Ok(None);
+  };
+  match layout {
+    LocalFeedLayout::Unknown => Ok(None),
+    LocalFeedLayout::Hierarchical => {
+      let version_root = root.join(&request.lower_id).join(&request.version);
+      let archive = version_root.join(format!("{}.{}.nupkg", request.lower_id, request.version));
+      let manifest = version_root.join(format!("{}.nuspec", request.lower_id));
+      let hash = version_root.join(format!("{}.{}.nupkg.sha512", request.lower_id, request.version));
+      Ok((archive.is_file() && manifest.is_file() && hash.is_file()).then_some(archive))
+    },
+    LocalFeedLayout::Flat(archives) => {
+      for archive in archives.iter().filter(|path| possible_flat_archive(path, &request.lower_id)) {
+        let (id, version) = read_local_archive_identity(archive)?;
+        if id.eq_ignore_ascii_case(&request.id) && version.normalized == request.version {
+          return Ok(Some(archive.clone()));
+        }
+      }
+      Ok(None)
+    },
+  }
+}
+
+fn local_expected_hash(endpoint: &ServiceEndpoint, request: &PackageRequest) -> Result<Option<String>, PackageError> {
+  let ServiceEndpoint::Local {
+    root,
+    layout: LocalFeedLayout::Hierarchical,
+    ..
+  } = endpoint
+  else {
+    return Ok(None);
+  };
+  let path = root
+    .join(&request.lower_id)
+    .join(&request.version)
+    .join(format!("{}.{}.nupkg.sha512", request.lower_id, request.version));
+  let value = fs::read_to_string(&path).map_err(|error| package_io("read local package hash", &path, error))?;
+  let value = value.trim();
+  let decoded = BASE64.decode(value).map_err(|error| {
+    PackageError::new(
+      PackageErrorKind::Integrity,
+      path.display().to_string(),
+      format!("invalid local package SHA-512: {error}"),
+    )
+  })?;
+  if decoded.len() != 64 {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      path.display().to_string(),
+      "local package SHA-512 must decode to 64 bytes",
+    ));
+  }
+  Ok(Some(value.to_owned()))
+}
+
+fn enumerate_local_versions(endpoint: &ServiceEndpoint, lower_id: &str) -> Result<Vec<PackageVersion>, PackageError> {
+  let ServiceEndpoint::Local { root, layout, .. } = endpoint else {
+    return Ok(Vec::new());
+  };
+  let mut versions = Vec::new();
+  match layout {
+    LocalFeedLayout::Unknown => {},
+    LocalFeedLayout::Hierarchical => {
+      let identity_root = root.join(lower_id);
+      let entries = match fs::read_dir(&identity_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(versions),
+        Err(error) => return Err(package_io("enumerate hierarchical package versions", &identity_root, error)),
+      };
+      for entry in entries {
+        let entry = entry.map_err(|error| package_io("enumerate hierarchical package versions", &identity_root, error))?;
+        if entry
+          .file_type()
+          .map_err(|error| package_io("inspect hierarchical package version", &entry.path(), error))?
+          .is_dir()
+          && hierarchical_source_entry_exists(&identity_root, &entry.path())
+          && let Some(version) = entry.file_name().to_str()
+          && let Ok(version) = PackageVersion::parse(version)
+        {
+          versions.push(version);
+        }
+      }
+    },
+    LocalFeedLayout::Flat(archives) => {
+      for archive in archives.iter().filter(|path| possible_flat_archive(path, lower_id)) {
+        let (id, version) = read_local_archive_identity(archive)?;
+        if id.eq_ignore_ascii_case(lower_id) {
+          versions.push(version);
+        }
+      }
+    },
+  }
+  Ok(versions)
+}
+
+fn possible_flat_archive(path: &Path, lower_id: &str) -> bool {
+  let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    return false;
+  };
+  name.len() > lower_id.len() + ".nupkg".len()
+    && name.get(..lower_id.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(lower_id))
+    && name.as_bytes().get(lower_id.len()) == Some(&b'.')
+}
+
+fn read_local_archive_identity(path: &Path) -> Result<(String, PackageVersion), PackageError> {
+  let file = fs::File::open(path).map_err(|error| package_io("open local package archive", path, error))?;
+  let mut archive = ZipArchive::new(file).map_err(|error| archive_error(path, format!("invalid local package archive: {error}")))?;
+  let mut manifest = None;
+  for index in 0..archive.len() {
+    let mut entry = archive
+      .by_index(index)
+      .map_err(|error| archive_error(path, format!("failed to inspect local package entry {index}: {error}")))?;
+    let entry_path = Path::new(entry.name());
+    if entry_path.components().count() != 1
+      || !entry_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nuspec"))
+    {
+      continue;
+    }
+    if manifest.is_some() {
+      return Err(archive_error(path, "local package contains multiple root nuspec files"));
+    }
+    if entry.size() > MAX_JSON_BYTES {
+      return Err(archive_error(path, "local package nuspec exceeds the metadata size limit"));
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry
+      .read_to_end(&mut bytes)
+      .map_err(|error| archive_error(path, format!("failed to read local package nuspec: {error}")))?;
+    manifest = Some(bytes);
+  }
+  let manifest = manifest.ok_or_else(|| archive_error(path, "local package contains no root nuspec"))?;
+  parse_local_nuspec_identity(path, &manifest)
+}
+
+fn parse_local_nuspec_identity(path: &Path, bytes: &[u8]) -> Result<(String, PackageVersion), PackageError> {
+  let mut reader = Reader::from_reader(bytes);
+  reader.config_mut().trim_text(true);
+  let mut current = NuspecText::None;
+  let mut id = None;
+  let mut version = None;
+  loop {
+    match reader.read_event() {
+      Ok(Event::Start(element)) => {
+        current = match local_name(element.name().as_ref()) {
+          b"id" if id.is_none() => NuspecText::Id,
+          b"version" if version.is_none() => NuspecText::Version,
+          _ => NuspecText::None,
+        };
+      },
+      Ok(Event::Text(text)) => {
+        let value = text
+          .xml_content(XmlVersion::Implicit1_0)
+          .map_err(|error| package_manifest_error(path, format!("invalid local nuspec text: {error}")))?
+          .into_owned();
+        match current {
+          NuspecText::Id => id = Some(value),
+          NuspecText::Version => version = Some(value),
+          NuspecText::None => {},
+        }
+      },
+      Ok(Event::End(_)) => current = NuspecText::None,
+      Ok(Event::Eof) => break,
+      Ok(_) => {},
+      Err(error) => return Err(package_manifest_error(path, format!("invalid local nuspec XML: {error}"))),
+    }
+  }
+  let id = id.ok_or_else(|| package_manifest_error(path, "local nuspec has no package id"))?;
+  let version = version.ok_or_else(|| package_manifest_error(path, "local nuspec has no package version"))?;
+  Ok((id, PackageVersion::parse(&version)?))
 }
 
 async fn get_optional_bytes(client: &reqwest::Client, url: &str, limit: u64, kind: &str) -> Result<Option<Vec<u8>>, PackageError> {
@@ -3114,7 +3564,23 @@ async fn download_and_publish(
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
+  if matches!(endpoint, ServiceEndpoint::Local { .. }) {
+    let archive = local_package_path(endpoint, request)?.ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::Network,
+        endpoint.source(),
+        format!("local package source does not contain {} {}", request.id, request.version),
+      )
+    })?;
+    let request = request.clone();
+    let cache_root = cache_root.to_owned();
+    let endpoint = endpoint.clone();
+    return tokio::task::spawn_blocking(move || install_local_package(&archive, request, cache_root, endpoint, target, parallel_extract))
+      .await
+      .map_err(package_blocking_task_error)?;
+  }
   let metadata = match endpoint {
+    ServiceEndpoint::Local { .. } => unreachable!("local package acquisition returned above"),
     ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, request, base).await?,
     ServiceEndpoint::V3 { package_base, .. } => v3_package_metadata(request, package_base),
   };
@@ -3183,6 +3649,86 @@ async fn download_and_publish(
   tokio::task::spawn_blocking(move || finish_download_and_publish(downloaded, staging_guard, scratch_guard))
     .await
     .map_err(package_blocking_task_error)?
+}
+
+fn install_local_package(
+  archive: &Path,
+  request: PackageRequest,
+  cache_root: PathBuf,
+  endpoint: ServiceEndpoint,
+  target: TargetFramework,
+  parallel_extract: bool,
+) -> Result<CachedPackage, PackageError> {
+  let expected_hash = local_expected_hash(&endpoint, &request)?;
+  let size = fs::metadata(archive)
+    .map_err(|error| package_io("inspect local package archive", archive, error))?
+    .len();
+  if size > MAX_PACKAGE_BYTES {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      archive.display().to_string(),
+      format!("local package archive size {size} exceeds the {MAX_PACKAGE_BYTES} byte limit"),
+    ));
+  }
+  let staging_root = unique_temp_root(&cache_root, &request);
+  fs::create_dir_all(&staging_root).map_err(|error| package_io("create package staging directory", &staging_root, error))?;
+  let staging_guard = TempGuard(Some(staging_root.clone()));
+  let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
+  let nupkg_path = staging_root.join(&nupkg_name);
+  if fs::hard_link(archive, &nupkg_path).is_err() {
+    fs::copy(archive, &nupkg_path).map_err(|error| package_io("copy local package archive into cache staging", &nupkg_path, error))?;
+  }
+  let (hash, bytes) = hash_local_package(&nupkg_path)?;
+  if bytes != size {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      archive.display().to_string(),
+      format!("local package archive changed size while being read: expected {size} bytes, read {bytes}"),
+    ));
+  }
+  if expected_hash.as_deref().is_some_and(|expected| expected != hash) {
+    return Err(PackageError::new(
+      PackageErrorKind::Integrity,
+      archive.display().to_string(),
+      "local package SHA-512 does not match source metadata",
+    ));
+  }
+  let downloaded = DownloadedPackage {
+    request,
+    cache_root,
+    endpoint,
+    temp_root: staging_root,
+    nupkg_name,
+    nupkg_path,
+    hash,
+    bytes,
+    requests: 0,
+    target,
+    parallel_extract,
+  };
+  finish_download_and_publish(downloaded, staging_guard, TempGuard(None))
+}
+
+fn hash_local_package(path: &Path) -> Result<(String, u64), PackageError> {
+  let mut file = fs::File::open(path).map_err(|error| package_io("open local package archive", path, error))?;
+  let mut hasher = Sha512::new();
+  let mut buffer = [0u8; 64 * 1024];
+  let mut total = 0u64;
+  loop {
+    let read = file.read(&mut buffer).map_err(|error| package_io("read local package archive", path, error))?;
+    if read == 0 {
+      break;
+    }
+    total = total.checked_add(read as u64).filter(|total| *total <= MAX_PACKAGE_BYTES).ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::Integrity,
+        path.display().to_string(),
+        "local package archive exceeds the size limit",
+      )
+    })?;
+    hasher.update(&buffer[..read]);
+  }
+  Ok((BASE64.encode(hasher.finalize()), total))
 }
 
 fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard: TempGuard, _scratch_guard: TempGuard) -> Result<CachedPackage, PackageError> {
@@ -5041,6 +5587,31 @@ mod tests {
     }
   }
 
+  fn write_test_package(temp: &TempDirectory, relative: &str, id: &str, version: &str) -> PathBuf {
+    let path = temp.0.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(&path).unwrap();
+    let mut archive = ZipWriter::new(file);
+    archive
+      .start_file(
+        format!("{id}.nuspec"),
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+      )
+      .unwrap();
+    archive
+      .write_all(format!(r#"<package><metadata><id>{id}</id><version>{version}</version></metadata></package>"#).as_bytes())
+      .unwrap();
+    archive
+      .start_file(
+        format!("lib/net10.0/{id}.dll"),
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+      )
+      .unwrap();
+    archive.write_all(b"managed assembly placeholder").unwrap();
+    archive.finish().unwrap();
+    path
+  }
+
   #[test]
   fn package_versions_follow_nuget_semver_precedence_and_normalization() {
     let alpha_two = PackageVersion::parse("1.0-alpha.2+BUILD").unwrap();
@@ -5773,6 +6344,34 @@ mod tests {
   }
 
   #[test]
+  fn parses_v2_version_pages_and_their_continuation() {
+    let page = br#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
+<entry><content><m:properties xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"><d:Version>1.2.0</d:Version></m:properties></content></entry>
+<entry><content><m:properties xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"><d:Version>2.0.0-beta.1</d:Version></m:properties></content></entry>
+<link rel="next" href="?page=2&amp;semVerLevel=2.0.0" /></feed>"#;
+
+    let parsed = parse_v2_version_page("https://packages.example.test/api/v2/FindPackagesById()", page).unwrap();
+
+    assert_eq!(
+      parsed.versions.iter().map(|version| version.normalized.as_str()).collect::<Vec<_>>(),
+      ["1.2.0", "2.0.0-beta.1"]
+    );
+    assert_eq!(parsed.next.as_deref(), Some("?page=2&semVerLevel=2.0.0"));
+  }
+
+  #[test]
+  fn rejects_ambiguous_v2_version_continuations() {
+    let page = br#"<feed><link rel="next" href="?page=2" /><link rel="next" href="?page=3" /></feed>"#;
+
+    let error = parse_v2_version_page("https://packages.example.test/api/v2/FindPackagesById()", page)
+      .err()
+      .unwrap();
+
+    assert_eq!(error.kind(), PackageErrorKind::Network);
+    assert!(error.to_string().contains("multiple continuation links"));
+  }
+
+  #[test]
   fn exact_v3_package_uses_only_the_discovered_flat_container() {
     let service_index = serde_json::json!({
       "resources": [{
@@ -6011,6 +6610,81 @@ mod tests {
     assert_eq!(identities, ["Child.Package", "Meta.Package"]);
     assert_eq!(resolution.cache_hits(), 2);
     assert_eq!(resolution.network_requests(), 0);
+  }
+
+  #[test]
+  fn local_flat_and_hierarchical_sources_resolve_ranges_without_http() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Flat.Package" Version="[1.0,2.0]" /><PackageReference Include="Tree.Package" Version="2.0.0" /></ItemGroup></Project>"#,
+    );
+    // Flat feeds trust the archive nuspec, not a potentially stale filename.
+    write_test_package(&temp, "flat/Flat.Package.9.9.9.nupkg", "Flat.Package", "1.2.3");
+    let tree_archive = write_test_package(&temp, "hierarchical/tree.package/2.0.0/tree.package.2.0.0.nupkg", "Tree.Package", "2.0.0");
+    temp.write(
+      "hierarchical/tree.package/2.0.0/tree.package.nuspec",
+      r#"<package><metadata><id>Tree.Package</id><version>2.0.0</version></metadata></package>"#,
+    );
+    let tree_hash = BASE64.encode(Sha512::digest(fs::read(tree_archive).unwrap()));
+    temp.write("hierarchical/tree.package/2.0.0/tree.package.2.0.0.nupkg.sha512", tree_hash);
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
+      sources: vec![
+        temp.0.join("flat").to_string_lossy().into_owned(),
+        temp.0.join("hierarchical").to_string_lossy().into_owned(),
+      ],
+      offline: true,
+      write_lock: true,
+    };
+
+    let resolution = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    let packages = resolution
+      .packages()
+      .iter()
+      .copied()
+      .map(|package| (resolution.package_id(package), resolution.package_version(package)))
+      .collect::<Vec<_>>();
+
+    assert_eq!(packages, [("Flat.Package", "1.2.3"), ("Tree.Package", "2.0.0")]);
+    assert_eq!(resolution.source_protocol(), "local");
+    assert_eq!(resolution.network_requests(), 0);
+    assert_eq!(resolution.downloaded_packages(), 2);
+    assert_eq!(resolution.compile_assets().count(), 2);
+  }
+
+  #[test]
+  fn hierarchical_local_source_rejects_a_mismatched_hash() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Tree.Package" Version="2.0.0" /></ItemGroup></Project>"#,
+    );
+    write_test_package(&temp, "feed/tree.package/2.0.0/tree.package.2.0.0.nupkg", "Tree.Package", "2.0.0");
+    temp.write(
+      "feed/tree.package/2.0.0/tree.package.nuspec",
+      r#"<package><metadata><id>Tree.Package</id><version>2.0.0</version></metadata></package>"#,
+    );
+    temp.write("feed/tree.package/2.0.0/tree.package.2.0.0.nupkg.sha512", BASE64.encode([0u8; 64]));
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
+      sources: vec![temp.0.join("feed").to_string_lossy().into_owned()],
+      offline: true,
+      write_lock: true,
+    };
+
+    let error = resolve_package_inputs(&[&project], &options).unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Integrity);
+    assert!(error.to_string().contains("does not match source metadata"));
   }
 
   #[test]

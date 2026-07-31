@@ -14,12 +14,15 @@ NuGet sources are typed records containing URL and protocol generation:
 
 - v3 sources discover `PackageBaseAddress` from the service index and derive
   exact normalized package-content URLs from that advertised base;
-- v2 sources read the exact OData package entry and its advertised content
-  URL, SHA-512, and size;
+- v2 sources enumerate ranged versions through bounded, cycle-checked
+  `FindPackagesById` Atom continuations, then read the exact OData package
+  entry and its advertised content URL, SHA-512, and size;
 - `protocolVersion="2"` and `"3"` are authoritative; absent values infer v3
   only for a `/v3/index.json` URL and otherwise infer v2;
-- only HTTPS HTTP sources are accepted initially. Local folders and source
-  authentication remain outside the supported subset. Credential-free config
+- HTTPS v2/v3 sources plus local flat or hierarchical folders are accepted;
+  local paths may be configuration-relative, CLI-relative, absolute, or
+  `file://`, and remain usable in offline mode. Source authentication remains
+  outside the supported subset. Credential-free config
   or lowercase environment HTTP proxies are applied by the native client;
   separate encrypted config credentials fail explicitly on Windows and are
   ignored elsewhere like NuGet. Proxy addresses and credentials are not
@@ -218,12 +221,12 @@ versions, and advanced conflict rules fail instead of being approximated.
 
 ## Verification
 
-Unit and CLI tests cover typed v2/v3 configuration, real v2 Atom parsing,
-target-dependent asset selection, SDK package-pruning bounds and edge
-retraction, zero-request warm locking, cache reuse, and archive traversal
-rejection. Live verification downloads the same public package through both
-NuGet v2 and v3 and compares identity, archive SHA-512, size, and selected
-compile asset.
+Unit and CLI tests cover typed local/v2/v3 configuration, v2 Atom metadata and
+continuations, flat and hierarchical discovery, flat archive identity checks,
+hierarchical hash rejection, target-dependent asset selection, zero-request
+warm locking, cache reuse, and archive traversal rejection. Live verification
+downloads the same public package through both NuGet v2 and v3 and compares
+identity, archive SHA-512, size, and selected compile asset.
 
 The benchmark preflight compares `dotnet restore` and `dv restore` complete
 package identity, exact-version, archive-SHA-512, target-framework, compile,
@@ -243,6 +246,11 @@ The storage-policy case builds an adapter against the selected SDK's official
 through MSBuild, and compares global/fallback/HTTP/temp paths, signature and
 proxy policy, package folders, identity/version/hash, and the compile asset
 selected from a fallback-only locked state.
+
+The local-source case maps two public packages across flat and hierarchical
+feeds, clears the global cache and restore outputs before every sample, and
+compares configured source paths, identities, versions, and SHA-512 values.
+`dv` must publish both entries while reporting zero HTTP requests.
 
 The next cold-path optimization is a persistent conditional service-index
 cache keyed by normalized source URL and validators such as ETag or
