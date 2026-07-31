@@ -31,7 +31,7 @@ Transform:
 
 Output:
 
-- schema-17 JSON containing every raw sample, statistic, and explicit
+- schema-18 JSON containing every raw sample, statistic, and explicit
   `measured` or `tbi` status;
 - a console table for immediate comparison;
 - no benchmark files written into an immutable fixture.
@@ -74,6 +74,7 @@ Invalid input behavior:
 | `nuget_source_sections` | four config levels with package/audit sources, protocols, disabled state, and nested mappings; populated isolated package cache and matching native lock | process launch, typed source-policy merge, mapping construction, one-package locked validation, and output |
 | `nuget_source_mapping` | fresh project/config copy, empty isolated package cache, one unreachable v3 source whose only mapping does not match the requested identity | process launch, project/config discovery, cache-miss proof, longest-pattern selection, zero-source proof, and the expected typed failure; source contact is forbidden |
 | `nuget_request_budget` | six seeded exact packages, empty isolated cache, two delayed loopback v3 feeds, global limit 4, per-source limit 2 | process launch, project/config discovery, bounded service discovery and archive fetch, integrity/extraction, and asset planning; both peak bounds and six byte-identical published packages are verified |
+| `nuget_source_telemetry` | the same cold two-source fixture with an empty cache | the same restore plus source-indexed request, response-byte, duration, and package cache-outcome reporting; aggregate requests/bytes are checked against server observations and reporter output is checked for source locations |
 | `nuget_storage_policy` | machine/user/repository policy, fallback-only package, empty global cache, matching native lock, reference HTTP cache bypassed | process launch, typed storage/signature/audit/proxy merge, fallback lookup, one-package locked validation, and output |
 | `nuget_cli_overrides` | conflicting implicit/config/environment values, explicit config/source/packages, populated CLI cache, matching native lock | process launch, explicit-config parse, CLI precedence transform, one-package locked validation, and output |
 | `nuget_local_sources` | mapped flat and hierarchical local feeds, empty global cache and restore outputs | process launch, local layout discovery, two-package graph resolution, 2,980,145 source bytes, hash/ZIP validation, extraction, atomic publication, and output |
@@ -115,7 +116,7 @@ directional decisions.`
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-source-mapping` | 1 `net10.0` project, 1 exact package request, empty cache, 1 unreachable v3 source, and 1 nonmatching mapping pattern | mapping-before-discovery behavior and typed unmapped failure | executable for both tools with expected-failure, diagnostic, and zero-request preflight |
-| `nuget-request-budget` | 1 `net10.0` project, 6 dependency-free exact packages, 2 delayed loopback v3 feeds, 4 global and 2 per-source active requests | deterministic request backpressure and cold restore throughput | executable for both tools with upper-bound, package-count, and source-contact validation |
+| `nuget-request-budget` | 1 `net10.0` project, 6 dependency-free exact packages, 2 delayed loopback v3 feeds, 4 global and 2 per-source active requests | deterministic request backpressure, cold restore throughput, and source telemetry | executable for both tools with upper-bound, package-count, source-contact, server-observed telemetry, and credential-free output validation |
 | `nuget-storage-policy` | 1 project, 3 config levels, 1 fallback-only package, isolated global/HTTP/scratch roots | storage precedence, fallback consumption, typed signature/audit policy, and proxy redaction | executable for both tools with official NuGet/MSBuild and package parity preflight |
 | `nuget-local-sources` | 1 project, 2 mapped local feeds, 1 flat package, 1 hierarchical package, 2,980,145 archive bytes | offline layout detection, local range/exact lookup, integrity validation, and cold cache publication | executable for both tools with source/package/hash parity preflight |
 | `nuget-service-index` | 1 project, 1 v3 source, 40 resource rows, 31 distinct types, 5 capability families, 9,272 response bytes | official resource preference, client-version compatibility, mirror retention, and live request latency | executable for both tools with exact SDK-shipped NuGet.Protocol endpoint parity preflight |

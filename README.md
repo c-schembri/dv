@@ -56,6 +56,9 @@ dv restore (unmapped source)       9.566 ms median
 dotnet restore (request budget) 3109.409 ms median
 dv restore (request budget)      247.157 ms median
 
+dotnet restore (source telemetry) 3067.502 ms median
+dv restore (source telemetry)      232.130 ms median
+
 dotnet restore (storage policy) 523.051 ms median
 dv restore (storage policy)       5.370 ms median
 
@@ -317,8 +320,9 @@ Initial machine:
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
   project evaluation, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
-  policy sections, storage policy, CLI overrides, local sources, service-index
-  capability discovery, source credentials, credential providers, the
+  policy sections, request budgets, source telemetry, storage policy, CLI
+  overrides, local sources, service-index capability discovery, source
+  credentials, credential providers, the
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; compiler planning uses 5 warm-ups; 10
@@ -344,6 +348,7 @@ Initial machine:
 | Load NuGet source policy sections | `dotnet restore SourceSections.csproj --locked-mode --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceSections.csproj --offline --json` | 527.659 ms | 5.850 ms | 90.2x | 537.783 ms | 8.229 ms |
 | Reject an unmapped package before source discovery | `dotnet restore SourceMapping.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore SourceMapping.csproj --packages .packages --json` | 531.249 ms | 9.566 ms | 55.5x | 1153.411 ms | 11.215 ms |
 | Restore six packages through bounded delayed feeds | `dotnet restore RequestBudget.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore RequestBudget.csproj --packages .packages --json` | 3109.409 ms | 247.157 ms | 12.6x | 5249.874 ms | 1178.249 ms |
+| Restore six packages and attribute source work | `dotnet restore RequestBudget.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore RequestBudget.csproj --packages .packages --json` | 3067.502 ms | 232.130 ms | 13.2x | 5257.469 ms | 1179.197 ms |
 | Resolve NuGet storage and restore policy | `dotnet restore StoragePolicy.csproj --locked-mode --no-http-cache --nologo --verbosity quiet` | `dv restore StoragePolicy.csproj --offline --json` | 523.051 ms | 5.370 ms | 97.4x | 605.407 ms | 6.526 ms |
 | Apply NuGet CLI overrides | `dotnet restore CliOverrides.csproj --locked-mode --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --no-http-cache --nologo --verbosity quiet` | `dv restore CliOverrides.csproj --source https://api.nuget.org/v3/index.json --configfile config/selected.config --packages policy/cli-global --offline --json` | 524.597 ms | 5.103 ms | 102.8x | 548.166 ms | 5.986 ms |
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
@@ -396,6 +401,11 @@ publish all six archives. Public
 network work and package seeding are outside timing, so the retained
 `3109.409 ms` versus `247.157 ms` result compares equivalent cold restore work
 under deterministic contention.
+The source-telemetry case repeats that cold transform independently and checks
+`dv`'s configuration-ordered request, response-byte, and duration rows against
+the loopback servers on every sample. It also requires six cache misses and
+forbids source locations in reporter output. The retained comparison is
+`3067.502 ms` versus `232.130 ms` (`13.2x`).
 The storage-policy case uses that same official assembly plus an MSBuild
 property query to verify
 global, HTTP-cache, scratch, ordered fallback, signature, audit, and proxy
@@ -458,6 +468,7 @@ recorded in the curated
 [NuGet source-policy baseline](docs/performance-baselines/2026-08-01-nuget-source-sections-windows.md),
 [NuGet source-mapping baseline](docs/performance-baselines/2026-08-01-nuget-source-mapping-windows.md),
 [NuGet request-budget baseline](docs/performance-baselines/2026-08-01-nuget-request-budget-windows.md),
+[NuGet source-telemetry baseline](docs/performance-baselines/2026-08-01-nuget-source-telemetry-windows.md),
 [NuGet storage-policy baseline](docs/performance-baselines/2026-08-01-nuget-storage-policy-windows.md),
 [NuGet CLI-override baseline](docs/performance-baselines/2026-08-01-nuget-cli-overrides-windows.md),
 [NuGet local-source baseline](docs/performance-baselines/2026-08-01-nuget-local-sources-windows.md),
@@ -517,6 +528,7 @@ cargo bench-all --case nuget_config_merge --samples 30 --warmups 3
 cargo bench-all --case nuget_source_sections --samples 30 --warmups 3
 cargo bench-all --case nuget_source_mapping --samples 30 --warmups 3
 cargo bench-all --case nuget_request_budget --samples 30 --warmups 3
+cargo bench-all --case nuget_source_telemetry --samples 30 --warmups 3
 cargo bench-all --case nuget_storage_policy --samples 30 --warmups 3
 cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3

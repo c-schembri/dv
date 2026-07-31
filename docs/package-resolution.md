@@ -159,8 +159,8 @@ span allocation. Actual per-package roots and ordered fallback roots are cold
 parallel path-span batches, so fallback support does not enlarge the hot
 package scan. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
 path is an 8-byte offset/length span into one owned UTF-8 buffer. The
-pointer-aligned `PackageResolution` header is 320 bytes after adding the two
-cold root batches and typed policy fields. Assuming the benchmark machine's
+pointer-aligned `PackageResolution` header is 328 bytes after adding the two
+cold root batches, typed policy fields, and source-work batch. Assuming the benchmark machine's
 observed 64-byte cache line, eight spans fit per line. Reporters and compiler
 planning scan only the ranges they consume.
 
@@ -211,7 +211,29 @@ Each `PackageResolution` owns:
 - dependency indices and one contiguous, explicitly partitioned package-asset
   span batch;
 - computed archive hashes, with source-advertised v2 hashes verified;
-- cache-hit, download, request, and payload-byte counters.
+- cache-hit, download, request, and payload-byte counters;
+- one 32-byte, eight-byte-aligned immutable row per configured source with its
+  configuration key, protocol, actual request attempts, source bytes,
+  and cumulative source-work microseconds.
+
+Remote tasks account into 24-byte, eight-byte-aligned `HttpWork` and
+`SourceWork` values that travel with existing task results. The deterministic
+scheduler owner merges them by contiguous source index, so instrumentation
+adds no shared atomic, lock, channel, task, or per-request allocation. Source
+duration includes retry and authentication waits plus body consumption;
+concurrent source durations may therefore sum above command wall time. Warm
+locked work materializes one zeroed row per configured source and classifies
+every validated package as a cache hit.
+
+The successful single-source path carries one inline source record. Only the
+rare path where a source fails and a later source succeeds allocates a small
+failure batch, preserving those attempted requests without charging the common
+path.
+
+The selected source and source-work rows retain configuration keys rather than
+locations. Reported inventory locations, persisted lock locations, and package
+metadata strip URL userinfo, query, and fragment components. Raw URLs remain
+only in command-local transport state where requests require them.
 
 The graph is immutable through compiler planning and reporting. Published
 package entries are immutable until an explicit future cache operation removes
@@ -259,6 +281,18 @@ separately for both the single-package startup boundary and the 203-package
 asset-plan boundary.
 `dv` package, request, and payload counts are recorded as typed benchmark
 evidence.
+
+The source-telemetry case uses the same six-package, two-source cold fixture,
+then checks each `dv` source row and aggregate against the loopback servers'
+actual request and response-byte counters. It also requires six cache misses
+and credential-free output:
+
+```powershell
+cargo bench-all --case nuget_source_telemetry --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[source-telemetry baseline](performance-baselines/2026-08-01-nuget-source-telemetry-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties

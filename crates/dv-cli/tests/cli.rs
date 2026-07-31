@@ -77,7 +77,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":12"));
+  assert!(lines[0].contains("\"schema_version\":13"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -406,8 +406,10 @@ fn explicit_nuget_config_replaces_the_implicit_hierarchy() {
 
   assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
   let stdout = String::from_utf8(output.stdout).unwrap();
-  assert!(stdout.contains("\"source\":\"https://packages.example.test/api/v2/\""));
+  assert!(stdout.contains("\"source\":\"selected\""));
   assert!(stdout.contains("\"source_protocol\":\"v2\""));
+  assert!(stdout.contains("\"source_work\":[{\"name\":\"selected\",\"protocol\":\"v2\",\"requests\":0,\"downloaded_bytes\":0,\"duration_us\":0}]"));
+  assert!(stdout.contains("\"cache_outcome\":\"hit\""));
   assert!(stdout.contains("\"network_requests\":0"));
 }
 

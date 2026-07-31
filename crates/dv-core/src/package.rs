@@ -1,4 +1,5 @@
 use std::{
+  borrow::Cow,
   cmp::Ordering,
   collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
   env,
@@ -13,7 +14,7 @@ use std::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
   },
   thread,
-  time::{Duration, SystemTime, UNIX_EPOCH},
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -30,7 +31,7 @@ use zeroize::Zeroizing;
 use zip::ZipArchive;
 
 use crate::{
-  CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageCancellation, ProjectSpec, TargetFramework,
+  CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageCancellation, ProjectSpec, TargetFramework,
   credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
   discover_sdks,
 };
@@ -121,6 +122,110 @@ const DEFAULT_REQUEST_BUDGET: PackageRequestBudget = PackageRequestBudget {
 const _: () = assert!(MAX_DOWNLOAD_WORKERS <= u16::MAX as usize);
 const _: () = assert!(size_of::<PackageRequestBudget>() == 2);
 const _: () = assert!(align_of::<PackageRequestBudget>() == 2);
+
+/// Response-local accounting returned through task results without shared writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HttpWork {
+  downloaded_bytes: u64,
+  duration_us: u64,
+  requests: u32,
+}
+
+/// Resolver accounting keyed by the deterministic configured-source index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SourceWork {
+  downloaded_bytes: u64,
+  duration_us: u64,
+  source_index: u32,
+  requests: u32,
+}
+
+struct HttpPayload<T> {
+  value: T,
+  work: HttpWork,
+}
+
+const _: () = assert!(size_of::<HttpWork>() == 24);
+const _: () = assert!(align_of::<HttpWork>() == 8);
+const _: () = assert!(size_of::<SourceWork>() == 24);
+const _: () = assert!(align_of::<SourceWork>() == 8);
+
+impl HttpWork {
+  fn merge(&mut self, other: Self, context: &str) -> Result<(), PackageError> {
+    self.requests = self
+      .requests
+      .checked_add(other.requests)
+      .ok_or_else(|| network_error(context, "HTTP request count overflow"))?;
+    self.downloaded_bytes = self
+      .downloaded_bytes
+      .checked_add(other.downloaded_bytes)
+      .ok_or_else(|| network_error(context, "HTTP response byte count overflow"))?;
+    self.duration_us = self
+      .duration_us
+      .checked_add(other.duration_us)
+      .ok_or_else(|| network_error(context, "HTTP request duration overflow"))?;
+    Ok(())
+  }
+}
+
+impl SourceWork {
+  const fn new(source_index: u32) -> Self {
+    Self {
+      downloaded_bytes: 0,
+      duration_us: 0,
+      source_index,
+      requests: 0,
+    }
+  }
+
+  fn merge_http(&mut self, work: HttpWork, context: &str) -> Result<(), PackageError> {
+    let mut total = HttpWork {
+      downloaded_bytes: self.downloaded_bytes,
+      duration_us: self.duration_us,
+      requests: self.requests,
+    };
+    total.merge(work, context)?;
+    self.downloaded_bytes = total.downloaded_bytes;
+    self.duration_us = total.duration_us;
+    self.requests = total.requests;
+    Ok(())
+  }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+  started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn source_work_table(source_count: usize) -> Result<Vec<SourceWork>, PackageError> {
+  (0..source_count)
+    .map(|index| u32_len(index, "NuGet package-source index").map(SourceWork::new))
+    .collect()
+}
+
+fn merge_source_work(target: &mut [SourceWork], work: SourceWork, context: &str) -> Result<(), PackageError> {
+  let slot = target.get_mut(work.source_index as usize).ok_or_else(|| {
+    PackageError::new(
+      PackageErrorKind::TextOverflow,
+      context,
+      format!("NuGet source-work index {} is outside the configured source batch", work.source_index),
+    )
+  })?;
+  if slot.source_index != work.source_index {
+    return Err(PackageError::new(
+      PackageErrorKind::TextOverflow,
+      context,
+      "NuGet source-work table is not indexed contiguously",
+    ));
+  }
+  slot.merge_http(
+    HttpWork {
+      downloaded_bytes: work.downloaded_bytes,
+      duration_us: work.duration_us,
+      requests: work.requests,
+    },
+    context,
+  )
+}
 
 impl PackageRequestBudget {
   const fn global_limit(self) -> usize {
@@ -347,6 +452,7 @@ pub struct ResolvedPackage {
   version: TextSpan,
   dependencies: ItemRange,
   direct: bool,
+  cache_hit: bool,
 }
 
 const _: () = assert!(size_of::<ResolvedPackage>() == 28);
@@ -539,10 +645,21 @@ struct PackageServiceEndpointRecord {
   kind: PackageServiceKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageSourceWorkRecord {
+  downloaded_bytes: u64,
+  duration_us: u64,
+  name: TextSpan,
+  requests: u32,
+  protocol: NugetProtocol,
+}
+
 const _: () = assert!(size_of::<PackageSourceRecord>() == 28);
 const _: () = assert!(align_of::<PackageSourceRecord>() == 4);
 const _: () = assert!(size_of::<PackageServiceEndpointRecord>() == 12);
 const _: () = assert!(align_of::<PackageServiceEndpointRecord>() == 4);
+const _: () = assert!(size_of::<PackageSourceWorkRecord>() == 32);
+const _: () = assert!(align_of::<PackageSourceWorkRecord>() == 8);
 
 /// Immutable effective package-source and service-capability batches.
 ///
@@ -554,12 +671,13 @@ pub struct PackageSourceInventory {
   text: Box<str>,
   sources: Box<[PackageSourceRecord]>,
   endpoints: Box<[PackageServiceEndpointRecord]>,
+  source_work: Box<[SourceWork]>,
   http_policy: PackageHttpPolicy,
   network_requests: u32,
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageSourceInventory>() == 80);
+const _: () = assert!(size_of::<PackageSourceInventory>() == 96);
 const _: () = assert!(align_of::<PackageSourceInventory>() == 8);
 
 impl PackageSourceInventory {
@@ -573,7 +691,7 @@ impl PackageSourceInventory {
     self.get(self.sources[source].name)
   }
 
-  /// Returns the configured source URL or local path.
+  /// Returns a credential-free configured source URL or local path.
   pub fn source_location(&self, source: usize) -> &str {
     self.get(self.sources[source].location)
   }
@@ -628,6 +746,21 @@ impl PackageSourceInventory {
     self.downloaded_bytes
   }
 
+  /// Returns actual HTTP attempts made against one source.
+  pub fn source_requests(&self, source: usize) -> u32 {
+    self.source_work[source].requests
+  }
+
+  /// Returns HTTP response-body or local archive bytes read from one source.
+  pub fn source_downloaded_bytes(&self, source: usize) -> u64 {
+    self.source_work[source].downloaded_bytes
+  }
+
+  /// Returns cumulative source-work microseconds for one source.
+  pub fn source_duration_us(&self, source: usize) -> u64 {
+    self.source_work[source].duration_us
+  }
+
   fn get(&self, span: TextSpan) -> &str {
     let start = span.start as usize;
     &self.text[start..start + span.len as usize]
@@ -647,7 +780,8 @@ pub struct PackageResolution {
   temp_root: TextSpan,
   lock_path: TextSpan,
   target_framework: TextSpan,
-  source: TextSpan,
+  source_name: TextSpan,
+  source_location: TextSpan,
   prune_fingerprint: TextSpan,
   source_protocol: NugetProtocol,
   signature_validation: SignatureValidationMode,
@@ -664,13 +798,14 @@ pub struct PackageResolution {
   assets: Box<[TextSpan]>,
   asset_ranges: PackageAssetRanges,
   runtime_targets: Box<[RuntimeTargetAsset]>,
+  source_work: Box<[PackageSourceWorkRecord]>,
   cache_hits: u32,
   downloaded_packages: u32,
   network_requests: u32,
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 304);
+const _: () = assert!(size_of::<PackageResolution>() == 328);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
@@ -732,14 +867,48 @@ impl PackageResolution {
     self.get(self.target_framework)
   }
 
-  /// Returns the selected package source.
+  /// Returns the credential-free configuration key for the selected source.
   pub fn source(&self) -> &str {
-    self.get(self.source)
+    self.get(self.source_name)
+  }
+
+  fn source_location(&self) -> &str {
+    self.get(self.source_location)
   }
 
   /// Returns the selected NuGet protocol generation.
   pub fn source_protocol(&self) -> &'static str {
     self.source_protocol.as_str()
+  }
+
+  /// Returns configured sources in deterministic configuration order.
+  pub fn source_work(&self) -> std::ops::Range<usize> {
+    0..self.source_work.len()
+  }
+
+  /// Returns a credential-free configured source identity.
+  pub fn source_work_name(&self, source: usize) -> &str {
+    self.get(self.source_work[source].name)
+  }
+
+  /// Returns `local`, `v2`, or `v3` for one source-work row.
+  pub fn source_work_protocol(&self, source: usize) -> &'static str {
+    self.source_work[source].protocol.as_str()
+  }
+
+  /// Returns actual HTTP attempts made against one source.
+  pub fn source_work_requests(&self, source: usize) -> u32 {
+    self.source_work[source].requests
+  }
+
+  /// Returns HTTP response-body or local archive bytes read from one source.
+  pub fn source_work_downloaded_bytes(&self, source: usize) -> u64 {
+    self.source_work[source].downloaded_bytes
+  }
+
+  /// Returns cumulative source-work microseconds for one source.
+  pub fn source_work_duration_us(&self, source: usize) -> u64 {
+    self.source_work[source].duration_us
   }
 
   /// Returns package records sorted by case-insensitive identity.
@@ -765,6 +934,11 @@ impl PackageResolution {
   /// Returns whether a package was directly referenced by the project.
   pub fn package_is_direct(&self, package: ResolvedPackage) -> bool {
     package.direct
+  }
+
+  /// Returns the successful cache classification for a resolved package.
+  pub fn package_cache_outcome(&self, package: ResolvedPackage) -> CacheOutcome {
+    if package.cache_hit { CacheOutcome::Hit } else { CacheOutcome::Miss }
   }
 
   /// Iterates dependency package indices.
@@ -857,7 +1031,7 @@ impl PackageResolution {
     self.network_requests
   }
 
-  /// Returns package payload bytes downloaded.
+  /// Returns HTTP response-body and local source archive bytes read.
   pub fn downloaded_bytes(&self) -> u64 {
     self.downloaded_bytes
   }
@@ -976,6 +1150,8 @@ pub struct PackageError {
   kind: PackageErrorKind,
   context: String,
   message: String,
+  http_work: Option<HttpWork>,
+  source_work: Vec<SourceWork>,
 }
 
 impl PackageError {
@@ -994,7 +1170,29 @@ impl PackageError {
       kind,
       context: context.into(),
       message: message.into(),
+      http_work: None,
+      source_work: Vec::new(),
     }
+  }
+
+  fn with_http_work(mut self, work: HttpWork) -> Self {
+    debug_assert_eq!(self.kind, PackageErrorKind::Network);
+    self.http_work = Some(work);
+    self
+  }
+
+  fn take_http_work(&mut self) -> Option<HttpWork> {
+    self.http_work.take()
+  }
+
+  fn with_source_work(mut self, work: Vec<SourceWork>) -> Self {
+    debug_assert_eq!(self.kind, PackageErrorKind::Network);
+    self.source_work = work;
+    self
+  }
+
+  fn take_source_work(&mut self) -> Vec<SourceWork> {
+    std::mem::take(&mut self.source_work)
   }
 }
 
@@ -1329,7 +1527,9 @@ struct ResolutionContext<'a> {
   fallback_roots: &'a [PathBuf],
   lock_path: &'a Path,
   target_framework: &'a str,
-  source: &'a str,
+  source_name: &'a str,
+  source_location: &'a str,
+  sources: &'a [(String, PackageSource)],
   prune_fingerprint: &'a str,
   source_protocol: NugetProtocol,
   signature_validation: SignatureValidationMode,
@@ -1388,15 +1588,14 @@ struct CachedPackage {
   hash: String,
   dependencies: Option<Vec<PackageRequirement>>,
   cache_hit: bool,
-  requests: u32,
-  bytes: u64,
+  source_work: Option<SourceWork>,
+  failed_source_work: Box<[SourceWork]>,
   origin: Option<PackageSource>,
 }
 
 struct ResolvedGraph {
   packages: BTreeMap<String, WorkPackage>,
-  network_requests: u32,
-  downloaded_bytes: u64,
+  source_work: Vec<SourceWork>,
 }
 
 /// Cold graph state is identity-ordered and owned by the resolver task. Parent
@@ -1422,14 +1621,13 @@ enum NodeSelection {
 enum MetadataTaskResult {
   Requirements {
     dependencies: Vec<PackageRequirement>,
-    requests: u32,
-    bytes: u64,
+    source_work: Option<SourceWork>,
+    failed_source_work: Box<[SourceWork]>,
     package: Option<CachedPackage>,
   },
   Versions {
     versions: Vec<PackageVersion>,
-    requests: u32,
-    bytes: u64,
+    source_work: Vec<SourceWork>,
   },
 }
 
@@ -1722,6 +1920,23 @@ impl HttpOrigin {
       && url.host_str().is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
       && url.port_or_known_default() == Some(self.port)
   }
+}
+
+fn redact_report_location(value: &str) -> Cow<'_, str> {
+  if !value.bytes().any(|byte| matches!(byte, b'@' | b'?' | b'#')) {
+    return Cow::Borrowed(value);
+  }
+  let Ok(mut url) = reqwest::Url::parse(value) else {
+    return Cow::Borrowed(value);
+  };
+  if !matches!(url.scheme(), "http" | "https") {
+    return Cow::Borrowed(value);
+  }
+  let _ = url.set_username("");
+  let _ = url.set_password(None);
+  url.set_query(None);
+  url.set_fragment(None);
+  Cow::Owned(url.into())
 }
 
 #[derive(Default)]
@@ -2019,7 +2234,7 @@ async fn inspect_source_batch(
 ) -> Result<PackageSourceInventory, PackageError> {
   let mut discovered = std::iter::repeat_with(|| None)
     .take(sources.len())
-    .collect::<Vec<Option<(NugetServiceEndpoints, u64)>>>();
+    .collect::<Vec<Option<(NugetServiceEndpoints, HttpWork)>>>();
   if probe_credentials {
     for (index, (_, source)) in sources.iter().enumerate() {
       if source.protocol != NugetProtocol::Local
@@ -2063,16 +2278,20 @@ async fn inspect_source_batch(
   let mut text = TextTable::with_capacity(text_capacity);
   let mut source_rows = Vec::with_capacity(sources.len());
   let mut endpoint_rows = Vec::new();
+  let mut source_work = (0..sources.len())
+    .map(|index| u32_len(index, "NuGet package-source index").map(SourceWork::new))
+    .collect::<Result<Vec<_>, _>>()?;
   let mut network_requests = 0u32;
   let mut downloaded_bytes = 0u64;
   for (index, (name, source)) in sources.iter().enumerate() {
     let start = u32_len(endpoint_rows.len(), "package-source endpoint range")?;
-    if let Some((services, bytes)) = discovered[index].take() {
+    if let Some((services, work)) = discovered[index].take() {
+      source_work[index].merge_http(work, &source.url)?;
       network_requests = network_requests
-        .checked_add(1)
+        .checked_add(work.requests)
         .ok_or_else(|| network_error(&source.url, "package-source request count overflow"))?;
       downloaded_bytes = downloaded_bytes
-        .checked_add(bytes)
+        .checked_add(work.downloaded_bytes)
         .ok_or_else(|| network_error(&source.url, "package-source response byte count overflow"))?;
       for (kind, capability) in [
         (PackageServiceKind::Registration, ServiceCapability::Registration),
@@ -2083,15 +2302,15 @@ async fn inspect_source_batch(
       ] {
         for endpoint in services.values(capability) {
           endpoint_rows.push(PackageServiceEndpointRecord {
-            location: text.push(endpoint)?,
+            location: text.push(redact_report_location(endpoint).as_ref())?,
             kind,
           });
         }
       }
     }
     source_rows.push(PackageSourceRecord {
-      name: text.push(name)?,
-      location: text.push(&source.url)?,
+      name: text.push(redact_report_location(name).as_ref())?,
+      location: text.push(redact_report_location(&source.url).as_ref())?,
       endpoints: ItemRange {
         start,
         len: u32_len(endpoint_rows.len() - start as usize, "package-source endpoint range")?,
@@ -2105,6 +2324,7 @@ async fn inspect_source_batch(
     text: text.text.into_boxed_str(),
     sources: source_rows.into_boxed_slice(),
     endpoints: endpoint_rows.into_boxed_slice(),
+    source_work: source_work.into_boxed_slice(),
     http_policy,
     network_requests,
     downloaded_bytes,
@@ -2141,15 +2361,18 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
 
   validate_acyclic(&resolved)?;
   let origin = resolved.values().find_map(|package| package.origin.as_ref());
-  let (source, source_protocol) = origin.map_or_else(
-    || {
-      config.sources.first().map_or_else(
-        || (DEFAULT_SOURCE.to_owned(), NugetProtocol::V3),
-        |(_, source)| (source.url.clone(), source.protocol),
-      )
-    },
-    |source| (source.url.clone(), source.protocol),
-  );
+  let selected_source = origin
+    .and_then(|origin| {
+      config
+        .sources
+        .iter()
+        .find(|(_, source)| source.url == origin.url && source.protocol == origin.protocol)
+    })
+    .or_else(|| config.sources.first());
+  let (source_name, raw_source_location, source_protocol) = selected_source.map_or(("", DEFAULT_SOURCE, NugetProtocol::V3), |(name, source)| {
+    (name.as_str(), source.url.as_str(), source.protocol)
+  });
+  let source_location = redact_report_location(raw_source_location);
   let resolution = materialize_resolution(
     ResolutionContext {
       cache_root: &config.cache_root,
@@ -2158,7 +2381,9 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       fallback_roots: &config.fallback_roots,
       lock_path: &lock_path,
       target_framework: target_text,
-      source: &source,
+      source_name,
+      source_location: source_location.as_ref(),
+      sources: &config.sources,
       prune_fingerprint: &pruning.fingerprint,
       source_protocol,
       signature_validation: config.signature_validation,
@@ -2168,8 +2393,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       proxy_configured: config.proxy.is_some(),
     },
     &resolved,
-    graph.network_requests,
-    graph.downloaded_bytes,
+    &graph.source_work,
   )?;
   if options.write_lock {
     write_lock(&resolution)?;
@@ -2509,7 +2733,7 @@ fn command_line_sources(
       (name.clone(), source.clone())
     } else {
       (
-        value.clone(),
+        redact_report_location(value).into_owned(),
         PackageSource::parse(value.clone(), None, false, false, Path::new("--source"), project_directory)?,
       )
     };
@@ -4168,15 +4392,15 @@ struct LazyServiceEndpoints {
   snapshot: Arc<[ServiceEndpoint]>,
 }
 
-#[derive(Clone, Copy)]
-struct ServiceDiscoveryOptions {
-  worker_budget: usize,
+struct ServiceDiscoveryOptions<'a> {
+  source_work: &'a mut [SourceWork],
+  worker_budget: u8,
   allow_network: bool,
 }
 
 const _: () = assert!(size_of::<LazyServiceEndpoints>() == 40);
 const _: () = assert!(align_of::<LazyServiceEndpoints>() == 8);
-const _: () = assert!(size_of::<ServiceDiscoveryOptions>() == 16);
+const _: () = assert!(size_of::<ServiceDiscoveryOptions>() == 24);
 const _: () = assert!(align_of::<ServiceDiscoveryOptions>() == 8);
 
 impl LazyServiceEndpoints {
@@ -4194,10 +4418,12 @@ impl LazyServiceEndpoints {
     credentials: &SourceCredentialBatch,
     mapping: Option<&PackageSourceMapping>,
     package_id: &str,
-    options: ServiceDiscoveryOptions,
-  ) -> Result<u32, PackageError> {
+    options: ServiceDiscoveryOptions<'_>,
+  ) -> Result<(), PackageError> {
     debug_assert!(options.worker_budget > 0);
-    let worker_budget = options.worker_budget.max(1);
+    let worker_budget = usize::from(options.worker_budget.max(1));
+    let allow_network = options.allow_network;
+    let source_work = options.source_work;
     let required_rank = mapping.and_then(|mapping| mapping.required_rank(package_id));
     if mapping.is_some() && required_rank.is_none() {
       return Err(unmapped_identity(package_id));
@@ -4224,7 +4450,7 @@ impl LazyServiceEndpoints {
           });
           changed = true;
         },
-        NugetProtocol::V2 if options.allow_network => {
+        NugetProtocol::V2 if allow_network => {
           self.slots[index] = Some(ServiceEndpoint::V2 {
             source: source.url.clone(),
             base: with_trailing_slash(source.url.clone()),
@@ -4233,7 +4459,7 @@ impl LazyServiceEndpoints {
           });
           changed = true;
         },
-        NugetProtocol::V3 if options.allow_network => jobs.push((index, source.url.clone(), credentials.get(index).cloned())),
+        NugetProtocol::V3 if allow_network => jobs.push((index, source.url.clone(), credentials.get(index).cloned())),
         NugetProtocol::V2 | NugetProtocol::V3 => {},
       }
       Ok(())
@@ -4248,14 +4474,13 @@ impl LazyServiceEndpoints {
       }
     }
     if !matched {
-      return if mapping.is_some() { Err(unmapped_identity(package_id)) } else { Ok(0) };
+      return if mapping.is_some() { Err(unmapped_identity(package_id)) } else { Ok(()) };
     }
 
-    let request_count =
-      u32::try_from(jobs.len()).map_err(|_| PackageError::new(PackageErrorKind::TextOverflow, package_id, "service-index request count exceeds u32"))?;
+    let completed_capacity = jobs.len();
     let mut pending = jobs.into_iter();
     let mut tasks = JoinSet::new();
-    let mut completed = Vec::with_capacity(request_count as usize);
+    let mut completed = Vec::with_capacity(completed_capacity);
     loop {
       while tasks.len() < worker_budget {
         let Some((index, source, credential)) = pending.next() else {
@@ -4275,7 +4500,17 @@ impl LazyServiceEndpoints {
     }
     completed.sort_unstable_by_key(|(index, ..)| *index);
     for (index, source, credential, result) in completed {
-      let (services, _) = result?;
+      let (services, work) = result?;
+      merge_source_work(
+        source_work,
+        SourceWork {
+          downloaded_bytes: work.downloaded_bytes,
+          duration_us: work.duration_us,
+          source_index: u32_len(index, "NuGet package-source index")?,
+          requests: work.requests,
+        },
+        &source,
+      )?;
       if services.package_base_address().is_none() {
         return Err(network_error(&source, "NuGet v3 source has no compatible PackageBaseAddress resource"));
       }
@@ -4290,7 +4525,7 @@ impl LazyServiceEndpoints {
     if changed {
       self.snapshot = endpoint_snapshot(&self.slots);
     }
-    Ok(request_count)
+    Ok(())
   }
 
   fn snapshot(&self) -> Arc<[ServiceEndpoint]> {
@@ -4405,13 +4640,13 @@ async fn fetch_v3_service_index(
   client: &reqwest::Client,
   credential: Option<&SourceCredential>,
   source: &str,
-) -> Result<(NugetServiceEndpoints, u64), PackageError> {
-  let bytes = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index").await?;
+) -> Result<(NugetServiceEndpoints, HttpWork), PackageError> {
+  let payload = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index").await?;
   let document: serde_json::Value =
-    serde_json::from_slice(&bytes).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
+    serde_json::from_slice(&payload.value).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
   let security_flags = credential.map_or(0, |credential| credential.security_flags);
   let endpoints = parse_v3_service_index(source, &document, security_flags)?;
-  Ok((endpoints, bytes.len() as u64))
+  Ok((endpoints, payload.work))
 }
 
 fn parse_v3_service_index(source: &str, document: &serde_json::Value, security_flags: u8) -> Result<NugetServiceEndpoints, PackageError> {
@@ -4600,8 +4835,7 @@ async fn resolve_streaming_graph(
   let mut ready = BTreeSet::new();
   stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
   let mut endpoints: Option<LazyServiceEndpoints> = None;
-  let mut network_requests = 0;
-  let mut downloaded_bytes = 0;
+  let mut source_work = source_work_table(config.sources.len())?;
   let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
   let mut tasks = JoinSet::new();
   let mut in_flight = BTreeSet::new();
@@ -4643,7 +4877,7 @@ async fn resolve_streaming_graph(
         if endpoints.is_none() {
           endpoints = Some(LazyServiceEndpoints::new(config.sources.len()));
         }
-        network_requests += endpoints
+        endpoints
           .as_mut()
           .expect("lazy endpoint state was initialized")
           .ensure_identity(
@@ -4653,8 +4887,9 @@ async fn resolve_streaming_graph(
             config.source_mapping.as_deref(),
             &lower_id,
             ServiceDiscoveryOptions {
-              worker_budget: MAX_DOWNLOAD_WORKERS - tasks.len(),
+              worker_budget: u8::try_from(MAX_DOWNLOAD_WORKERS - tasks.len()).expect("package worker budget fits u8"),
               allow_network: !options.offline,
+              source_work: &mut source_work,
             },
           )
           .await?;
@@ -4710,9 +4945,13 @@ async fn resolve_streaming_graph(
       Err(error) => return Err(error),
     };
     match result {
-      MetadataTaskResult::Versions { versions, requests, bytes } => {
-        network_requests += requests;
-        downloaded_bytes += bytes;
+      MetadataTaskResult::Versions {
+        versions,
+        source_work: task_work,
+      } => {
+        for work in task_work {
+          merge_source_work(&mut source_work, work, &lower_id)?;
+        }
         if let Some(node) = nodes.get_mut(&lower_id) {
           node.available_versions = Some(versions);
           dirty.insert(lower_id);
@@ -4720,12 +4959,16 @@ async fn resolve_streaming_graph(
       },
       MetadataTaskResult::Requirements {
         dependencies,
-        requests,
-        bytes,
+        source_work: task_work,
+        failed_source_work,
         package,
       } => {
-        network_requests += requests;
-        downloaded_bytes += bytes;
+        for work in failed_source_work {
+          merge_source_work(&mut source_work, work, &lower_id)?;
+        }
+        if let Some(work) = task_work {
+          merge_source_work(&mut source_work, work, &lower_id)?;
+        }
         if let Some(package) = package
           && let Some(version) = task_version
         {
@@ -4812,8 +5055,12 @@ async fn resolve_streaming_graph(
       .ok_or_else(package_worker_stopped)?
       .map_err(package_blocking_task_error)?;
     let cached = cached?;
-    network_requests += cached.requests;
-    downloaded_bytes += cached.bytes;
+    for work in &cached.failed_source_work {
+      merge_source_work(&mut source_work, *work, &request.lower_id)?;
+    }
+    if let Some(work) = cached.source_work {
+      merge_source_work(&mut source_work, work, &request.lower_id)?;
+    }
     acquired.insert(request.lower_id.clone(), (request, cached));
   }
 
@@ -4828,8 +5075,7 @@ async fn resolve_streaming_graph(
 
   Ok(ResolvedGraph {
     packages: resolved,
-    network_requests,
-    downloaded_bytes,
+    source_work,
   })
 }
 
@@ -5072,8 +5318,8 @@ async fn load_node_metadata(
       .map_err(package_blocking_task_error)??;
     return Ok(MetadataTaskResult::Requirements {
       dependencies,
-      requests: 0,
-      bytes: 0,
+      source_work: None,
+      failed_source_work: Box::new([]),
       package: None,
     });
   }
@@ -5087,8 +5333,7 @@ async fn load_node_metadata(
     if !cached_versions.is_empty() {
       return Ok(MetadataTaskResult::Versions {
         versions: cached_versions,
-        requests: 0,
-        bytes: 0,
+        source_work: Vec::new(),
       });
     }
   }
@@ -5101,8 +5346,7 @@ async fn load_node_metadata(
       if !cached_versions.is_empty() {
         return Ok(MetadataTaskResult::Versions {
           versions: cached_versions,
-          requests: 0,
-          bytes: 0,
+          source_work: Vec::new(),
         });
       }
     }
@@ -5113,6 +5357,7 @@ async fn load_node_metadata(
     ));
   }
 
+  let mut exact_source_work = Vec::new();
   if let Some(request) = request {
     match ensure_package(client, request, storage, endpoints, source_mapping, target, false).await {
       Ok(cached) => {
@@ -5122,12 +5367,12 @@ async fn load_node_metadata(
         };
         return Ok(MetadataTaskResult::Requirements {
           dependencies,
-          requests: cached.requests,
-          bytes: cached.bytes,
+          source_work: cached.source_work,
+          failed_source_work: cached.failed_source_work.clone(),
           package: Some(cached),
         });
       },
-      Err(error) if error.kind() == PackageErrorKind::Network => {},
+      Err(mut error) if error.kind() == PackageErrorKind::Network => exact_source_work = error.take_source_work(),
       Err(error) => return Err(error),
     }
   }
@@ -5136,8 +5381,8 @@ async fn load_node_metadata(
   // floating/ranged requests. Local sources must not hide already cached
   // versions merely because they remain available in offline mode.
   let mut versions = enumerate_cached_versions(storage.cache_root, storage.fallback_roots, lower_id)?;
-  let mut requests = 0u32;
-  let mut bytes = 0u64;
+  exact_source_work.reserve(endpoints.len());
+  let mut source_work = exact_source_work;
   for endpoint in endpoints {
     if !source_mapping_selects(source_mapping, selected_rank, lower_id, endpoint.source_index()) {
       continue;
@@ -5148,12 +5393,16 @@ async fn load_node_metadata(
         let package_base = services.package_base_address().expect("v3 endpoint discovery requires package content");
         let separator = if package_base.ends_with('/') { "" } else { "/" };
         let url = format!("{package_base}{separator}{lower_id}/index.json");
-        let Some(body) = get_optional_bytes(client, endpoint.credential(), &url, MAX_JSON_BYTES, "NuGet package version index").await? else {
-          requests += 1;
+        let payload = get_optional_bytes(client, endpoint.credential(), &url, MAX_JSON_BYTES, "NuGet package version index").await?;
+        source_work.push(SourceWork {
+          downloaded_bytes: payload.work.downloaded_bytes,
+          duration_us: payload.work.duration_us,
+          source_index: endpoint.source_index(),
+          requests: payload.work.requests,
+        });
+        let Some(body) = payload.value else {
           continue;
         };
-        requests += 1;
-        bytes += body.len() as u64;
         let document: V3VersionIndex =
           serde_json::from_slice(&body).map_err(|error| network_error(&url, format!("invalid NuGet package version index: {error}")))?;
         if document.versions.len() > MAX_ARCHIVE_ENTRIES {
@@ -5166,12 +5415,12 @@ async fn load_node_metadata(
       ServiceEndpoint::V2 { base, .. } => {
         let batch = enumerate_v2_versions(client, endpoint.credential(), base, lower_id).await?;
         versions.extend(batch.versions);
-        requests = requests
-          .checked_add(batch.requests)
-          .ok_or_else(|| network_error(base, "NuGet v2 request count overflow"))?;
-        bytes = bytes
-          .checked_add(batch.bytes)
-          .ok_or_else(|| network_error(base, "NuGet v2 response byte count overflow"))?;
+        source_work.push(SourceWork {
+          downloaded_bytes: batch.work.downloaded_bytes,
+          duration_us: batch.work.duration_us,
+          source_index: endpoint.source_index(),
+          requests: batch.work.requests,
+        });
       },
     }
   }
@@ -5184,7 +5433,7 @@ async fn load_node_metadata(
       format!("no enabled source could enumerate package {lower_id}"),
     ));
   }
-  Ok(MetadataTaskResult::Versions { versions, requests, bytes })
+  Ok(MetadataTaskResult::Versions { versions, source_work })
 }
 
 #[derive(Deserialize)]
@@ -5194,8 +5443,7 @@ struct V3VersionIndex {
 
 struct VersionBatch {
   versions: Vec<PackageVersion>,
-  requests: u32,
-  bytes: u64,
+  work: HttpWork,
 }
 
 async fn enumerate_v2_versions(
@@ -5208,8 +5456,7 @@ async fn enumerate_v2_versions(
   let mut url = format!("{base}FindPackagesById()?id='{lower_id}'&semVerLevel=2.0.0");
   let mut visited = HashSet::new();
   let mut versions = Vec::new();
-  let mut requests = 0u32;
-  let mut bytes = 0u64;
+  let mut work = HttpWork::default();
   loop {
     if !visited.insert(url.clone()) {
       return Err(network_error(&url, "NuGet v2 version enumeration contains a continuation cycle"));
@@ -5217,14 +5464,11 @@ async fn enumerate_v2_versions(
     if visited.len() > MAX_ARCHIVE_ENTRIES {
       return Err(network_error(&url, "NuGet v2 version enumeration exceeds the page count limit"));
     }
-    let Some(body) = get_optional_bytes(client, credential, &url, MAX_JSON_BYTES, "NuGet v2 version page").await? else {
-      requests = requests.checked_add(1).ok_or_else(|| network_error(&url, "NuGet v2 request count overflow"))?;
+    let payload = get_optional_bytes(client, credential, &url, MAX_JSON_BYTES, "NuGet v2 version page").await?;
+    work.merge(payload.work, &url)?;
+    let Some(body) = payload.value else {
       break;
     };
-    requests = requests.checked_add(1).ok_or_else(|| network_error(&url, "NuGet v2 request count overflow"))?;
-    bytes = bytes
-      .checked_add(body.len() as u64)
-      .ok_or_else(|| network_error(&url, "NuGet v2 response byte count overflow"))?;
     let page = parse_v2_version_page(&url, &body)?;
     if versions.len().checked_add(page.versions.len()).is_none_or(|count| count > MAX_ARCHIVE_ENTRIES) {
       return Err(network_error(&url, "NuGet v2 version enumeration exceeds the version count limit"));
@@ -5248,7 +5492,7 @@ async fn enumerate_v2_versions(
     }
     url = continuation.into();
   }
-  Ok(VersionBatch { versions, requests, bytes })
+  Ok(VersionBatch { versions, work })
 }
 
 struct V2VersionPage {
@@ -5534,25 +5778,35 @@ async fn get_optional_bytes(
   url: &str,
   limit: u64,
   kind: &str,
-) -> Result<Option<Vec<u8>>, PackageError> {
+) -> Result<HttpPayload<Option<Vec<u8>>>, PackageError> {
   let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
   if response.status() == reqwest::StatusCode::NOT_FOUND {
-    return Ok(None);
+    let work = response.work(0);
+    return Ok(HttpPayload { value: None, work });
   }
-  response
-    .error_for_status_ref()
-    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  if let Err(error) = response.error_for_status_ref() {
+    let work = response.work(0);
+    return Err(network_error(url, format!("HTTP request failed: {error}")).with_http_work(work));
+  }
   if response.content_length().is_some_and(|length| length > limit) {
-    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+    let work = response.work(0);
+    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")).with_http_work(work));
   }
   let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit) as usize);
-  while let Some(chunk) = response.chunk(url, kind).await? {
+  loop {
+    let chunk = match response.chunk(url, kind).await {
+      Ok(Some(chunk)) => chunk,
+      Ok(None) => break,
+      Err(error) => return Err(error.with_http_work(response.work(bytes.len() as u64))),
+    };
     if bytes.len().checked_add(chunk.len()).is_none_or(|length| length as u64 > limit) {
-      return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+      let downloaded = bytes.len().saturating_add(chunk.len()).min(u64::MAX as usize) as u64;
+      return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")).with_http_work(response.work(downloaded)));
     }
     bytes.extend_from_slice(&chunk);
   }
-  Ok(Some(bytes))
+  let work = response.work(bytes.len() as u64);
+  Ok(HttpPayload { value: Some(bytes), work })
 }
 
 fn package_worker_stopped() -> PackageError {
@@ -5574,7 +5828,7 @@ async fn ensure_package(
 ) -> Result<CachedPackage, PackageError> {
   if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
     let request = request.clone();
-    return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true, 0, 0))
+    return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true))
       .await
       .map_err(package_blocking_task_error)?;
   }
@@ -5583,23 +5837,41 @@ async fn ensure_package(
     return Err(unmapped_identity(&request.id));
   }
   let mut last_error = None;
+  let mut failed_source_work = Vec::new();
   for endpoint in endpoints {
     if !source_mapping_selects(source_mapping, selected_rank, &request.lower_id, endpoint.source_index()) {
       continue;
     }
     match download_and_publish(client, request, storage.cache_root, storage.temp_root, endpoint, target, parallel_extract).await {
-      Ok(package) => return Ok(package),
-      Err(error) if error.kind() == PackageErrorKind::Network => last_error = Some(error),
+      Ok(mut package) => {
+        package.failed_source_work = failed_source_work.into_boxed_slice();
+        return Ok(package);
+      },
+      Err(mut error) if error.kind() == PackageErrorKind::Network => {
+        if let Some(work) = error.take_http_work() {
+          failed_source_work.push(SourceWork {
+            downloaded_bytes: work.downloaded_bytes,
+            duration_us: work.duration_us,
+            source_index: endpoint.source_index(),
+            requests: work.requests,
+          });
+        }
+        last_error = Some(error);
+      },
       Err(error) => return Err(error),
     }
   }
-  Err(last_error.unwrap_or_else(|| {
-    PackageError::new(
-      PackageErrorKind::Network,
-      format!("{} {}", request.id, request.version),
-      format!("no enabled source could provide package {} {}", request.id, request.version),
-    )
-  }))
+  Err(
+    last_error
+      .unwrap_or_else(|| {
+        PackageError::new(
+          PackageErrorKind::Network,
+          format!("{} {}", request.id, request.version),
+          format!("no enabled source could provide package {} {}", request.id, request.version),
+        )
+      })
+      .with_source_work(failed_source_work),
+  )
 }
 
 fn package_root(cache_root: &Path, request: &PackageRequest) -> PathBuf {
@@ -5627,7 +5899,7 @@ struct PackageMetadata {
   content_url: String,
   expected_hash: Option<String>,
   expected_size: Option<u64>,
-  requests: u32,
+  work: HttpWork,
 }
 
 /// Owned handoff from async network/file streaming to bounded blocking archive work.
@@ -5639,8 +5911,7 @@ struct DownloadedPackage {
   nupkg_name: String,
   nupkg_path: PathBuf,
   hash: String,
-  bytes: u64,
-  requests: u32,
+  work: HttpWork,
   target: TargetFramework,
   parallel_extract: bool,
 }
@@ -5694,7 +5965,8 @@ async fn download_and_publish(
   let scratch_guard = TempGuard(Some(scratch_root.clone()));
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
   let scratch_nupkg = scratch_root.join(&nupkg_name);
-  let (hash, bytes) = download_package(client, endpoint.credential(), &metadata.content_url, &scratch_nupkg).await?;
+  let (hash, package_work) = download_package(client, endpoint.credential(), &metadata.content_url, &scratch_nupkg).await?;
+  let bytes = package_work.downloaded_bytes;
   if let Some(expected) = metadata.expected_size
     && bytes != expected
   {
@@ -5726,6 +5998,8 @@ async fn download_and_publish(
       .await
       .map_err(|error| package_io("copy package archive into cache staging", &nupkg_path, error))?;
   }
+  let mut work = metadata.work;
+  work.merge(package_work, &metadata.content_url)?;
   let downloaded = DownloadedPackage {
     request: request.clone(),
     cache_root: cache_root.to_owned(),
@@ -5734,8 +6008,7 @@ async fn download_and_publish(
     nupkg_name,
     nupkg_path,
     hash,
-    bytes,
-    requests: metadata.requests + 1,
+    work,
     target,
     parallel_extract,
   };
@@ -5752,6 +6025,7 @@ fn install_local_package(
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
+  let source_started = Instant::now();
   let expected_hash = local_expected_hash(&endpoint, &request)?;
   let size = fs::metadata(archive)
     .map_err(|error| package_io("inspect local package archive", archive, error))?
@@ -5794,8 +6068,11 @@ fn install_local_package(
     nupkg_name,
     nupkg_path,
     hash,
-    bytes,
-    requests: 0,
+    work: HttpWork {
+      downloaded_bytes: bytes,
+      duration_us: elapsed_us(source_started),
+      requests: 0,
+    },
     target,
     parallel_extract,
   };
@@ -5838,7 +6115,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
   let package_metadata = serde_json::json!({
     "schemaVersion": 1,
     "sha512": &downloaded.hash,
-    "source": downloaded.endpoint.source(),
+    "source": redact_report_location(downloaded.endpoint.source()),
     "protocol": downloaded.endpoint.protocol().as_str(),
   });
   fs::write(
@@ -5860,12 +6137,24 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
       hash: downloaded.hash,
       dependencies: Some(dependencies),
       cache_hit: false,
-      requests: downloaded.requests,
-      bytes: downloaded.bytes,
+      source_work: Some(SourceWork {
+        downloaded_bytes: downloaded.work.downloaded_bytes,
+        duration_us: downloaded.work.duration_us,
+        source_index: downloaded.endpoint.source_index(),
+        requests: downloaded.work.requests,
+      }),
+      failed_source_work: Box::new([]),
       origin: None,
     }
   } else {
-    validate_cached_package(&final_root, &downloaded.request, false, downloaded.requests, downloaded.bytes)?
+    let mut cached = validate_cached_package(&final_root, &downloaded.request, false)?;
+    cached.source_work = Some(SourceWork {
+      downloaded_bytes: downloaded.work.downloaded_bytes,
+      duration_us: downloaded.work.duration_us,
+      source_index: downloaded.endpoint.source_index(),
+      requests: downloaded.work.requests,
+    });
+    cached
   };
   cached.origin = Some(PackageSource {
     url: downloaded.endpoint.source().to_owned(),
@@ -5898,7 +6187,7 @@ fn v3_package_metadata(request: &PackageRequest, package_base: &str) -> PackageM
     ),
     expected_hash: None,
     expected_size: None,
-    requests: 0,
+    work: HttpWork::default(),
   }
 }
 
@@ -5909,9 +6198,11 @@ async fn v2_package_metadata(
   base: &str,
 ) -> Result<PackageMetadata, PackageError> {
   let metadata_url = format!("{base}Packages(Id='{}',Version='{}')", request.id, request.version);
-  let bytes = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
+  let payload = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
   let security_flags = credential.map_or(0, |credential| credential.security_flags);
-  parse_v2_package_metadata(request, &metadata_url, &bytes, security_flags)
+  let mut metadata = parse_v2_package_metadata(request, &metadata_url, &payload.value, security_flags)?;
+  metadata.work = payload.work;
+  Ok(metadata)
 }
 
 fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes: &[u8], security_flags: u8) -> Result<PackageMetadata, PackageError> {
@@ -6015,7 +6306,7 @@ fn parse_v2_package_metadata(request: &PackageRequest, metadata_url: &str, bytes
     content_url,
     expected_hash: Some(hash.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no package hash"))?),
     expected_size: Some(size.ok_or_else(|| network_error(metadata_url, "NuGet v2 metadata has no valid package size"))?),
-    requests: 1,
+    work: HttpWork::default(),
   })
 }
 
@@ -6034,11 +6325,12 @@ async fn download_package(
   credential: Option<&SourceCredential>,
   url: &str,
   destination: &Path,
-) -> Result<(String, u64), PackageError> {
+) -> Result<(String, HttpWork), PackageError> {
   let mut response = send_authenticated(client, credential, url, "package download").await?;
-  response
-    .error_for_status_ref()
-    .map_err(|error| network_error(url, format!("package download failed: {error}")))?;
+  if let Err(error) = response.error_for_status_ref() {
+    let work = response.work(0);
+    return Err(network_error(url, format!("package download failed: {error}")).with_http_work(work));
+  }
   let content_length = response.content_length();
   if content_length.is_some_and(|length| length > MAX_PACKAGE_BYTES) {
     return Err(PackageError::new(
@@ -6052,7 +6344,12 @@ async fn download_package(
     .map_err(|error| package_io("create package archive", destination, error))?;
   let mut hasher = Sha512::new();
   let mut total = 0u64;
-  while let Some(chunk) = response.chunk(url, "package").await? {
+  loop {
+    let chunk = match response.chunk(url, "package").await {
+      Ok(Some(chunk)) => chunk,
+      Ok(None) => break,
+      Err(error) => return Err(error.with_http_work(response.work(total))),
+    };
     let read = chunk.len();
     total = total
       .checked_add(read as u64)
@@ -6074,29 +6371,43 @@ async fn download_package(
       format!("package response body has {total} bytes but Content-Length declared {expected}"),
     ));
   }
-  Ok((BASE64.encode(hasher.finalize()), total))
+  let work = response.work(total);
+  Ok((BASE64.encode(hasher.finalize()), work))
 }
 
-async fn get_bytes(client: &reqwest::Client, credential: Option<&SourceCredential>, url: &str, limit: u64, kind: &str) -> Result<Vec<u8>, PackageError> {
+async fn get_bytes(
+  client: &reqwest::Client,
+  credential: Option<&SourceCredential>,
+  url: &str,
+  limit: u64,
+  kind: &str,
+) -> Result<HttpPayload<Vec<u8>>, PackageError> {
   let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
-  response
-    .error_for_status_ref()
-    .map_err(|error| network_error(url, format!("HTTP request failed: {error}")))?;
+  if let Err(error) = response.error_for_status_ref() {
+    let work = response.work(0);
+    return Err(network_error(url, format!("HTTP request failed: {error}")).with_http_work(work));
+  }
   if response.content_length().is_some_and(|length| length > limit) {
-    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")));
+    let work = response.work(0);
+    return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")).with_http_work(work));
   }
   let capacity = response.content_length().unwrap_or(0).min(limit) as usize;
   let mut bytes = Vec::with_capacity(capacity);
-  while let Some(chunk) = response.chunk(url, kind).await? {
-    let next = bytes
-      .len()
-      .checked_add(chunk.len())
-      .filter(|length| *length as u64 <= limit)
-      .ok_or_else(|| network_error(url, format!("{kind} response exceeds the {limit} byte limit")))?;
+  loop {
+    let chunk = match response.chunk(url, kind).await {
+      Ok(Some(chunk)) => chunk,
+      Ok(None) => break,
+      Err(error) => return Err(error.with_http_work(response.work(bytes.len() as u64))),
+    };
+    let Some(next) = bytes.len().checked_add(chunk.len()).filter(|length| *length as u64 <= limit) else {
+      let downloaded = bytes.len().saturating_add(chunk.len()).min(u64::MAX as usize) as u64;
+      return Err(network_error(url, format!("{kind} response exceeds the {limit} byte limit")).with_http_work(response.work(downloaded)));
+    };
     bytes.extend_from_slice(&chunk);
     debug_assert_eq!(bytes.len(), next);
   }
-  Ok(bytes)
+  let work = response.work(bytes.len() as u64);
+  Ok(HttpPayload { value: bytes, work })
 }
 
 #[cfg(test)]
@@ -6154,7 +6465,9 @@ struct AuthenticatedResponse {
   response: reqwest::Response,
   _global_permit: Option<OwnedSemaphorePermit>,
   _source_permit: Option<OwnedSemaphorePermit>,
+  started: Instant,
   download_timeout: Duration,
+  requests: u32,
 }
 
 impl std::ops::Deref for AuthenticatedResponse {
@@ -6178,6 +6491,14 @@ impl AuthenticatedResponse {
       .map_err(|_| network_error(url, format!("{kind} response stalled for {} seconds", self.download_timeout.as_secs())))?
       .map_err(|error| network_error(url, format!("read {kind} response: {error}")))
   }
+
+  fn work(&self, downloaded_bytes: u64) -> HttpWork {
+    HttpWork {
+      downloaded_bytes,
+      duration_us: elapsed_us(self.started),
+      requests: self.requests,
+    }
+  }
 }
 
 async fn send_with_policy(
@@ -6189,6 +6510,8 @@ async fn send_with_policy(
   global_permit: Option<OwnedSemaphorePermit>,
   source_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<AuthenticatedResponse, PackageError> {
+  let started = Instant::now();
+  let mut requests = 0u32;
   'network: for network_attempt in 0..policy.max_tries {
     for authentication_attempt in 0..=2 {
       let (authorization, generation, provider_was_used) = match credential {
@@ -6199,25 +6522,39 @@ async fn send_with_policy(
       if let Some(authorization) = authorization {
         request = request.header(AUTHORIZATION, authorization);
       }
+      requests = requests.checked_add(1).ok_or_else(|| network_error(url, "HTTP request count overflow"))?;
       let sent = tokio::time::timeout(Duration::from_secs(policy.request_timeout_seconds as u64), request.send()).await;
       let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
           if network_attempt + 1 == policy.max_tries {
-            return Err(network_error(url, format!("{operation} failed after {} attempts: {error}", policy.max_tries)));
+            return Err(
+              network_error(url, format!("{operation} failed after {} attempts: {error}", policy.max_tries)).with_http_work(HttpWork {
+                downloaded_bytes: 0,
+                duration_us: elapsed_us(started),
+                requests,
+              }),
+            );
           }
           tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
           continue 'network;
         },
         Err(_) => {
           if network_attempt + 1 == policy.max_tries {
-            return Err(network_error(
-              url,
-              format!(
-                "{operation} timed out after {} seconds and {} attempts",
-                policy.request_timeout_seconds, policy.max_tries
-              ),
-            ));
+            return Err(
+              network_error(
+                url,
+                format!(
+                  "{operation} timed out after {} seconds and {} attempts",
+                  policy.request_timeout_seconds, policy.max_tries
+                ),
+              )
+              .with_http_work(HttpWork {
+                downloaded_bytes: 0,
+                duration_us: elapsed_us(started),
+                requests,
+              }),
+            );
           }
           tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
           continue 'network;
@@ -6225,10 +6562,10 @@ async fn send_with_policy(
       };
       if response.status() == reqwest::StatusCode::UNAUTHORIZED && authentication_attempt < 2 {
         let Some(credential) = credential else {
-          return Ok(authenticated_response(response, global_permit, source_permit, policy));
+          return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
         };
         if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
-          return Ok(authenticated_response(response, global_permit, source_permit, policy));
+          return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
         }
         drop(response);
         continue;
@@ -6239,7 +6576,7 @@ async fn send_with_policy(
         tokio::time::sleep(delay).await;
         continue 'network;
       }
-      return Ok(authenticated_response(response, global_permit, source_permit, policy));
+      return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
     }
   }
   unreachable!("the bounded transport loop always returns")
@@ -6250,12 +6587,16 @@ fn authenticated_response(
   global_permit: Option<OwnedSemaphorePermit>,
   source_permit: Option<OwnedSemaphorePermit>,
   policy: PackageHttpPolicy,
+  started: Instant,
+  requests: u32,
 ) -> AuthenticatedResponse {
   AuthenticatedResponse {
     response,
     _global_permit: global_permit,
     _source_permit: source_permit,
+    started,
     download_timeout: Duration::from_secs(policy.download_timeout_seconds as u64),
+    requests,
   }
 }
 
@@ -6299,7 +6640,11 @@ fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
 }
 
 fn network_error(context: impl Into<String>, message: impl Into<String>) -> PackageError {
-  PackageError::new(PackageErrorKind::Network, context, message)
+  let context = context.into();
+  let redacted = redact_report_location(&context);
+  let message = message.into();
+  let message = if redacted == context { message } else { message.replace(&context, &redacted) };
+  PackageError::new(PackageErrorKind::Network, redacted, message)
 }
 
 fn package_credential_provider_error(error: CredentialProviderError) -> PackageError {
@@ -6443,7 +6788,7 @@ fn normalize_nuspec_name(root: &Path, request: &PackageRequest) -> Result<(), Pa
   fs::rename(&nuspecs[0], &expected).map_err(|error| package_io("normalize package nuspec", &expected, error))
 }
 
-fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: bool, requests: u32, bytes: u64) -> Result<CachedPackage, PackageError> {
+fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: bool) -> Result<CachedPackage, PackageError> {
   if !root.is_dir() {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
@@ -6485,8 +6830,8 @@ fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: boo
     hash,
     dependencies: None,
     cache_hit,
-    requests,
-    bytes,
+    source_work: None,
+    failed_source_work: Box::new([]),
     origin: None,
   })
 }
@@ -7165,8 +7510,7 @@ fn validate_acyclic(packages: &BTreeMap<String, WorkPackage>) -> Result<(), Pack
 fn materialize_resolution(
   context: ResolutionContext<'_>,
   work: &BTreeMap<String, WorkPackage>,
-  network_requests: u32,
-  downloaded_bytes: u64,
+  source_work: &[SourceWork],
 ) -> Result<PackageResolution, PackageError> {
   let indices: BTreeMap<&str, u32> = work.keys().enumerate().map(|(index, id)| (id.as_str(), index as u32)).collect();
   let estimated = work
@@ -7201,7 +7545,9 @@ fn materialize_resolution(
     + context.fallback_roots.iter().map(|path| path.as_os_str().len()).sum::<usize>()
     + context.lock_path.as_os_str().len()
     + context.target_framework.len()
-    + context.source.len()
+    + context.source_name.len()
+    + context.source_location.len()
+    + context.sources.iter().map(|(name, _)| name.len()).sum::<usize>()
     + context.prune_fingerprint.len();
   let mut table = TextTable::with_capacity(estimated);
   let cache_root_span = table.push_path(context.cache_root)?;
@@ -7210,8 +7556,41 @@ fn materialize_resolution(
   let fallback_roots = context.fallback_roots.iter().map(|path| table.push_path(path)).collect::<Result<Box<_>, _>>()?;
   let lock_path_span = table.push_path(context.lock_path)?;
   let target_framework_span = table.push(context.target_framework)?;
-  let source_span = table.push(context.source)?;
+  let source_name_span = table.push(redact_report_location(context.source_name).as_ref())?;
+  let source_location_span = table.push(context.source_location)?;
   let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
+  if context.sources.len() != source_work.len() {
+    return Err(PackageError::new(
+      PackageErrorKind::TextOverflow,
+      "NuGet source telemetry",
+      "configured source and source-work batch lengths differ",
+    ));
+  }
+  let mut materialized_source_work = Vec::with_capacity(source_work.len());
+  let mut network_requests = 0u32;
+  let mut downloaded_bytes = 0u64;
+  for (index, ((name, source), work)) in context.sources.iter().zip(source_work).enumerate() {
+    if work.source_index as usize != index {
+      return Err(PackageError::new(
+        PackageErrorKind::TextOverflow,
+        "NuGet source telemetry",
+        "source-work batch is not in configured source order",
+      ));
+    }
+    network_requests = network_requests
+      .checked_add(work.requests)
+      .ok_or_else(|| network_error(name, "HTTP request count overflow"))?;
+    downloaded_bytes = downloaded_bytes
+      .checked_add(work.downloaded_bytes)
+      .ok_or_else(|| network_error(name, "HTTP response byte count overflow"))?;
+    materialized_source_work.push(PackageSourceWorkRecord {
+      downloaded_bytes: work.downloaded_bytes,
+      duration_us: work.duration_us,
+      name: table.push(redact_report_location(name).as_ref())?,
+      requests: work.requests,
+      protocol: source.protocol,
+    });
+  }
   let mut packages = Vec::with_capacity(work.len());
   let mut package_roots = Vec::with_capacity(work.len());
   let mut package_assets = Vec::with_capacity(work.len());
@@ -7274,6 +7653,7 @@ fn materialize_resolution(
         len: dependency_len,
       },
       direct: package.request.direct,
+      cache_hit: package.cache_hit,
     });
     package_roots.push(table.push_path(&package.root)?);
     package_assets.push(PackageAssets {
@@ -7314,7 +7694,8 @@ fn materialize_resolution(
     temp_root: temp_root_span,
     lock_path: lock_path_span,
     target_framework: target_framework_span,
-    source: source_span,
+    source_name: source_name_span,
+    source_location: source_location_span,
     prune_fingerprint: prune_fingerprint_span,
     source_protocol: context.source_protocol,
     signature_validation: context.signature_validation,
@@ -7331,6 +7712,7 @@ fn materialize_resolution(
     assets: assets.into_boxed_slice(),
     asset_ranges,
     runtime_targets: runtime_targets.into_boxed_slice(),
+    source_work: materialized_source_work.into_boxed_slice(),
     cache_hits,
     downloaded_packages: work.len() as u32 - cache_hits,
     network_requests,
@@ -7410,7 +7792,8 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     temp_root: empty,
     lock_path: lock,
     target_framework,
-    source: empty,
+    source_name: empty,
+    source_location: empty,
     prune_fingerprint: empty,
     source_protocol: NugetProtocol::V3,
     signature_validation: SignatureValidationMode::Accept,
@@ -7437,6 +7820,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
       native: ItemRange { start: 0, len: 0 },
     },
     runtime_targets: Box::new([]),
+    source_work: Box::new([]),
     cache_hits: 0,
     downloaded_packages: 0,
     network_requests: 0,
@@ -7473,17 +7857,19 @@ fn read_warm_lock(
         .and_then(|locked| PackageVersion::parse(&locked.version).ok())
         .is_some_and(|version| request.range.contains(&version))
     });
+  let selected_source = config
+    .sources
+    .iter()
+    .find(|(_, source)| redact_report_location(&source.url) == lock.source && source.protocol == lock.source_protocol);
   if lock.schema_version != LOCK_SCHEMA_VERSION
     || lock.target_framework != target_text
     || lock.prune_fingerprint != prune_fingerprint
     || !direct_matches
-    || !config
-      .sources
-      .iter()
-      .any(|(_, source)| source.url == lock.source && source.protocol == lock.source_protocol)
+    || selected_source.is_none()
   {
     return Ok(None);
   }
+  let (source_name, _) = selected_source.expect("selected source was checked");
 
   let mut work = BTreeMap::new();
   for package in lock.packages {
@@ -7587,6 +7973,7 @@ fn read_warm_lock(
     }
   }
   validate_acyclic(&work)?;
+  let source_work = source_work_table(config.sources.len())?;
   materialize_resolution(
     ResolutionContext {
       cache_root: &config.cache_root,
@@ -7595,7 +7982,9 @@ fn read_warm_lock(
       fallback_roots: &config.fallback_roots,
       lock_path: path,
       target_framework: target_text,
-      source: &lock.source,
+      source_name,
+      source_location: &lock.source,
+      sources: &config.sources,
       prune_fingerprint,
       source_protocol: lock.source_protocol,
       signature_validation: config.signature_validation,
@@ -7605,8 +7994,7 @@ fn read_warm_lock(
       proxy_configured: config.proxy.is_some(),
     },
     &work,
-    0,
-    0,
+    &source_work,
   )
   .map(Some)
 }
@@ -7723,7 +8111,7 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
   let lock = LockFile {
     schema_version: LOCK_SCHEMA_VERSION,
     target_framework: resolution.target_framework().into(),
-    source: resolution.source().into(),
+    source: resolution.source_location().into(),
     source_protocol: resolution.source_protocol,
     prune_fingerprint: resolution.get(resolution.prune_fingerprint).into(),
     direct,
@@ -8278,6 +8666,15 @@ mod tests {
       .unwrap();
     assert!(error.to_string().contains("allowInsecureConnections=true"));
 
+    let selected = command_line_sources(
+      &["https://packages.example.test/v3/index.json?sig=cli-secret#fragment".to_owned()],
+      Vec::new(),
+      Path::new("."),
+    )
+    .unwrap();
+    assert_eq!(selected[0].0, "https://packages.example.test/v3/index.json");
+    assert!(selected[0].1.url.contains("cli-secret"));
+
     let origin = HttpOrigin::parse("http://packages.example.test:80/v3/index.json", Path::new("NuGet.Config")).unwrap();
     assert!(!origin.matches("ftp://packages.example.test:80/archive"));
   }
@@ -8404,6 +8801,58 @@ mod tests {
     assert!(!inventory.text.contains("higher-secret"));
     assert!(!inventory.text.contains("environment-user"));
     assert!(!inventory.text.contains("environment-pat"));
+  }
+
+  #[test]
+  fn source_inventory_redacts_query_credentials_from_reported_locations() {
+    let document =
+      r#"{"version":"3.0.0","resources":[{"@id":"https://content.example.test/flat/?sig=endpoint-secret#fragment","@type":"PackageBaseAddress/3.0.0"}]}"#;
+    let response = format!(
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{document}",
+      document.len()
+    );
+    let (url, worker) = response_server(vec![response]);
+    let sources = vec![(
+      "https://identity.example.test/index.json?sig=name-secret".to_owned(),
+      PackageSource {
+        url: format!("{url}?sig=config-secret#fragment"),
+        protocol: NugetProtocol::V3,
+        security_flags: SOURCE_ALLOW_INSECURE_CONNECTIONS,
+      },
+    )];
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let inventory = runtime
+      .block_on(inspect_source_batch(
+        &client,
+        &sources,
+        &SourceCredentialBatch::default(),
+        true,
+        false,
+        DEFAULT_HTTP_POLICY,
+      ))
+      .unwrap();
+
+    assert_eq!(inventory.source_name(0), "https://identity.example.test/index.json");
+    assert_eq!(inventory.source_location(0), url);
+    assert_eq!(inventory.endpoint_location(0), "https://content.example.test/flat/");
+    assert_eq!(inventory.source_requests(0), 1);
+    assert!(inventory.source_downloaded_bytes(0) > 0);
+    assert!(inventory.source_duration_us(0) > 0);
+    assert!(!inventory.text.contains("secret"));
+    assert!(matches!(redact_report_location(DEFAULT_SOURCE), Cow::Borrowed(_)));
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn network_diagnostics_redact_query_credentials() {
+    let source = "https://packages.example.test/v3/index.json?sig=diagnostic-secret#fragment";
+    let error = network_error(source, format!("request to {source} failed"));
+
+    assert_eq!(error.context(), "https://packages.example.test/v3/index.json");
+    assert!(!error.to_string().contains("diagnostic-secret"));
+    assert!(error.to_string().contains("https://packages.example.test/v3/index.json"));
   }
 
   #[test]
@@ -8692,10 +9141,11 @@ mod tests {
     )
     .unwrap();
     let mut endpoints = LazyServiceEndpoints::new(sources.len());
+    let mut source_work = source_work_table(sources.len()).unwrap();
     let client = reqwest::Client::builder().build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-    let requests = runtime
+    runtime
       .block_on(endpoints.ensure_identity(
         &client,
         &sources,
@@ -8703,13 +9153,16 @@ mod tests {
         Some(&mapping),
         "selected.package",
         ServiceDiscoveryOptions {
-          worker_budget: MAX_DOWNLOAD_WORKERS,
+          worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
+          source_work: &mut source_work,
         },
       ))
       .unwrap();
 
-    assert_eq!(requests, 1);
+    assert_eq!(source_work[1].requests, 1);
+    assert!(source_work[1].downloaded_bytes > 0);
+    assert!(source_work[1].duration_us > 0);
     assert_eq!(endpoints.snapshot().len(), 1);
     assert_eq!(endpoints.snapshot()[0].source_index(), 1);
     worker.join().unwrap();
@@ -8737,6 +9190,7 @@ mod tests {
     )
     .unwrap();
     let mut endpoints = LazyServiceEndpoints::new(sources.len());
+    let mut source_work = source_work_table(sources.len()).unwrap();
     let client = reqwest::Client::builder().build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -8748,8 +9202,9 @@ mod tests {
         Some(&mapping),
         "unmapped.package",
         ServiceDiscoveryOptions {
-          worker_budget: MAX_DOWNLOAD_WORKERS,
+          worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
+          source_work: &mut source_work,
         },
       ))
       .unwrap_err();
@@ -8761,10 +9216,11 @@ mod tests {
   #[test]
   fn empty_source_batch_without_mapping_is_not_an_unmapped_identity() {
     let mut endpoints = LazyServiceEndpoints::new(0);
+    let mut source_work = Vec::new();
     let client = reqwest::Client::builder().build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-    let requests = runtime
+    runtime
       .block_on(endpoints.ensure_identity(
         &client,
         &[],
@@ -8772,13 +9228,14 @@ mod tests {
         None,
         "missing.package",
         ServiceDiscoveryOptions {
-          worker_budget: MAX_DOWNLOAD_WORKERS,
+          worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
+          source_work: &mut source_work,
         },
       ))
       .unwrap();
 
-    assert_eq!(requests, 0);
+    assert!(source_work.is_empty());
     assert!(endpoints.snapshot().is_empty());
   }
 
@@ -8796,6 +9253,7 @@ mod tests {
     )
     .unwrap();
     let mut endpoints = LazyServiceEndpoints::new(0);
+    let mut source_work = Vec::new();
     let client = reqwest::Client::builder().build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -8807,8 +9265,9 @@ mod tests {
         Some(&mapping),
         "selected.package",
         ServiceDiscoveryOptions {
-          worker_budget: MAX_DOWNLOAD_WORKERS,
+          worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
+          source_work: &mut source_work,
         },
       ))
       .unwrap_err();
@@ -8867,12 +9326,11 @@ mod tests {
       ))
       .unwrap();
 
-    let MetadataTaskResult::Versions { versions, requests, bytes } = result else {
+    let MetadataTaskResult::Versions { versions, source_work } = result else {
       panic!("cached ranged identity should return its version batch");
     };
     assert_eq!(versions.iter().map(|version| version.normalized.as_str()).collect::<Vec<_>>(), ["1.2.3"]);
-    assert_eq!(requests, 0);
-    assert_eq!(bytes, 0);
+    assert!(source_work.is_empty());
   }
 
   #[test]
@@ -8927,15 +9385,11 @@ mod tests {
       ))
       .unwrap();
 
-    let MetadataTaskResult::Requirements {
-      dependencies, requests, bytes, ..
-    } = result
-    else {
+    let MetadataTaskResult::Requirements { dependencies, source_work, .. } = result else {
       panic!("exact cached identity should return its dependency batch");
     };
     assert!(dependencies.is_empty());
-    assert_eq!(requests, 0);
-    assert_eq!(bytes, 0);
+    assert_eq!(source_work, None);
   }
 
   #[test]
@@ -9252,6 +9706,66 @@ mod tests {
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(body.as_ref(), b"ok");
+    let work = response.work(body.len() as u64);
+    assert_eq!(work.requests, 2);
+    assert_eq!(work.downloaded_bytes, 2);
+    assert!(work.duration_us > 0);
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn successful_source_fallback_retains_failed_request_work() {
+    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned();
+    let (url, worker) = response_server(vec![response]);
+    let service_index = serde_json::json!({
+      "version": "3.0.0",
+      "resources": [{ "@id": url, "@type": "PackageBaseAddress/3.0.0" }]
+    });
+    let services = parse_v3_service_index("http://feed.test/index.json", &service_index, SOURCE_ALLOW_INSECURE_CONNECTIONS).unwrap();
+    let temp = TempDirectory::new();
+    let local_root = temp.0.join("feed");
+    write_test_package(&temp, "feed/Sample.Package.1.2.3.nupkg", "Sample.Package", "1.2.3");
+    fs::create_dir_all(temp.0.join("packages")).unwrap();
+    fs::create_dir_all(temp.0.join("scratch")).unwrap();
+    let endpoints = [
+      ServiceEndpoint::V3 {
+        source: "http://feed.test/index.json".to_owned(),
+        services: Arc::new(services),
+        credential: None,
+        source_index: 0,
+      },
+      ServiceEndpoint::Local {
+        source: local_root.display().to_string(),
+        layout: detect_local_feed_layout(&local_root).unwrap(),
+        root: local_root,
+        source_index: 1,
+      },
+    ];
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+    let package = runtime
+      .block_on(ensure_package(
+        &client,
+        &request(),
+        PackageStorage {
+          cache_root: &temp.0.join("packages"),
+          fallback_roots: &[],
+          temp_root: &temp.0.join("scratch"),
+        },
+        &endpoints,
+        None,
+        TargetFramework::parse("net10.0").unwrap(),
+        false,
+      ))
+      .unwrap();
+
+    assert_eq!(package.failed_source_work.len(), 1);
+    assert_eq!(package.failed_source_work[0].source_index, 0);
+    assert_eq!(package.failed_source_work[0].requests, 1);
+    assert_eq!(package.failed_source_work[0].downloaded_bytes, 0);
+    assert!(package.failed_source_work[0].duration_us > 0);
+    assert_eq!(package.source_work.unwrap().source_index, 1);
     worker.join().unwrap();
   }
 
@@ -9572,7 +10086,7 @@ mod tests {
 
     assert_eq!(parsed.content_url, "https://packages.example.test/api/v2/package/Sample.Package/1.2.3");
     assert_eq!(parsed.expected_size, Some(42));
-    assert_eq!(parsed.requests, 1);
+    assert_eq!(parsed.work.requests, 0);
 
     let insecure = String::from_utf8(metadata.to_vec()).unwrap().replace("https://packages", "http://packages");
     let error = parse_v2_package_metadata(&request(), "http://packages.example.test/api/v2/Packages(...)", insecure.as_bytes(), 0)
@@ -9662,7 +10176,7 @@ mod tests {
     );
     assert_eq!(metadata.expected_hash, None);
     assert_eq!(metadata.expected_size, None);
-    assert_eq!(metadata.requests, 0);
+    assert_eq!(metadata.work.requests, 0);
   }
 
   #[test]
@@ -9814,8 +10328,8 @@ mod tests {
       hash: BASE64.encode([0u8; 64]),
       dependencies: None,
       cache_hit: true,
-      requests: 0,
-      bytes: 0,
+      source_work: None,
+      failed_source_work: Box::new([]),
       origin: None,
     };
 
@@ -9866,8 +10380,8 @@ mod tests {
       hash: BASE64.encode([0u8; 64]),
       dependencies: None,
       cache_hit: true,
-      requests: 0,
-      bytes: 0,
+      source_work: None,
+      failed_source_work: Box::new([]),
       origin: None,
     };
 
@@ -9942,6 +10456,13 @@ mod tests {
     assert_eq!(identities, ["Child.Package", "Meta.Package"]);
     assert_eq!(resolution.cache_hits(), 2);
     assert_eq!(resolution.network_requests(), 0);
+    assert!(
+      resolution
+        .packages()
+        .iter()
+        .copied()
+        .all(|package| resolution.package_cache_outcome(package) == CacheOutcome::Hit)
+    );
   }
 
   #[test]
@@ -10063,7 +10584,7 @@ mod tests {
     let temp = TempDirectory::new();
     temp.write(
       "NuGet.Config",
-      r#"<configuration><packageSources><clear /><add key="legacy" value="https://packages.example.test/api/v2/" protocolVersion="2" /></packageSources></configuration>"#,
+      r#"<configuration><packageSources><clear /><add key="legacy" value="https://packages.example.test/api/v2/?sig=lock-secret#fragment" protocolVersion="2" /></packageSources></configuration>"#,
     );
     temp.write("Program.cs", "");
     let project_path = temp.write(
@@ -10101,13 +10622,22 @@ mod tests {
     };
 
     let first = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    let persisted_lock = fs::read_to_string(temp.0.join("dv.lock.json")).unwrap();
     let second = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
 
     assert_eq!(first.target_framework(), "net8.0");
     assert_eq!(first.source_protocol(), "v2");
+    assert!(persisted_lock.contains("https://packages.example.test/api/v2/"));
+    assert!(!persisted_lock.contains("lock-secret"));
     assert_eq!(first.network_requests(), 0);
     assert_eq!(second.network_requests(), 0);
     assert_eq!(second.cache_hits(), 1);
+    assert_eq!(second.package_cache_outcome(second.packages()[0]), CacheOutcome::Hit);
+    assert_eq!(second.source_work().len(), 1);
+    assert_eq!(second.source_work_name(0), "legacy");
+    assert_eq!(second.source_work_requests(0), 0);
+    assert_eq!(second.source_work_downloaded_bytes(0), 0);
+    assert_eq!(second.source_work_duration_us(0), 0);
     assert_eq!(second.compile_assets().collect::<Vec<_>>(), [root.join("lib/net6.0/Sample.Package.dll")]);
     assert_eq!(
       second.assets(PackageAssetFamily::Compile).collect::<Vec<_>>(),

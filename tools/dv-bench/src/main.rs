@@ -42,6 +42,7 @@ enum CaseKind {
   NugetSourceSections,
   NugetSourceMapping,
   NugetRequestBudget,
+  NugetSourceTelemetry,
   NugetStoragePolicy,
   NugetCliOverrides,
   NugetLocalSources,
@@ -314,6 +315,22 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuget_source_telemetry",
+    kind: CaseKind::NugetSourceTelemetry,
+    args: &[
+      "restore",
+      "RequestBudget.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "-p:NuGetAudit=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "nuget_storage_policy",
     kind: CaseKind::NugetStoragePolicy,
     args: &[
@@ -571,6 +588,12 @@ const DV_CASES: &[Case] = &[
   Case {
     name: "nuget_request_budget",
     kind: CaseKind::NugetRequestBudget,
+    args: &["restore", "RequestBudget.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "nuget_source_telemetry",
+    kind: CaseKind::NugetSourceTelemetry,
     args: &["restore", "RequestBudget.csproj", "--packages", ".packages", "--json"],
     implemented: true,
   },
@@ -1908,7 +1931,7 @@ fn verify_nuget_config_hierarchy(repository: &Path, dv_executable: &Path, fixtur
   if normalize_windows_path(&reference_relative.to_string_lossy()) != normalize_windows_path(&actual_relative.to_string_lossy()) {
     return Err(format!("NuGet configuration cache precedence mismatch: dotnet={reference_cache:?} dv={actual_cache:?}").into());
   }
-  if required_string(&dv, "source")? != "https://api.nuget.org/v3/index.json" || required_string(&dv, "source_protocol")? != "v3" {
+  if required_string(&dv, "source")? != "nuget.org" || required_string(&dv, "source_protocol")? != "v3" {
     return Err("dv configuration hierarchy did not select the repository NuGet v3 source".into());
   }
 
@@ -1988,7 +2011,7 @@ fn verify_nuget_config_merge(repository: &Path, dv_executable: &Path, fixture: &
       return Err(format!("dotnet configuration merge retained disabled or cleared source {removed}").into());
     }
   }
-  if required_string(&dv, "source")? != "https://api.nuget.org/v3/index.json" || required_string(&dv, "source_protocol")? != "v3" {
+  if required_string(&dv, "source")? != "selected" || required_string(&dv, "source_protocol")? != "v3" {
     return Err("dv configuration merge did not select the environment-expanded NuGet v3 source".into());
   }
 
@@ -2124,7 +2147,7 @@ fn verify_nuget_source_sections(repository: &Path, dv_executable: &Path, fixture
   {
     return Err("dotnet source-section restore did not retain the two enabled mapped sources".into());
   }
-  if required_string(&dv, "source")? != "https://api.nuget.org/v3/index.json" || required_string(&dv, "source_protocol")? != "v3" {
+  if required_string(&dv, "source")? != "selected" || required_string(&dv, "source_protocol")? != "v3" {
     return Err("dv source-section restore did not select the enabled NuGet v3 source".into());
   }
 
@@ -3402,7 +3425,7 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
     } else {
       None
     };
-    let request_budget_fixture = if matches!(case.kind, CaseKind::NugetRequestBudget) {
+    let request_budget_fixture = if matches!(case.kind, CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry) {
       Some(RequestBudgetFixture::start(&case_workspace)?)
     } else {
       None
@@ -3418,7 +3441,11 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
       }
       let mut measurement = measure(executable, case, case_cwd(case, case_fixture, &case_workspace))?;
       if let Some(fixture) = request_budget_fixture.as_ref() {
-        measurement.work = Some(fixture.validate_metrics()?);
+        let fixture_work = fixture.validate_metrics()?;
+        if matches!(case.kind, CaseKind::NugetSourceTelemetry) && !is_dotnet(executable) {
+          fixture.validate_reported_telemetry(measurement.work)?;
+        }
+        measurement.work = Some(fixture_work);
       }
       if index >= options.warmups {
         samples_ns.push(measurement.elapsed_ns);
@@ -3467,6 +3494,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetSourceSections
       | CaseKind::NugetSourceMapping
       | CaseKind::NugetRequestBudget
+      | CaseKind::NugetSourceTelemetry
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -3730,7 +3758,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::NugetLocalSources) {
     prepare_nuget_local_sources(workspace)?;
   }
-  if matches!(case.kind, CaseKind::NugetRequestBudget) {
+  if matches!(case.kind, CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry) {
     prepare_nuget_request_budget(workspace)?;
   }
   if matches!(case.kind, CaseKind::PackageAssetPlan) {
@@ -4098,6 +4126,22 @@ impl RequestBudgetFixture {
     }
     Ok(())
   }
+
+  fn validate_reported_telemetry(&self, reported: Option<WorkEvidence>) -> Result<()> {
+    let reported = reported.ok_or("dv telemetry benchmark emitted no package work evidence")?;
+    let expected_requests = u64::try_from(self.global.requests.load(Ordering::Relaxed))?;
+    let expected_bytes = u64::try_from(self.global.bytes.load(Ordering::Relaxed))?;
+    if reported.network_requests != Some(expected_requests) || reported.downloaded_bytes != Some(expected_bytes) {
+      return Err(
+        format!(
+          "dv source telemetry differs from server observation: reported requests={:?} bytes={:?}, observed requests={expected_requests} bytes={expected_bytes}",
+          reported.network_requests, reported.downloaded_bytes
+        )
+        .into(),
+      );
+    }
+    Ok(())
+  }
 }
 
 fn validate_published_packages(root: &Path, packages: &[ServedPackage]) -> Result<(u64, u64)> {
@@ -4345,7 +4389,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
-    CaseKind::NugetRequestBudget => reset_nuget_request_budget_iteration(workspace),
+    CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => reset_nuget_request_budget_iteration(workspace),
     CaseKind::NugetServiceIndex => reset_service_index_iteration(workspace),
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold
@@ -4413,7 +4457,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
     CaseKind::NugetSourceSections => fixtures.nuget_source_sections,
     CaseKind::NugetSourceMapping => fixtures.nuget_source_mapping,
-    CaseKind::NugetRequestBudget => fixtures.nuget_request_budget,
+    CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => fixtures.nuget_request_budget,
     CaseKind::NugetStoragePolicy => fixtures.nuget_storage_policy,
     CaseKind::NugetCliOverrides => fixtures.nuget_cli_overrides,
     CaseKind::NugetLocalSources => fixtures.nuget_local_sources,
@@ -4442,7 +4486,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
     CaseKind::NugetSourceSections => Some("nuget-source-sections"),
     CaseKind::NugetSourceMapping => Some("nuget-source-mapping"),
-    CaseKind::NugetRequestBudget => Some("nuget-request-budget"),
+    CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => Some("nuget-request-budget"),
     CaseKind::NugetStoragePolicy => Some("nuget-storage-policy"),
     CaseKind::NugetCliOverrides => Some("nuget-cli-overrides"),
     CaseKind::NugetLocalSources => Some("nuget-local-sources"),
@@ -4469,6 +4513,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       | CaseKind::NugetSourceSections
       | CaseKind::NugetSourceMapping
       | CaseKind::NugetRequestBudget
+      | CaseKind::NugetSourceTelemetry
       | CaseKind::NugetStoragePolicy
       | CaseKind::NugetCliOverrides
       | CaseKind::NugetLocalSources
@@ -4493,6 +4538,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   if !is_dotnet(executable) && matches!(case.kind, CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold) {
     validate_pack_inventory_cache(cwd)?;
   }
+  if !is_dotnet(executable) && matches!(case.kind, CaseKind::NugetSourceTelemetry) {
+    validate_source_telemetry(&output.stdout)?;
+  }
   let work = if matches!(case.kind, CaseKind::NugetSourceMapping) {
     Some(WorkEvidence {
       network_requests: Some(0),
@@ -4515,6 +4563,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::NugetCliOverrides
         | CaseKind::NugetLocalSources
         | CaseKind::NugetRequestBudget
+        | CaseKind::NugetSourceTelemetry
     )
   {
     Some(parse_work_evidence(&output.stdout)?)
@@ -4594,6 +4643,69 @@ fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
         .ok_or("dv package event omitted packages")?,
     ),
   })
+}
+
+fn validate_source_telemetry(stdout: &[u8]) -> Result<()> {
+  let text = std::str::from_utf8(stdout)?;
+  if text.contains("benchmark-secret") || text.contains("http://127.0.0.1") {
+    return Err("dv source telemetry exposed a source location or query credential".into());
+  }
+  let event = text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .ok_or("dv telemetry restore did not emit package_resolution_created")?;
+  let sources = event
+    .get("source_work")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv package event omitted source_work")?;
+  if sources.len() != 2 {
+    return Err(format!("dv source telemetry reported {} sources instead of two", sources.len()).into());
+  }
+  let mut requests = 0u64;
+  let mut bytes = 0u64;
+  for (index, (source, expected_name)) in sources.iter().zip(["source-a", "source-b"]).enumerate() {
+    if source.get("name").and_then(serde_json::Value::as_str) != Some(expected_name) || source.get("protocol").and_then(serde_json::Value::as_str) != Some("v3")
+    {
+      return Err(format!("dv source telemetry row {index} lost configured source identity or order").into());
+    }
+    let source_requests = source
+      .get("requests")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv source telemetry omitted requests")?;
+    let source_bytes = source
+      .get("downloaded_bytes")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv source telemetry omitted downloaded_bytes")?;
+    let duration = source
+      .get("duration_us")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv source telemetry omitted duration_us")?;
+    if source_requests == 0 || source_bytes == 0 || duration == 0 {
+      return Err(format!("dv source telemetry row {index} did not record its cold network work").into());
+    }
+    requests = requests.checked_add(source_requests).ok_or("source request sum overflowed u64")?;
+    bytes = bytes.checked_add(source_bytes).ok_or("source byte sum overflowed u64")?;
+  }
+  if event.get("network_requests").and_then(serde_json::Value::as_u64) != Some(requests)
+    || event.get("downloaded_bytes").and_then(serde_json::Value::as_u64) != Some(bytes)
+  {
+    return Err("dv aggregate package work differs from its source-work batch".into());
+  }
+  let packages = event
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv package event omitted packages")?;
+  if packages.len() != 6
+    || packages
+      .iter()
+      .any(|package| package.get("cache_outcome").and_then(serde_json::Value::as_str) != Some("miss"))
+  {
+    return Err("dv cold telemetry restore did not classify every resolved package as a cache miss".into());
+  }
+  Ok(())
 }
 
 fn parse_source_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
@@ -4784,7 +4896,7 @@ fn apply_case_nuget_environment(command: &mut Command, kind: CaseKind, cwd: &Pat
     apply_nuget_client_certificate_environment(command, cwd)?;
   } else if matches!(kind, CaseKind::NugetHttpPolicy) {
     apply_nuget_http_policy_environment(command, cwd);
-  } else if matches!(kind, CaseKind::NugetRequestBudget) {
+  } else if matches!(kind, CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry) {
     apply_nuget_config_environment(command, cwd);
     command
       .env("NUGET_CONCURRENCY_LIMIT", "4")
@@ -5054,6 +5166,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "nuget_source_sections"
           | "nuget_source_mapping"
           | "nuget_request_budget"
+          | "nuget_source_telemetry"
           | "nuget_storage_policy"
           | "nuget_cli_overrides"
           | "nuget_local_sources"
@@ -5194,6 +5307,7 @@ fn case_label(case: &str) -> &str {
     "nuget_source_sections" => "NuGet source sections",
     "nuget_source_mapping" => "NuGet source mapping",
     "nuget_request_budget" => "NuGet request budget",
+    "nuget_source_telemetry" => "NuGet source telemetry",
     "nuget_storage_policy" => "NuGet storage policy",
     "nuget_cli_overrides" => "NuGet CLI overrides",
     "nuget_local_sources" => "NuGet local sources",

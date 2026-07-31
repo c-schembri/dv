@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 12;
+pub const EVENT_SCHEMA_VERSION: u16 = 13;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub struct PackageServiceEndpointEvent {
 /// One effective package source and its selected capabilities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackageSourceCapabilityEvent {
-  /// Configuration key or command-line source identity.
+  /// Configuration key or redacted command-line source identity.
   pub name: String,
   /// Configured source URL or local path.
   pub location: String,
@@ -73,6 +73,27 @@ pub struct PackageSourceCapabilityEvent {
   pub disable_tls_certificate_validation: bool,
   /// Capability-ordered endpoint batch.
   pub endpoints: Vec<PackageServiceEndpointEvent>,
+  /// Actual HTTP attempts made against this source.
+  pub requests: u32,
+  /// HTTP response-body or local archive bytes read from this source.
+  pub downloaded_bytes: u64,
+  /// Cumulative source-work time; concurrent values may exceed command wall time.
+  pub duration_us: u64,
+}
+
+/// Credential-free work attributed to one configured package source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageSourceWorkEvent {
+  /// Configuration key or redacted CLI source identity; never includes URL credentials.
+  pub name: String,
+  /// `local`, `v2`, or `v3`.
+  pub protocol: String,
+  /// Actual HTTP attempts, including retries and authentication retries.
+  pub requests: u32,
+  /// HTTP response-body or local archive bytes read from this source.
+  pub downloaded_bytes: u64,
+  /// Cumulative source-work time; concurrent values may exceed command wall time.
+  pub duration_us: u64,
 }
 
 /// Redacted effective NuGet HTTP behavior for a package-source command.
@@ -202,6 +223,8 @@ pub struct ResolvedPackageEvent {
   pub direct: bool,
   /// Number of outgoing dependency edges.
   pub dependency_count: u32,
+  /// Whether the package was reused or acquired for this command.
+  pub cache_outcome: CacheOutcome,
 }
 
 /// Event variants emitted by command execution.
@@ -426,7 +449,7 @@ pub enum EventPayload {
     downloaded_packages: u32,
     /// HTTP requests made during package planning.
     package_network_requests: u32,
-    /// Package payload bytes downloaded.
+    /// HTTP response-body and local source archive bytes read for packages.
     package_downloaded_bytes: u64,
   },
   /// One exact package graph was resolved and cached.
@@ -455,10 +478,12 @@ pub enum EventPayload {
     lock_path: String,
     /// Evaluated target framework.
     target_framework: String,
-    /// Selected NuGet source.
+    /// Credential-free configuration key or redacted CLI identity for the selected source.
     source: String,
     /// Selected NuGet protocol generation.
     source_protocol: String,
+    /// Credential-free work in configured source order.
+    source_work: Vec<PackageSourceWorkEvent>,
     /// Packages sorted by case-insensitive identity.
     packages: Vec<ResolvedPackageEvent>,
     /// Ordered compile assemblies selected for the evaluated target.
@@ -487,7 +512,7 @@ pub enum EventPayload {
     downloaded_packages: u32,
     /// HTTP requests made.
     network_requests: u32,
-    /// Package payload bytes downloaded.
+    /// HTTP response-body and local source archive bytes read.
     downloaded_bytes: u64,
   },
   /// Effective package sources and v3 capabilities were inspected.

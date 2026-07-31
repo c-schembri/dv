@@ -853,8 +853,19 @@ boundary, not final drop-in parity.
   delayed two-source fixture enforces global `4` and per-source `2` limits for
   both tools. Thirty Windows samples measure `3109.409 ms` for Microsoft versus
   `247.157 ms` for `dv` (`12.6x`). `P2`
-- [~] `NUGET-015` Record request count, bytes, cache outcome, and source timing
-  without recording credentials. `P2`
+- [x] `NUGET-015` Record request count, bytes, cache outcome, and source timing
+  without recording credentials. Actual attempts, including successful retry
+  and authentication retry paths, source bytes, and cumulative source-work
+  microseconds are accumulated in 24-byte task-local records and merged once
+  by configured source index. Package rows carry `hit` or `miss`; warm locked
+  restores publish zero source work. Event schema 13 identifies rows only by
+  redacted source keys and protocol generations. Source URLs are stripped of
+  userinfo, query, and fragment data before inventory, lock, or package-metadata
+  publication. No
+  atomics, locks, or per-request events were added to the hot path. The cold
+  two-source benchmark checks telemetry sums against the loopback servers and
+  all six package outcomes on every sample. Thirty Windows samples measure
+  `3067.502 ms` for Microsoft versus `232.130 ms` for `dv` (`13.2x`). `P2`
 
 ## 8. Package Resolution, Assets, Cache, And Locking
 
