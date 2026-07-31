@@ -132,8 +132,8 @@ analyzer-config arguments, four C# inputs, a 4,608-byte assembly, an
 11,340-byte PDB, a 156,160-byte apphost, a 428-byte dependency manifest, and a
 268-byte runtime configuration.
 
-The Rust workspace currently has 16 Rust source files, 14,812 nonblank source
-lines, and 90 `#[test]` functions. These counts describe the current
+The Rust workspace currently has 16 Rust source files, 15,315 nonblank source
+lines, and 91 `#[test]` functions. These counts describe the current
 repository, not the expected shape of real customer repositories.
 
 ### Outputs
@@ -704,8 +704,16 @@ boundary, not final drop-in parity.
   `Microsoft.NETCore.App.Runtime.linux-arm`; `dv` also reports version, TFM,
   RID, kind, acquisition, and guidance. A 30-sample restore oracle measures
   `532.652 ms` versus `6.378 ms` for `dv` (`83.5x`). `P1`
-- [ ] `PACKS-010` Cache immutable SDK pack inventories by selected SDK
-  fingerprint and invalidate on installation changes. `P2`
+- [x] `PACKS-010` Cache immutable SDK pack inventories by selected SDK
+  fingerprint and invalidate on installation changes. The schema-2 cache owns
+  one text allocation and a contiguous batch of 187 twelve-byte asset records;
+  relative paths keep the observed file to 12,405 bytes. SDK/TFM/RID/pack
+  selection plus manifest, graph, host-generation, and package-completion
+  metadata select immutable entries; SHA-512-invalid, corrupt, or stale
+  entries rebuild through atomic publication. Decoded paths must remain inside
+  the selected packs. A 30-sample cold-inventory oracle measures `368.322 ms`
+  versus `11.118 ms` (`33.1x`), while warm reuse measures `360.550 ms` versus
+  `6.403 ms` (`56.3x`). `P2`
 
 ## 7. NuGet Configuration, Sources, And Authentication
 

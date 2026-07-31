@@ -59,7 +59,8 @@ Invalid input behavior:
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
-| `runtime_pack_plan` | restored immutable `runtime-pack-project` fixture and installed SDK packs | process launch, SDK/graph/manifest parsing, runtime and host pack selection, validation of 187 runtime assets, apphost selection, and JSON output |
+| `runtime_pack_plan` | restored isolated runtime pack and one validated immutable inventory built during warm-up | process launch, SDK/graph/manifest selection, inventory fingerprint/decode, compact path materialization, and JSON output |
+| `runtime_pack_inventory_cold` | restored isolated runtime pack; only the `dv` inventory removed before every iteration | process launch, SDK/graph/manifest selection, validation of 187 runtime assets, apphost selection, binary inventory publication, and JSON output |
 | `framework_reference_plan` | restored immutable `framework-reference-project` fixture and installed targeting/shared packs | process launch, project/SDK manifest parsing, two framework and targeting-pack resolutions, installed shared-framework roll-forward, and JSON output |
 | `pack_diagnostic` | fresh `unavailable-pack-project` copy, empty local source, empty isolated packages | process launch, SDK/manifest/RID evaluation, missing-pack proof, and actionable failure output |
 | `restore_cold` | fresh fixture copy | restore |
@@ -173,6 +174,13 @@ Measure runtime, host, native-asset, and apphost planning:
 
 ```text
 cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3
+```
+
+Measure cold immutable inventory construction while keeping restored package
+contents outside timing:
+
+```text
+cargo bench-all --case runtime_pack_inventory_cold --samples 30 --warmups 3
 ```
 
 Measure framework references, targeting packs, and shared-runtime roll-forward:

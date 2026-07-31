@@ -26,10 +26,12 @@ Transform:
 4. Expand the manifest's literal `**RID**` placeholder once.
 5. Resolve each pack from the selected dotnet root first, matching SDK task
    precedence, then from the configured global-packages directory.
-6. Parse `data/RuntimeList.xml`, validate every selected path, and separate its
-   managed and native files without directory guessing.
-7. Locate exactly one `apphost` or `apphost.exe` template beneath the selected
-   host RID.
+6. Resolve a fingerprinted immutable pack inventory. A miss parses
+   `data/RuntimeList.xml`, validates every selected path, separates managed and
+   native files, and locates exactly one `apphost` or `apphost.exe`; a hit
+   decodes the validated compact inventory.
+7. Materialize absolute output paths directly from the cached relative spans
+   and selected pack root.
 
 For default self-contained acquisition, the runtime pack uses
 `LatestRuntimeFrameworkVersion`. Explicit per-reference or project
@@ -56,6 +58,13 @@ the JSON boundary.
 
 Transient XML records are discarded after planning. Asset order is the runtime
 manifest order, which is also the downstream copy order.
+
+The [SDK pack inventory cache](sdk-pack-inventory-cache.md) decodes to a
+40-byte in-memory header, one text allocation, and contiguous 12-byte asset
+records. It is
+fingerprinted by selected SDK, target/RID/pack selection, source manifests,
+host generation, and package completion metadata. Cache construction and
+publication never occur in downstream copy loops.
 
 ## Failure Boundaries
 
@@ -99,5 +108,7 @@ apphost targets, and compares:
 - host root and selected RID;
 - the resolved apphost path and `AppHostSourcePath`.
 
-The 30-sample Windows baseline measured `376.764 ms` for the MSBuild query and
-`8.030 ms` for `dv`, a `46.9x` median improvement.
+The current 30-sample warm-cache Windows baseline measured `360.550 ms` for
+the MSBuild query and `6.403 ms` for `dv`, a `56.3x` median improvement. With
+the inventory removed before every sample, construction measured `368.322 ms`
+versus `11.118 ms`, a `33.1x` improvement.

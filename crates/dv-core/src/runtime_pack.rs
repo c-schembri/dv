@@ -3,9 +3,12 @@ use std::{
   fmt, fs, io,
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
+  sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+  time::UNIX_EPOCH,
 };
 
 use quick_xml::{Reader, XmlVersion, events::Event};
+use sha2::{Digest, Sha512};
 
 use crate::{
   PackAcquisition, PackKind, PackRequirement, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, load_portable_runtime_graph,
@@ -16,6 +19,15 @@ const BUNDLED_VERSIONS_FILE: &str = "Microsoft.NETCoreSdk.BundledVersions.props"
 const RUNTIME_LIST_FILE: &str = "data/RuntimeList.xml";
 const IMPLICIT_FRAMEWORK_REFERENCE: &str = "Microsoft.NETCore.App";
 const RID_PLACEHOLDER: &str = "**RID**";
+const PORTABLE_GRAPH_FILE: &str = "PortableRuntimeIdentifierGraph.json";
+const PACK_INVENTORY_CACHE_DIRECTORY: &str = ".dv/sdk-pack-inventories/v2";
+const PACK_INVENTORY_MAGIC: &[u8; 8] = b"DVPKINV\0";
+const PACK_INVENTORY_SCHEMA: u32 = 2;
+const PACK_FINGERPRINT_BYTES: usize = 64;
+const PACK_CHECKSUM_BYTES: usize = 64;
+const CACHE_PAYLOAD_OFFSET: usize = PACK_INVENTORY_MAGIC.len() + size_of::<u32>() + PACK_FINGERPRINT_BYTES + PACK_CHECKSUM_BYTES;
+const CACHE_HEADER_BYTES: usize = CACHE_PAYLOAD_OFFSET + 4 * size_of::<u32>();
+static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TextSpan {
@@ -247,7 +259,33 @@ enum AssetKind {
 #[derive(Debug)]
 struct RuntimeAsset {
   kind: AssetKind,
-  path: PathBuf,
+  path: TextSpan,
+}
+
+const _: () = assert!(size_of::<RuntimeAsset>() == 12);
+const _: () = assert!(align_of::<RuntimeAsset>() == 4);
+
+#[derive(Debug)]
+struct RuntimePackInventory {
+  text: Box<str>,
+  assets: Box<[RuntimeAsset]>,
+  apphost_template: TextSpan,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<RuntimePackInventory>() == 40);
+const _: () = assert!(align_of::<RuntimePackInventory>() == align_of::<usize>());
+
+impl RuntimePackInventory {
+  fn asset_relative_path(&self, asset: &RuntimeAsset) -> &str {
+    let start = asset.path.start as usize;
+    &self.text[start..start + asset.path.len as usize]
+  }
+
+  fn apphost_relative_path(&self) -> &str {
+    let start = self.apphost_template.start as usize;
+    &self.text[start..start + self.apphost_template.len as usize]
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +295,25 @@ struct PackSelection<'a> {
   pattern: &'a str,
   version: &'a str,
   target_framework: &'a str,
+}
+
+struct PackInventoryInputs<'a> {
+  sdk_path: &'a Path,
+  sdk_version: &'a str,
+  sdk_manifest: &'a Path,
+  runtime_graph: &'a Path,
+  target_framework: &'a str,
+  framework_version: &'a str,
+  requested_runtime_identifier: &'a str,
+  runtime_identifier: &'a str,
+  runtime_pack_id: &'a str,
+  runtime_pack_version: &'a str,
+  runtime_pack_root: &'a Path,
+  runtime_manifest: &'a Path,
+  host_runtime_identifier: &'a str,
+  host_pack_id: &'a str,
+  host_pack_version: &'a str,
+  host_pack_root: &'a Path,
 }
 
 /// Selects runtime and host packs for a project's active runtime identifier.
@@ -341,8 +398,27 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
   )?;
   let runtime_manifest = runtime_pack_root.join(RUNTIME_LIST_FILE);
   let framework_version = project.target().framework_version();
-  let runtime_assets = read_runtime_assets(&runtime_manifest, &runtime_pack_root, project.target_framework(), &framework_version)?;
-  let apphost_template = find_apphost_template(&host_pack_root, host_runtime_identifier)?;
+  let (pack_inventory, _) = load_or_build_pack_inventory(
+    &global_packages.join(PACK_INVENTORY_CACHE_DIRECTORY),
+    PackInventoryInputs {
+      sdk_path: &sdk_root,
+      sdk_version: selected.version.as_str(),
+      sdk_manifest: &manifest,
+      runtime_graph: &sdk_root.join(PORTABLE_GRAPH_FILE),
+      target_framework: project.target_framework(),
+      framework_version: &framework_version,
+      requested_runtime_identifier,
+      runtime_identifier,
+      runtime_pack_id: &runtime_pack_id,
+      runtime_pack_version,
+      runtime_pack_root: &runtime_pack_root,
+      runtime_manifest: &runtime_manifest,
+      host_runtime_identifier,
+      host_pack_id: &host_pack_id,
+      host_pack_version: &definitions.host_version,
+      host_pack_root: &host_pack_root,
+    },
+  )?;
 
   materialize_plan(
     project,
@@ -357,8 +433,7 @@ pub fn plan_runtime_packs(project: &ProjectSpec, inventory: &SdkInventory, packa
     &host_pack_id,
     &definitions.host_version,
     &host_pack_root,
-    &apphost_template,
-    &runtime_assets,
+    &pack_inventory,
   )
 }
 
@@ -540,12 +615,240 @@ fn locate_pack(
   })
 }
 
-fn read_runtime_assets(path: &Path, pack_root: &Path, target_framework: &str, expected_version: &str) -> Result<Vec<RuntimeAsset>, RuntimePackError> {
+fn load_or_build_pack_inventory(cache_directory: &Path, inputs: PackInventoryInputs<'_>) -> Result<(RuntimePackInventory, bool), RuntimePackError> {
+  let fingerprint = pack_inventory_fingerprint(&inputs);
+  if let Some(fingerprint) = fingerprint {
+    let cache_path = cache_directory.join(format!("{}.bin", hex_fingerprint(&fingerprint)));
+    if let Ok(bytes) = fs::read(&cache_path) {
+      if let Some(inventory) = decode_pack_inventory(&bytes, &fingerprint)
+        && join_relative_path(inputs.host_pack_root, Path::new(inventory.apphost_relative_path())).is_file()
+      {
+        return Ok((inventory, true));
+      }
+      let _ = fs::remove_file(&cache_path);
+    }
+
+    let inventory = build_pack_inventory(&inputs)?;
+    publish_pack_inventory(cache_directory, &cache_path, &fingerprint, &inventory);
+    return Ok((inventory, false));
+  }
+
+  build_pack_inventory(&inputs).map(|inventory| (inventory, false))
+}
+
+fn pack_inventory_fingerprint(inputs: &PackInventoryInputs<'_>) -> Option<[u8; PACK_FINGERPRINT_BYTES]> {
+  let mut hasher = Sha512::new();
+  hasher.update(PACK_INVENTORY_MAGIC);
+  hasher.update(PACK_INVENTORY_SCHEMA.to_le_bytes());
+  for value in [
+    inputs.sdk_version,
+    inputs.target_framework,
+    inputs.framework_version,
+    inputs.requested_runtime_identifier,
+    inputs.runtime_identifier,
+    inputs.runtime_pack_id,
+    inputs.runtime_pack_version,
+    inputs.host_runtime_identifier,
+    inputs.host_pack_id,
+    inputs.host_pack_version,
+  ] {
+    hash_bytes(&mut hasher, value.as_bytes());
+  }
+  for path in [
+    inputs.sdk_path,
+    inputs.sdk_manifest,
+    inputs.runtime_graph,
+    inputs.runtime_pack_root,
+    inputs.runtime_manifest,
+    inputs.host_pack_root,
+  ] {
+    hash_path(&mut hasher, path)?;
+  }
+  for path in [inputs.sdk_manifest, inputs.runtime_graph, inputs.runtime_manifest] {
+    hash_metadata(&mut hasher, path)?;
+  }
+  let host_native = inputs.host_pack_root.join("runtimes").join(inputs.host_runtime_identifier).join("native");
+  hash_path(&mut hasher, &host_native)?;
+  hash_metadata(&mut hasher, &host_native)?;
+  for pack_root in [inputs.runtime_pack_root, inputs.host_pack_root] {
+    let completion = pack_root.join(".nupkg.metadata");
+    let completion_metadata = fs::metadata(&completion).ok().filter(|metadata| metadata.is_file());
+    hasher.update([u8::from(completion_metadata.is_some())]);
+    if let Some(metadata) = completion_metadata {
+      hash_path(&mut hasher, &completion)?;
+      hash_metadata_value(&mut hasher, &metadata)?;
+    }
+  }
+  Some(hasher.finalize().into())
+}
+
+fn hash_path(hasher: &mut Sha512, path: &Path) -> Option<()> {
+  let text = path.to_str()?;
+  hasher.update((text.len() as u64).to_le_bytes());
+  for byte in text.bytes() {
+    let normalized = if cfg!(windows) && byte == b'\\' { b'/' } else { byte };
+    hasher.update([normalized]);
+  }
+  Some(())
+}
+
+fn hash_metadata(hasher: &mut Sha512, path: &Path) -> Option<()> {
+  let metadata = fs::metadata(path).ok()?;
+  hash_metadata_value(hasher, &metadata)
+}
+
+fn hash_metadata_value(hasher: &mut Sha512, metadata: &fs::Metadata) -> Option<()> {
+  let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+  hasher.update(metadata.len().to_le_bytes());
+  hasher.update(modified.as_secs().to_le_bytes());
+  hasher.update(modified.subsec_nanos().to_le_bytes());
+  hasher.update([u8::from(metadata.is_dir())]);
+  Some(())
+}
+
+fn hash_bytes(hasher: &mut Sha512, bytes: &[u8]) {
+  hasher.update((bytes.len() as u64).to_le_bytes());
+  hasher.update(bytes);
+}
+
+fn hex_fingerprint(fingerprint: &[u8; PACK_FINGERPRINT_BYTES]) -> String {
+  const HEX: &[u8; 16] = b"0123456789abcdef";
+  let mut output = String::with_capacity(PACK_FINGERPRINT_BYTES * 2);
+  for byte in fingerprint {
+    output.push(HEX[usize::from(byte >> 4)] as char);
+    output.push(HEX[usize::from(byte & 0x0f)] as char);
+  }
+  output
+}
+
+fn decode_pack_inventory(bytes: &[u8], expected_fingerprint: &[u8; PACK_FINGERPRINT_BYTES]) -> Option<RuntimePackInventory> {
+  if bytes.len() < CACHE_HEADER_BYTES || bytes.get(..PACK_INVENTORY_MAGIC.len())? != PACK_INVENTORY_MAGIC {
+    return None;
+  }
+  let mut cursor = PACK_INVENTORY_MAGIC.len();
+  if read_u32(bytes, &mut cursor)? != PACK_INVENTORY_SCHEMA {
+    return None;
+  }
+  if bytes.get(cursor..cursor + PACK_FINGERPRINT_BYTES)? != expected_fingerprint {
+    return None;
+  }
+  cursor += PACK_FINGERPRINT_BYTES;
+  let checksum = bytes.get(cursor..cursor + PACK_CHECKSUM_BYTES)?;
+  cursor += PACK_CHECKSUM_BYTES;
+  if Sha512::digest(bytes.get(cursor..)?).as_slice() != checksum {
+    return None;
+  }
+  let text_len = read_u32(bytes, &mut cursor)?;
+  let asset_count = read_u32(bytes, &mut cursor)?;
+  let apphost_template = TextSpan {
+    start: read_u32(bytes, &mut cursor)?,
+    len: read_u32(bytes, &mut cursor)?,
+  };
+  let text_end = cursor.checked_add(text_len as usize)?;
+  let text = std::str::from_utf8(bytes.get(cursor..text_end)?).ok()?;
+  let apphost_relative_path = span_text(text, apphost_template)?;
+  if !is_safe_pack_relative_path(apphost_relative_path) {
+    return None;
+  }
+  cursor = text_end;
+  let record_bytes = (asset_count as usize).checked_mul(1 + 2 * size_of::<u32>())?;
+  if cursor.checked_add(record_bytes)? != bytes.len() {
+    return None;
+  }
+  let mut assets = Vec::with_capacity(asset_count as usize);
+  for _ in 0..asset_count {
+    let kind = match *bytes.get(cursor)? {
+      0 => AssetKind::Managed,
+      1 => AssetKind::Native,
+      _ => return None,
+    };
+    cursor += 1;
+    let path = TextSpan {
+      start: read_u32(bytes, &mut cursor)?,
+      len: read_u32(bytes, &mut cursor)?,
+    };
+    let relative_path = span_text(text, path)?;
+    if !is_safe_pack_relative_path(relative_path) {
+      return None;
+    }
+    assets.push(RuntimeAsset { kind, path });
+  }
+  Some(RuntimePackInventory {
+    text: text.into(),
+    assets: assets.into_boxed_slice(),
+    apphost_template,
+  })
+}
+
+fn span_text(text: &str, span: TextSpan) -> Option<&str> {
+  let start = span.start as usize;
+  let end = start.checked_add(span.len as usize)?;
+  text.get(start..end)
+}
+
+fn is_safe_pack_relative_path(value: &str) -> bool {
+  !value.is_empty() && Path::new(value).components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+  let end = cursor.checked_add(size_of::<u32>())?;
+  let value = u32::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+  *cursor = end;
+  Some(value)
+}
+
+fn publish_pack_inventory(cache_directory: &Path, cache_path: &Path, fingerprint: &[u8; PACK_FINGERPRINT_BYTES], inventory: &RuntimePackInventory) {
+  if fs::create_dir_all(cache_directory).is_err() || cache_path.is_file() {
+    return;
+  }
+  let bytes = encode_pack_inventory(fingerprint, inventory);
+  let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+  let temporary = cache_directory.join(format!(".pack-inventory-{}-{sequence}.tmp", std::process::id()));
+  if fs::write(&temporary, bytes).is_err() {
+    let _ = fs::remove_file(&temporary);
+    return;
+  }
+  if fs::rename(&temporary, cache_path).is_err() {
+    let _ = fs::remove_file(&temporary);
+  }
+}
+
+fn encode_pack_inventory(fingerprint: &[u8; PACK_FINGERPRINT_BYTES], inventory: &RuntimePackInventory) -> Vec<u8> {
+  let record_bytes = inventory.assets.len() * (1 + 2 * size_of::<u32>());
+  let text_len = u32::try_from(inventory.text.len()).expect("inventory text was built through the compact text table");
+  let asset_count = u32::try_from(inventory.assets.len()).expect("inventory asset count was checked before publication");
+  let mut bytes = Vec::with_capacity(CACHE_HEADER_BYTES + inventory.text.len() + record_bytes);
+  bytes.extend_from_slice(PACK_INVENTORY_MAGIC);
+  bytes.extend_from_slice(&PACK_INVENTORY_SCHEMA.to_le_bytes());
+  bytes.extend_from_slice(fingerprint);
+  bytes.extend_from_slice(&[0; PACK_CHECKSUM_BYTES]);
+  bytes.extend_from_slice(&text_len.to_le_bytes());
+  bytes.extend_from_slice(&asset_count.to_le_bytes());
+  bytes.extend_from_slice(&inventory.apphost_template.start.to_le_bytes());
+  bytes.extend_from_slice(&inventory.apphost_template.len.to_le_bytes());
+  bytes.extend_from_slice(inventory.text.as_bytes());
+  for asset in &inventory.assets {
+    bytes.push(match asset.kind {
+      AssetKind::Managed => 0,
+      AssetKind::Native => 1,
+    });
+    bytes.extend_from_slice(&asset.path.start.to_le_bytes());
+    bytes.extend_from_slice(&asset.path.len.to_le_bytes());
+  }
+  let checksum: [u8; PACK_CHECKSUM_BYTES] = Sha512::digest(&bytes[CACHE_PAYLOAD_OFFSET..]).into();
+  let checksum_start = CACHE_PAYLOAD_OFFSET - PACK_CHECKSUM_BYTES;
+  bytes[checksum_start..CACHE_PAYLOAD_OFFSET].copy_from_slice(&checksum);
+  bytes
+}
+
+fn build_pack_inventory(inputs: &PackInventoryInputs<'_>) -> Result<RuntimePackInventory, RuntimePackError> {
+  let path = inputs.runtime_manifest;
   let bytes = fs::read(path).map_err(|error| io_error("read runtime-pack manifest", path, error))?;
   let mut reader = Reader::from_reader(bytes.as_slice());
   reader.config_mut().trim_text(true);
   let mut root_seen = false;
   let mut assets = Vec::with_capacity(192);
+  let mut text = TextTable::with_capacity(32 * 1024);
 
   loop {
     match reader.read_event() {
@@ -555,10 +858,10 @@ fn read_runtime_assets(path: &Path, pack_root: &Path, target_framework: &str, ex
         }
         let framework_name = xml_attribute(&reader, &element, b"FrameworkName", path)?;
         let framework_version = xml_attribute(&reader, &element, b"TargetFrameworkVersion", path)?;
-        if framework_name.as_deref() != Some(IMPLICIT_FRAMEWORK_REFERENCE) || framework_version.as_deref() != Some(expected_version) {
+        if framework_name.as_deref() != Some(IMPLICIT_FRAMEWORK_REFERENCE) || framework_version.as_deref() != Some(inputs.framework_version) {
           return Err(invalid_manifest(
             path,
-            format!("runtime-pack manifest target does not match {target_framework}"),
+            format!("runtime-pack manifest target does not match {}", inputs.target_framework),
           ));
         }
         root_seen = true;
@@ -577,10 +880,10 @@ fn read_runtime_assets(path: &Path, pack_root: &Path, target_framework: &str, ex
         };
         let relative = required_attribute(&reader, &element, b"Path", path)?;
         let relative_path = Path::new(&relative);
-        if relative_path.is_absolute() || relative_path.components().any(|component| matches!(component, Component::ParentDir)) {
+        if !is_safe_pack_relative_path(&relative) {
           return Err(invalid_manifest(path, "runtime asset path escapes the selected pack"));
         }
-        let asset = join_relative_path(pack_root, relative_path);
+        let asset = join_relative_path(inputs.runtime_pack_root, relative_path);
         if !asset.is_file() {
           return Err(RuntimePackError::new(
             RuntimePackErrorKind::MissingAsset,
@@ -588,7 +891,10 @@ fn read_runtime_assets(path: &Path, pack_root: &Path, target_framework: &str, ex
             format!("runtime-pack asset {} is missing", asset.display()),
           ));
         }
-        assets.push(RuntimeAsset { kind, path: asset });
+        assets.push(RuntimeAsset {
+          kind,
+          path: text.push(&relative)?,
+        });
       },
       Ok(Event::Eof) => break,
       Ok(_) => {},
@@ -601,7 +907,17 @@ fn read_runtime_assets(path: &Path, pack_root: &Path, target_framework: &str, ex
   if !assets.iter().any(|asset| asset.kind == AssetKind::Managed) || !assets.iter().any(|asset| asset.kind == AssetKind::Native) {
     return Err(invalid_manifest(path, "runtime-pack manifest must contain managed and native assets"));
   }
-  Ok(assets)
+  compact_len(assets.len(), "runtime pack inventory")?;
+  let apphost = find_apphost_template(inputs.host_pack_root, inputs.host_runtime_identifier)?;
+  let apphost_relative_path = apphost
+    .strip_prefix(inputs.host_pack_root)
+    .map_err(|_| invalid_manifest(inputs.host_pack_root, "apphost template escapes the selected host pack"))?;
+  let apphost_template = text.push_path(apphost_relative_path)?;
+  Ok(RuntimePackInventory {
+    text: text.text.into_boxed_str(),
+    assets: assets.into_boxed_slice(),
+    apphost_template,
+  })
 }
 
 fn find_apphost_template(pack_root: &Path, runtime_identifier: &str) -> Result<PathBuf, RuntimePackError> {
@@ -649,10 +965,10 @@ fn materialize_plan(
   host_pack_id: &str,
   host_pack_version: &str,
   host_pack_root: &Path,
-  apphost_template: &Path,
-  runtime_assets: &[RuntimeAsset],
+  pack_inventory: &RuntimePackInventory,
 ) -> Result<RuntimePackPlan, RuntimePackError> {
-  let estimated_text = runtime_assets.iter().map(|asset| asset.path.as_os_str().len()).sum::<usize>() + 2048;
+  let runtime_root_length = runtime_pack_root.as_os_str().len();
+  let estimated_text = pack_inventory.text.len() + pack_inventory.assets.len() * (runtime_root_length + 1) + 2048;
   let mut table = TextTable::with_capacity(estimated_text);
   let project_span = table.push_path(project.project_path())?;
   let sdk_version_span = table.push(sdk_version)?;
@@ -667,17 +983,17 @@ fn materialize_plan(
   let host_pack_id_span = table.push(host_pack_id)?;
   let host_pack_version_span = table.push(host_pack_version)?;
   let host_pack_root_span = table.push_path(host_pack_root)?;
-  let apphost_template_span = table.push_path(apphost_template)?;
+  let apphost_template_span = table.push_joined_path(host_pack_root, pack_inventory.apphost_relative_path())?;
 
-  let mut assets = Vec::with_capacity(runtime_assets.len());
+  let mut assets = Vec::with_capacity(pack_inventory.assets.len());
   let managed_start = compact_len(assets.len(), "runtime asset span batch")?;
-  for asset in runtime_assets.iter().filter(|asset| asset.kind == AssetKind::Managed) {
-    assets.push(table.push_path(&asset.path)?);
+  for asset in pack_inventory.assets.iter().filter(|asset| asset.kind == AssetKind::Managed) {
+    assets.push(table.push_joined_path(runtime_pack_root, pack_inventory.asset_relative_path(asset))?);
   }
   let managed_end = compact_len(assets.len(), "runtime asset span batch")?;
   let native_start = managed_end;
-  for asset in runtime_assets.iter().filter(|asset| asset.kind == AssetKind::Native) {
-    assets.push(table.push_path(&asset.path)?);
+  for asset in pack_inventory.assets.iter().filter(|asset| asset.kind == AssetKind::Native) {
+    assets.push(table.push_joined_path(runtime_pack_root, pack_inventory.asset_relative_path(asset))?);
   }
   let native_end = compact_len(assets.len(), "runtime asset span batch")?;
 
@@ -737,6 +1053,34 @@ impl TextTable {
       )
     })?;
     self.push(value)
+  }
+
+  fn push_joined_path(&mut self, root: &Path, relative: &str) -> Result<TextSpan, RuntimePackError> {
+    let root = root.to_str().ok_or_else(|| {
+      RuntimePackError::new(
+        RuntimePackErrorKind::NonUnicodePath,
+        root,
+        format!("runtime-pack path {} is not valid Unicode", root.display()),
+      )
+    })?;
+    let start = compact_len(self.text.len(), "runtime-pack plan text")?;
+    self.text.push_str(root);
+    if !root.ends_with(std::path::MAIN_SEPARATOR) {
+      self.text.push(std::path::MAIN_SEPARATOR);
+    }
+    if cfg!(windows) {
+      for character in relative.chars() {
+        self.text.push(if matches!(character, '/' | '\\') {
+          std::path::MAIN_SEPARATOR
+        } else {
+          character
+        });
+      }
+    } else {
+      self.text.push_str(relative);
+    }
+    let len = compact_len(self.text.len() - start as usize, "runtime-pack plan value")?;
+    Ok(TextSpan { start, len })
   }
 }
 
@@ -896,6 +1240,84 @@ mod tests {
     assert_eq!(plan.managed_assets().collect::<Vec<_>>(), [managed.to_str().unwrap()]);
     assert_eq!(plan.native_assets().collect::<Vec<_>>(), [native.to_str().unwrap()]);
     assert_eq!(plan.apphost_template(), apphost.to_str().unwrap());
+
+    let cache_directory = cache.join(PACK_INVENTORY_CACHE_DIRECTORY);
+    let sdk_path = temp.0.join("dotnet").join("sdk").join("10.0.100");
+    let sdk_manifest = sdk_path.join(BUNDLED_VERSIONS_FILE);
+    let graph_path = sdk_path.join(PORTABLE_GRAPH_FILE);
+    let runtime_manifest = runtime_root.join(RUNTIME_LIST_FILE);
+    let inputs = || PackInventoryInputs {
+      sdk_path: &sdk_path,
+      sdk_version: "10.0.100",
+      sdk_manifest: &sdk_manifest,
+      runtime_graph: &graph_path,
+      target_framework: "net10.0",
+      framework_version: "10.0",
+      requested_runtime_identifier: "child-x64",
+      runtime_identifier: "base-x64",
+      runtime_pack_id: "Runtime.base-x64",
+      runtime_pack_version: "10.2.3",
+      runtime_pack_root: &runtime_root,
+      runtime_manifest: &runtime_manifest,
+      host_runtime_identifier: "base-x64",
+      host_pack_id: "Host.base-x64",
+      host_pack_version: "10.4.5",
+      host_pack_root: &host_root,
+    };
+    let (cached, cache_hit) = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap();
+    assert!(cache_hit);
+    assert_eq!(cached.assets.len(), 2);
+    assert_eq!(cached.asset_relative_path(&cached.assets[0]), "runtimes/base-x64/lib/net10.0/Core.dll");
+    assert_eq!(Path::new(cached.apphost_relative_path()), Path::new("runtimes/base-x64/native/apphost"));
+    let cache_file = fs::read_dir(&cache_directory).unwrap().next().unwrap().unwrap().path();
+    let mut corrupt = fs::read(&cache_file).unwrap();
+    *corrupt.last_mut().unwrap() ^= 0xff;
+    fs::write(&cache_file, corrupt).unwrap();
+    let (rebuilt, cache_hit) = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap();
+    assert!(!cache_hit);
+    assert_eq!(rebuilt.assets.len(), 2);
+    let (_, cache_hit) = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap();
+    assert!(cache_hit);
+
+    temp.write("packages/runtime.base-x64/10.2.3/runtimes/base-x64/lib/net10.0/Extra.dll", "extra");
+    temp.write(
+      "packages/runtime.base-x64/10.2.3/data/RuntimeList.xml",
+      r#"<FileList TargetFrameworkVersion="10.0" FrameworkName="Microsoft.NETCore.App"><File Type="Managed" Path="runtimes/base-x64/lib/net10.0/Core.dll"/><File Type="Managed" Path="runtimes/base-x64/lib/net10.0/Extra.dll"/><File Type="Native" Path="runtimes/base-x64/native/core.so"/></FileList>"#,
+    );
+    let (changed, cache_hit) = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap();
+    assert!(!cache_hit);
+    assert_eq!(changed.assets.len(), 3);
+    let (_, cache_hit) = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap();
+    assert!(cache_hit);
+
+    let changed_sdk = PackInventoryInputs {
+      sdk_version: "10.0.101",
+      ..inputs()
+    };
+    let (_, cache_hit) = load_or_build_pack_inventory(&cache_directory, changed_sdk).unwrap();
+    assert!(!cache_hit);
+
+    fs::remove_file(&apphost).unwrap();
+    let error = load_or_build_pack_inventory(&cache_directory, inputs()).unwrap_err();
+    assert_eq!(error.kind(), RuntimePackErrorKind::MissingAsset);
+  }
+
+  #[test]
+  fn rejects_checksum_valid_cache_paths_outside_the_selected_pack() {
+    let fingerprint = [0x5a; PACK_FINGERPRINT_BYTES];
+    let text = "../outside.dllruntimes/base-x64/native/apphost";
+    let inventory = RuntimePackInventory {
+      text: text.into(),
+      assets: vec![RuntimeAsset {
+        kind: AssetKind::Managed,
+        path: TextSpan { start: 0, len: 14 },
+      }]
+      .into_boxed_slice(),
+      apphost_template: TextSpan { start: 14, len: 32 },
+    };
+
+    let bytes = encode_pack_inventory(&fingerprint, &inventory);
+    assert!(decode_pack_inventory(&bytes, &fingerprint).is_none());
   }
 
   #[test]
@@ -956,7 +1378,25 @@ mod tests {
       "pack/data/RuntimeList.xml",
       r#"<FileList TargetFrameworkVersion="10.0" FrameworkName="Microsoft.NETCore.App"><File Type="Managed" Path="../outside.dll"/></FileList>"#,
     );
-    let error = read_runtime_assets(&manifest, &root, "net10.0", "10.0").unwrap_err();
+    let error = build_pack_inventory(&PackInventoryInputs {
+      sdk_path: &root,
+      sdk_version: "10.0.100",
+      sdk_manifest: &manifest,
+      runtime_graph: &manifest,
+      target_framework: "net10.0",
+      framework_version: "10.0",
+      requested_runtime_identifier: "win-x64",
+      runtime_identifier: "win-x64",
+      runtime_pack_id: "Runtime.win-x64",
+      runtime_pack_version: "10.0.0",
+      runtime_pack_root: &root,
+      runtime_manifest: &manifest,
+      host_runtime_identifier: "win-x64",
+      host_pack_id: "Host.win-x64",
+      host_pack_version: "10.0.0",
+      host_pack_root: &root,
+    })
+    .unwrap_err();
     assert_eq!(error.kind(), RuntimePackErrorKind::InvalidManifest);
   }
 }

@@ -12,6 +12,7 @@ diagnostic rather than approximate Microsoft behavior.
 | Target frameworks | one installed modern unified .NET target; .NET 10 fixture baseline | Parsed dynamically and matching reference pack validated |
 | Runtime identifiers | selected SDK portable graph, opaque ordinal RID keys | Loaded into compact breadth-first compatibility ranges and used for manifest-declared pack selection |
 | Runtime and host packs | implicit `Microsoft.NETCore.App`, one active RID, restored runtime pack, installed/restored host pack | Managed/native runtime assets and exact apphost template planned and oracle-verified |
+| SDK pack inventory cache | selected SDK, TFM/RID/pack dimensions, immutable completed packs | Fingerprinted binary inventory invalidates on SDK/manifest/host/package generation changes and rebuilds corrupt entries |
 | Unavailable packs | unsupported TFM/RID or absent runtime, host, targeting, or shared-framework input | Stable diagnostic includes exact requirement dimensions and one concrete acquisition action |
 | Framework references | implicit `Microsoft.NETCore.App` plus explicit SDK-known references | Manifest-defined runtime/targeting versions, targeting packs, profiles, and shared-runtime roll-forward planned and oracle-verified |
 | Output types | `Exe` and `Library` | Implemented |
