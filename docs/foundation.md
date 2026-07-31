@@ -3,8 +3,9 @@
 ## Scope
 
 Phase 0 established contracts and evidence collection. Phase 1 now includes
-native SDK discovery, while unsupported build commands return a stable
-diagnostic and exit code instead of delegating to Microsoft orchestration.
+native SDK discovery and strict evaluation of the initial SDK-style C# project
+subset. Unsupported build commands and project behaviors return stable
+diagnostics instead of delegating to Microsoft orchestration.
 
 ## Real Platform
 
@@ -53,6 +54,12 @@ The Phase 0 wire types use owned `String` and `Vec` values deliberately:
 This is not permission to use the wire representation as the hot execution
 layout. Phase 1 must transform compact indexed execution records into reporter
 events only at the output edge, in batches, reusing capacity.
+
+The first such record is `ProjectSpec`. It stores retained project text in one
+immutable buffer and represents source/project paths with 8-byte spans.
+Package references are 16-byte pairs of spans. Temporary filesystem paths are
+necessary while traversing variable external input, then discarded after the
+final compact batch is built.
 
 ## Simplification Decisions
 

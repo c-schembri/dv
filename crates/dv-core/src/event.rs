@@ -70,6 +70,15 @@ pub struct SdkInstallationEvent {
   pub selected: bool,
 }
 
+/// One exact package dependency materialized at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectPackageEvent {
+  /// NuGet package identifier.
+  pub id: String,
+  /// Exact package version.
+  pub version: String,
+}
+
 /// Event variants emitted by command execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -125,6 +134,35 @@ pub enum EventPayload {
     installations: Vec<SdkInstallationEvent>,
     /// `global.json` used for selection, when present.
     global_json: Option<String>,
+  },
+  /// One SDK-style project was discovered and evaluated.
+  ProjectEvaluated {
+    /// Full project-file path.
+    project: String,
+    /// SDK declared by the project.
+    sdk: String,
+    /// Single evaluated target framework.
+    target_framework: String,
+    /// Managed output type.
+    output_type: String,
+    /// Selected build configuration.
+    configuration: String,
+    /// Output assembly name.
+    assembly_name: String,
+    /// Generated root namespace.
+    root_namespace: String,
+    /// Effective nullable mode.
+    nullable: String,
+    /// Effective implicit-usings mode.
+    implicit_usings: String,
+    /// Whether deterministic compiler output is required.
+    deterministic: bool,
+    /// Ordered source paths relative to the project.
+    sources: Vec<String>,
+    /// Ordered project-reference paths.
+    project_references: Vec<String>,
+    /// Ordered exact package references.
+    package_references: Vec<ProjectPackageEvent>,
   },
   /// A structured diagnostic was produced.
   Diagnostic {

@@ -4,25 +4,25 @@ This matrix defines the first supported input. `Planned` means the behavior is
 explicitly in scope but is not implemented; `Reject` means Phase 1 must emit a
 diagnostic rather than approximate Microsoft behavior.
 
-| Input or behavior | Initial contract | Phase 0 |
+| Input or behavior | Initial contract | Current status |
 |---|---|---|
-| Project type | SDK-style C# `.csproj` | Planned |
+| Project type | SDK-style C# `.csproj` | Implemented |
 | SDK discovery | Native root enumeration and `global.json` selection | Implemented |
-| SDK declaration | `Microsoft.NET.Sdk` | Planned |
-| Target frameworks | one installed `net9.0` target | Planned |
-| Output types | `Exe` and `Library` | Planned |
-| Source items | default `**/*.cs`, excluding generated/output trees | Planned |
-| Nullable | `enable` or omitted SDK default | Planned |
-| Implicit usings | `enable` or `disable` | Planned |
-| Project references | acyclic SDK-style references | Planned |
-| Package references | one target, public source, exact versions first | Planned |
-| Configuration | `Debug` and `Release` | Planned |
+| SDK declaration | `Microsoft.NET.Sdk` | Implemented |
+| Target frameworks | one installed `net9.0` target | Evaluated; pack validation planned |
+| Output types | `Exe` and `Library` | Implemented |
+| Source items | default `**/*.cs`, excluding generated/output trees | Implemented |
+| Nullable | `enable` or omitted SDK default | Implemented |
+| Implicit usings | `enable` or `disable` | Implemented |
+| Project references | acyclic SDK-style references | Paths captured; graph validation planned |
+| Package references | one target, public source, exact versions first | Exact references captured; resolution planned |
+| Configuration | `Debug` and `Release` | Implemented |
 | Generated inputs | global usings, assembly attributes, editor config | Planned |
 | Outputs | managed assembly, portable PDB, deps/runtime config as required | Planned |
-| Custom imports/targets/tasks | no execution | Reject |
-| Legacy project format | unsupported | Reject |
-| Multi-targeting | unsupported initially | Reject |
-| F# and Visual Basic | unsupported initially | Reject |
+| Custom imports/targets/tasks | no execution | Rejected |
+| Legacy project format | unsupported | Rejected |
+| Multi-targeting | unsupported initially | Rejected |
+| F# and Visual Basic | unsupported initially | Rejected |
 | Native/AOT workloads | unsupported initially | Reject |
 
 ## Correctness Oracle

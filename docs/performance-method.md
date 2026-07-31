@@ -17,8 +17,9 @@ Input:
 
 Transform:
 
-1. Build `dv` and verify that `dotnet --version` and `dv sdk current` select
-   identical SDK text outside the timed interval.
+1. Build `dv` and run the case-specific parity check outside the timed
+   interval. SDK selection must return identical version text. Project
+   evaluation must return identical requested properties and item identities.
 2. Prepare fixture state outside the timed interval.
 3. Launch one process and wait for its terminal status.
 4. Reject non-zero status and retain its output in the failure message.
@@ -52,6 +53,7 @@ Invalid input behavior:
 |---|---|---|
 | `sdk_current` | no project state | process launch, SDK discovery, and selection |
 | `cli_version` | none | `dv` process launch and self-version output |
+| `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `restore_cold` | fresh fixture copy | restore |
 | `build_clean` | fresh restored fixture | build |
 | `build_noop` | already built fixture | no-op build proof |
@@ -120,4 +122,10 @@ Measure only SDK selection:
 
 ```text
 cargo bench-all --case sdk_current --dv target/release/dv
+```
+
+Measure only like-for-like project evaluation:
+
+```text
+cargo bench-all --case project_evaluate --samples 30 --warmups 3
 ```

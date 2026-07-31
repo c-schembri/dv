@@ -18,6 +18,13 @@ impl TempDirectory {
     fs::create_dir_all(&path).unwrap();
     Self(path)
   }
+
+  fn write(&self, relative: &str, contents: &str) -> PathBuf {
+    let path = self.0.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, contents).unwrap();
+    path
+  }
 }
 
 impl Drop for TempDirectory {
@@ -38,6 +45,7 @@ fn help_exposes_the_initial_command_surface() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   assert!(stdout.contains("dv <command>"));
   assert!(stdout.contains("sync"));
+  assert!(stdout.contains("project"));
   assert!(stdout.contains("--json"));
 }
 
@@ -96,4 +104,77 @@ fn sdk_current_json_reports_selected_path() {
   assert!(stdout.contains("\"type\":\"sdk_selected\""));
   assert!(stdout.contains("\"version\":\"10.0.100\""));
   assert!(stdout.contains("\"outcome\":\"succeeded\""));
+}
+
+#[test]
+fn project_inspect_discovers_and_prints_one_project() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "Console.WriteLine(\"hello\");");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>"#,
+  );
+
+  let output = dv().args(["project", "inspect"]).current_dir(&temp.0).output().unwrap();
+
+  assert!(output.status.success());
+  assert!(output.stderr.is_empty());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("Assembly            App"));
+  assert!(stdout.contains("Target              net9.0"));
+  assert!(stdout.contains("  Program.cs"));
+}
+
+#[test]
+fn project_inspect_json_reports_the_evaluated_batch() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Example.Package" Version="1.2.3" />
+  </ItemGroup>
+</Project>"#,
+  );
+
+  let output = dv()
+    .args(["project", "inspect", "App.csproj", "--configuration", "Release", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success());
+  assert!(output.stderr.is_empty());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"type\":\"project_evaluated\""));
+  assert!(stdout.contains("\"configuration\":\"Release\""));
+  assert!(stdout.contains("\"sources\":[\"Program.cs\"]"));
+  assert!(stdout.contains("\"id\":\"Example.Package\",\"version\":\"1.2.3\""));
+}
+
+#[test]
+fn project_inspect_rejects_ambiguous_selection() {
+  let temp = TempDirectory::new();
+  let project = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>"#;
+  temp.write("A.csproj", project);
+  temp.write("B.csproj", project);
+
+  let output = dv().args(["project", "inspect"]).current_dir(&temp.0).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("error[DV0201]"));
+  assert!(stderr.contains("pass one project path explicitly"));
 }

@@ -275,10 +275,14 @@ A workflow is complete only when:
 
 ## Immediate Next Steps
 
-1. Write the initial compatibility matrix for a minimal SDK-style C# project.
-2. Trace the exact Roslyn inputs and runtime launch requirements for that
-   project without using Microsoft orchestration tools.
-3. Create benchmark fixtures and record baseline `dotnet` timings.
-4. Scaffold the Rust workspace and structured diagnostic/event model.
-5. Build the smallest end-to-end path: resolve, compile, cache, and run one
+Completed foundations now include the compatibility matrix, Roslyn trace,
+benchmark fixtures, Rust workspace, structured events, native SDK selection,
+and strict evaluation of the initial SDK-style project subset.
+
+1. Discover the selected framework reference pack and build the compiler input
+   batch for the small console fixture.
+2. Resolve exact package references into a content-addressed cache and initial
+   lockfile.
+3. Invoke Roslyn through the selected native runtime host.
+4. Build the smallest end-to-end path: resolve, compile, cache, and run one
    console application.

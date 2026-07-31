@@ -44,6 +44,7 @@ items.
 - `cache_decision`
 - `sdk_selected`
 - `sdk_inventory`
+- `project_evaluated`
 - `diagnostic`
 - `command_finished`
 
@@ -77,6 +78,13 @@ Initial codes:
 | `DV0103` | Invalid SDK version |
 | `DV0104` | No compatible installed SDK |
 | `DV0105` | SDK path cannot be represented losslessly in JSON |
+| `DV0200` | No project found |
+| `DV0201` | Ambiguous implicit project selection |
+| `DV0202` | Project filesystem failure |
+| `DV0203` | Malformed project XML |
+| `DV0204` | Unsupported project behavior |
+| `DV0205` | Invalid project property |
+| `DV0206` | Project path cannot be represented in the compact UTF-8 table |
 
 Codes are never reused for a different meaning.
 

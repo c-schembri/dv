@@ -17,6 +17,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(Clone, Copy)]
 enum CaseKind {
   Startup,
+  ProjectEvaluate,
   RestoreCold,
   BuildClean,
   BuildNoOp,
@@ -35,6 +36,18 @@ const DOTNET_CASES: &[Case] = &[
     name: "sdk_current",
     kind: CaseKind::Startup,
     args: &["--version"],
+    implemented: true,
+  },
+  Case {
+    name: "project_evaluate",
+    kind: CaseKind::ProjectEvaluate,
+    args: &[
+      "msbuild",
+      "SmallConsole.csproj",
+      "--nologo",
+      "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
+      "-getItem:Compile,ProjectReference,PackageReference",
+    ],
     implemented: true,
   },
   Case {
@@ -68,6 +81,12 @@ const DV_CASES: &[Case] = &[
     name: "sdk_current",
     kind: CaseKind::Startup,
     args: &["sdk", "current"],
+    implemented: true,
+  },
+  Case {
+    name: "project_evaluate",
+    kind: CaseKind::ProjectEvaluate,
+    args: &["project", "inspect", "SmallConsole.csproj", "--json"],
     implemented: true,
   },
   Case {
@@ -168,7 +187,12 @@ fn run() -> Result<()> {
   let workspace = repository.join("target/benchmark-work");
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
-  verify_sdk_selection(&dv_executable, &fixture)?;
+  if options.case.as_deref().is_none_or(|case| case == "sdk_current") {
+    verify_sdk_selection(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
+    verify_project_evaluation(&dv_executable, &fixture)?;
+  }
 
   let mut runs = run_tool("dotnet", Path::new("dotnet"), DOTNET_CASES, &options, &fixture, &workspace.join("dotnet"))?;
   runs.extend(run_tool("dv", &dv_executable, DV_CASES, &options, &fixture, &workspace.join("dv"))?);
@@ -208,6 +232,97 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
     return Err(format!("SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {dv_version:?}").into());
   }
   Ok(())
+}
+
+fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let dotnet_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "SmallConsole.csproj",
+      "--nologo",
+      "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
+      "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    fixture,
+  )?;
+  let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
+  let dv_text = command_text(dv_executable, &["project", "inspect", "SmallConsole.csproj", "--json"], fixture)?;
+  let dv = dv_text
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
+    .ok_or("dv project inspection did not emit project_evaluated")?;
+
+  for (dotnet_name, dv_name) in [
+    ("TargetFramework", "target_framework"),
+    ("OutputType", "output_type"),
+    ("Nullable", "nullable"),
+    ("ImplicitUsings", "implicit_usings"),
+    ("AssemblyName", "assembly_name"),
+    ("RootNamespace", "root_namespace"),
+    ("Configuration", "configuration"),
+  ] {
+    let reference = dotnet.pointer(&format!("/Properties/{dotnet_name}")).and_then(serde_json::Value::as_str);
+    let actual = dv.get(dv_name).and_then(serde_json::Value::as_str);
+    if reference != actual {
+      return Err(format!("project evaluation mismatch for {dotnet_name}: dotnet={reference:?}, dv={actual:?}").into());
+    }
+  }
+  let reference_deterministic = dotnet.pointer("/Properties/Deterministic").and_then(serde_json::Value::as_str);
+  let actual_deterministic = dv.get("deterministic").and_then(serde_json::Value::as_bool);
+  if reference_deterministic != actual_deterministic.map(|value| if value { "true" } else { "false" }) {
+    return Err(format!("project evaluation mismatch for Deterministic: dotnet={reference_deterministic:?}, dv={actual_deterministic:?}").into());
+  }
+
+  let dotnet_sources = item_identities(&dotnet, "Compile")?;
+  let dv_sources = string_array(&dv, "sources")?;
+  if dotnet_sources != dv_sources {
+    return Err(format!("project source evaluation mismatch: dotnet={dotnet_sources:?}, dv={dv_sources:?}").into());
+  }
+  if !item_identities(&dotnet, "ProjectReference")?.is_empty() || !string_array(&dv, "project_references")?.is_empty() {
+    return Err("small-console project unexpectedly contains project references".into());
+  }
+  if !item_identities(&dotnet, "PackageReference")?.is_empty() {
+    return Err("small-console project unexpectedly contains package references".into());
+  }
+  if !dv.get("package_references").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
+    return Err("dv small-console evaluation unexpectedly contains package references".into());
+  }
+  Ok(())
+}
+
+fn item_identities(document: &serde_json::Value, item: &str) -> Result<Vec<String>> {
+  document
+    .pointer(&format!("/Items/{item}"))
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| format!("dotnet project query omitted {item} items"))?
+    .iter()
+    .map(|value| {
+      value
+        .get("Identity")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("dotnet {item} item omitted Identity").into())
+    })
+    .collect()
+}
+
+fn string_array(document: &serde_json::Value, field: &str) -> Result<Vec<String>> {
+  document
+    .get(field)
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| format!("dv project event omitted {field}"))?
+    .iter()
+    .map(|value| {
+      value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("dv {field} contains non-text data").into())
+    })
+    .collect()
 }
 
 fn prepare_dv_executable(repository: &Path, requested: Option<&Path>) -> Result<PathBuf> {
@@ -345,6 +460,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
+    CaseKind::ProjectEvaluate => Ok(()),
     CaseKind::RestoreCold => reset_fixture(fixture, workspace),
     CaseKind::BuildClean => {
       reset_fixture(fixture, workspace)?;
@@ -378,7 +494,11 @@ fn is_dotnet(executable: &Path) -> bool {
 }
 
 fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path {
-  if matches!(case.kind, CaseKind::Startup) { fixture } else { workspace }
+  if matches!(case.kind, CaseKind::Startup | CaseKind::ProjectEvaluate) {
+    fixture
+  } else {
+    workspace
+  }
 }
 
 fn measure(executable: &Path, args: &[&str], cwd: &Path) -> Result<u64> {
@@ -577,6 +697,7 @@ fn case_label(case: &str) -> &str {
   match case {
     "sdk_current" => "SDK selection",
     "cli_version" => "CLI self-version",
+    "project_evaluate" => "Project evaluation",
     "restore_cold" => "Cold restore",
     "sync_cold" => "Cold sync",
     "build_clean" => "Clean build",

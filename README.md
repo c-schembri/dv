@@ -11,11 +11,15 @@ Roslyn remains the compiler and Microsoft .NET remains the runtime; `dv` owns
 the expensive orchestration around them.
 
 ```text
-dotnet --version     63.050 ms median
-dv sdk current        3.451 ms median
+dotnet --version               65.841 ms median
+dv sdk current                  3.698 ms median
+
+dotnet msbuild project query  302.195 ms median
+dv project inspect              3.325 ms median
 ```
 
-Both commands selected the same installed SDK: `10.0.100`.
+The benchmark preflight verifies the same selected SDK and the same evaluated
+project properties and source items before retaining samples.
 
 ## Why dv
 
@@ -42,10 +46,10 @@ The project is in the first implementation phase.
 | Native CLI and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
+| Initial SDK-style project evaluation | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
 | Package resolution and cache | Planned |
-| Project evaluation | Planned |
 | Direct Roslyn compilation | Planned |
 | Incremental and no-op builds | Planned |
 | Application runner | Planned |
@@ -54,6 +58,11 @@ The project is in the first implementation phase.
 SDK discovery supports all documented roll-forward policies, prerelease
 filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
+
+Project evaluation supports one `Microsoft.NET.Sdk` C# project targeting
+`net9.0`, `Exe` and `Library` outputs, default source discovery, Debug/Release
+configuration, project-reference paths, and exact package-reference capture.
+Unsupported MSBuild behavior fails explicitly.
 
 ## Quick Start
 
@@ -71,6 +80,12 @@ cargo run -p dv-cli --release -- sdk list
 
 # Emit the versioned JSON event stream
 cargo run -p dv-cli --release -- sdk current --json
+
+# Inspect the project in the current directory
+cargo run -p dv-cli --release -- project inspect
+
+# Inspect an explicit project as structured events
+cargo run -p dv-cli --release -- project inspect path\to\App.csproj --json
 
 # Run all implemented and reference benchmarks
 cargo bench-all
@@ -98,19 +113,26 @@ Initial machine:
 - warm OS caches; fixture and prerequisite setup outside timed intervals
 
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
-| Operation | Reference command | `dv` command | Reference median | `dv` median | Reference p95 | `dv` p95 |
-|---|---|---|---:|---:|---:|---:|
-| Select current SDK | `dotnet --version` | `dv sdk current` | 63.050 ms | 3.451 ms | 66.537 ms | 4.300 ms |
+| Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
+|---|---|---|---:|---:|---:|---:|---:|
+| Select current SDK | `dotnet --version` | `dv sdk current` | 65.841 ms | 3.698 ms | 17.8x | 69.283 ms | 4.450 ms |
+| Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 302.195 ms | 3.325 ms | 90.9x | 321.541 ms | 3.937 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
-Before measuring, the harness verifies that both commands select identical SDK
-text. Raw samples and the full machine record are summarized in the
+Before measuring, the harness verifies SDK text and compares every requested
+project property plus the ordered compile-item identities. The exact MSBuild
+query is printed in benchmark output and recorded in the
 [curated baseline](docs/performance-baselines/2026-07-31-windows.md).
+
+The warm one-shot target for lightweight commands on this machine is `5 ms`
+end to end. It is a local engineering budget, not a universal Windows
+guarantee.
 
 Reproduce the comparison:
 
 ```powershell
 cargo bench-all --case sdk_current --samples 30 --warmups 3
+cargo bench-all --case project_evaluate --samples 30 --warmups 3
 ```
 
 Run the full suite:
@@ -152,8 +174,10 @@ lifetime, stated memory/access costs, and a measurable definition of done.
 See:
 
 - [Project plan](PLAN.md)
+- [Feature parity implementation map](docs/feature-parity-map.md)
 - [Data-oriented agent rules](AGENTS.md)
 - [SDK discovery contract](docs/sdk-discovery.md)
+- [Project evaluation contract](docs/project-evaluation.md)
 - [Performance method](docs/performance-method.md)
 - [Events and diagnostics](docs/events-and-diagnostics.md)
 - [Compatibility matrix](docs/compatibility-matrix.md)
@@ -163,7 +187,7 @@ See:
 
 ```text
 crates/dv-cli       dv executable and command surface
-crates/dv-core      typed diagnostics, events, and SDK selection
+crates/dv-core      typed diagnostics, SDK selection, and project evaluation
 tools/dv-bench      process-level benchmark harness
 benchmarks/fixtures immutable representative .NET inputs
 docs                contracts, evidence, and architecture decisions

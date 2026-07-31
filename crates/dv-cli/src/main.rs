@@ -2,14 +2,14 @@ use std::{
   env,
   ffi::OsString,
   io::{self, Write},
-  path::Path,
+  path::{Path, PathBuf},
   process::ExitCode,
   time::Instant,
 };
 
 use dv_core::{
-  ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks,
-  write_json_lines,
+  ContextField, Diagnostic, DiagnosticCode, Event, EventPayload, Outcome, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectPackageEvent,
+  ProjectSpec, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -31,6 +31,7 @@ Commands:
   pack       Create packages
   publish    Publish deployable output
   sdk        Manage SDKs and runtimes
+  project    Inspect project inputs
 
 Output:
   --json     Emit the versioned JSON event protocol
@@ -40,6 +41,11 @@ const SDK_HELP: &str = "\
 Usage:
   dv sdk current    Print the selected .NET SDK version
   dv sdk list       List discovered .NET SDKs
+";
+
+const PROJECT_HELP: &str = "\
+Usage:
+  dv project inspect [PROJECT] [--configuration Debug|Release]
 ";
 
 fn main() -> ExitCode {
@@ -100,6 +106,7 @@ fn main() -> ExitCode {
       ExitCode::SUCCESS
     },
     Some("sdk") => run_sdk(started, json, args, &semantic_args[1..]),
+    Some("project") => run_project(started, json, args, &semantic_args[1..]),
     Some(command) if is_known_command(command) => fail(
       started,
       json,
@@ -140,7 +147,7 @@ fn decode_args(raw_args: &[OsString]) -> Result<Vec<String>, &OsString> {
 fn is_known_command(command: &str) -> bool {
   matches!(
     command,
-    "init" | "add" | "remove" | "sync" | "build" | "run" | "test" | "pack" | "publish" | "sdk"
+    "init" | "add" | "remove" | "sync" | "build" | "run" | "test" | "pack" | "publish" | "sdk" | "project"
   )
 }
 
@@ -244,6 +251,198 @@ fn sdk_list(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
     Err(diagnostic) => return fail(started, true, "sdk list", args, *diagnostic),
   };
   succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
+}
+
+fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+  if project_args.is_empty()
+    || matches!(project_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h"))
+    || matches!(project_args, [inspect, argument] if inspect == "inspect" && matches!(argument.as_str(), "help" | "--help" | "-h"))
+  {
+    print!("{PROJECT_HELP}");
+    return ExitCode::SUCCESS;
+  }
+  if project_args.first().map(String::as_str) != Some("inspect") {
+    let subcommand = project_args.first().map_or("<missing>", String::as_str);
+    return fail(
+      started,
+      json,
+      "project",
+      args,
+      diagnostic(
+        "DV0001",
+        format!("unknown project command {subcommand:?}"),
+        Some(ContextField {
+          name: "command".into(),
+          value: format!("project {subcommand}"),
+        }),
+        Some("Use `dv project --help` to list project commands."),
+      ),
+    );
+  }
+
+  let (requested_path, configuration) = match parse_project_inspect_args(&project_args[1..]) {
+    Ok(options) => options,
+    Err(problem) => {
+      return fail(
+        started,
+        json,
+        "project inspect",
+        args,
+        diagnostic(
+          "DV0002",
+          problem,
+          None,
+          Some("Use `dv project inspect --help` to inspect the accepted arguments."),
+        ),
+      );
+    },
+  };
+  let current_directory = match env::current_dir() {
+    Ok(directory) => directory,
+    Err(error) => {
+      return fail(
+        started,
+        json,
+        "project inspect",
+        args,
+        diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+      );
+    },
+  };
+  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+    Ok(project) => project,
+    Err(error) => return fail(started, json, "project inspect", args, project_diagnostic(error)),
+  };
+
+  if !json {
+    return write_project(&project);
+  }
+
+  let packages = project
+    .package_references()
+    .iter()
+    .map(|package| ProjectPackageEvent {
+      id: project.package_id(*package).into(),
+      version: project.package_version(*package).into(),
+    })
+    .collect();
+  let payload = EventPayload::ProjectEvaluated {
+    project: project.project_path().display().to_string(),
+    sdk: project.sdk().into(),
+    target_framework: project.target_framework().into(),
+    output_type: project.output_type().as_str().into(),
+    configuration: project.configuration().as_str().into(),
+    assembly_name: project.assembly_name().into(),
+    root_namespace: project.root_namespace().into(),
+    nullable: toggle_text(project.nullable_enabled()).into(),
+    implicit_usings: toggle_text(project.implicit_usings_enabled()).into(),
+    deterministic: project.deterministic(),
+    sources: project.sources().map(str::to_owned).collect(),
+    project_references: project.project_references().map(str::to_owned).collect(),
+    package_references: packages,
+  };
+  succeed(started, "project inspect", args, payload)
+}
+
+fn parse_project_inspect_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
+  let mut project = None;
+  let mut configuration = ProjectConfiguration::Debug;
+  let mut index = 0;
+  while index < arguments.len() {
+    match arguments[index].as_str() {
+      "-h" | "--help" | "help" => return Err("help must be requested as `dv project --help`".into()),
+      "--configuration" => {
+        index += 1;
+        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+        configuration = ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?;
+      },
+      value if value.starts_with('-') => return Err(format!("unknown project option {value:?}")),
+      value if project.is_none() => project = Some(PathBuf::from(value)),
+      value => return Err(format!("unexpected project argument {value:?}")),
+    }
+    index += 1;
+  }
+  Ok((project, configuration))
+}
+
+fn load_project(directory: &Path, requested: Option<&Path>, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
+  let Some(requested) = requested else {
+    return evaluate_project(directory, configuration);
+  };
+  let requested = if requested.is_absolute() {
+    requested.to_owned()
+  } else {
+    directory.join(requested)
+  };
+  if requested.is_dir() {
+    evaluate_project(&requested, configuration)
+  } else {
+    evaluate_project_path(&requested, configuration)
+  }
+}
+
+fn write_project(project: &ProjectSpec) -> ExitCode {
+  let mut output = String::with_capacity(512);
+  use std::fmt::Write as _;
+  writeln!(output, "Project             {}", project.project_path().display()).expect("writing a String succeeds");
+  writeln!(output, "SDK                 {}", project.sdk()).expect("writing a String succeeds");
+  writeln!(output, "Target              {}", project.target_framework()).expect("writing a String succeeds");
+  writeln!(output, "Output              {}", project.output_type().as_str()).expect("writing a String succeeds");
+  writeln!(output, "Configuration       {}", project.configuration().as_str()).expect("writing a String succeeds");
+  writeln!(output, "Assembly            {}", project.assembly_name()).expect("writing a String succeeds");
+  writeln!(output, "Root namespace      {}", project.root_namespace()).expect("writing a String succeeds");
+  writeln!(output, "Nullable            {}", toggle_text(project.nullable_enabled())).expect("writing a String succeeds");
+  writeln!(output, "Implicit usings     {}", toggle_text(project.implicit_usings_enabled())).expect("writing a String succeeds");
+  writeln!(output, "Deterministic       {}", project.deterministic()).expect("writing a String succeeds");
+  writeln!(output, "Sources             {}", project.sources().len()).expect("writing a String succeeds");
+  for source in project.sources() {
+    writeln!(output, "  {source}").expect("writing a String succeeds");
+  }
+  writeln!(output, "Project references  {}", project.project_references().len()).expect("writing a String succeeds");
+  for reference in project.project_references() {
+    writeln!(output, "  {reference}").expect("writing a String succeeds");
+  }
+  writeln!(output, "Package references  {}", project.package_references().len()).expect("writing a String succeeds");
+  for package in project.package_references() {
+    writeln!(output, "  {} {}", project.package_id(*package), project.package_version(*package)).expect("writing a String succeeds");
+  }
+  io::stdout()
+    .lock()
+    .write_all(output.as_bytes())
+    .expect("writing project output to stdout succeeds");
+  ExitCode::SUCCESS
+}
+
+fn toggle_text(enabled: bool) -> &'static str {
+  if enabled { "enable" } else { "disable" }
+}
+
+fn project_diagnostic(error: ProjectError) -> Diagnostic {
+  let code = match error.kind() {
+    ProjectErrorKind::NotFound => "DV0200",
+    ProjectErrorKind::Ambiguous => "DV0201",
+    ProjectErrorKind::Io => "DV0202",
+    ProjectErrorKind::InvalidXml => "DV0203",
+    ProjectErrorKind::Unsupported => "DV0204",
+    ProjectErrorKind::InvalidProperty => "DV0205",
+    ProjectErrorKind::NonUnicodePath => "DV0206",
+  };
+  let help = match error.kind() {
+    ProjectErrorKind::NotFound => Some("Pass a path to one SDK-style C# project."),
+    ProjectErrorKind::Ambiguous => Some("Pass one .csproj path explicitly."),
+    ProjectErrorKind::Unsupported | ProjectErrorKind::InvalidProperty => Some("Use the supported single-target Microsoft.NET.Sdk project subset."),
+    ProjectErrorKind::InvalidXml => Some("Correct the project XML and try again."),
+    ProjectErrorKind::Io | ProjectErrorKind::NonUnicodePath => None,
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    help,
+  )
 }
 
 fn load_sdk_inventory(started: Instant, json: bool, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
