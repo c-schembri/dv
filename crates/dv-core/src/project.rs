@@ -3080,7 +3080,7 @@ mod tests {
     assert_eq!(inventory.working_set_bytes(), 5 * size_of::<WorkspaceCandidate>() + 35);
   }
 
-  #[cfg(unix)]
+  #[cfg(target_os = "linux")]
   #[test]
   fn workspace_inventory_rejects_a_recognized_non_unicode_candidate() {
     use std::os::unix::ffi::OsStringExt;

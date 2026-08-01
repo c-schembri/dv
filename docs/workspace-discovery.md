@@ -54,9 +54,10 @@ selection path does not speculate about them.
 ## Verification
 
 Focused tests cover every candidate kind, stable ordering, ignored files and
-nested directories, compact working-set bytes, one unsupported candidate, and
-ordered ambiguity. The retained benchmark compares Microsoft implicit project
-selection/evaluation with `dv project inspect --json` on the identical
+nested directories, compact working-set bytes, one unsupported candidate,
+Linux non-Unicode rejection, and ordered ambiguity. The retained benchmark
+compares Microsoft implicit project selection/evaluation with
+`dv project inspect --json` on the identical
 immutable `small-console` directory and validates the same evaluated property
 and item batch before timing. Thirty retained samples after three warm-ups
 measured Microsoft at `290.493 ms` median and `305.210 ms` p95 versus
