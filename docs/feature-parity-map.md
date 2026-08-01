@@ -351,9 +351,9 @@ contracts.
   process tests deliver real SIGINT during stalled HTTP work; all-platform
   tests cover transitions, deadline stability, diagnostics, and the child
   boundary. Thirty warm Windows samples measure cancellation-ready SDK
-  selection at `69.974 ms` for Microsoft and `5.554 ms` for `dv` (`12.6x`
+  selection at `68.400 ms` for Microsoft and `5.302 ms` for `dv` (`12.9x`
   faster); `dv --version`, which deliberately skips installation, remains
-  `5.062 ms`. `P1`
+  `4.330 ms`. `P1`
 - [ ] `CLI-015` Preserve child exit codes where the command contract requires
   it and distinguish launch failure from child failure. `P1`
 - [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,

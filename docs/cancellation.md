@@ -95,10 +95,10 @@ only as metadata.
 The like-for-like Windows case compares `dotnet --version` with `dv sdk
 current`; both select and print the active SDK, while `dv` additionally installs
 the new handler before discovery. Thirty retained samples after five warm-ups
-measured Microsoft at `68.262 ms` median and `71.868 ms` p95, versus `6.309 ms`
-and `7.356 ms` for `dv`, a `10.8x` median advantage. The non-work `dv
---version` control measured `5.364 ms` median and `5.764 ms` p95. Because SDK
-discovery is also included, the `0.945 ms` difference is only an upper bound on
+measured Microsoft at `68.400 ms` median and `72.780 ms` p95, versus `5.302 ms`
+and `6.346 ms` for `dv`, a `12.9x` median advantage. The non-work `dv
+--version` control measured `4.330 ms` median and `5.332 ms` p95. Because SDK
+discovery is also included, the `0.972 ms` difference is only an upper bound on
 the end-to-end handler cost. Raw samples
 are retained in
 `benchmarks/results/2026-08-01-cli-cancellation-windows.json` and

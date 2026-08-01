@@ -29,15 +29,15 @@ allocation, handler registration, SDK discovery and selection, and output.
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| Microsoft .NET 10 | 68.262 ms | 71.868 ms | 65.596 ms | 72.110 ms |
-| `dv` | 6.309 ms | 7.356 ms | 5.308 ms | 7.863 ms |
+| Microsoft .NET 10 | 68.400 ms | 72.780 ms | 63.473 ms | 77.189 ms |
+| `dv` | 5.302 ms | 6.346 ms | 4.311 ms | 7.379 ms |
 
-`dv` was 10.8x faster at the median. The complete stable batch is reported; no
+`dv` was 12.9x faster at the median. The complete stable batch is reported; no
 retained sample was removed.
 
 The non-work `dv --version` control, which deliberately skips cancellation
-installation and SDK discovery, measured 5.364 ms median, 5.764 ms p95,
-4.636 ms minimum, and 7.104 ms maximum. Its 0.945 ms median difference from
+installation and SDK discovery, measured 4.330 ms median, 5.332 ms p95,
+3.942 ms minimum, and 5.740 ms maximum. Its 0.972 ms median difference from
 `dv sdk current` is only an upper bound on handler cost because the latter also
 performs SDK discovery and selection.
 
