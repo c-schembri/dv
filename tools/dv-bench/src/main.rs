@@ -24,6 +24,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 enum CaseKind {
   Startup,
   CliUnknownOption,
+  CliForwarding,
   RidGraph,
   ProjectEvaluate,
   PackageReferenceConditions,
@@ -80,6 +81,7 @@ struct Case {
 
 struct Fixtures<'a> {
   small: &'a Path,
+  argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
   runtime_pack: &'a Path,
@@ -135,6 +137,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_forwarding",
+    kind: CaseKind::CliForwarding,
+    args: &["bin/Release/net10.0/ArgumentForwarding.dll", "alpha", "", "--color", "two words"],
     implemented: true,
   },
   Case {
@@ -743,6 +751,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_forwarding",
+    kind: CaseKind::CliForwarding,
+    args: &["--json", "run", "--", "alpha", "", "--color", "two words"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["sdk", "compatible-rids", "linux-musl-x64"],
@@ -1128,6 +1142,7 @@ fn run() -> Result<()> {
   let options = parse_options(env::args_os().skip(1))?;
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
+  let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
   let runtime_pack_fixture = repository.join("benchmarks/fixtures/runtime-pack-project");
@@ -1160,6 +1175,7 @@ fn run() -> Result<()> {
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
     small: &fixture,
+    argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
     runtime_pack: &runtime_pack_fixture,
@@ -1199,6 +1215,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
     verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_forwarding") {
+    verify_forwarding_boundary(&dv_executable, &argument_forwarding_fixture, &workspace.join("verify-cli-forwarding"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
@@ -1403,6 +1422,123 @@ fn validate_unknown_option_failure(output: &Output, reference: bool) -> Result<(
     if text.contains("error[DV01") || text.contains("error[DV02") {
       return Err(format!("dv unknown-option command performed discovery before rejection: {text}").into());
     }
+  }
+  Ok(())
+}
+
+const FORWARDED_ARGUMENTS: &[&str] = &["alpha", "", "--color", "two words"];
+const DOTNET_FORWARDING_ORACLE_ARGS: &[&str] = &[
+  "run",
+  "--project",
+  "ArgumentForwarding.csproj",
+  "--configuration",
+  "Release",
+  "--no-build",
+  "--no-restore",
+  "--",
+  "alpha",
+  "",
+  "--color",
+  "two words",
+];
+
+fn verify_forwarding_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  let dotnet_workspace = verification.join("dotnet");
+  let dv_workspace = verification.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "ArgumentForwarding.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &dotnet_workspace,
+    "argument-forwarding oracle build",
+  )?;
+
+  let reference = Command::new("dotnet")
+    .args(DOTNET_FORWARDING_ORACLE_ARGS)
+    .current_dir(&dotnet_workspace)
+    .output()?;
+  validate_forwarding_output(&reference, true)?;
+
+  let actual = Command::new(dv_executable)
+    .args(DV_CASES.iter().find(|case| case.name == "cli_forwarding").expect("forwarding case exists").args)
+    .current_dir(&dv_workspace)
+    .output()?;
+  validate_forwarding_output(&actual, false)
+}
+
+fn validate_forwarding_output(output: &Output, reference: bool) -> Result<()> {
+  if reference {
+    if !output.status.success() {
+      return Err(
+        format!(
+          "Microsoft forwarding oracle failed with status {:?}: stdout={} stderr={}",
+          output.status.code(),
+          String::from_utf8_lossy(&output.stdout),
+          String::from_utf8_lossy(&output.stderr)
+        )
+        .into(),
+      );
+    }
+    let actual: Vec<String> = serde_json::from_slice(&output.stdout)?;
+    if actual != FORWARDED_ARGUMENTS {
+      return Err(format!("dotnet forwarded argument batch differs: {actual:?}").into());
+    }
+    return Ok(());
+  }
+
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "dv forwarding boundary returned status {:?} with stderr {:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let start = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("command_started"))
+    .ok_or("dv forwarding event stream omitted command_started")?;
+  let raw = start
+    .get("args")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv forwarding event stream omitted raw args")?;
+  let delimiter = raw
+    .iter()
+    .position(|value| value.as_str() == Some("--"))
+    .ok_or("dv forwarding event stream omitted delimiter")?;
+  let forwarded = raw[delimiter + 1..]
+    .iter()
+    .map(|value| value.as_str().ok_or("dv forwarded argument was not text"))
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  if forwarded != FORWARDED_ARGUMENTS {
+    return Err(format!("dv forwarded argument batch differs: {forwarded:?}").into());
+  }
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv forwarding boundary omitted its diagnostic")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0003") {
+    return Err("dv forwarding boundary did not reach the typed run request".into());
+  }
+  let forwarded_count = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+    context.iter().find_map(|field| {
+      (field.get("name").and_then(serde_json::Value::as_str) == Some("forwarded_argument_count"))
+        .then(|| field.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    })
+  });
+  if forwarded_count != Some("4") {
+    return Err(format!("dv forwarding boundary reported the wrong typed batch count: {forwarded_count:?}").into());
   }
   Ok(())
 }
@@ -5224,6 +5360,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
       | CaseKind::CliUnknownOption
+      | CaseKind::CliForwarding
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -5231,6 +5368,14 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
+  }
+  if matches!(case.kind, CaseKind::CliForwarding) && is_dotnet(executable) {
+    run_checked(
+      executable,
+      &["build", "ArgumentForwarding.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+      workspace,
+      "argument-forwarding oracle build",
+    )?;
   }
   if matches!(case.kind, CaseKind::NugetServiceIndex) && is_dotnet(executable) {
     run_checked(
@@ -6654,6 +6799,7 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::CliUnknownOption
+    | CaseKind::CliForwarding
     | CaseKind::RidGraph
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
@@ -6743,6 +6889,7 @@ fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path
 
 fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
+    CaseKind::CliForwarding => fixtures.argument_forwarding,
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
@@ -6780,6 +6927,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
 fn fixture_name(case: &Case) -> Option<&'static str> {
   match case.kind {
     CaseKind::Startup => None,
+    CaseKind::CliForwarding => Some("argument-forwarding"),
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
@@ -6844,6 +6992,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliForwarding) {
+    validate_forwarding_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -7737,6 +7887,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
     "cli_unknown_option" => "Unknown-option rejection",
+    "cli_forwarding" => "Forwarded argument capture (run TBI)",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",

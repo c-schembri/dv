@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
+| Lossless typed CLI, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -378,6 +378,11 @@ target\release\dv.exe sdk current
 README results are limited to commands that produce the same meaningful
 result. Unimplemented `dv` workflows appear as `TBI` in the full benchmark
 output and are not promoted into this table.
+
+The `CLI-012` forwarding parser has a separate structural baseline because
+`dv run` execution remains TBI. It verifies exact `dotnet run --` behavior but
+does not claim like-for-like run performance. See the
+[forwarding baseline](docs/performance-baselines/2026-08-01-cli-forwarding-windows.md).
 
 Initial machine:
 
@@ -681,6 +686,7 @@ cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
+cargo bench-all --case cli_forwarding --samples 30 --warmups 5
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case project_select_named --samples 30 --warmups 3

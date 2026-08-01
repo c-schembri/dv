@@ -86,6 +86,11 @@ allocation. Command operands are borrowed. Event strings remain a cold,
 output-only allocation required by the JSON schema and are not created for
 human output.
 
+The forwarded-argument view is one 16-byte slice, aligned to `usize`, so four
+views fit in an assumed 64-byte cache line. Only one read-only view exists per
+invocation, so explicit cache-line alignment would waste space without
+preventing contention.
+
 ## Unknown Option Boundary
 
 `CLI-011` rejects an unrecognized global option during the initial linear
@@ -108,6 +113,25 @@ or directory in the input workspace. Integration tests repeat the
 no-discovery assertion with malformed `global.json` and project inputs across
 every active command family.
 
+## Child Argument Boundary
+
+`CLI-012` recognizes the first `--` after native `run` or `test`. One optional
+nonzero index, compile-time protected to one machine word, splits the
+already-owned raw batch: command options retain their existing
+borrowed view and the complete tail becomes a contiguous
+`ForwardedArguments<'_>` slice. The delimiter is not forwarded. Empty strings,
+a second literal `--`, option-looking text, and platform-native non-Unicode
+operands are never decoded, copied, normalized, or reordered. An empty tail is
+distinct from an invocation without a delimiter. A 64-token test remains one
+direct slice rather than allocating a semantic index batch.
+
+Global parsing stops at the delimiter. Consequently `--json`, color, verbosity,
+and compatibility spellings in the tail remain application/test data. Other
+current commands do not accept child arguments and continue to reject `--` as
+an unknown command option before discovery. The run and test boundaries consume
+the typed batch today; process launch remains deliberately ordered after
+environment, cancellation, and child-exit contracts.
+
 ## Boundaries
 
 - Command names and text-only SDK operands must be valid Unicode.
@@ -115,8 +139,8 @@ every active command family.
 - The command syntax version is `1` and is independent of the JSON event schema.
 - Native and explicit compatibility modes exist. Automatic grammar inference,
   aliases, and precedence remain partial under `DROP-002` and `DROP-003`.
-- End-of-options and child forwarding remain open under `CLI-012` and
-  `DROP-013`; no unsupported syntax is silently accepted by this contract.
+- Automatic drop-in forwarding aliases remain open under `DROP-013`; no
+  unsupported syntax is silently accepted by this contract.
 
 The design is disproved if a supported path cannot round-trip through
 `PathBuf`, classification performs external I/O, or process-level startup
@@ -164,3 +188,21 @@ retained samples after three warm-ups measured `dotnet` at `146.054 ms` median
 and `152.690 ms` p95, and `dv` at `4.827 ms` median and `6.424 ms` p95. `dv`
 was `30.3x` faster at the median. Raw samples are retained as
 `benchmarks/results/baseline-1785575360.json`.
+
+The forwarding preflight builds a .NET 10 application outside timing and
+requires `dotnet run --` to deliver `alpha`, an empty string, `--color`, and
+`two words` in exact order. `dv` reports the same four-item typed tail, while
+cross-platform unit tests additionally retain an invalid-Unicode OS token.
+Thirty retained samples after five warm-ups compare direct Microsoft-host
+capture/reporting with the `dv` forwarding boundary: `44.698 ms` versus
+`5.606 ms` median, and `51.902 ms` versus `6.184 ms` p95 (`8.0x` median).
+Because `dv run` execution is still TBI, this structural result is not promoted
+as a like-for-like run benchmark. Raw samples are
+`benchmarks/results/cli-forwarding-final.json`.
+
+The no-delimiter control measured `dv sdk current` at `6.102 ms` median and
+`6.892 ms` p95, matching the earlier published `6.102 ms` median. The added
+predictable delimiter check therefore shows no practical common-path
+regression. `dotnet --version` measured `77.833 ms`, so `dv` remained `12.8x`
+faster on the like-for-like SDK result. Raw control samples are
+`benchmarks/results/sdk-current-cli012-control.json`.

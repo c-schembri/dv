@@ -138,6 +138,16 @@ fn main() -> ExitCode {
     },
     CommandKind::KnownUnimplemented => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
+      if matches!(command, "run" | "test") {
+        return unsupported_child_command(
+          started,
+          globals,
+          command,
+          invocation.event_arguments(json),
+          command_args,
+          invocation.forwarded_arguments(),
+        );
+      }
       unsupported(
         started,
         globals,
@@ -197,6 +207,32 @@ fn main() -> ExitCode {
       ),
     ),
   }
+}
+
+fn unsupported_child_command(
+  started: Instant,
+  globals: InvocationOptions,
+  command: &str,
+  args: Vec<String>,
+  _command_args: CommandArguments<'_>,
+  forwarded_args: Option<invocation::ForwardedArguments<'_>>,
+) -> ExitCode {
+  let mut problem = diagnostic(
+    "DV0003",
+    format!("command {command:?} is not implemented yet"),
+    Some(ContextField {
+      name: "command".into(),
+      value: command.into(),
+    }),
+    Some("Use --help to inspect the Phase 0 command surface."),
+  );
+  if let Some(forwarded) = forwarded_args {
+    problem.context.push(ContextField {
+      name: "forwarded_argument_count".into(),
+      value: forwarded.as_slice().len().to_string(),
+    });
+  }
+  unsupported(started, globals, command, args, problem)
 }
 
 fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> Option<String> {

@@ -300,8 +300,18 @@ contracts.
   requires Microsoft's `MSB1001`, `dv`'s `DV0002`, the exact option spelling,
   and an unchanged workspace. Thirty warm Windows samples measure `146.054 ms`
   for Microsoft versus `4.827 ms` for `dv` (`30.3x`). `P1`
-- [ ] `CLI-012` Preserve arguments after `--` byte-for-byte for child
-  application and test processes. `P1`
+- [x] `CLI-012` Preserve arguments after `--` byte-for-byte for child
+  application and test processes. `run` and `test` now receive one typed
+  borrowed `OsString` tail from the process-owned argument batch; empty and
+  non-Unicode operands, repeated delimiters, and post-delimiter globals remain
+  opaque, and no second buffer or parse is introduced. A one-word optional
+  nonzero index distinguishes no delimiter from an empty tail without widening
+  the hot request; a 64-token test remains one direct slice. The .NET 10 oracle
+  proves the same four-argument tail through `dotnet run --`. Thirty warm
+  Windows samples measure direct Microsoft host capture at `50.726 ms` and the
+  `dv` typed handoff at `4.713 ms` (`10.8x` lower), but this is explicitly not a
+  like-for-like execution claim: child launch remains in the ordered run/test
+  workflows. `P1`
 - [ ] `CLI-013` Define environment-variable precedence and redact secrets from
   all output modes. `P1`
 - [ ] `CLI-014` Install Ctrl+C/SIGINT cancellation before starting work and

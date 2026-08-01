@@ -139,6 +139,52 @@ fn compatibility_unknown_options_use_reference_failure_exit_without_io() {
 }
 
 #[test]
+fn child_delimiter_keeps_trailing_global_spellings_opaque() {
+  for command in ["run", "test"] {
+    let human = dv().args([command, "--", "--json", "--verbosity", "loud", ""]).output().unwrap();
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(stderr.contains("error[DV0003]"));
+    assert!(stderr.contains("forwarded_argument_count: 4"));
+
+    let json = dv().args(["--json", command, "--", "--no-color", "--verbosity", "loud", ""]).output().unwrap();
+    assert_eq!(json.status.code(), Some(2));
+    assert!(json.stderr.is_empty());
+    let stdout = String::from_utf8(json.stdout).unwrap();
+    assert!(stdout.contains("\"code\":\"DV0003\""));
+    assert!(stdout.contains("\"name\":\"forwarded_argument_count\",\"value\":\"4\""));
+    assert!(stdout.contains("\"args\":[\"--json\""));
+    assert!(stdout.contains("\"--no-color\",\"--verbosity\",\"loud\",\"\"]"));
+  }
+}
+
+#[test]
+fn delimiter_on_non_child_commands_fails_before_discovery() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ definitely not JSON");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  for arguments in [
+    vec!["sdk", "current", "--", "opaque"],
+    vec!["project", "inspect", "Broken.csproj", "--", "opaque"],
+    vec!["build", "--plan", "Broken.csproj", "--", "opaque"],
+    vec!["restore", "Broken.csproj", "--", "--offline"],
+    vec!["sync", "Broken.csproj", "--"],
+  ] {
+    let output = dv().args(&arguments).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0002]"), "arguments={arguments:?}: {stderr}");
+    assert!(stderr.contains("unknown"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV01"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV02"), "arguments={arguments:?}: {stderr}");
+  }
+
+  assert!(!temp.0.join("obj").exists());
+}
+
+#[test]
 fn explicit_color_policy_affects_only_human_diagnostics() {
   let colored = dv().args(["frobnicate", "--color"]).output().unwrap();
   let plain = dv().args(["frobnicate", "--no-color"]).output().unwrap();

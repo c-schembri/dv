@@ -1,6 +1,7 @@
 use std::{
   ffi::{OsStr, OsString},
   mem::{align_of, size_of},
+  num::NonZeroUsize,
   ops::Index,
 };
 
@@ -145,9 +146,12 @@ const _: () = assert!(align_of::<InvocationRequest>() == align_of::<usize>());
 pub(crate) struct InvocationBatch {
   raw_arguments: RawArguments,
   semantic_indices: Option<SemanticIndices>,
+  forwarded_index: Option<NonZeroUsize>,
   request: InvocationRequest,
   option_error: Option<String>,
 }
+
+const _: () = assert!(size_of::<Option<NonZeroUsize>>() == size_of::<usize>());
 
 const INLINE_SEMANTIC_ARGUMENTS: usize = 16;
 
@@ -246,6 +250,13 @@ impl RawArguments {
       Self::Empty | Self::One(_) => &[],
     }
   }
+
+  fn range(&self, start: usize, end: usize) -> &[OsString] {
+    match self {
+      Self::Many(arguments) => arguments.get(start..end).unwrap_or_default(),
+      Self::Empty | Self::One(_) => &[],
+    }
+  }
 }
 
 impl InvocationBatch {
@@ -257,9 +268,16 @@ impl InvocationBatch {
     let mut color_explicit = false;
     let mut command_index = None;
     let mut semantic_indices = None::<SemanticIndices>;
+    let mut forwarded_index = None;
     let mut option_error = None;
     let mut index = 0;
     while raw_arguments.get(index).is_some() {
+      if raw_arguments.get(index).is_some_and(|argument| argument == "--")
+        && command_index.is_some_and(|command| accepts_forwarded_arguments(raw_arguments.get(command).expect("command index is valid")))
+      {
+        forwarded_index = NonZeroUsize::new(index + 1);
+        break;
+      }
       match parse_global_option(&raw_arguments, index, &mut globals, &mut mode, &mut compat_explicit, &mut color_explicit) {
         Ok(Some(width)) => {
           if let Some(command) = command_index
@@ -308,6 +326,7 @@ impl InvocationBatch {
     Self {
       raw_arguments,
       semantic_indices,
+      forwarded_index,
       request: InvocationRequest {
         command_index: command_index.unwrap_or(usize::MAX),
         syntax_version: COMMAND_SYNTAX_VERSION,
@@ -333,9 +352,10 @@ impl InvocationBatch {
 
   pub(crate) fn command_arguments(&self) -> CommandArguments<'_> {
     let start = self.request.command_index.saturating_add(1);
+    let end = self.forwarded_index.map(|index| index.get() - 1);
     CommandArguments {
       storage: self.semantic_indices.as_ref().map_or_else(
-        || CommandArgumentStorage::Direct(self.raw_arguments.after(start)),
+        || CommandArgumentStorage::Direct(end.map_or_else(|| self.raw_arguments.after(start), |end| self.raw_arguments.range(start, end))),
         |indices| CommandArgumentStorage::Indexed {
           raw: &self.raw_arguments,
           indices,
@@ -343,6 +363,12 @@ impl InvocationBatch {
       ),
       start: 0,
     }
+  }
+
+  pub(crate) fn forwarded_arguments(&self) -> Option<ForwardedArguments<'_>> {
+    self.forwarded_index.map(|index| ForwardedArguments {
+      values: self.raw_arguments.after(index.get()),
+    })
   }
 
   pub(crate) fn option_error(&self) -> Option<&str> {
@@ -360,6 +386,20 @@ impl InvocationBatch {
   #[cfg(test)]
   fn raw_arguments(&self) -> Vec<&OsString> {
     self.raw_arguments.iter().collect()
+  }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardedArguments<'a> {
+  values: &'a [OsString],
+}
+
+const _: () = assert!(size_of::<ForwardedArguments<'static>>() == 16);
+const _: () = assert!(align_of::<ForwardedArguments<'static>>() == align_of::<usize>());
+
+impl<'a> ForwardedArguments<'a> {
+  pub(crate) fn as_slice(self) -> &'a [OsString] {
+    self.values
   }
 }
 
@@ -526,6 +566,10 @@ fn classify_command(command: &OsStr) -> CommandKind {
   }
 }
 
+fn accepts_forwarded_arguments(command: &OsStr) -> bool {
+  matches!(command.to_str(), Some("run" | "test"))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -543,6 +587,74 @@ mod tests {
     assert_eq!(batch.raw_arguments(), ["--json", "restore", "", "App.csproj"]);
     assert!(batch.event_arguments(false).is_empty());
     assert_eq!(batch.event_arguments(true), ["--json", "restore", "", "App.csproj"]);
+  }
+
+  #[test]
+  fn delimiter_splits_one_borrowed_lossless_forwarding_batch() {
+    let opaque = non_unicode_argument();
+    let batch = InvocationBatch::capture([
+      OsString::from("run"),
+      OsString::from("--quiet"),
+      OsString::from("project.csproj"),
+      OsString::from("--"),
+      OsString::from("--json"),
+      OsString::from(""),
+      OsString::from("--"),
+      OsString::from("--compat=msbuild"),
+      opaque.clone(),
+    ]);
+
+    assert_eq!(batch.request().command, CommandKind::KnownUnimplemented);
+    assert_eq!(batch.request().options().verbosity(), DiagnosticVerbosity::Quiet);
+    assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("project.csproj")]);
+    let forwarded = batch.forwarded_arguments().expect("delimiter creates a forwarded batch");
+    assert_eq!(batch.request().mode, InvocationMode::Native);
+    assert_eq!(forwarded.as_slice().len(), 5);
+    assert_eq!(
+      forwarded.as_slice(),
+      [
+        OsString::from("--json"),
+        OsString::from(""),
+        OsString::from("--"),
+        OsString::from("--compat=msbuild"),
+        opaque
+      ]
+    );
+  }
+
+  #[test]
+  fn empty_forwarding_tail_is_distinct_from_no_delimiter() {
+    let delimited = InvocationBatch::capture([OsString::from("test"), OsString::from("--")]);
+    let plain = InvocationBatch::capture([OsString::from("test")]);
+
+    assert!(delimited.forwarded_arguments().is_some_and(|arguments| arguments.as_slice().is_empty()));
+    assert!(plain.forwarded_arguments().is_none());
+  }
+
+  #[test]
+  fn large_forwarding_tail_remains_one_direct_slice() {
+    let mut arguments = vec![OsString::from("run"), OsString::from("--")];
+    arguments.extend((0..64).map(|index| OsString::from(format!("value-{index}"))));
+    let batch = InvocationBatch::capture(arguments);
+
+    assert!(batch.semantic_indices.is_none());
+    assert_eq!(batch.command_arguments().len(), 0);
+    let forwarded = batch.forwarded_arguments().expect("delimiter creates a forwarded batch");
+    assert_eq!(forwarded.as_slice().len(), 64);
+    assert_eq!(forwarded.as_slice().first().map(OsString::as_os_str), Some(OsStr::new("value-0")));
+    assert_eq!(forwarded.as_slice().last().map(OsString::as_os_str), Some(OsStr::new("value-63")));
+  }
+
+  #[cfg(unix)]
+  fn non_unicode_argument() -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(vec![0xff, b'x'])
+  }
+
+  #[cfg(windows)]
+  fn non_unicode_argument() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    OsString::from_wide(&[0xd800, b'x' as u16])
   }
 
   #[test]
