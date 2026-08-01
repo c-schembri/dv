@@ -38,6 +38,7 @@ enum CaseKind {
   PackageGraphMassive,
   PackageAssetPlan,
   PackageReferenceMetadata,
+  PackagePruning,
   NuspecFrameworkMetadata,
   PackageRidContentCold,
   PackageRidContentWarm,
@@ -273,6 +274,21 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "MetadataProject.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_pruning",
+    kind: CaseKind::PackagePruning,
+    args: &[
+      "restore",
+      "LegacyPruningProject.csproj",
       "--locked-mode",
       "--packages",
       ".packages",
@@ -729,6 +745,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_pruning",
+    kind: CaseKind::PackagePruning,
+    args: &["restore", "LegacyPruningProject.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuspec_framework_metadata",
     kind: CaseKind::NuspecFrameworkMetadata,
     args: &["restore", "FrameworkMetadata.csproj", "--packages", ".packages", "--offline", "--json"],
@@ -1110,6 +1132,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "package_reference_metadata") {
     verify_package_reference_metadata(&repository, &dv_executable, &package_reference_metadata_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_pruning") {
+    verify_package_pruning(&repository, &dv_executable, &package_reference_metadata_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "nuspec_framework_metadata") {
     verify_nuspec_framework_metadata(&repository, &dv_executable, &nuspec_framework_metadata_fixture)?;
@@ -2417,6 +2442,38 @@ fn verify_package_reference_metadata(repository: &Path, dv_executable: &Path, fi
     return Err("dv compiler plan generated a different package property name".into());
   }
   assert_relative_policy_path(plan_property, "value", &dv_workspace, ".packages/newtonsoft.json/13.0.3")?;
+  Ok(())
+}
+
+fn verify_package_pruning(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  verify_package_sync(repository, dv_executable, fixture, "LegacyPruningProject.csproj", 1)?;
+  let oracle_text = command_text(
+    Path::new("dotnet"),
+    &[
+      "msbuild",
+      "LegacyPruningProject.csproj",
+      "--nologo",
+      "-target:AddPrunePackageReferences",
+      "-getItem:PrunePackageReference",
+    ],
+    fixture,
+  )?;
+  let oracle: serde_json::Value = serde_json::from_str(&oracle_text)?;
+  let packages = oracle
+    .pointer("/Items/PrunePackageReference")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("package-pruning oracle omitted PrunePackageReference items")?;
+  if packages.len() != 420 {
+    return Err(format!("package-pruning oracle expected 420 merged .NET 9 identities, found {}", packages.len()).into());
+  }
+  for (id, version) in [("System.IO.Pipelines", "9.0.32767"), ("System.Text.Json", "9.0.32767")] {
+    let matched = packages.iter().any(|package| {
+      package.get("Identity").and_then(serde_json::Value::as_str) == Some(id) && package.get("Version").and_then(serde_json::Value::as_str) == Some(version)
+    });
+    if !matched {
+      return Err(format!("package-pruning oracle omitted {id} {version}").into());
+    }
+  }
   Ok(())
 }
 
@@ -4983,6 +5040,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
+      | CaseKind::PackagePruning
       | CaseKind::NuspecFrameworkMetadata
       | CaseKind::PackageRidContentCold
       | CaseKind::PackageRidContentWarm
@@ -5318,6 +5376,33 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
         &["restore", "MetadataProject.csproj", "--packages", ".packages", "--json"],
         workspace,
         "PackageReference metadata setup",
+      )?;
+    }
+  }
+  if matches!(case.kind, CaseKind::PackagePruning) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "LegacyPruningProject.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "package-pruning setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "LegacyPruningProject.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "package-pruning setup",
       )?;
     }
   }
@@ -6390,6 +6475,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan
     | CaseKind::PackageReferenceMetadata
+    | CaseKind::PackagePruning
     | CaseKind::PackageRidContentWarm
     | CaseKind::CentralPackageManagement
     | CaseKind::NugetConfigHierarchy
@@ -6473,7 +6559,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
-    CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
+    CaseKind::PackageReferenceMetadata | CaseKind::PackagePruning => fixtures.package_reference_metadata,
     CaseKind::NuspecFrameworkMetadata => fixtures.nuspec_framework_metadata,
     CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => fixtures.package_rid_content,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
@@ -6509,7 +6595,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
-    CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
+    CaseKind::PackageReferenceMetadata | CaseKind::PackagePruning => Some("package-reference-metadata"),
     CaseKind::NuspecFrameworkMetadata => Some("nuspec-framework-metadata"),
     CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => Some("package-rid-content"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
@@ -6599,6 +6685,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageGraphMassive
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
+        | CaseKind::PackagePruning
         | CaseKind::NuspecFrameworkMetadata
         | CaseKind::PackageRidContentCold
         | CaseKind::PackageRidContentWarm
@@ -7294,6 +7381,7 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "package_graph_massive"
           | "package_asset_plan"
           | "package_reference_metadata"
+          | "package_pruning"
           | "package_rid_content_cold"
           | "package_rid_content_warm"
           | "package_sync_warm"
@@ -7439,6 +7527,7 @@ fn case_label(case: &str) -> &str {
     "package_graph_massive" => "Cold massive solution graph",
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
+    "package_pruning" => "Legacy package pruning",
     "nuspec_framework_metadata" => "NuGet framework metadata",
     "package_rid_content_cold" => "Cold RID/content asset plan",
     "package_rid_content_warm" => "Warm RID/content asset plan",

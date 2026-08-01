@@ -536,6 +536,27 @@ cargo bench-all --case nuspec_framework_metadata --samples 30 --warmups 3
 The curated distribution is retained in the
 [nuspec framework-metadata baseline](performance-baselines/2026-08-01-nuspec-framework-metadata-windows.md).
 
+Package pruning evaluates `RestoreEnablePackagePruning` and
+`AllowMissingPrunePackageData` once. .NET 9 and earlier select generated
+effective tables derived from the pinned Microsoft SDK source revision; .NET
+10 and later read the selected SDK's historical Core data or the highest
+matching reference-pack `PackageOverrides.txt`. Direct framework profiles are
+reduced through the selected SDK manifest to Core, ASP.NET, or WindowsDesktop
+runtime names. Missing WindowsDesktop pack data uses Microsoft's nearest
+generated framework fallback. The merged identity/version batch is sorted,
+deduplicated by maximum upper version, compacted into 32-byte rows, and hashed
+semantically for warm-lock invalidation.
+
+The maintained .NET 9 Core + ASP.NET case runs with one locked package and no
+network work:
+
+```powershell
+cargo bench-all --case package_pruning --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[package-pruning baseline](performance-baselines/2026-08-01-package-pruning-windows.md).
+
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties
 through MSBuild, and compares global/fallback/HTTP/temp paths, signature and

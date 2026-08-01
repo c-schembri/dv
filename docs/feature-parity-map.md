@@ -983,12 +983,16 @@ boundary, not final drop-in parity.
   Windows-fallback projects verify all asset families. Thirty Windows samples
   measure cold local restore at `600.782 ms` versus `23.186 ms` (`25.9x`) and
   warm locked restore at `456.098 ms` versus `7.589 ms` (`60.1x`). `P2`
-- [~] `RES-012` .NET 10 package pruning reads the selected SDK's
-  `PrunePackageData` or matching reference-pack `PackageOverrides.txt`, applies
-  the SDK's stable patch ceiling, retracts pruned graph edges, and fingerprints
-  the semantic table in lock schema 2. Generated .NET 9-and-earlier pruning
-  tables, compatible-framework reduction, and framework fallback remain.
-  `P2`
+- [x] `RES-012` Package pruning evaluates the SDK properties and direct
+  framework profiles, reads .NET 10-and-later data from the selected SDK or
+  highest matching reference pack, and uses generated authoritative effective
+  tables for .NET Standard and .NET 9-and-earlier targets. Core, ASP.NET, and
+  WindowsDesktop batches merge by greatest upper version; WindowsDesktop uses
+  the SDK's nearest compatible generated fallback. Stable package versions get
+  the SDK's patch ceiling, pruned graph edges retract, and the compact semantic
+  table fingerprints warm locks. The generated .NET 8/9 Core and ASP.NET
+  counts match MSBuild at 418/420. Thirty warm samples measure `636.670 ms`
+  for Microsoft restore versus `9.698 ms` for `dv` (`65.7x`). `P2`
 - [x] `RES-013` Stream exact `.nupkg` content through SHA-512 into bounded
   temporary storage. `P1`
 - [x] `RES-014` Verify package identity, version, v2 source hash/size, ZIP

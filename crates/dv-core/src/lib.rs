@@ -6,6 +6,7 @@ mod diagnostic;
 mod event;
 mod framework;
 mod framework_reference;
+mod legacy_pruning;
 mod pack_requirement;
 mod package;
 mod project;

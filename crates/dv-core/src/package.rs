@@ -34,7 +34,10 @@ use crate::{
   BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
   PackageCancellation, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
   credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
-  discover_sdks, load_portable_runtime_graph,
+  discover_sdks,
+  framework_reference::package_pruning_runtime_names,
+  legacy_pruning::{LegacyPrunePackage, PruningFramework, exact_legacy_pruning, nearest_legacy_pruning},
+  load_portable_runtime_graph,
 };
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
@@ -3333,7 +3336,7 @@ fn resolve_project(
   let central_pins = central_package_pins(project)?;
   let target = project.target();
   let target_text = project.target_framework();
-  let pruning = discover_package_pruning(project.project_directory(), target, inventory)?;
+  let pruning = discover_package_pruning(project, inventory)?;
   let runtime_graph_fingerprint = runtime_compatibility_fingerprint(project.runtime_identifier(), runtime_graph)?;
   if let Some(resolution) = read_warm_lock(&lock_path, &config, &direct, project, &pruning.fingerprint, &runtime_graph_fingerprint)? {
     return Ok(resolution);
@@ -3492,7 +3495,9 @@ fn central_package_pins(project: &ProjectSpec) -> Result<Vec<CentralPackagePin>,
 }
 
 fn discover_project_sdk(project: &ProjectSpec) -> Result<Option<SdkInventory>, PackageError> {
-  if project.runtime_identifier().is_none() && (project.target().family() != FrameworkFamily::Net || project.target().major() < 10) {
+  let pruning_needs_sdk = project.restore_package_pruning_enabled()
+    && ((project.target().family() == FrameworkFamily::Net && project.target().major() >= 10) || !project.framework_references().is_empty());
+  if project.runtime_identifier().is_none() && !pruning_needs_sdk {
     return Ok(None);
   }
   discover_sdks(project.project_directory()).map(Some).map_err(|error| {
@@ -3523,57 +3528,189 @@ fn runtime_compatibility_fingerprint(runtime_identifier: Option<&str>, runtime_g
   Ok(BASE64.encode(hasher.finalize()))
 }
 
-fn discover_package_pruning(project_directory: &Path, target: TargetFramework, inventory: Option<&SdkInventory>) -> Result<PackagePruning, PackageError> {
-  if target.family() != FrameworkFamily::Net || target.major() < 10 {
+fn discover_package_pruning(project: &ProjectSpec, inventory: Option<&SdkInventory>) -> Result<PackagePruning, PackageError> {
+  if !project.restore_package_pruning_enabled() {
     return Ok(PackagePruning::default());
+  }
+
+  let target = project.target();
+  if target.family() == FrameworkFamily::NetFramework {
+    if project.allow_missing_prune_package_data() {
+      return compact_package_pruning(Vec::new());
+    }
+    return Err(missing_pruning_data(project, PruningFramework::Default));
+  }
+
+  let mut packages = Vec::new();
+  if target.family() == FrameworkFamily::NetStandard && project.framework_references().is_empty() {
+    let found = extend_legacy_pruning(&mut packages, project, PruningFramework::Default, false)?;
+    if !found && !project.allow_missing_prune_package_data() {
+      return Err(missing_pruning_data(project, PruningFramework::Default));
+    }
+    return compact_package_pruning(packages);
+  }
+
+  let needs_sdk = (target.family() == FrameworkFamily::Net && target.major() >= 10) || !project.framework_references().is_empty();
+  if !needs_sdk {
+    if target.family() != FrameworkFamily::NetStandard {
+      let found = extend_legacy_pruning(&mut packages, project, PruningFramework::Core, true)?;
+      if !found && !project.allow_missing_prune_package_data() {
+        return Err(missing_pruning_data(project, PruningFramework::Core));
+      }
+    }
+    return compact_package_pruning(packages);
   }
 
   let discovered;
   let inventory = if let Some(inventory) = inventory {
     inventory
   } else {
-    discovered = discover_sdks(project_directory).map_err(|error| {
+    discovered = discover_sdks(project.project_directory()).map_err(|error| {
       PackageError::new(
         PackageErrorKind::Configuration,
-        project_directory.display().to_string(),
+        project.project_directory().display().to_string(),
         format!("failed to select the SDK needed for package pruning: {error}"),
       )
     })?;
     &discovered
   };
-  let selected = inventory.selected();
-  let framework_version = target.framework_version();
-  let sdk_data = inventory
-    .installation_path(selected)
-    .join("PrunePackageData")
-    .join(&framework_version)
-    .join("Microsoft.NETCore.App")
-    .join("PackageOverrides.txt");
-  if sdk_data.is_file() {
-    return read_package_pruning(&sdk_data);
+
+  let frameworks = pruning_framework_batch(project, Some(inventory))?;
+
+  if target.family() != FrameworkFamily::Net || target.major() < 10 {
+    for kind in frameworks.iter() {
+      let found = extend_legacy_pruning(&mut packages, project, kind, target.family() != FrameworkFamily::NetStandard)?;
+      if !found && !project.allow_missing_prune_package_data() {
+        return Err(missing_pruning_data(project, kind));
+      }
+    }
+    return compact_package_pruning(packages);
   }
 
-  let pack_root = inventory.root(selected).join("packs").join("Microsoft.NETCore.App.Ref");
-  let pack = select_targeting_pack(&pack_root, target)?;
-  let pack_data = pack.join("data").join("PackageOverrides.txt");
-  if !pack_data.is_file() {
-    return Err(PackageError::new(
-      PackageErrorKind::Configuration,
-      pack_data.display().to_string(),
-      format!("selected SDK {} has no package-pruning data for net{}", selected.version, framework_version),
-    ));
+  for kind in frameworks.iter() {
+    let found = extend_modern_pruning(&mut packages, project, inventory, kind)?;
+    if !found && !project.allow_missing_prune_package_data() {
+      return Err(missing_pruning_data(project, kind));
+    }
   }
-  read_package_pruning(&pack_data)
+  compact_package_pruning(packages)
 }
 
-fn select_targeting_pack(root: &Path, target: TargetFramework) -> Result<PathBuf, PackageError> {
-  let entries = fs::read_dir(root).map_err(|error| package_io("enumerate targeting packs", root, error))?;
+#[derive(Clone, Copy)]
+struct PruningFrameworkBatch {
+  values: [PruningFramework; 3],
+  len: u8,
+}
+
+const _: () = assert!(size_of::<PruningFrameworkBatch>() == 4);
+const _: () = assert!(align_of::<PruningFrameworkBatch>() == 1);
+
+impl PruningFrameworkBatch {
+  fn empty() -> Self {
+    Self {
+      values: [PruningFramework::Default; 3],
+      len: 0,
+    }
+  }
+
+  fn push(&mut self, framework: PruningFramework) {
+    if !self.iter().any(|existing| existing == framework) {
+      debug_assert!(usize::from(self.len) < self.values.len());
+      self.values[usize::from(self.len)] = framework;
+      self.len += 1;
+    }
+  }
+
+  fn iter(&self) -> impl Iterator<Item = PruningFramework> + '_ {
+    self.values[..usize::from(self.len)].iter().copied()
+  }
+}
+
+fn pruning_framework_batch(project: &ProjectSpec, inventory: Option<&SdkInventory>) -> Result<PruningFrameworkBatch, PackageError> {
+  let mut batch = PruningFrameworkBatch::empty();
+  match project.target().family() {
+    FrameworkFamily::Net | FrameworkFamily::NetCoreApp => batch.push(PruningFramework::Core),
+    FrameworkFamily::NetStandard => batch.push(PruningFramework::Default),
+    FrameworkFamily::NetFramework => return Ok(batch),
+  }
+  let mut needs_manifest = false;
+  for reference in project.framework_references() {
+    if let Some(framework) = pruning_framework_kind(project.framework_reference_id(*reference)) {
+      batch.push(framework);
+    } else {
+      needs_manifest = true;
+    }
+  }
+  if needs_manifest {
+    let inventory = inventory.ok_or_else(|| {
+      PackageError::new(
+        PackageErrorKind::Configuration,
+        project.project_path().display().to_string(),
+        "framework-profile pruning requires the selected SDK inventory",
+      )
+    })?;
+    let runtime_names = package_pruning_runtime_names(project, inventory).map_err(|error| {
+      PackageError::new(
+        PackageErrorKind::Configuration,
+        error.path().display().to_string(),
+        format!("failed to map package-pruning framework references: {error}"),
+      )
+    })?;
+    for runtime_name in runtime_names {
+      if let Some(framework) = pruning_framework_kind(&runtime_name) {
+        batch.push(framework);
+      }
+    }
+  }
+  Ok(batch)
+}
+
+fn extend_modern_pruning(
+  packages: &mut Vec<ParsedPrunedPackage>,
+  project: &ProjectSpec,
+  inventory: &SdkInventory,
+  framework: PruningFramework,
+) -> Result<bool, PackageError> {
+  let target = project.target();
+  let selected = inventory.selected();
+  let sdk_data_root = inventory.installation_path(selected).join("PrunePackageData");
+  let pack_root = inventory
+    .root(selected)
+    .join("packs")
+    .join(format!("{}.Ref", pruning_framework_name(framework)));
+  let sdk_data = sdk_data_root
+    .join(target.framework_version())
+    .join(pruning_framework_name(framework))
+    .join("PackageOverrides.txt");
+  if framework == PruningFramework::Core && sdk_data.is_file() {
+    extend_parsed_pruning(packages, parse_package_pruning(&sdk_data)?)?;
+    return Ok(true);
+  }
+  if let Some(pack_data) = select_pruning_pack_data(&pack_root, target.major(), target.minor())? {
+    extend_parsed_pruning(packages, parse_package_pruning(&pack_data)?)?;
+    return Ok(true);
+  }
+  if framework == PruningFramework::WindowsDesktop
+    && let Some(table) = nearest_legacy_pruning(target.family(), target.major(), target.minor(), framework)
+  {
+    extend_legacy_packages(packages, table, true)?;
+    return Ok(true);
+  }
+  Ok(false)
+}
+
+fn select_pruning_pack_data(root: &Path, major: u16, minor: u16) -> Result<Option<PathBuf>, PackageError> {
+  let entries = match fs::read_dir(root) {
+    Ok(entries) => entries,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(package_io("enumerate package-pruning packs", root, error)),
+  };
   let mut selected = None::<(PackageVersion, PathBuf)>;
   for entry in entries {
-    let entry = entry.map_err(|error| package_io("enumerate targeting packs", root, error))?;
+    let entry = entry.map_err(|error| package_io("enumerate package-pruning packs", root, error))?;
     if !entry
       .file_type()
-      .map_err(|error| package_io("inspect targeting pack", &entry.path(), error))?
+      .map_err(|error| package_io("inspect package-pruning pack", &entry.path(), error))?
       .is_dir()
     {
       continue;
@@ -3584,23 +3721,109 @@ fn select_targeting_pack(root: &Path, target: TargetFramework) -> Result<PathBuf
     let Ok(version) = PackageVersion::parse(&value) else {
       continue;
     };
-    if version.prerelease().is_some() || version.numbers[0] != u32::from(target.major()) || version.numbers[1] != u32::from(target.minor()) {
+    let data = entry.path().join("data").join("PackageOverrides.txt");
+    if version.prerelease().is_some() || version.numbers[0] != u32::from(major) || version.numbers[1] != u32::from(minor) || !data.is_file() {
       continue;
     }
     if selected.as_ref().is_none_or(|(current, _)| version > *current) {
-      selected = Some((version, entry.path()));
+      selected = Some((version, data));
     }
   }
-  selected.map(|(_, path)| path).ok_or_else(|| {
-    PackageError::new(
-      PackageErrorKind::Configuration,
-      root.display().to_string(),
-      format!("selected SDK has no Microsoft.NETCore.App reference pack for net{}", target.framework_version()),
-    )
-  })
+  Ok(selected.map(|(_, path)| path))
 }
 
-fn read_package_pruning(path: &Path) -> Result<PackagePruning, PackageError> {
+fn extend_parsed_pruning(packages: &mut Vec<ParsedPrunedPackage>, selected: Vec<ParsedPrunedPackage>) -> Result<(), PackageError> {
+  if packages.len().saturating_add(selected.len()) > MAX_PRUNE_PACKAGES {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      "package-pruning data",
+      format!("merged package-pruning data exceeds {MAX_PRUNE_PACKAGES} entries"),
+    ));
+  }
+  packages.extend(selected);
+  Ok(())
+}
+
+fn pruning_framework_kind(runtime_name: &str) -> Option<PruningFramework> {
+  if runtime_name.eq_ignore_ascii_case("Microsoft.NETCore.App") {
+    Some(PruningFramework::Core)
+  } else if runtime_name.eq_ignore_ascii_case("Microsoft.AspNetCore.App") {
+    Some(PruningFramework::AspNetCore)
+  } else if runtime_name.eq_ignore_ascii_case("Microsoft.WindowsDesktop.App") {
+    Some(PruningFramework::WindowsDesktop)
+  } else {
+    None
+  }
+}
+
+fn extend_legacy_pruning(
+  packages: &mut Vec<ParsedPrunedPackage>,
+  project: &ProjectSpec,
+  framework: PruningFramework,
+  stable_patch_ceiling: bool,
+) -> Result<bool, PackageError> {
+  let target = project.target();
+  if let Some(table) = exact_legacy_pruning(target.family(), target.major(), target.minor(), framework) {
+    extend_legacy_packages(packages, table, stable_patch_ceiling)?;
+    return Ok(true);
+  }
+  Ok(false)
+}
+
+fn missing_pruning_data(project: &ProjectSpec, framework: PruningFramework) -> PackageError {
+  PackageError::new(
+    PackageErrorKind::Configuration,
+    project.project_path().display().to_string(),
+    format!(
+      "selected SDK has no package-pruning data for {} {}",
+      project.target_framework(),
+      pruning_framework_name(framework)
+    ),
+  )
+}
+
+fn pruning_framework_name(framework: PruningFramework) -> &'static str {
+  match framework {
+    PruningFramework::Default => "",
+    PruningFramework::Core => "Microsoft.NETCore.App",
+    PruningFramework::AspNetCore => "Microsoft.AspNetCore.App",
+    PruningFramework::WindowsDesktop => "Microsoft.WindowsDesktop.App",
+  }
+}
+
+fn extend_legacy_packages(packages: &mut Vec<ParsedPrunedPackage>, table: &[LegacyPrunePackage], stable_patch_ceiling: bool) -> Result<(), PackageError> {
+  if packages.len().saturating_add(table.len()) > MAX_PRUNE_PACKAGES {
+    return Err(PackageError::new(
+      PackageErrorKind::Configuration,
+      "generated package-pruning data",
+      format!("merged package-pruning data exceeds {MAX_PRUNE_PACKAGES} entries"),
+    ));
+  }
+  packages.reserve(table.len());
+  for package in table {
+    let numbers = if stable_patch_ceiling {
+      [package.numbers[0], package.numbers[1], 32_767, 0]
+    } else {
+      package.numbers
+    };
+    let normalized = if numbers[3] == 0 {
+      format!("{}.{}.{}", numbers[0], numbers[1], numbers[2])
+    } else {
+      format!("{}.{}.{}.{}", numbers[0], numbers[1], numbers[2], numbers[3])
+    };
+    packages.push(ParsedPrunedPackage {
+      lower_id: package.id.to_owned(),
+      upper: PackageVersion {
+        normalized,
+        numbers,
+        prerelease_start: None,
+      },
+    });
+  }
+  Ok(())
+}
+
+fn parse_package_pruning(path: &Path) -> Result<Vec<ParsedPrunedPackage>, PackageError> {
   let bytes = fs::read(path).map_err(|error| package_io("read package-pruning data", path, error))?;
   if bytes.len() as u64 > MAX_PRUNE_DATA_BYTES {
     return Err(PackageError::new(
@@ -3657,7 +3880,12 @@ fn read_package_pruning(path: &Path) -> Result<PackagePruning, PackageError> {
       upper,
     });
   }
-  compact_package_pruning(packages)
+  Ok(packages)
+}
+
+#[cfg(test)]
+fn read_package_pruning(path: &Path) -> Result<PackagePruning, PackageError> {
+  compact_package_pruning(parse_package_pruning(path)?)
 }
 
 fn compact_package_pruning(mut packages: Vec<ParsedPrunedPackage>) -> Result<PackagePruning, PackageError> {
@@ -11115,6 +11343,74 @@ mod tests {
     assert!(pruning.contains("system.runtime.compilerservices.unsafe", &PackageVersion::parse("7.0.19").unwrap()));
     assert_eq!(pruning.packages.len(), 2);
     assert!(!pruning.fingerprint.is_empty());
+  }
+
+  #[test]
+  fn generated_net8_and_net9_tables_match_the_sdk_oracle() {
+    let mut net8 = Vec::new();
+    let mut net9 = Vec::new();
+    let net8_target = TargetFramework::parse("net8.0").unwrap();
+    let net9_target = TargetFramework::parse("net9.0").unwrap();
+    let net8_table = exact_legacy_pruning(net8_target.family(), net8_target.major(), net8_target.minor(), PruningFramework::Core).unwrap();
+    let net9_table = exact_legacy_pruning(net9_target.family(), net9_target.major(), net9_target.minor(), PruningFramework::Core).unwrap();
+    extend_legacy_packages(&mut net8, net8_table, true).unwrap();
+    extend_legacy_packages(&mut net9, net9_table, true).unwrap();
+    extend_legacy_packages(
+      &mut net8,
+      exact_legacy_pruning(net8_target.family(), net8_target.major(), net8_target.minor(), PruningFramework::AspNetCore).unwrap(),
+      true,
+    )
+    .unwrap();
+    extend_legacy_packages(
+      &mut net9,
+      exact_legacy_pruning(net9_target.family(), net9_target.major(), net9_target.minor(), PruningFramework::AspNetCore).unwrap(),
+      true,
+    )
+    .unwrap();
+
+    let net8 = compact_package_pruning(net8).unwrap();
+    let net9 = compact_package_pruning(net9).unwrap();
+
+    assert_eq!(net8.packages.len(), 418);
+    assert_eq!(net9.packages.len(), 420);
+    assert!(net8.contains("system.text.json", &PackageVersion::parse("8.0.32767").unwrap()));
+    assert!(!net8.contains("system.text.json", &PackageVersion::parse("8.0.32768").unwrap()));
+    assert!(net9.contains("system.text.json", &PackageVersion::parse("9.0.32767").unwrap()));
+  }
+
+  #[test]
+  fn legacy_pruning_policy_rejects_missing_data_unless_explicitly_allowed() {
+    let temp = TempDirectory::new();
+    let missing_path = temp.write(
+      "Missing.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard3.0</TargetFramework><RestoreEnablePackagePruning>true</RestoreEnablePackagePruning></PropertyGroup></Project>"#,
+    );
+    let allowed_path = temp.write(
+      "Allowed.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard3.0</TargetFramework><RestoreEnablePackagePruning>true</RestoreEnablePackagePruning><AllowMissingPrunePackageData>true</AllowMissingPrunePackageData></PropertyGroup></Project>"#,
+    );
+    let framework_path = temp.write(
+      "Framework.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net48</TargetFramework><RestoreEnablePackagePruning>true</RestoreEnablePackagePruning></PropertyGroup></Project>"#,
+    );
+
+    let missing = evaluate_project_path(&missing_path, ProjectConfiguration::Debug).unwrap();
+    let allowed = evaluate_project_path(&allowed_path, ProjectConfiguration::Debug).unwrap();
+    let framework = evaluate_project_path(&framework_path, ProjectConfiguration::Debug).unwrap();
+    let allowed = discover_package_pruning(&allowed, None).unwrap();
+    let missing_error = match discover_package_pruning(&missing, None) {
+      Ok(_) => panic!("missing pruning data must fail"),
+      Err(error) => error,
+    };
+    let framework_error = match discover_package_pruning(&framework, None) {
+      Ok(_) => panic!(".NET Framework pruning without data must fail"),
+      Err(error) => error,
+    };
+
+    assert_eq!(missing_error.kind, PackageErrorKind::Configuration);
+    assert_eq!(framework_error.kind, PackageErrorKind::Configuration);
+    assert!(allowed.packages.is_empty());
+    assert!(!allowed.fingerprint.is_empty());
   }
 
   #[test]

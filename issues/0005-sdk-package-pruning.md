@@ -2,8 +2,7 @@
 
 ## Status
 
-Resolved for .NET 10 package pruning. Legacy generated tables are tracked in
-`0006-legacy-sdk-package-pruning.md`.
+Resolved for selected-SDK and generated legacy package pruning.
 
 ## Question
 

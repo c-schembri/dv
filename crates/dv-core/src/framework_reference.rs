@@ -8,7 +8,8 @@ use std::{
 use quick_xml::{Reader, XmlVersion, events::Event};
 
 use crate::{
-  FrameworkReference, PackAcquisition, PackKind, PackRequirement, ProjectSpec, RuntimeRollForward, SdkInventory, package::global_packages_directory,
+  FrameworkFamily, FrameworkReference, PackAcquisition, PackKind, PackRequirement, ProjectSpec, RuntimeRollForward, SdkInventory,
+  package::global_packages_directory,
 };
 
 const BUNDLED_VERSIONS_FILE: &str = "Microsoft.NETCoreSdk.BundledVersions.props";
@@ -288,6 +289,37 @@ pub fn plan_framework_references(
   Ok(plans.into_boxed_slice())
 }
 
+/// Maps one project's direct framework references through the selected SDK.
+///
+/// Package pruning depends only on runtime framework identities. Keeping this
+/// transform separate avoids pack and shared-runtime discovery during restore.
+pub(crate) fn package_pruning_runtime_names(project: &ProjectSpec, inventory: &SdkInventory) -> Result<Vec<String>, FrameworkReferenceError> {
+  let selected = inventory.selected();
+  let manifest = inventory.installation_path(selected).join(BUNDLED_VERSIONS_FILE);
+  let definitions = read_framework_definitions(&manifest, &[project])?;
+  let requested = package_pruning_requested_frameworks(project);
+  let mut frameworks = Vec::with_capacity(requested.len());
+  for request in requested {
+    let definition = definitions
+      .iter()
+      .find(|definition| definition.target_framework == project.target_framework() && definition.name.eq_ignore_ascii_case(request.name))
+      .ok_or_else(|| {
+        FrameworkReferenceError::new(
+          FrameworkReferenceErrorKind::UnknownFramework,
+          &manifest,
+          format!("selected SDK has no framework reference {:?} for {}", request.name, project.target_framework()),
+        )
+      })?;
+    if !frameworks
+      .iter()
+      .any(|runtime_name: &String| runtime_name.eq_ignore_ascii_case(&definition.runtime_name))
+    {
+      frameworks.push(definition.runtime_name.clone());
+    }
+  }
+  Ok(frameworks)
+}
+
 fn plan_project(
   project: &ProjectSpec,
   sdk_version: &str,
@@ -296,25 +328,7 @@ fn plan_project(
   dotnet_root: &Path,
   packages_directory: Option<&Path>,
 ) -> Result<FrameworkReferencePlan, FrameworkReferenceError> {
-  let explicit_core = project
-    .framework_references()
-    .iter()
-    .copied()
-    .find(|reference| project.framework_reference_id(*reference).eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE));
-  let mut requested = Vec::with_capacity(project.framework_references().len() + usize::from(explicit_core.is_none()));
-  requested.push(RequestedFramework {
-    name: IMPLICIT_FRAMEWORK_REFERENCE,
-    source: explicit_core,
-  });
-  for reference in project.framework_references() {
-    let name = project.framework_reference_id(*reference);
-    if !name.eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE) {
-      requested.push(RequestedFramework {
-        name,
-        source: Some(*reference),
-      });
-    }
-  }
+  let requested = requested_frameworks(project);
 
   let mut rows = Vec::with_capacity(requested.len());
   let mut global_packages = None;
@@ -385,6 +399,55 @@ fn plan_project(
   }
 
   materialize_plan(project, sdk_version, manifest, rows)
+}
+
+fn requested_frameworks(project: &ProjectSpec) -> Vec<RequestedFramework<'_>> {
+  let explicit_core = project
+    .framework_references()
+    .iter()
+    .copied()
+    .find(|reference| project.framework_reference_id(*reference).eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE));
+  let mut requested = Vec::with_capacity(project.framework_references().len() + usize::from(explicit_core.is_none()));
+  requested.push(RequestedFramework {
+    name: IMPLICIT_FRAMEWORK_REFERENCE,
+    source: explicit_core,
+  });
+  for reference in project.framework_references() {
+    let name = project.framework_reference_id(*reference);
+    if !name.eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE) {
+      requested.push(RequestedFramework {
+        name,
+        source: Some(*reference),
+      });
+    }
+  }
+  requested
+}
+
+fn package_pruning_requested_frameworks(project: &ProjectSpec) -> Vec<RequestedFramework<'_>> {
+  let explicit_core = project
+    .framework_references()
+    .iter()
+    .copied()
+    .find(|reference| project.framework_reference_id(*reference).eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE));
+  let has_implicit_core = matches!(project.target().family(), FrameworkFamily::Net | FrameworkFamily::NetCoreApp);
+  let mut requested = Vec::with_capacity(project.framework_references().len() + usize::from(has_implicit_core && explicit_core.is_none()));
+  if has_implicit_core {
+    requested.push(RequestedFramework {
+      name: IMPLICIT_FRAMEWORK_REFERENCE,
+      source: explicit_core,
+    });
+  }
+  for reference in project.framework_references() {
+    let name = project.framework_reference_id(*reference);
+    if !name.eq_ignore_ascii_case(IMPLICIT_FRAMEWORK_REFERENCE) || !has_implicit_core {
+      requested.push(RequestedFramework {
+        name,
+        source: Some(*reference),
+      });
+    }
+  }
+  requested
 }
 
 fn requested_runtime_version<'a>(project: &'a ProjectSpec, reference: Option<FrameworkReference>, definition: &'a KnownFramework) -> &'a str {

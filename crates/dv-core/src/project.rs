@@ -43,7 +43,7 @@ use quick_xml::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{BENCHMARK_CACHE_LINE_BYTES, TargetFramework};
+use crate::{BENCHMARK_CACHE_LINE_BYTES, FrameworkFamily, TargetFramework};
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
@@ -345,6 +345,8 @@ pub struct ProjectSpec {
   deterministic: bool,
   self_contained: bool,
   nuget_audit_enabled: bool,
+  restore_package_pruning: bool,
+  allow_missing_prune_package_data: bool,
   central_package_management: bool,
   central_transitive_pinning: bool,
   nuget_audit_mode: NugetAuditMode,
@@ -561,6 +563,16 @@ impl ProjectSpec {
     self.nuget_audit_enabled
   }
 
+  /// Returns whether framework-provided packages are pruned during restore.
+  pub fn restore_package_pruning_enabled(&self) -> bool {
+    self.restore_package_pruning
+  }
+
+  /// Returns whether missing SDK pruning data is tolerated.
+  pub fn allow_missing_prune_package_data(&self) -> bool {
+    self.allow_missing_prune_package_data
+  }
+
   /// Returns whether auditing covers direct or all dependencies.
   pub fn nuget_audit_mode(&self) -> NugetAuditMode {
     self.nuget_audit_mode
@@ -665,6 +677,8 @@ enum Property {
   NugetAudit,
   NugetAuditMode,
   NugetAuditLevel,
+  RestoreEnablePackagePruning,
+  AllowMissingPrunePackageData,
   ManagePackageVersionsCentrally,
   CentralPackageTransitivePinningEnabled,
   CentralPackageVersionOverrideEnabled,
@@ -741,6 +755,8 @@ struct RawProject {
   nuget_audit: Option<String>,
   nuget_audit_mode: Option<String>,
   nuget_audit_level: Option<String>,
+  restore_enable_package_pruning: Option<String>,
+  allow_missing_prune_package_data: Option<String>,
   manage_package_versions_centrally: Option<String>,
   central_package_transitive_pinning_enabled: Option<String>,
   central_package_version_override_enabled: Option<String>,
@@ -1529,6 +1545,8 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::NugetAudit => raw.nuget_audit = Some(text.to_owned()),
       Property::NugetAuditMode => raw.nuget_audit_mode = Some(text.to_owned()),
       Property::NugetAuditLevel => raw.nuget_audit_level = Some(text.to_owned()),
+      Property::RestoreEnablePackagePruning => raw.restore_enable_package_pruning = Some(text.to_owned()),
+      Property::AllowMissingPrunePackageData => raw.allow_missing_prune_package_data = Some(text.to_owned()),
       Property::ManagePackageVersionsCentrally => raw.manage_package_versions_centrally = Some(text.to_owned()),
       Property::CentralPackageTransitivePinningEnabled => raw.central_package_transitive_pinning_enabled = Some(text.to_owned()),
       Property::CentralPackageVersionOverrideEnabled => raw.central_package_version_override_enabled = Some(text.to_owned()),
@@ -1602,6 +1620,18 @@ fn materialize_project(
   let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
   let self_contained = parse_bool(&project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
   let nuget_audit_enabled = parse_bool(&project_path, "NuGetAudit", raw.nuget_audit.as_deref(), true)?;
+  let restore_package_pruning = parse_bool(
+    &project_path,
+    "RestoreEnablePackagePruning",
+    raw.restore_enable_package_pruning.as_deref(),
+    parsed_target.family() == FrameworkFamily::Net && parsed_target.major() >= 10,
+  )?;
+  let allow_missing_prune_package_data = parse_bool(
+    &project_path,
+    "AllowMissingPrunePackageData",
+    raw.allow_missing_prune_package_data.as_deref(),
+    false,
+  )?;
   let central_path = central.path.as_deref().unwrap_or(&project_path);
   let central_package_management = central.path.is_some()
     && parse_bool(
@@ -2034,6 +2064,8 @@ fn materialize_project(
     deterministic,
     self_contained,
     nuget_audit_enabled,
+    restore_package_pruning,
+    allow_missing_prune_package_data,
     central_package_management,
     central_transitive_pinning,
     nuget_audit_mode,
@@ -2466,6 +2498,8 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
     "NuGetAudit" => Ok(Property::NugetAudit),
     "NuGetAuditMode" => Ok(Property::NugetAuditMode),
     "NuGetAuditLevel" => Ok(Property::NugetAuditLevel),
+    "RestoreEnablePackagePruning" => Ok(Property::RestoreEnablePackagePruning),
+    "AllowMissingPrunePackageData" => Ok(Property::AllowMissingPrunePackageData),
     "ManagePackageVersionsCentrally" => Ok(Property::ManagePackageVersionsCentrally),
     "CentralPackageTransitivePinningEnabled" => Ok(Property::CentralPackageTransitivePinningEnabled),
     "CentralPackageVersionOverrideEnabled" => Ok(Property::CentralPackageVersionOverrideEnabled),
@@ -2989,6 +3023,29 @@ mod tests {
     assert!(defaulted.nuget_audit_enabled());
     assert_eq!(defaulted.nuget_audit_mode(), NugetAuditMode::All);
     assert_eq!(defaulted.nuget_audit_level(), NugetAuditLevel::Low);
+  }
+
+  #[test]
+  fn evaluates_package_pruning_defaults_and_explicit_legacy_opt_in() {
+    let temp = TempDirectory::new();
+    let net10 = temp.write("Net10.csproj", &project_xml("", ""));
+    let net9 = temp.write(
+      "Net9.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>"#,
+    );
+    let opted_in = temp.write(
+      "Net9OptIn.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net9.0</TargetFramework><RestoreEnablePackagePruning>true</RestoreEnablePackagePruning><AllowMissingPrunePackageData>true</AllowMissingPrunePackageData></PropertyGroup></Project>"#,
+    );
+
+    let net10 = evaluate_project_path(&net10, ProjectConfiguration::Debug).unwrap();
+    let net9 = evaluate_project_path(&net9, ProjectConfiguration::Debug).unwrap();
+    let opted_in = evaluate_project_path(&opted_in, ProjectConfiguration::Debug).unwrap();
+
+    assert!(net10.restore_package_pruning_enabled());
+    assert!(!net9.restore_package_pruning_enabled());
+    assert!(opted_in.restore_package_pruning_enabled());
+    assert!(opted_in.allow_missing_prune_package_data());
   }
 
   #[test]
