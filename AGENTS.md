@@ -235,6 +235,13 @@ cargo build --workspace --release
 Run affected benchmarks and report exact results when a performance path
 changes.
 
+Every push must finish green in GitHub Actions. Before pushing, run the exact
+local format, lint, workspace-test, release-build, and affected benchmark-smoke
+gates. After pushing, wait for the workflow attached to that exact commit SHA
+and verify every Windows, Linux, macOS, and benchmark job succeeds. Do not start
+or push the next feature on top of a red run; inspect the failed job, correct it,
+repeat the local gates, push the correction, and wait for green.
+
 ## Final Self-Check
 
 Before delivering Tier 1 or Tier 2 work, verify:
