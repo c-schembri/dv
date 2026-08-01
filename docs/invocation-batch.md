@@ -480,6 +480,16 @@ Fifty retained samples after ten warm-ups measured `141.461 ms` versus
 faster. Full evidence is retained in the
 [lexical-preservation baseline](performance-baselines/2026-08-02-cli-lexical-preservation-windows.md).
 
+`DROP-022` closes the accepted-option boundary for the current Phase 1
+global, build, restore, project, run, and test surfaces. Each accepted option
+now changes typed state; unsupported tokens fail before discovery rather than
+being silently ignored. The like-for-like `dotnet test
+--definitely-unknown` comparison measured `140.183 ms` versus `6.035 ms`
+median and `159.044 ms` versus `7.126 ms` p95 across 50 retained samples, so
+`dv` is `23.2x` faster. Both commands return exit 1 and preserve the fixture
+exactly. Full evidence is retained in the
+[option-effect baseline](performance-baselines/2026-08-02-cli-option-effects-windows.md).
+
 `DROP-010` compares `dotnet pack --definitely-unknown` with `dv --compat
 dotnet pack --definitely-unknown`. Both reject the same invalid pack option;
 fixture snapshots prove the route does not reach SDK, project, or filesystem

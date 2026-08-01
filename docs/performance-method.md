@@ -59,9 +59,10 @@ Invalid input behavior:
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_protocol_version` | immutable `small-console` directory; three-native-alias schema preflight outside timing | `dv` process launch and one validated schema-20 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
-| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,154-byte static manifest write; Microsoft has no equivalent query and reports TBI |
+| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,158-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_compat_check` | immutable 195-byte workflow and 278-byte SDK project; event/version/count/exit/no-write preflight outside timing | `dv` process launch, bounded reads, literal script/XML scan, static manifest-index classification, and one validated schema-20 event batch; Microsoft has no equivalent non-executing scanner and reports TBI |
 | `cli_compat_help` | immutable `small-console` fixture; successful output-shape and zero-mutation preflight outside timing | process launch, profile-aware static help dispatch, output validation, and no SDK/project/filesystem/network discovery |
+| `cli_option_effects` | immutable `small-console` fixture; tree snapshot and exact exit/sentinel/diagnostic preflight outside timing | process launch, one-pass typed child-option parsing, pre-I/O unknown-option rejection, and output validation |
 | `cli_command_normalization` | immutable `small-console` fixture; tree snapshot and typed invalid-option parity preflight outside timing | process launch, lossless command capture, `dotnet restore`/`dv sync` normalization boundary, pre-I/O rejection, and output validation |
 | `cli_transform_equivalence` | immutable `small-console` fixture; tree snapshot, exact alias-equivalence unit corpus, and typed invalid-option parity preflight outside timing | process launch, lossless capture, dotnet-profile stripping, normalized borrowed transform construction, pre-I/O rejection, and output validation |
 | `cli_mode_classification` | immutable `small-console` fixture; tree snapshot and compatibility-profile rejection parity preflight outside timing | process launch, one-pass explicit mode classification, `dotnet`-profile exit selection, stable profile diagnostic context, pre-I/O rejection, and output validation |
@@ -223,6 +224,7 @@ Measure accepted command-spelling normalization through the restore/sync
 pre-I/O boundary:
 
 ```text
+cargo bench-all --case cli_option_effects --samples 50 --warmups 10
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_transform_equivalence --samples 50 --warmups 10
 cargo bench-all --case cli_compat_help --samples 50 --warmups 10

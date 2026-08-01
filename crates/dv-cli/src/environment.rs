@@ -3,7 +3,7 @@ use std::{
   mem::{align_of, size_of},
 };
 
-use crate::{invocation::CommandArguments, output::is_sensitive_name};
+use crate::output::is_sensitive_name;
 
 const INLINE_ENVIRONMENT_EDITS: usize = 4;
 
@@ -132,30 +132,17 @@ const _: () = assert!(size_of::<ChildEnvironmentPlan<'static>>() == 104);
 const _: () = assert!(align_of::<ChildEnvironmentPlan<'static>>() == align_of::<usize>());
 
 impl<'a> ChildEnvironmentPlan<'a> {
-  pub(crate) fn capture(directives: impl IntoIterator<Item = &'a str>, arguments: CommandArguments<'a>) -> Result<Self, EnvironmentError> {
+  pub(crate) fn capture(directives: impl IntoIterator<Item = &'a str>) -> Result<Self, EnvironmentError> {
     let mut plan = Self {
       storage: EnvironmentStorage::default(),
     };
     plan.extend(EnvironmentSource::Directive, directives)?;
     plan.extend(EnvironmentSource::LaunchProfile, std::iter::empty())?;
-
-    let mut index = 0;
-    while let Some(argument) = arguments.get(index) {
-      match argument.to_str() {
-        Some("-e" | "--environment") => {
-          let assignment = arguments.get(index + 1).ok_or(EnvironmentError::MissingCommandLineValue)?;
-          let assignment = assignment.to_str().ok_or(EnvironmentError::NonUnicodeCommandLineValue)?;
-          plan.push(EnvironmentSource::CommandLine, assignment)?;
-          index += 2;
-        },
-        Some(value) if value.starts_with("--environment=") => {
-          plan.push(EnvironmentSource::CommandLine, &value["--environment=".len()..])?;
-          index += 1;
-        },
-        _ => index += 1,
-      }
-    }
     Ok(plan)
+  }
+
+  pub(crate) fn push_command_line(&mut self, assignment: &'a str) -> Result<(), EnvironmentError> {
+    self.push(EnvironmentSource::CommandLine, assignment)
   }
 
   #[cfg(test)]
@@ -224,7 +211,6 @@ fn environment_names_equal(left: &str, right: &str) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EnvironmentError {
   MalformedDirective,
-  MissingCommandLineValue,
   NonUnicodeCommandLineValue,
   MissingSeparator { source: EnvironmentSource },
   EmptyName { source: EnvironmentSource },
@@ -236,7 +222,6 @@ impl fmt::Display for EnvironmentError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::MalformedDirective => formatter.write_str("environment directive must use [env:NAME=VALUE]"),
-      Self::MissingCommandLineValue => formatter.write_str("--environment requires NAME=VALUE"),
       Self::NonUnicodeCommandLineValue => formatter.write_str("--environment NAME=VALUE must be valid Unicode text"),
       Self::MissingSeparator { source } => write!(formatter, "{} environment input must use NAME=VALUE", source.as_str()),
       Self::EmptyName { source } => write!(formatter, "{} environment input has an empty variable name", source.as_str()),
@@ -271,8 +256,6 @@ impl EnvironmentSource {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::invocation::InvocationBatch;
-  use std::ffi::OsString;
 
   #[test]
   fn precedence_is_ambient_then_directive_profile_and_command_line() {
@@ -294,13 +277,11 @@ mod tests {
   #[test]
   fn command_line_capture_accepts_both_forms_and_spills_only_after_four_edits() {
     for count in [4, 5] {
-      let mut arguments = vec![OsString::from("run")];
-      for index in 0..count {
-        arguments.push(OsString::from("--environment"));
-        arguments.push(OsString::from(format!("VALUE_{index}={index}")));
+      let assignments = (0..count).map(|index| format!("VALUE_{index}={index}")).collect::<Vec<_>>();
+      let mut plan = ChildEnvironmentPlan::capture(std::iter::empty()).unwrap();
+      for assignment in &assignments {
+        plan.push_command_line(assignment).unwrap();
       }
-      let invocation = InvocationBatch::capture(arguments);
-      let plan = ChildEnvironmentPlan::capture(std::iter::empty(), invocation.command_arguments()).unwrap();
 
       assert_eq!(plan.edit_count(), count);
       if count == INLINE_ENVIRONMENT_EDITS {

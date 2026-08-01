@@ -91,6 +91,7 @@ struct GoldenFileChange {
 enum CaseKind {
   Startup,
   CliUnknownOption,
+  CliOptionEffects,
   CliGoldenTrace,
   CliCompatCheck,
   CliCommandNormalization,
@@ -241,6 +242,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_option_effects",
+    kind: CaseKind::CliOptionEffects,
+    args: &["test", "--definitely-unknown"],
     implemented: true,
   },
   Case {
@@ -948,6 +955,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_option_effects",
+    kind: CaseKind::CliOptionEffects,
+    args: &["--compat", "dotnet", "test", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_command_normalization",
     kind: CaseKind::CliCommandNormalization,
     args: &["sync", "--definitely-unknown"],
@@ -1507,6 +1520,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
     verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_option_effects") {
+    verify_option_effect_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-option-effects"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_command_normalization") {
     verify_command_normalization_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-command-normalization"))?;
   }
@@ -2045,6 +2061,48 @@ fn validate_unknown_option_failure(output: &Output, reference: bool) -> Result<(
     }
     if text.contains("error[DV01") || text.contains("error[DV02") {
       return Err(format!("dv unknown-option command performed discovery before rejection: {text}").into());
+    }
+  }
+  Ok(())
+}
+
+fn verify_option_effect_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["test", "--definitely-unknown"][..], true),
+    (dv_executable, "dv", &["--compat", "dotnet", "test", "--definitely-unknown"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_option_effect_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} option-effect preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_option_effect_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("option-effect command unexpectedly succeeded".into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    let lower = text.to_ascii_lowercase();
+    if output.status.code() != Some(1) || !text.contains("MSB1001") || !lower.contains("unknown switch") || !text.contains("--definitely-unknown") {
+      return Err(format!("dotnet test option oracle omitted MSB1001/Unknown switch: {text}").into());
+    }
+  } else {
+    if output.status.code() != Some(1)
+      || !output.stdout.is_empty()
+      || !text.contains("error[DV0002]")
+      || !text.contains("unknown test option \"--definitely-unknown\"")
+    {
+      return Err(format!("dv child-option diagnostic did not match the typed boundary: {text}").into());
+    }
+    if text.contains("error[DV0003]") || text.contains("error[DV01") || text.contains("error[DV02") {
+      return Err(format!("dv child-option command passed rejection or performed discovery: {text}").into());
     }
   }
   Ok(())
@@ -6622,6 +6680,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliGoldenTrace
       | CaseKind::CliCompatCheck
       | CaseKind::CliUnknownOption
+      | CaseKind::CliOptionEffects
       | CaseKind::CliCommandNormalization
       | CaseKind::CliTransformEquivalence
       | CaseKind::CliModeClassification
@@ -8075,6 +8134,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     },
     CaseKind::CliCompatCheck
     | CaseKind::CliUnknownOption
+    | CaseKind::CliOptionEffects
     | CaseKind::CliCommandNormalization
     | CaseKind::CliTransformEquivalence
     | CaseKind::CliModeClassification
@@ -8292,6 +8352,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliOptionEffects) {
+    validate_option_effect_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliCommandNormalization) {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliTransformEquivalence) {
@@ -9206,6 +9268,7 @@ fn case_label(case: &str) -> &str {
     "cli_golden_trace" => "Golden CI substitution trace",
     "cli_compat_help" => "Compatibility help",
     "cli_unknown_option" => "Unknown-option rejection",
+    "cli_option_effects" => "Child option effect boundary",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_transform_equivalence" => "Typed transform equivalence",
     "cli_mode_classification" => "Invocation mode classification",

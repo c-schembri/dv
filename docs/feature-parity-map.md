@@ -543,9 +543,20 @@ contracts.
   median and `7.314 ms` p95 on Windows across 50 retained samples; Microsoft
   has no equivalent static compatibility command, so its result is explicitly
   TBI rather than a false like-for-like ratio. `P2`
-- [ ] `DROP-022` Never claim a command is drop-in compatible while any accepted
+- [x] `DROP-022` Never claim a command is drop-in compatible while any accepted
   option is ignored; every option must affect the typed request or fail
-  explicitly. `P1-P5`
+  explicitly. The current Phase 1 global, build, restore, project, run, and test
+  option surfaces are covered by effect tests. Build retains `--plan` in its
+  32-byte typed request instead of pre-scanning and discarding it. Run/test use
+  one linear transform into a 136-byte project/configuration/environment batch;
+  malformed, repeated, and unsupported options fail before project, SDK,
+  filesystem, child-process, or network work. Help and the compatibility
+  manifest continue to label unimplemented Microsoft options as partial or
+  missing rather than accepting them as no-ops. A 50-sample Windows oracle for
+  `test --definitely-unknown` measured Microsoft at `140.183 ms` median and
+  `159.044 ms` p95 versus `6.035 ms` and `7.126 ms` for `dv`, a `23.2x`
+  median improvement with identical exit-1, sentinel, and zero-mutation
+  preconditions. `P1-P5`
 
 ## 1B. `dotnet` Driver Command-Line Surface
 

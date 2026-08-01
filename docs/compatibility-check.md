@@ -53,7 +53,7 @@ parse and each lookup scans only the chosen tool's bounded command batch.
 
 `CompatibilitySupport` and the internal tool key are one byte, each command
 range is four bytes, and each stack token is 12 bytes. The 64-token line batch
-therefore occupies 768 stack bytes. The 270,154-byte release manifest is
+therefore occupies 768 stack bytes. The 270,158-byte release manifest is
 projected at build time into immutable static command slices, ranges, and only
 unresolved row IDs. On 64-bit builds each three-field command record is 40 bytes:
 the 115-record table occupies 4,600 bytes before its borrowed path/row slices,

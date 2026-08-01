@@ -509,6 +509,9 @@ the [compatibility-diagnostics baseline](docs/performance-baselines/2026-08-02-c
 Profile-aware token case, prefixes, separators, repetition, and `--` behavior
 have like-for-like evidence in the
 [lexical-preservation baseline](docs/performance-baselines/2026-08-02-cli-lexical-preservation-windows.md).
+Accepted Phase 1 options now either populate typed command data or fail before
+work; the like-for-like child boundary is retained in the
+[option-effect baseline](docs/performance-baselines/2026-08-02-cli-option-effects-windows.md).
 Ambiguous command precedence has a like-for-like pre-I/O baseline in the
 [route-precedence evidence](docs/performance-baselines/2026-08-01-cli-route-precedence-windows.md).
 
@@ -531,8 +534,8 @@ Initial machine:
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; command normalization, cancellation-ready SDK selection, compiler
   planning, and cold/warm signed-package validation use 5 warm-ups; invocation
-  mode, exit policy, lexical preservation, and route precedence use 50 retained
-  samples after 10 warm-ups; 10
+  mode, exit policy, lexical preservation, option effects, and route precedence
+  use 50 retained samples after 10 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -547,6 +550,7 @@ Initial machine:
 | Replay the versioned golden CI offline restore | `dotnet restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | `dv restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | 626.828 ms | 7.507 ms | 83.5x | 2658.372 ms | 9.153 ms |
 | Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
+| Reject an unsupported test option at the typed child boundary | `dotnet test --definitely-unknown` | `dv --compat dotnet test --definitely-unknown` | 140.183 ms | 6.035 ms | 23.2x | 159.044 ms | 7.126 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Create the same typed restore transform through compatibility syntax | `dotnet restore --definitely-unknown` | `dv --compat dotnet restore --definitely-unknown` | 141.390 ms | 5.606 ms | 25.2x | 163.790 ms | 6.352 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
@@ -838,6 +842,7 @@ cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
+cargo bench-all --case cli_option_effects --samples 50 --warmups 10
 cargo bench-all --case cli_environment --samples 30 --warmups 3
 cargo bench-all --case cli_forwarding --samples 30 --warmups 5
 cargo bench-all --case cli_child_exit --samples 30 --warmups 5
@@ -952,6 +957,7 @@ See:
 - [Events and diagnostics](docs/events-and-diagnostics.md)
 - [Compatibility matrix](docs/compatibility-matrix.md)
 - [Compatibility check](docs/compatibility-check.md)
+- [Option effect boundary](docs/option-effect-boundary.md)
 - [Direct Roslyn strategy](docs/roslyn-invocation.md)
 
 ## Workspace

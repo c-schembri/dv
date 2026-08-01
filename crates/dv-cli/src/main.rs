@@ -168,14 +168,16 @@ Usage:
 const RUN_HELP: &str = "\
 Usage:
   dv --compat dotnet run [PROJECT] [options] [-- APPLICATION-ARGUMENTS]
-  dv run [PROJECT] [options] [-- APPLICATION-ARGUMENTS]
+  dv run [PROJECT] [--project PATH] [--configuration Debug|Release]
+         [-e|--environment NAME=VALUE]... [-- APPLICATION-ARGUMENTS]
 ";
 
 const TEST_HELP: &str = "\
 Usage:
   dv --compat dotnet test [PROJECT] [options] [-- TEST-ARGUMENTS]
   dv --compat vstest [TEST-CONTAINER] [options]
-  dv test [PROJECT] [options] [-- TEST-ARGUMENTS]
+  dv test [PROJECT] [--project PATH] [--configuration Debug|Release]
+          [-e|--environment NAME=VALUE]... [-- TEST-ARGUMENTS]
 ";
 
 const COMPAT_HELP: &str = "\
@@ -348,13 +350,30 @@ fn run() -> ExitCode {
         print!("{}", if request.command() == CommandKind::Run { RUN_HELP } else { TEST_HELP });
         return ExitCode::SUCCESS;
       }
+      let options = match parse_child_args(globals, command, command_args, transform.environment_directives()) {
+        Ok(options) => options,
+        Err(problem) => {
+          return reject(
+            started,
+            globals,
+            command,
+            invocation.event_arguments(json),
+            diagnostic(
+              "DV0002",
+              problem,
+              None,
+              Some("Remove the unsupported option or use --help to inspect the accepted arguments."),
+            ),
+          );
+        },
+      };
       unsupported_child_command(
         started,
         globals,
         command,
         invocation.event_arguments(json),
         transform.forwarded(),
-        ChildEnvironmentPlan::capture(transform.environment_directives(), command_args),
+        options,
         cancellation.as_ref().expect("run/test commands install cancellation"),
       )
     },
@@ -651,26 +670,9 @@ fn unsupported_child_command(
   command: &str,
   args: Vec<String>,
   forwarded_args: Option<invocation::ForwardedArguments<'_>>,
-  environment: Result<ChildEnvironmentPlan<'_>, EnvironmentError>,
+  options: ChildCommandOptions<'_>,
   cancellation: &CancellationToken,
 ) -> ExitCode {
-  let environment = match environment {
-    Ok(environment) => environment,
-    Err(error) => {
-      return reject(
-        started,
-        globals,
-        command,
-        args,
-        diagnostic(
-          "DV0002",
-          error.to_string(),
-          None,
-          Some("Use NAME=VALUE with [env:NAME=VALUE], -e, or --environment."),
-        ),
-      );
-    },
-  };
   let mut problem = diagnostic(
     "DV0003",
     format!("command {command:?} is not implemented yet"),
@@ -690,14 +692,25 @@ fn unsupported_child_command(
     name: "child_exit_policy".into(),
     value: child_exit_policy(command).as_str().into(),
   });
-  if environment.edit_count() != 0 {
+  problem.context.push(ContextField {
+    name: "project".into(),
+    value: options
+      .project
+      .path()
+      .map_or_else(|| "<current-directory>".into(), |path| redact_argument_text(path.as_os_str()).into_owned()),
+  });
+  problem.context.push(ContextField {
+    name: "configuration".into(),
+    value: options.configuration.as_str().into(),
+  });
+  if options.environment.edit_count() != 0 {
     problem.context.push(ContextField {
       name: "environment_edit_count".into(),
-      value: environment.edit_count().to_string(),
+      value: options.environment.edit_count().to_string(),
     });
     problem.context.push(ContextField {
       name: "sensitive_environment_edit_count".into(),
-      value: environment.sensitive_edit_count().to_string(),
+      value: options.environment.sensitive_edit_count().to_string(),
     });
   }
   problem.context.push(ContextField {
@@ -705,6 +718,79 @@ fn unsupported_child_command(
     value: cancellation.child_grace().as_millis().to_string(),
   });
   unsupported(started, globals, command, args, problem)
+}
+
+struct ChildCommandOptions<'a> {
+  project: ProjectSelection<'a>,
+  configuration: ProjectConfiguration,
+  environment: ChildEnvironmentPlan<'a>,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ChildCommandOptions<'_>>() == 136);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<ChildCommandOptions<'_>>() == std::mem::align_of::<usize>());
+
+fn parse_child_args<'a>(
+  globals: InvocationOptions,
+  command: &str,
+  arguments: CommandArguments<'a>,
+  directives: impl IntoIterator<Item = &'a str>,
+) -> Result<ChildCommandOptions<'a>, String> {
+  let mut project = ProjectSelection::default();
+  let mut environment = ChildEnvironmentPlan::capture(directives).map_err(|error| error.to_string())?;
+  let mut configuration = None;
+  let mut index = 0;
+  while index < arguments.len() {
+    let argument = arguments.get(index).expect("bounded child option index is valid");
+    match argument.to_str() {
+      Some("--project") => {
+        let path = take_project_value(globals, arguments, &mut index)?;
+        project.select_named(path)?;
+      },
+      Some(value) if combined_option_value(value, "--project", None).is_some() => {
+        let value = combined_option_value(value, "--project", None).expect("guard accepted a combined project");
+        project.select_named(OsStr::new(value))?;
+      },
+      Some("--configuration" | "-c") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration" | "-c") => {
+        let value = take_semantic_value(arguments, &mut index, "--configuration requires Debug or Release")?
+          .to_str()
+          .ok_or("--configuration requires valid Unicode text")?;
+        configuration = Some(parse_configuration(value)?);
+      },
+      Some(value) if combined_option_value(value, "--configuration", Some("-c")).is_some() => {
+        if configuration.is_some() {
+          return Err("--configuration cannot be specified more than once".into());
+        }
+        let value = combined_option_value(value, "--configuration", Some("-c")).expect("guard accepted a combined configuration");
+        configuration = Some(parse_configuration(value)?);
+      },
+      Some("-e" | "--environment") => {
+        let assignment = take_semantic_value(arguments, &mut index, "--environment requires NAME=VALUE")?
+          .to_str()
+          .ok_or_else(|| EnvironmentError::NonUnicodeCommandLineValue.to_string())?;
+        environment.push_command_line(assignment).map_err(|error| error.to_string())?;
+      },
+      Some(value) if value.starts_with("--environment=") => {
+        environment
+          .push_command_line(&value["--environment=".len()..])
+          .map_err(|error| error.to_string())?;
+      },
+      _ if globals.argument_is_option(argument) => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
+      _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
+      _ if matches!(project, ProjectSelection::Named(_)) => {
+        return Err("--project cannot be combined with a positional project or solution path".into());
+      },
+      _ => return Err(format!("unexpected {command} argument {:?}", redact_argument_text(argument))),
+    }
+    index += 1;
+  }
+  Ok(ChildCommandOptions {
+    project,
+    configuration: configuration.unwrap_or(ProjectConfiguration::Debug),
+    environment,
+  })
 }
 
 fn child_exit_policy(command: &str) -> ChildExitPolicy {
@@ -921,6 +1007,7 @@ const _: () = assert!(std::mem::size_of::<ProjectSelection<'_>>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::align_of::<ProjectSelection<'_>>() == std::mem::align_of::<usize>());
 
+#[derive(Debug, Eq, PartialEq)]
 struct PackageCommandOptions<'a> {
   project: ProjectSelection<'a>,
   additional_projects: Vec<&'a Path>,
@@ -951,7 +1038,7 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
     match argument.to_str() {
       Some("--configuration" | "-c") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration" | "-c") => {
-        let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
+        let value = take_semantic_value(arguments, &mut index, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
         options.configuration = Some(parse_configuration(value)?);
@@ -964,7 +1051,7 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
         options.configuration = Some(parse_configuration(value)?);
       },
       Some("--project") => {
-        let path = take_project_value(globals, arguments, &mut index, false)?;
+        let path = take_project_value(globals, arguments, &mut index)?;
         options.project.select_named(path)?;
       },
       Some(value) if combined_option_value(value, "--project", None).is_some() => {
@@ -973,7 +1060,7 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
       },
       Some("--packages") if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
       Some("--packages") => {
-        let path = take_semantic_value(arguments, &mut index, false, "--packages requires a path")?;
+        let path = take_semantic_value(arguments, &mut index, "--packages requires a path")?;
         if path.is_empty() {
           return Err("--packages requires a path".into());
         }
@@ -991,7 +1078,7 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
       },
       Some("--configfile") if options.config_file.is_some() => return Err("--configfile cannot be specified more than once".into()),
       Some("--configfile") => {
-        let path = take_semantic_value(arguments, &mut index, false, "--configfile requires a path")?;
+        let path = take_semantic_value(arguments, &mut index, "--configfile requires a path")?;
         if path.is_empty() {
           return Err("--configfile requires a path".into());
         }
@@ -1008,7 +1095,7 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
         options.config_file = Some(PathBuf::from(value));
       },
       Some("--source" | "-s") => {
-        let source = take_semantic_value(arguments, &mut index, false, "--source requires a package source")?
+        let source = take_semantic_value(arguments, &mut index, "--source requires a package source")?
           .to_str()
           .ok_or("--source requires valid Unicode text")?;
         if source.is_empty() {
@@ -1046,14 +1133,9 @@ fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: 
   Ok(options)
 }
 
-fn take_semantic_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, ignore_plan: bool, missing: &'static str) -> Result<&'a OsStr, &'static str> {
-  loop {
-    *index += 1;
-    let value = arguments.get(*index).ok_or(missing)?;
-    if !ignore_plan || value != "--plan" {
-      return Ok(value);
-    }
-  }
+fn take_semantic_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, missing: &'static str) -> Result<&'a OsStr, &'static str> {
+  *index += 1;
+  arguments.get(*index).ok_or(missing)
 }
 
 fn combined_option_value<'a>(argument: &'a str, long: &str, short: Option<&str>) -> Option<&'a str> {
@@ -1067,14 +1149,9 @@ fn parse_configuration(value: &str) -> Result<ProjectConfiguration, String> {
   ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))
 }
 
-fn take_project_value<'a>(
-  globals: InvocationOptions,
-  arguments: CommandArguments<'a>,
-  index: &mut usize,
-  ignore_plan: bool,
-) -> Result<&'a OsStr, &'static str> {
+fn take_project_value<'a>(globals: InvocationOptions, arguments: CommandArguments<'a>, index: &mut usize) -> Result<&'a OsStr, &'static str> {
   const MISSING: &str = "--project requires a project or solution path";
-  let value = take_semantic_value(arguments, index, ignore_plan, MISSING)?;
+  let value = take_semantic_value(arguments, index, MISSING)?;
   if globals.argument_is_option(value) { Err(MISSING) } else { Ok(value) }
 }
 
@@ -1119,8 +1196,7 @@ fn run_build(
     return ExitCode::SUCCESS;
   }
   let cancellation = cancellation.expect("non-help build commands install cancellation");
-  let plan_requested = build_args.iter().any(|argument| argument == "--plan");
-  let (requested_path, configuration) = match parse_project_args(globals, build_args, true, "build") {
+  let options = match parse_project_args(globals, build_args, true, "build") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1132,7 +1208,7 @@ fn run_build(
       );
     },
   };
-  if !plan_requested {
+  if !options.plan {
     return unsupported(
       started,
       globals,
@@ -1158,7 +1234,7 @@ fn run_build(
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.path(), configuration) {
+  let project = match load_project(&current_directory, options.project.path(), options.configuration) {
     Ok(project) => project,
     Err(error) => return build_fail(started, globals, "build --plan", args, project_diagnostic(error)),
   };
@@ -1833,7 +1909,7 @@ fn run_project(
     );
   }
 
-  let (requested_path, configuration) = match parse_project_args(globals, operands, false, "project inspect") {
+  let options = match parse_project_args(globals, operands, false, "project inspect") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1862,7 +1938,7 @@ fn run_project(
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.path(), configuration) {
+  let project = match load_project(&current_directory, options.project.path(), options.configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project inspect", args, project_diagnostic(error)),
   };
@@ -2280,7 +2356,7 @@ fn parse_pack_plan_args<'a>(
     match argument.to_str() {
       Some("--packages") if packages.is_some() => return Err("--packages cannot be specified more than once".into()),
       Some("--packages") => {
-        let path = take_semantic_value(arguments, &mut index, false, "--packages requires a path")?;
+        let path = take_semantic_value(arguments, &mut index, "--packages requires a path")?;
         if path.is_empty() {
           return Err("--packages requires a path".into());
         }
@@ -2297,7 +2373,7 @@ fn parse_pack_plan_args<'a>(
         packages = Some(PathBuf::from(value));
       },
       Some("--project") => {
-        let path = take_project_value(globals, arguments, &mut index, false)?;
+        let path = take_project_value(globals, arguments, &mut index)?;
         project.select_named(path)?;
       },
       Some(value) if combined_option_value(value, "--project", None).is_some() => {
@@ -2306,7 +2382,7 @@ fn parse_pack_plan_args<'a>(
       },
       Some("--configuration" | "-c") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration" | "-c") => {
-        let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
+        let value = take_semantic_value(arguments, &mut index, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
         configuration = Some(parse_configuration(value)?);
@@ -2332,22 +2408,36 @@ fn parse_pack_plan_args<'a>(
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectCommandOptions<'a> {
+  project: ProjectSelection<'a>,
+  configuration: ProjectConfiguration,
+  plan: bool,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ProjectCommandOptions<'_>>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<ProjectCommandOptions<'_>>() == std::mem::align_of::<usize>());
+
 fn parse_project_args<'a>(
   globals: InvocationOptions,
   arguments: CommandArguments<'a>,
-  ignore_plan: bool,
+  accept_plan: bool,
   command: &str,
-) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
+) -> Result<ProjectCommandOptions<'a>, String> {
   let mut project = ProjectSelection::default();
   let mut configuration = None;
+  let mut plan = false;
   let mut index = 0;
   while index < arguments.len() {
     let argument = arguments.get(index).expect("bounded project option index is valid");
     match argument.to_str() {
-      Some("--plan") if ignore_plan => {},
+      Some("--plan") if accept_plan && plan => return Err("--plan cannot be specified more than once".into()),
+      Some("--plan") if accept_plan => plan = true,
       Some("-h" | "--help" | "help") => return Err(format!("help must be requested as `dv {command} --help`")),
       Some("--project") => {
-        let path = take_project_value(globals, arguments, &mut index, ignore_plan)?;
+        let path = take_project_value(globals, arguments, &mut index)?;
         project.select_named(path)?;
       },
       Some(value) if combined_option_value(value, "--project", None).is_some() => {
@@ -2356,7 +2446,7 @@ fn parse_project_args<'a>(
       },
       Some("--configuration" | "-c") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration" | "-c") => {
-        let value = take_semantic_value(arguments, &mut index, ignore_plan, "--configuration requires Debug or Release")?
+        let value = take_semantic_value(arguments, &mut index, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
         configuration = Some(parse_configuration(value)?);
@@ -2377,7 +2467,11 @@ fn parse_project_args<'a>(
     }
     index += 1;
   }
-  Ok((project, configuration.unwrap_or(ProjectConfiguration::Debug)))
+  Ok(ProjectCommandOptions {
+    project,
+    configuration: configuration.unwrap_or(ProjectConfiguration::Debug),
+    plan,
+  })
 }
 
 fn write_compiler_plan(plan: &CompilerPlan) -> ExitCode {
@@ -3187,20 +3281,21 @@ mod argument_tests {
   fn project_path_operands_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), path.clone()]);
-    let (parsed, configuration) = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
+    let parsed = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
 
-    assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
-    assert_eq!(configuration, ProjectConfiguration::Debug);
+    assert_eq!(parsed.project.path().map(Path::as_os_str), Some(path.as_os_str()));
+    assert_eq!(parsed.configuration, ProjectConfiguration::Debug);
+    assert!(!parsed.plan);
   }
 
   #[test]
   fn named_project_paths_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), OsString::from("--project"), path.clone()]);
-    let (parsed, _) = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
+    let parsed = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
 
-    assert!(matches!(parsed, ProjectSelection::Named(_)));
-    assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
+    assert!(matches!(parsed.project, ProjectSelection::Named(_)));
+    assert_eq!(parsed.project.path().map(Path::as_os_str), Some(path.as_os_str()));
 
     let batch = InvocationBatch::capture([OsString::from("frameworks"), OsString::from("--project"), path.clone()]);
     let (parsed, _, _) = parse_pack_plan_args(batch.options(), batch.command_arguments(), "frameworks").unwrap();
@@ -3259,19 +3354,17 @@ mod argument_tests {
   }
 
   #[test]
-  fn build_plan_marker_does_not_become_an_option_value() {
+  fn build_plan_marker_cannot_be_consumed_as_an_option_value() {
     let batch = InvocationBatch::capture(["build", "--configuration", "--plan", "Release"].map(OsString::from));
-    let (_, configuration) = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
-
-    assert_eq!(configuration, ProjectConfiguration::Release);
+    assert!(parse_project_args(batch.options(), batch.command_arguments(), true, "build").is_err());
   }
 
   #[test]
   fn configuration_forms_match_dotnet_case_and_separator_rules() {
     for option in ["--configuration=Release", "--configuration:Release", "-c=Release", "-c:Release"] {
       let batch = InvocationBatch::capture(["--compat", "dotnet", "build", option].map(OsString::from));
-      let (_, configuration) = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
-      assert_eq!(configuration, ProjectConfiguration::Release, "{option}");
+      let parsed = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
+      assert_eq!(parsed.configuration, ProjectConfiguration::Release, "{option}");
     }
 
     for option in ["--Configuration=Release", "-C:Release", "--configurationRelease"] {
@@ -3288,6 +3381,7 @@ mod argument_tests {
     for arguments in [
       ["build", "--configuration", "Debug", "-c:Release"],
       ["build", "-c=Debug", "--configuration:Release", ""],
+      ["build", "--plan", "--plan", ""],
     ] {
       let batch = InvocationBatch::capture(arguments.map(OsString::from));
       assert!(parse_project_args(batch.options(), batch.command_arguments(), true, "build").is_err());
@@ -3301,11 +3395,96 @@ mod argument_tests {
   }
 
   #[test]
+  fn every_accepted_phase_one_command_option_changes_typed_state() {
+    let build_baseline = InvocationBatch::capture(["build"].map(OsString::from));
+    let build_baseline = parse_project_args(build_baseline.options(), build_baseline.command_arguments(), true, "build").unwrap();
+    for arguments in [
+      &["build", "--plan"][..],
+      &["build", "--project", "App.csproj"],
+      &["build", "--project=App.csproj"],
+      &["build", "--configuration", "Release"],
+      &["build", "-c", "Release"],
+      &["build", "--configuration=Release"],
+      &["build", "-c:Release"],
+    ] {
+      let batch = InvocationBatch::capture(arguments.iter().map(OsString::from));
+      let parsed = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
+      assert_ne!(parsed, build_baseline, "{arguments:?}");
+    }
+
+    let restore_baseline = InvocationBatch::capture(["restore"].map(OsString::from));
+    let restore_baseline = parse_package_args(restore_baseline.options(), "restore", restore_baseline.command_arguments()).unwrap();
+    for arguments in [
+      &["restore", "--project", "App.csproj"][..],
+      &["restore", "--project=App.csproj"],
+      &["restore", "--configuration", "Release"],
+      &["restore", "-c", "Release"],
+      &["restore", "--configuration:Release"],
+      &["restore", "-c=Release"],
+      &["restore", "--packages", "packages"],
+      &["restore", "--packages=packages"],
+      &["restore", "--configfile", "NuGet.config"],
+      &["restore", "--configfile:NuGet.config"],
+      &["restore", "--source", "feed"],
+      &["restore", "-s", "feed"],
+      &["restore", "--source=feed"],
+      &["restore", "-s:feed"],
+      &["restore", "--offline"],
+      &["restore", "--interactive"],
+    ] {
+      let batch = InvocationBatch::capture(arguments.iter().map(OsString::from));
+      let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
+      assert_ne!(parsed, restore_baseline, "{arguments:?}");
+    }
+
+    let batch = InvocationBatch::capture(["project", "--probe-credentials"].map(OsString::from));
+    let parsed = parse_package_args(batch.options(), "project package-sources", batch.command_arguments()).unwrap();
+    assert!(parsed.probe_credentials);
+  }
+
+  #[test]
   fn repeatable_sources_preserve_combined_value_order() {
     let batch = InvocationBatch::capture(["restore", "--source:first", "-s=second", "--source", "third", "App.csproj"].map(OsString::from));
     let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
 
     assert_eq!(parsed.sources, ["first", "second", "third"]);
+  }
+
+  #[test]
+  fn child_options_are_typed_and_unknown_options_fail() {
+    let batch = InvocationBatch::capture(
+      [
+        "run",
+        "--project=App.csproj",
+        "-c:Release",
+        "--environment",
+        "PUBLIC=one",
+        "--environment=TOKEN=secret",
+      ]
+      .map(OsString::from),
+    );
+    let parsed = parse_child_args(batch.options(), "run", batch.command_arguments(), ["DIRECTIVE=value"]).unwrap();
+
+    assert!(matches!(parsed.project, ProjectSelection::Named(_)));
+    assert_eq!(parsed.project.path(), Some(Path::new("App.csproj")));
+    assert_eq!(parsed.configuration, ProjectConfiguration::Release);
+    assert_eq!(parsed.environment.edit_count(), 3);
+    assert_eq!(parsed.environment.sensitive_edit_count(), 1);
+
+    for arguments in [
+      vec!["test", "--definitely-unknown"],
+      vec!["test", "--no-build"],
+      vec!["test", "App.csproj", "Other.csproj"],
+      vec!["test", "-c", "Debug", "--configuration=Release"],
+      vec!["test", "--environment", "missing-separator"],
+    ] {
+      let batch = InvocationBatch::capture(arguments.into_iter().map(OsString::from));
+      assert!(
+        parse_child_args(batch.options(), "test", batch.command_arguments(), std::iter::empty()).is_err(),
+        "{:?}",
+        batch.command_arguments().iter().collect::<Vec<_>>()
+      );
+    }
   }
 
   #[test]

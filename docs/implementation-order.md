@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 73 rows are implemented;
+- 74 rows are implemented;
 - 31 rows have partial foundations;
-- 364 rows are missing;
+- 363 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -134,12 +134,16 @@ cache publication. Network work is outside the verification benchmark.
 
 Status: in progress; `CLI-005` through `CLI-008`, `CLI-011` through
 `CLI-015`, `CLI-017`, `DROP-001` through `DROP-003`, `DROP-010`, `DROP-011`,
-`DROP-013`, and `DROP-017` are complete.
+`DROP-013`, `DROP-017`, and `DROP-022` are complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
 command-lifetime cancellation with a bounded child deadline, and lossless
 child termination classification are available.
+Every accepted option in the current Phase 1 global, build, restore, project,
+run, and test surface now changes typed state or fails before discovery.
+Build retains its plan marker in the typed request, while run/test construct
+project, configuration, and environment state in one strict linear pass.
 The reachable `DROP-016` Phase 1 surface now classifies success, usage,
 unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result

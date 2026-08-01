@@ -276,7 +276,9 @@ fn compatibility_check_scans_literal_scripts_and_projects_without_execution() {
   assert_eq!(report["invocations"].as_array().unwrap().len(), 4);
   assert_eq!(report["invocations"][0]["support"], "implemented");
   assert_eq!(report["invocations"][1]["support"], "partial");
-  assert!(report["invocations"][1]["parity_rows"].as_array().unwrap().iter().any(|row| row == "DROP-022"));
+  let unresolved = report["invocations"][1]["parity_rows"].as_array().unwrap();
+  assert!(!unresolved.is_empty());
+  assert!(unresolved.iter().all(|row| row != "DROP-022"));
   assert_eq!(report["invocations"][2]["support"], "missing");
   assert_eq!(report["invocations"][3]["support"], "uncheckable");
   assert_eq!(events.last().unwrap()["outcome"], "failed");
@@ -467,6 +469,48 @@ fn child_delimiter_keeps_trailing_global_spellings_opaque() {
     assert!(stdout.contains("\"args\":[\"--json\""));
     assert!(stdout.contains("\"--no-color\",\"--verbosity\",\"loud\",\"\"]"));
   }
+}
+
+#[test]
+fn child_options_affect_the_typed_boundary_or_fail_before_io() {
+  let temp = TempDirectory::new();
+  temp.write("App.csproj", "<Project><Broken>");
+
+  let typed = dv()
+    .args([
+      "--json",
+      "--compat",
+      "dotnet",
+      "test",
+      "--project",
+      "App.csproj",
+      "-c:Release",
+      "--environment",
+      "PUBLIC=value",
+    ])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+  assert_eq!(typed.status.code(), Some(1));
+  assert!(typed.stderr.is_empty());
+  let stdout = String::from_utf8(typed.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0003\""));
+  assert!(stdout.contains("\"name\":\"project\",\"value\":\"App.csproj\""));
+  assert!(stdout.contains("\"name\":\"configuration\",\"value\":\"Release\""));
+  assert!(stdout.contains("\"name\":\"environment_edit_count\",\"value\":\"1\""));
+
+  let rejected = dv()
+    .args(["--compat", "dotnet", "test", "--definitely-unknown"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+  assert_eq!(rejected.status.code(), Some(1));
+  assert!(rejected.stdout.is_empty());
+  let stderr = String::from_utf8(rejected.stderr).unwrap();
+  assert!(stderr.contains("error[DV0002]"), "{stderr}");
+  assert!(stderr.contains("unknown test option \"--definitely-unknown\""), "{stderr}");
+  assert!(!stderr.contains("error[DV0003]"), "{stderr}");
+  assert!(!temp.0.join("obj").exists());
 }
 
 #[test]
