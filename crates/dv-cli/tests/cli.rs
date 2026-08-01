@@ -150,10 +150,24 @@ fn compatibility_help_forms_expose_profile_and_canonical_syntax_before_io() {
     assert!(stdout.contains(canonical), "profile {profile}: {stdout}");
   }
 
+  for arguments in [&["--compat", "nuget", "-?"][..], &["--compat", "vstest", "-h"]] {
+    let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "arguments={arguments:?}");
+    assert!(output.stdout.is_empty(), "arguments={arguments:?}");
+    assert!(!String::from_utf8(output.stderr).unwrap().contains("Selected compatibility profile"));
+  }
+
   #[cfg(windows)]
   for (profile, help) in [("dotnet", "/?"), ("msbuild", "/Help"), ("vstest", "/?")] {
     let output = dv().args(["--compat", profile, help]).current_dir(&temp.0).output().unwrap();
     assert!(output.status.success(), "profile {profile}: {}", String::from_utf8_lossy(&output.stderr));
+  }
+
+  #[cfg(windows)]
+  for (profile, help) in [("nuget", "/?"), ("vstest", "/h")] {
+    let output = dv().args(["--compat", profile, help]).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "profile {profile}, help {help}");
+    assert!(output.stdout.is_empty(), "profile {profile}, help {help}");
   }
 
   assert!(!temp.0.join("obj").exists());

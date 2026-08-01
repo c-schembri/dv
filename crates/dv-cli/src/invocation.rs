@@ -914,8 +914,8 @@ fn command_help_token(mode: InvocationMode, argument: &str) -> bool {
     InvocationMode::Native => matches!(argument, "help" | "-h" | "--help"),
     InvocationMode::Dotnet => matches!(argument, "-h" | "-?" | "--help"),
     InvocationMode::Msbuild => matches!(argument, "-?" | "-h") || argument.eq_ignore_ascii_case("-help") || argument.eq_ignore_ascii_case("--help"),
-    InvocationMode::Nuget => matches!(argument, "-?" | "-h" | "--help"),
-    InvocationMode::Vstest => matches!(argument, "-?" | "-h") || argument.eq_ignore_ascii_case("--help"),
+    InvocationMode::Nuget => matches!(argument, "-h" | "--help"),
+    InvocationMode::Vstest => argument == "-?" || argument.eq_ignore_ascii_case("--help"),
   };
   dash || windows_slash_help_token(mode, argument)
 }
@@ -924,8 +924,9 @@ fn command_help_token(mode: InvocationMode, argument: &str) -> bool {
 fn windows_slash_help_token(mode: InvocationMode, argument: &str) -> bool {
   match mode {
     InvocationMode::Dotnet => argument == "/?",
-    InvocationMode::Msbuild | InvocationMode::Vstest => matches!(argument, "/?" | "/h") || argument.eq_ignore_ascii_case("/help"),
-    InvocationMode::Nuget => argument == "/?",
+    InvocationMode::Msbuild => matches!(argument, "/?" | "/h") || argument.eq_ignore_ascii_case("/help"),
+    InvocationMode::Vstest => argument == "/?" || argument.eq_ignore_ascii_case("/help"),
+    InvocationMode::Nuget => false,
     InvocationMode::Native => false,
   }
 }
@@ -1503,8 +1504,8 @@ mod tests {
     for (profile, accepted) in [
       ("dotnet", &["-h", "-?", "--help", "help"][..]),
       ("msbuild", &["-h", "-?", "-help", "-Help", "--help", "--Help"][..]),
-      ("nuget", &["-h", "-?", "--help"][..]),
-      ("vstest", &["-h", "-?", "--help", "--Help"][..]),
+      ("nuget", &["-h", "--help"][..]),
+      ("vstest", &["-?", "--help", "--Help"][..]),
     ] {
       for help in accepted {
         let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(help)]);
@@ -1512,7 +1513,14 @@ mod tests {
       }
     }
 
-    for (profile, rejected) in [("dotnet", "--Help"), ("msbuild", "help"), ("nuget", "help"), ("vstest", "help")] {
+    for (profile, rejected) in [
+      ("dotnet", "--Help"),
+      ("msbuild", "help"),
+      ("nuget", "-?"),
+      ("nuget", "help"),
+      ("vstest", "-h"),
+      ("vstest", "help"),
+    ] {
       let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(rejected)]);
       assert_ne!(batch.request().command(), CommandKind::Help, "profile {profile}, help {rejected}");
     }
@@ -1537,7 +1545,7 @@ mod tests {
   #[cfg(windows)]
   #[test]
   fn windows_slash_help_forms_follow_the_selected_reference_tool() {
-    for profile in ["dotnet", "msbuild", "nuget", "vstest"] {
+    for profile in ["dotnet", "msbuild", "vstest"] {
       let question = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from("/?")]);
       assert_eq!(question.request().command(), CommandKind::Help, "profile {profile}");
     }
@@ -1548,7 +1556,7 @@ mod tests {
       }
     }
 
-    for (profile, rejected) in [("dotnet", "/help"), ("nuget", "/help")] {
+    for (profile, rejected) in [("dotnet", "/help"), ("nuget", "/?"), ("nuget", "/help"), ("vstest", "/h")] {
       let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(rejected)]);
       assert_ne!(batch.request().command(), CommandKind::Help, "profile {profile}, help {rejected}");
     }
