@@ -26,6 +26,7 @@ enum CaseKind {
   CliUnknownOption,
   CliCommandNormalization,
   CliModeClassification,
+  CliRoutePrecedence,
   CliEnvironment,
   CliForwarding,
   CliChildExit,
@@ -159,6 +160,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_mode_classification",
     kind: CaseKind::CliModeClassification,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_route_precedence",
+    kind: CaseKind::CliRoutePrecedence,
+    args: &["pack", "--definitely-unknown"],
     implemented: true,
   },
   Case {
@@ -815,6 +822,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_route_precedence",
+    kind: CaseKind::CliRoutePrecedence,
+    args: &["--compat", "dotnet", "pack", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_environment",
     kind: CaseKind::CliEnvironment,
     args: &["build", "--definitely-unknown"],
@@ -1329,6 +1342,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_mode_classification") {
     verify_mode_classification_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-mode-classification"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_route_precedence") {
+    verify_route_precedence_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-route-precedence"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_environment") {
     verify_environment_boundary(
       &dv_executable,
@@ -1659,6 +1675,44 @@ fn validate_mode_classification_failure(output: &Output, reference: bool) -> Res
   }
   if text.contains("error[DV01") || text.contains("error[DV02") {
     return Err(format!("dv dotnet mode performed discovery before classified rejection: {text}").into());
+  }
+  Ok(())
+}
+
+fn verify_route_precedence_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["pack", "--definitely-unknown"][..], true),
+    (dv_executable, "dv", &["--compat", "dotnet", "pack", "--definitely-unknown"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_route_precedence_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} route-precedence preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_route_precedence_failure(output: &Output, reference: bool) -> Result<()> {
+  if reference {
+    return validate_unknown_option_failure(output, true);
+  }
+  if output.status.success() {
+    return Err("route-precedence boundary unexpectedly succeeded".into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if output.status.code() != Some(1)
+    || !output.stdout.is_empty()
+    || !text.contains("error[DV0002]")
+    || !text.contains("unknown pack option \"--definitely-unknown\"")
+  {
+    return Err(format!("dv dotnet pack route did not reject at its typed pre-I/O boundary: {text}").into());
+  }
+  if text.contains("error[DV01") || text.contains("error[DV02") || text.contains("error[DV04") {
+    return Err(format!("dv dotnet pack route performed discovery before classified rejection: {text}").into());
   }
   Ok(())
 }
@@ -5953,6 +6007,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
       | CaseKind::CliModeClassification
+      | CaseKind::CliRoutePrecedence
       | CaseKind::CliEnvironment
       | CaseKind::CliForwarding
       | CaseKind::CliChildExit
@@ -7396,6 +7451,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
     | CaseKind::CliModeClassification
+    | CaseKind::CliRoutePrecedence
     | CaseKind::CliEnvironment
     | CaseKind::CliForwarding
     | CaseKind::CliChildExit
@@ -7602,6 +7658,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliModeClassification) {
     validate_mode_classification_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliRoutePrecedence) {
+    validate_route_precedence_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliEnvironment) {
     validate_environment_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliForwarding) {
@@ -8504,6 +8562,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_mode_classification" => "Invocation mode classification",
+    "cli_route_precedence" => "Ambiguous command routing",
     "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
     "cli_child_exit" => "Child exit policy (run TBI)",

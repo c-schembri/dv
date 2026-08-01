@@ -60,11 +60,14 @@ remapping. Reference-specific test, no-tests, signal, launch-failure, and
 cancellation exit policies remain partial under `DROP-016`, `RUN-009`, and
 their workflows.
 
-`--compat` currently changes exit policy only. Full reference grammar,
-diagnostic prose, stdout/stderr formats, and automatic executable-token
-inference remain open in the corresponding `DROP-*` rows. Compatibility
-manifest version 1 now records those surfaces and their partial/missing states
-instead of implying that capture equals execution support.
+`--compat` selects both this exit policy and the `DROP-010` command-route
+precedence. The profile prevents an ambiguous NuGet, MSBuild, or VSTest word
+from entering a native workflow, but it does not claim that the routed grammar
+is implemented. Full reference grammar, diagnostic prose, stdout/stderr
+formats, and automatic executable-token inference remain open in the
+corresponding `DROP-*` rows. Compatibility manifest version 1 records those
+surfaces and their partial/missing states instead of implying that capture
+equals execution support.
 
 ## Evidence
 

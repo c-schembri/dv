@@ -241,8 +241,36 @@ fn run() -> ExitCode {
         cancellation.as_ref().expect("run/test commands install cancellation"),
       )
     },
-    CommandKind::Init | CommandKind::Add | CommandKind::Remove | CommandKind::Pack | CommandKind::Publish => {
+    CommandKind::Init
+    | CommandKind::Add
+    | CommandKind::Remove
+    | CommandKind::Pack
+    | CommandKind::Publish
+    | CommandKind::DotnetList
+    | CommandKind::NugetRestore
+    | CommandKind::NugetPack
+    | CommandKind::NugetPush
+    | CommandKind::NugetList
+    | CommandKind::NugetAdd
+    | CommandKind::NugetRemove
+    | CommandKind::NugetUpdate
+    | CommandKind::MsbuildInput
+    | CommandKind::VstestInput => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
+      if let Some(problem) = first_unsupported_option(command, command_args) {
+        return reject(
+          started,
+          globals,
+          command,
+          invocation.event_arguments(json),
+          diagnostic(
+            "DV0002",
+            problem,
+            None,
+            Some("Remove the unsupported option or inspect the compatibility manifest."),
+          ),
+        );
+      }
       unsupported(
         started,
         globals,
@@ -453,6 +481,15 @@ fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> O
     }
   }
   unexpected
+}
+
+fn first_unsupported_option(command: &str, arguments: CommandArguments<'_>) -> Option<String> {
+  arguments.iter().find_map(|argument| {
+    argument
+      .to_str()
+      .is_some_and(|value| value.starts_with('-'))
+      .then(|| format!("unknown {command} option {:?}", redact_argument_text(argument)))
+  })
 }
 
 fn run_package_command(

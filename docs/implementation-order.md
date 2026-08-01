@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 68 rows are implemented;
+- 69 rows are implemented;
 - 30 rows have partial foundations;
-- 370 rows are missing;
+- 369 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -133,7 +133,8 @@ cache publication. Network work is outside the verification benchmark.
 ### Wave 1: Invocation And Manifest Spine
 
 Status: in progress; `CLI-005` through `CLI-008`, `CLI-011` through
-`CLI-015`, `CLI-017`, and `DROP-001` through `DROP-003` are complete.
+`CLI-015`, `CLI-017`, `DROP-001` through `DROP-003`, and `DROP-010` are
+complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
@@ -144,9 +145,10 @@ all supported version aliases normalize to one typed request and event shape.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
 NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
 parity records with explicit per-dimension support state.
-All 19 currently accepted command spellings normalize to 14 semantic command
-kinds in one six-byte request; raw spelling and compatibility provenance stay
-with the cold lossless argument owner.
+All 20 currently accepted native command spellings normalize to 15 native
+semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
+24 command kinds in the same six-byte request; raw spelling and compatibility
+provenance stay with the cold lossless argument owner.
 The broader foundations of `DROP-011` and `DROP-016` remain partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command

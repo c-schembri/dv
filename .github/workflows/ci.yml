@@ -44,6 +44,8 @@ jobs:
         run: cargo run -p dv-bench -- --case cli_command_normalization --samples 1 --warmups 0 --output target/benchmark-command-normalization-smoke.json
       - name: Run invocation mode benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_mode_classification --samples 1 --warmups 0 --output target/benchmark-invocation-mode-smoke.json
+      - name: Run route precedence benchmark smoke test
+        run: cargo run -p dv-bench -- --case cli_route_precedence --samples 1 --warmups 0 --output target/benchmark-route-precedence-smoke.json
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-smoke

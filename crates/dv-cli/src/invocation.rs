@@ -58,10 +58,23 @@ pub(crate) enum CommandKind {
   Test,
   Pack,
   Publish,
+  DotnetList,
+  NugetRestore,
+  NugetPack,
+  NugetPush,
+  NugetList,
+  NugetAdd,
+  NugetRemove,
+  NugetUpdate,
+  MsbuildInput,
+  VstestInput,
   Unknown,
   InvalidText,
   InvalidOptions,
 }
+
+const _: () = assert!(size_of::<CommandKind>() == 1);
+const _: () = assert!(align_of::<CommandKind>() == 1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
@@ -400,7 +413,7 @@ impl InvocationBatch {
     let mut index = 0;
     while raw_arguments.get(index).is_some() {
       if raw_arguments.get(index).is_some_and(|argument| argument == "--")
-        && command_index.is_some_and(|command| accepts_forwarded_arguments(raw_arguments.get(command).expect("command index is valid")))
+        && command_index.is_some_and(|command| accepts_forwarded_arguments(scan.mode, raw_arguments.get(command).expect("command index is valid")))
       {
         forwarded_index = NonZeroUsize::new(index + 1);
         break;
@@ -428,7 +441,7 @@ impl InvocationBatch {
             let argument = raw_arguments.get(index).expect("global option index is valid");
             if argument
               .to_str()
-              .is_some_and(|value| value.starts_with('-') && matches!(classify_command(argument), CommandKind::Unknown))
+              .is_some_and(|value| value.starts_with('-') && matches!(classify_command(scan.mode, argument), CommandKind::Unknown))
             {
               option_error = Some(format!("unknown global option {}", output::quoted_os_argument(argument)));
               break;
@@ -465,7 +478,7 @@ impl InvocationBatch {
     }
     if option_error.is_none()
       && environment_directive_seen
-      && !command_index.is_some_and(|index| accepts_forwarded_arguments(raw_arguments.get(index).expect("command index is valid")))
+      && !command_index.is_some_and(|index| accepts_forwarded_arguments(scan.mode, raw_arguments.get(index).expect("command index is valid")))
     {
       option_error = Some("environment directives are supported only by run and test".into());
     }
@@ -476,7 +489,7 @@ impl InvocationBatch {
       CommandKind::InvalidOptions
     } else {
       command_index.map_or(CommandKind::Help, |index| {
-        classify_command(raw_arguments.get(index).expect("classified argument index is valid"))
+        classify_command(scan.mode, raw_arguments.get(index).expect("classified argument index is valid"))
       })
     };
     Self {
@@ -719,29 +732,113 @@ fn parse_verbosity(value: &OsStr) -> Result<DiagnosticVerbosity, String> {
   }
 }
 
-fn classify_command(command: &OsStr) -> CommandKind {
-  match command.to_str() {
-    Some("-h" | "--help" | "help") => CommandKind::Help,
-    Some("-V" | "--version" | "version") => CommandKind::Version,
-    Some("sdk") => CommandKind::Sdk,
-    Some("project") => CommandKind::Project,
-    Some("build") => CommandKind::Build,
-    Some("restore" | "sync") => CommandKind::Restore,
-    Some("compat") => CommandKind::Compat,
-    Some("init") => CommandKind::Init,
-    Some("add") => CommandKind::Add,
-    Some("remove") => CommandKind::Remove,
-    Some("run") => CommandKind::Run,
-    Some("test") => CommandKind::Test,
-    Some("pack") => CommandKind::Pack,
-    Some("publish") => CommandKind::Publish,
-    Some(_) => CommandKind::Unknown,
-    None => CommandKind::InvalidText,
+const AMBIGUOUS_COMMAND_PRECEDENCE: [[CommandKind; 5]; 7] = [
+  [
+    CommandKind::Restore,
+    CommandKind::Restore,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetRestore,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::Pack,
+    CommandKind::Pack,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetPack,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::Unknown,
+    CommandKind::Unknown,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetPush,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::DotnetList,
+    CommandKind::DotnetList,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetList,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::Add,
+    CommandKind::Add,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetAdd,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::Remove,
+    CommandKind::Remove,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetRemove,
+    CommandKind::VstestInput,
+  ],
+  [
+    CommandKind::Unknown,
+    CommandKind::Unknown,
+    CommandKind::MsbuildInput,
+    CommandKind::NugetUpdate,
+    CommandKind::VstestInput,
+  ],
+];
+
+const _: () = assert!(InvocationMode::Native as usize == 0);
+const _: () = assert!(InvocationMode::Dotnet as usize == 1);
+const _: () = assert!(InvocationMode::Msbuild as usize == 2);
+const _: () = assert!(InvocationMode::Nuget as usize == 3);
+const _: () = assert!(InvocationMode::Vstest as usize == 4);
+const _: () = assert!(size_of::<[[CommandKind; 5]; 7]>() == 35);
+const _: () = assert!(align_of::<[[CommandKind; 5]; 7]>() == 1);
+
+fn classify_command(mode: InvocationMode, command: &OsStr) -> CommandKind {
+  let Some(command) = command.to_str() else {
+    return CommandKind::InvalidText;
+  };
+  if let Some(row) = ambiguous_command_row(command) {
+    return AMBIGUOUS_COMMAND_PRECEDENCE[row][mode as usize];
+  }
+  match mode {
+    InvocationMode::Native | InvocationMode::Dotnet => classify_dotnet_command(command),
+    InvocationMode::Nuget => CommandKind::Unknown,
+    InvocationMode::Msbuild => CommandKind::MsbuildInput,
+    InvocationMode::Vstest => CommandKind::VstestInput,
   }
 }
 
-fn accepts_forwarded_arguments(command: &OsStr) -> bool {
-  matches!(classify_command(command), CommandKind::Run | CommandKind::Test)
+fn ambiguous_command_row(command: &str) -> Option<usize> {
+  match command {
+    "restore" => Some(0),
+    "pack" => Some(1),
+    "push" => Some(2),
+    "list" => Some(3),
+    "add" => Some(4),
+    "remove" => Some(5),
+    "update" => Some(6),
+    _ => None,
+  }
+}
+
+fn classify_dotnet_command(command: &str) -> CommandKind {
+  match command {
+    "-h" | "--help" | "help" => CommandKind::Help,
+    "-V" | "--version" | "version" => CommandKind::Version,
+    "sdk" => CommandKind::Sdk,
+    "project" => CommandKind::Project,
+    "build" => CommandKind::Build,
+    "sync" => CommandKind::Restore,
+    "compat" => CommandKind::Compat,
+    "init" => CommandKind::Init,
+    "run" => CommandKind::Run,
+    "test" => CommandKind::Test,
+    "publish" => CommandKind::Publish,
+    _ => CommandKind::Unknown,
+  }
+}
+
+fn accepts_forwarded_arguments(mode: InvocationMode, command: &OsStr) -> bool {
+  matches!(classify_command(mode, command), CommandKind::Run | CommandKind::Test)
 }
 
 #[cfg(test)]
@@ -1018,6 +1115,7 @@ mod tests {
       ("test", CommandKind::Test),
       ("pack", CommandKind::Pack),
       ("publish", CommandKind::Publish),
+      ("list", CommandKind::DotnetList),
     ];
 
     for (spelling, expected) in cases {
@@ -1116,11 +1214,11 @@ mod tests {
 
   #[test]
   fn compatibility_mode_is_typed_and_removed_from_command_operands() {
-    for (name, expected) in [
-      ("dotnet", InvocationMode::Dotnet),
-      ("msbuild", InvocationMode::Msbuild),
-      ("nuget", InvocationMode::Nuget),
-      ("vstest", InvocationMode::Vstest),
+    for (name, expected_mode, expected_command) in [
+      ("dotnet", InvocationMode::Dotnet, CommandKind::Sdk),
+      ("msbuild", InvocationMode::Msbuild, CommandKind::MsbuildInput),
+      ("nuget", InvocationMode::Nuget, CommandKind::Unknown),
+      ("vstest", InvocationMode::Vstest, CommandKind::VstestInput),
     ] {
       let combined = OsString::from(format!("--compat={name}"));
       for arguments in [
@@ -1141,11 +1239,45 @@ mod tests {
       ] {
         let batch = InvocationBatch::capture(arguments);
 
-        assert_eq!(batch.request().command(), CommandKind::Sdk, "{name}");
-        assert_eq!(batch.options().mode, expected, "{name}");
+        assert_eq!(batch.request().command(), expected_command, "{name}");
+        assert_eq!(batch.options().mode, expected_mode, "{name}");
         assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("current")], "{name}");
       }
     }
+  }
+
+  #[test]
+  fn ambiguous_words_follow_the_explicit_profile_precedence_table() {
+    for (word, native, dotnet, nuget) in [
+      ("restore", CommandKind::Restore, CommandKind::Restore, CommandKind::NugetRestore),
+      ("pack", CommandKind::Pack, CommandKind::Pack, CommandKind::NugetPack),
+      ("push", CommandKind::Unknown, CommandKind::Unknown, CommandKind::NugetPush),
+      ("list", CommandKind::DotnetList, CommandKind::DotnetList, CommandKind::NugetList),
+      ("add", CommandKind::Add, CommandKind::Add, CommandKind::NugetAdd),
+      ("remove", CommandKind::Remove, CommandKind::Remove, CommandKind::NugetRemove),
+      ("update", CommandKind::Unknown, CommandKind::Unknown, CommandKind::NugetUpdate),
+    ] {
+      let native_batch = InvocationBatch::capture([OsString::from(word)]);
+      let dotnet_batch = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from(word)]);
+      let nuget_batch = InvocationBatch::capture([OsString::from("--compat=nuget"), OsString::from(word)]);
+      let msbuild_batch = InvocationBatch::capture([OsString::from("--compat=msbuild"), OsString::from(word)]);
+      let vstest_batch = InvocationBatch::capture([OsString::from("--compat=vstest"), OsString::from(word)]);
+
+      assert_eq!(native_batch.request().command(), native, "native {word}");
+      assert_eq!(dotnet_batch.request().command(), dotnet, "dotnet {word}");
+      assert_eq!(nuget_batch.request().command(), nuget, "nuget {word}");
+      assert_eq!(msbuild_batch.request().command(), CommandKind::MsbuildInput, "msbuild {word}");
+      assert_eq!(vstest_batch.request().command(), CommandKind::VstestInput, "vstest {word}");
+    }
+  }
+
+  #[test]
+  fn wrong_profile_run_words_do_not_activate_the_child_delimiter() {
+    let batch = InvocationBatch::capture(["--compat=nuget", "run", "--", "--json", "argument"].map(OsString::from));
+
+    assert_eq!(batch.request().command(), CommandKind::Unknown);
+    assert!(batch.forwarded_arguments().is_none());
+    assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("--"), OsStr::new("argument")]);
   }
 
   #[test]

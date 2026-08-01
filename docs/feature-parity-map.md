@@ -435,9 +435,18 @@ contracts.
   `dotnet vstest` and `vstest.console` replacement. `P3`
 - [ ] `DROP-009` Accept `dv APP.dll ...`, `dv exec APP.dll ...`, and runtime
   host options for direct `dotnet` application-host replacement. `P2`
-- [ ] `DROP-010` Resolve ambiguous command words such as `restore`, `pack`,
+- [x] `DROP-010` Resolve ambiguous command words such as `restore`, `pack`,
   `push`, `list`, `add`, and `update` using an explicit precedence table that
-  matches the input shape and never guesses after side effects begin. `P1`
+  matches the input shape and never guesses after side effects begin. The
+  selected profile and first semantic OS token index a 35-byte read-only
+  matrix and map directly to one of 24 exact one-byte command kinds;
+  native/dotnet, NuGet, MSBuild-input, and VSTest-input routes cannot cross
+  into one another. NuGet-only `push` and `update` remain unknown without
+  NuGet evidence. The six-byte request, one linear scan, and allocation/I/O
+  counts are unchanged. Fifty Windows pre-I/O rejection samples measured
+  `280.174 ms` for `dotnet pack` and `5.242 ms` for the corresponding `dv`
+  route, a `53.4x` median improvement.
+  `P1`
 - [~] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
   diagnostics and ambiguous automation without requiring it for ordinary
   executable-token replacement. The typed selector and exit policy are

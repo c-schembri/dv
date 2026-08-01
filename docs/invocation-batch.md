@@ -30,7 +30,8 @@ batches preserve behavior through contiguous spill storage.`
    multi-token batch, retaining the exact platform encoding.
 3. One linear, predictable scan -> typed global output policy, invocation
    mode, and first semantic token.
-4. First semantic token -> one of 14 exact semantic command kinds before SDK,
+4. Selected profile plus first semantic token -> one of 24 exact routed
+   command kinds before SDK,
    current-directory, project, filesystem, process, or network access. The raw
    command index and compatibility provenance stay outside the hot request.
 5. Command operands -> borrowed views. Text-only positions reject invalid
@@ -139,6 +140,36 @@ boolean locals without adding persistent state, allocation, a second scan, or
 external work. The common native branch is predictable; selector parsing is a
 rare exact-match branch over one borrowed token. Duplicate, missing,
 unsupported, and non-Unicode values reject rather than selecting a fallback.
+
+## Route Precedence
+
+`DROP-010` resolves ambiguous first words with this exhaustive precedence
+matrix. The selected profile is authoritative; the parser never probes the
+filesystem or launches a candidate tool to decide.
+
+| First word | Native / dotnet | NuGet | MSBuild | VSTest |
+|---|---|---|---|---|
+| `restore` | `Restore` | `NugetRestore` | `MsbuildInput` | `VstestInput` |
+| `pack` | `Pack` | `NugetPack` | `MsbuildInput` | `VstestInput` |
+| `push` | `Unknown` | `NugetPush` | `MsbuildInput` | `VstestInput` |
+| `list` | `DotnetList` | `NugetList` | `MsbuildInput` | `VstestInput` |
+| `add` | `Add` | `NugetAdd` | `MsbuildInput` | `VstestInput` |
+| `remove` | `Remove` | `NugetRemove` | `MsbuildInput` | `VstestInput` |
+| `update` | `Unknown` | `NugetUpdate` | `MsbuildInput` | `VstestInput` |
+
+Other native/dotnet words use the exact canonical command match; other NuGet
+words are unknown. MSBuild and VSTest words remain typed input routes because
+their project/container grammars are owned by later rows. NuGet-only direct
+replacement without explicit profile evidence remains open under `DROP-007`
+and `DROP-012`; guessing it here would make a future canonical command unsafe.
+
+The seven-word `match` produces a row index into one 35-byte read-only matrix;
+the already-classified one-byte mode selects its column. This is one indexed
+byte read, not a runtime table scan or hash lookup. It adds no state to the
+six-byte request and does not allocate. Only native/dotnet `run` and `test` may
+activate the child delimiter; a word in another profile cannot cross into
+child orchestration. Routed but unimplemented operations return a typed
+pre-I/O failure rather than falling through to native restore/build.
 
 ## Layout And Access
 
@@ -367,3 +398,11 @@ Fifty retained samples after ten warm-ups measured `152.984 ms` versus
 faster at this like-for-like boundary. The selected-SDK control remained
 `12.0x` faster. Full evidence is retained in the
 [invocation-mode baseline](performance-baselines/2026-08-01-invocation-mode-windows.md).
+
+`DROP-010` compares `dotnet pack --definitely-unknown` with `dv --compat
+dotnet pack --definitely-unknown`. Both reject the same invalid pack option;
+fixture snapshots prove the route does not reach SDK, project, or filesystem
+work. Fifty retained samples after ten warm-ups measured `280.174 ms` versus
+`5.242 ms` median and `306.891 ms` versus `5.841 ms` p95, so `dv` is `53.4x`
+faster. The SDK control remained `12.8x` faster. Full evidence is retained in
+the [route-precedence baseline](performance-baselines/2026-08-01-cli-route-precedence-windows.md).

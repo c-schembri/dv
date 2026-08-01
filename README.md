@@ -220,12 +220,19 @@ versions in one validated event batch, while human `dv --version` remains
 unchanged. Version aliases normalize to the same typed command and cannot
 select a different wire schema.
 
-All 19 command spellings currently accepted by `dv` normalize to 14 exact
-semantic kinds. In particular, `sync` and `restore` share one `Restore`
-request; the original OS spelling remains only in the cold argument owner for
-diagnostics and events. Compatibility provenance is likewise separate from
-semantics. This keeps the hot request at 6 bytes rather than carrying the raw
-command index through dispatch.
+All 20 native command spellings currently accepted by `dv` normalize to 15
+native semantic kinds. Profile-aware routing expands that to 24 exact command
+kinds without enlarging the six-byte request. In particular, `sync` and
+`restore` share one `Restore` request, while NuGet `restore` is a distinct
+pre-I/O route and MSBuild/VSTest words cannot enter the native restore path.
+The original OS spelling remains only in the cold argument owner for
+diagnostics and events.
+
+Seven overlapping words (`restore`, `pack`, `push`, `list`, `add`, `remove`,
+and `update`) use a 35-byte read-only precedence matrix indexed by the selected
+profile. Routing performs one indexed byte read after the existing exact-token
+match, allocates nothing, and cannot probe a project or fall through into a
+different tool grammar.
 
 `dv compat manifest` emits compatibility manifest version `1` as a static JSON
 artifact. It records the selected .NET 10 SDK, MSBuild, NuGet, and VSTest
@@ -454,6 +461,8 @@ Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
 Explicit invocation-mode classification has a like-for-like pre-I/O baseline
 in the [invocation-mode evidence](docs/performance-baselines/2026-08-01-invocation-mode-windows.md).
+Ambiguous command precedence has a like-for-like pre-I/O baseline in the
+[route-precedence evidence](docs/performance-baselines/2026-08-01-cli-route-precedence-windows.md).
 
 Initial machine:
 
@@ -488,6 +497,7 @@ Initial machine:
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Select the `dotnet` invocation mode and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 152.984 ms | 5.641 ms | 27.1x | 193.102 ms | 6.630 ms |
+| Route ambiguous `pack` and reject before discovery | `dotnet pack --definitely-unknown` | `dv --compat dotnet pack --definitely-unknown` | 280.174 ms | 5.242 ms | 53.4x | 306.891 ms | 5.841 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
@@ -765,6 +775,7 @@ cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
+cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3
