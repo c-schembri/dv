@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

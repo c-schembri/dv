@@ -112,6 +112,16 @@ packages remain distinct from project-direct packages in lock schema 5 and
 event schema 15. See the
 [central package management contract](central-package-management.md).
 
+Version constraints are owned by one identity-ordered graph node and keyed by
+their immediate parent identity. Project-direct ranges suppress all transitive
+constraints. For transitive conflicts, a parent constraint suppresses another
+only when the nearer parent dominates it in the selected package graph: every
+project-root path to the deeper parent must pass through the nearer one.
+Alternate project-root paths keep shared diamond nodes active as cousins, as do
+unrelated branches at different absolute depths. Replacing a selected version
+retracts its previous edges and dirties the affected descendant constraint
+targets before the next bounded convergence pass.
+
 Exact `Newtonsoft.Json` `13.0.3` is the representative package. Its 2,441,966
 byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`
 fixture. A v3 miss performs two requests: service index and package content.
@@ -162,6 +172,20 @@ No worker mutates these records, so extra cache-line alignment would consume
 memory without preventing false sharing. `ASSUMPTION: the benchmark host has
 64-byte data cache lines - affects layout analysis only; no correctness or
 alignment decision depends on it.`
+
+Zero- and one-parent identities take the straight-line selection path without
+ancestry storage. Multi-parent identities compact active range references into
+one contiguous temporary vector and walk reverse parent links plus forward
+root paths with reused stack and visited vectors. Those branches are
+data-dependent and therefore
+unpredictable; graph map lookups are random, while each dependency and active
+range batch is traversed linearly. On the captured 203-identity graph, 93
+identities have at least two incoming parents and the maximum is 33. The
+temporary vectors are necessary because parent count and graph depth are
+externally sized; they are allocated only for multi-parent selection and die
+before the node is mutated. Dense transitive-closure storage was rejected
+because it would charge every graph mutation for a relation used only by
+multi-parent nodes.
 
 For .NET 10 and later, pruning is driven by the selected SDK's versioned
 `PrunePackageData` first and the matching `Microsoft.NETCore.App.Ref`
@@ -292,8 +316,8 @@ them. `dv.lock.json` is project-owned persistent state.
 | Package authentication or provider work cancelled | `DV0411` |
 | Uncached identity has no enabled winning source mapping | `DV0412` |
 
-Unsupported package build-target execution, signature enforcement, and
-advanced conflict rules fail instead of being approximated.
+Unsupported package build-target execution and signature enforcement fail
+instead of being approximated.
 
 ## Verification
 
@@ -344,6 +368,22 @@ cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
 
 The curated distribution is retained in the
 [floating-version baseline](performance-baselines/2026-08-01-nuget-floating-version-windows.md).
+
+The conflict-resolution case generates fifteen deterministic local archives and
+populates each tool's package cache outside timing. Each sample removes restore
+outputs and locks, then resolves one nested direct-wins downgrade and one
+different-depth cousin graph with zero network work. An additional diamond
+keeps a project-direct package's alternate root path active as a cousin. The
+two cousin leaf versions point at different children so preflight also proves
+the losing version's edge is retracted. It requires the same exact
+eleven-identity version batch from Microsoft restore and `dv`:
+
+```powershell
+cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[package conflict-resolution baseline](performance-baselines/2026-08-01-package-conflict-resolution-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties

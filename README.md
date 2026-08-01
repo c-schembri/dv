@@ -146,6 +146,7 @@ The project is in the first implementation phase.
 | NuGet interval and floating version selection | Implemented |
 | PackageReference asset, warning, alias, and path-property policy | Implemented |
 | Central versions, overrides, global references, and transitive pinning | Implemented |
+| Lowest-applicable, nested direct-wins, and cousin package convergence | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -344,7 +345,7 @@ Initial machine:
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
-  metadata, central package management, service-index
+  metadata, central package management, package conflict resolution, service-index
   capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
@@ -380,6 +381,7 @@ Initial machine:
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
+| Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -528,6 +530,7 @@ recorded in the curated
 [conditional-reference baseline](docs/performance-baselines/2026-08-01-package-reference-conditions-windows.md),
 [PackageReference metadata baseline](docs/performance-baselines/2026-08-01-package-reference-metadata-windows.md),
 [central package management baseline](docs/performance-baselines/2026-08-01-central-package-management-windows.md),
+[package conflict-resolution baseline](docs/performance-baselines/2026-08-01-package-conflict-resolution-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -592,6 +595,7 @@ cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
 cargo bench-all --case package_reference_metadata --samples 30 --warmups 3
 cargo bench-all --case central_package_management --samples 30 --warmups 3
+cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3

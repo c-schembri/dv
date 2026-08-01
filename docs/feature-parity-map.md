@@ -925,12 +925,18 @@ boundary, not final drop-in parity.
   SHA-512, asset family, and `CentralTransitive` role. Thirty Windows samples
   measure `461.826 ms` for Microsoft versus `29.864 ms` for `dv` (`15.5x`).
   `P2`
-- [~] `RES-007` Lowest-applicable-version, direct-dependency-wins, and cousin
+- [x] `RES-007` Lowest-applicable-version, direct-dependency-wins, and cousin
   convergence use an identity-ordered constraint table with stale-edge
-  retraction and bounded non-convergence failure. The eShop-derived acceptance
-  graph selects every one of the reference graph's 203 identities at the same
-  exact version after SDK-owned package pruning; advanced conflict behavior
-  remains. `P1`
+  retraction and bounded non-convergence failure. Direct wins is applied at
+  every package subgraph by suppressing only constraints whose parent is
+  dominated by a nearer constraining parent; alternate project-root paths keep
+  shared diamond nodes as cousins. Unrelated cousins still combine across
+  different absolute depths. Edge changes invalidate affected descendants
+  deterministically. Microsoft-oracled local graphs verify the nested downgrade
+  and cousin selections, while the eShop-derived acceptance graph retains exact
+  identity/version parity across 203 packages. Thirty warm-cache Windows
+  samples measure `604.023 ms` for Microsoft versus `16.971 ms` for `dv`
+  (`35.6x`). `P1`
 - [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
   package/version, and incompatible-framework diagnostics. `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and

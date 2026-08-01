@@ -39,6 +39,7 @@ enum CaseKind {
   PackageAssetPlan,
   PackageReferenceMetadata,
   CentralPackageManagement,
+  PackageConflictResolution,
   PackageSyncWarm,
   NugetConfigHierarchy,
   NugetConfigMerge,
@@ -78,6 +79,7 @@ struct Fixtures<'a> {
   package: &'a Path,
   package_reference_metadata: &'a Path,
   central_package_management: &'a Path,
+  package_conflict_resolution: &'a Path,
   package_reference_conditions: &'a Path,
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
@@ -282,6 +284,21 @@ const DOTNET_CASES: &[Case] = &[
       "--locked-mode",
       "--packages",
       ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_conflict_resolution",
+    kind: CaseKind::PackageConflictResolution,
+    args: &[
+      "restore",
+      "ConflictResolution.csproj",
+      "--packages",
+      ".packages",
+      "-p:NoWarn=NU1605",
       "--nologo",
       "--verbosity",
       "quiet",
@@ -647,6 +664,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_conflict_resolution",
+    kind: CaseKind::PackageConflictResolution,
+    args: &["restore", "ConflictResolution.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_config_hierarchy",
     kind: CaseKind::NugetConfigHierarchy,
     args: &["restore", "ConfigHierarchy.csproj", "--offline", "--json"],
@@ -890,6 +913,7 @@ fn run() -> Result<()> {
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
   let central_package_management_fixture = repository.join("benchmarks/fixtures/central-package-management");
+  let package_conflict_resolution_fixture = repository.join("benchmarks/fixtures/package-conflict-resolution");
   let package_reference_conditions_fixture = repository.join("benchmarks/fixtures/package-reference-conditions");
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
@@ -918,6 +942,7 @@ fn run() -> Result<()> {
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
     central_package_management: &central_package_management_fixture,
+    package_conflict_resolution: &package_conflict_resolution_fixture,
     package_reference_conditions: &package_reference_conditions_fixture,
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
@@ -983,6 +1008,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "central_package_management") {
     verify_central_package_management(&repository, &dv_executable, &central_package_management_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_conflict_resolution") {
+    verify_package_conflict_resolution(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_config_hierarchy") {
     verify_nuget_config_hierarchy(&repository, &dv_executable, &nuget_config_fixture)?;
@@ -2263,6 +2291,95 @@ fn verify_central_package_management(repository: &Path, dv_executable: &Path, fi
     || pinned.get("direct").and_then(serde_json::Value::as_bool) != Some(false)
   {
     return Err("dv did not preserve the central-transitive package role".into());
+  }
+  Ok(())
+}
+
+fn verify_package_conflict_resolution(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-conflict-resolution-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  reset_fixture(fixture, &root)?;
+  for package in CONFLICT_PACKAGES {
+    write_conflict_package(&root.join("feed"), package)?;
+  }
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "ConflictResolution.csproj",
+      "--packages",
+      "dotnet-packages",
+      "-p:NoWarn=NU1605",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &root,
+    "Microsoft package conflict oracle",
+  )?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join("obj/project.assets.json"))?)?;
+  let mut microsoft = assets
+    .get("libraries")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft package conflict oracle omitted libraries")?
+    .keys()
+    .map(|key| {
+      key
+        .split_once('/')
+        .map(|(id, version)| (id.to_owned(), version.to_owned()))
+        .ok_or_else(|| format!("Microsoft package conflict library has no version: {key}").into())
+    })
+    .collect::<Result<Vec<_>>>()?;
+  microsoft.sort_unstable();
+
+  remove_generated_path(&root.join("obj"))?;
+  let restored = command_text(
+    dv_executable,
+    &["restore", "ConflictResolution.csproj", "--packages", "dv-packages", "--offline", "--json"],
+    &root,
+  )?;
+  let resolution = json_event(&restored, "package_resolution_created").ok_or("dv conflict restore omitted package_resolution_created")?;
+  let mut dv = resolution
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv conflict restore omitted packages")?
+    .iter()
+    .map(|package| {
+      Ok((
+        package
+          .get("id")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("dv conflict package omitted id")?
+          .to_owned(),
+        package
+          .get("version")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("dv conflict package omitted version")?
+          .to_owned(),
+      ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  dv.sort_unstable();
+  let expected = [
+    ("Cousin.Current", "1.0.0"),
+    ("Cousin.Deep", "1.0.0"),
+    ("Cousin.Leaf", "2.0.0"),
+    ("Cousin.Left", "1.0.0"),
+    ("Cousin.Right", "1.0.0"),
+    ("Diamond.Leaf", "2.0.0"),
+    ("Diamond.Provider", "1.0.0"),
+    ("Diamond.Relational", "1.0.0"),
+    ("Direct.Deep", "1.0.0"),
+    ("Direct.Leaf", "1.0.0"),
+    ("Direct.Top", "1.0.0"),
+  ];
+  let mut expected = expected
+    .into_iter()
+    .map(|(id, version)| (id.to_owned(), version.to_owned()))
+    .collect::<Vec<_>>();
+  expected.sort_unstable();
+  if microsoft != expected || dv != expected {
+    return Err(format!("package conflict selection differs: expected={expected:?} Microsoft={microsoft:?} dv={dv:?}").into());
   }
   Ok(())
 }
@@ -3987,6 +4104,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
       | CaseKind::CentralPackageManagement
+      | CaseKind::PackageConflictResolution
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
@@ -4345,6 +4463,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       )?;
     }
   }
+  if matches!(case.kind, CaseKind::PackageConflictResolution) {
+    prepare_package_conflict_resolution(executable, workspace)?;
+  }
   if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
   }
@@ -4564,6 +4685,146 @@ fn prepare_nuget_floating_version(workspace: &Path) -> Result<()> {
   }
   fs::remove_file(workspace.join(".seed.config"))?;
   reset_nuget_floating_iteration(workspace)
+}
+
+struct ConflictPackage {
+  id: &'static str,
+  version: &'static str,
+  dependencies: &'static [(&'static str, &'static str)],
+}
+
+const CONFLICT_PACKAGES: &[ConflictPackage] = &[
+  ConflictPackage {
+    id: "Direct.Leaf",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Direct.Leaf",
+    version: "2.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Direct.Deep",
+    version: "1.0.0",
+    dependencies: &[("Direct.Leaf", "[2.0.0]")],
+  },
+  ConflictPackage {
+    id: "Direct.Top",
+    version: "1.0.0",
+    dependencies: &[("Direct.Leaf", "[1.0.0]"), ("Direct.Deep", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Cousin.Leaf",
+    version: "1.0.0",
+    dependencies: &[("Cousin.Stale", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Cousin.Leaf",
+    version: "2.0.0",
+    dependencies: &[("Cousin.Current", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Cousin.Stale",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Cousin.Current",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Cousin.Deep",
+    version: "1.0.0",
+    dependencies: &[("Cousin.Leaf", "[2.0.0]")],
+  },
+  ConflictPackage {
+    id: "Cousin.Left",
+    version: "1.0.0",
+    dependencies: &[("Cousin.Leaf", "[1.0.0,3.0.0)")],
+  },
+  ConflictPackage {
+    id: "Cousin.Right",
+    version: "1.0.0",
+    dependencies: &[("Cousin.Deep", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diamond.Leaf",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Diamond.Leaf",
+    version: "2.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Diamond.Provider",
+    version: "1.0.0",
+    dependencies: &[("Diamond.Leaf", "[1.0.0,3.0.0)"), ("Diamond.Relational", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diamond.Relational",
+    version: "1.0.0",
+    dependencies: &[("Diamond.Leaf", "[2.0.0]")],
+  },
+];
+
+fn write_conflict_package(feed: &Path, package: &ConflictPackage) -> Result<()> {
+  use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+  fs::create_dir_all(feed)?;
+  let path = feed.join(format!("{}.{}.nupkg", package.id, package.version));
+  let mut archive = ZipWriter::new(fs::File::create(path)?);
+  let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+  let mut nuspec = format!(
+    "<?xml version=\"1.0\"?><package><metadata><id>{}</id><version>{}</version><authors>dv</authors><description>Conflict resolution oracle.</description><dependencies><group targetFramework=\"net10.0\">",
+    package.id, package.version
+  );
+  for (id, range) in package.dependencies {
+    write!(nuspec, "<dependency id=\"{id}\" version=\"{range}\" />")?;
+  }
+  nuspec.push_str("</group></dependencies></metadata></package>");
+  archive.start_file(format!("{}.nuspec", package.id), options)?;
+  archive.write_all(nuspec.as_bytes())?;
+  archive.start_file(format!("lib/net10.0/{}.dll", package.id), options)?;
+  archive.write_all(b"deterministic managed assembly placeholder")?;
+  archive.finish()?;
+  Ok(())
+}
+
+fn prepare_package_conflict_resolution(executable: &Path, workspace: &Path) -> Result<()> {
+  let feed = workspace.join("feed");
+  remove_generated_path(&feed)?;
+  for package in CONFLICT_PACKAGES {
+    write_conflict_package(&feed, package)?;
+  }
+  if is_dotnet(executable) {
+    run_checked(
+      executable,
+      &[
+        "restore",
+        "ConflictResolution.csproj",
+        "--packages",
+        ".packages",
+        "-p:NoWarn=NU1605",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      workspace,
+      "package conflict resolution setup",
+    )?;
+  } else {
+    run_checked(
+      executable,
+      &["restore", "ConflictResolution.csproj", "--packages", ".packages", "--offline", "--json"],
+      workspace,
+      "package conflict resolution setup",
+    )?;
+  }
+  reset_package_conflict_iteration(workspace)
 }
 
 fn prepare_nuget_request_budget(workspace: &Path) -> Result<()> {
@@ -4967,6 +5228,13 @@ fn reset_nuget_request_budget_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_package_conflict_iteration(workspace: &Path) -> Result<()> {
+  for relative in ["obj", "dv.lock.json", "packages.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn remove_generated_path(path: &Path) -> Result<()> {
   const RETRIES: [Duration; 4] = [
     Duration::from_millis(10),
@@ -5008,6 +5276,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetClientCertificates
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
+    CaseKind::PackageConflictResolution => reset_package_conflict_iteration(workspace),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetFloatingVersion => reset_nuget_floating_iteration(workspace),
     CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => reset_nuget_request_budget_iteration(workspace),
@@ -5076,6 +5345,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
+    CaseKind::PackageConflictResolution => fixtures.package_conflict_resolution,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
@@ -5109,6 +5379,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
+    CaseKind::PackageConflictResolution => Some("package-conflict-resolution"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
@@ -5187,6 +5458,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
         | CaseKind::CentralPackageManagement
+        | CaseKind::PackageConflictResolution
         | CaseKind::PackageSyncWarm
         | CaseKind::NugetConfigHierarchy
         | CaseKind::NugetConfigMerge
@@ -5203,6 +5475,11 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(1) || evidence.resolved_packages != Some(1))
     {
       return Err(format!("floating-version sample did not perform one zero-network package acquisition: {evidence:?}").into());
+    }
+    if matches!(case.kind, CaseKind::PackageConflictResolution)
+      && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(0) || evidence.resolved_packages != Some(11))
+    {
+      return Err(format!("conflict-resolution sample did not resolve eleven cached packages with zero network work: {evidence:?}").into());
     }
     Some(evidence)
   } else if !is_dotnet(executable)
@@ -5945,6 +6222,7 @@ fn case_label(case: &str) -> &str {
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
     "central_package_management" => "Central package management",
+    "package_conflict_resolution" => "Package conflict resolution",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",

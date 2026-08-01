@@ -1868,6 +1868,52 @@ enum NodeSelection {
   Enumerate,
 }
 
+#[derive(Clone, Copy)]
+enum ConstraintView<'a> {
+  All(&'a BTreeMap<String, VersionRange>),
+  Active(&'a [&'a VersionRange]),
+}
+
+impl<'a> ConstraintView<'a> {
+  fn any(self, predicate: impl FnMut(&VersionRange) -> bool) -> bool {
+    match self {
+      Self::All(constraints) => constraints.values().any(predicate),
+      Self::Active(constraints) => constraints.iter().copied().any(predicate),
+    }
+  }
+
+  fn all(self, predicate: impl FnMut(&VersionRange) -> bool) -> bool {
+    match self {
+      Self::All(constraints) => constraints.values().all(predicate),
+      Self::Active(constraints) => constraints.iter().copied().all(predicate),
+    }
+  }
+
+  fn first(self, mut predicate: impl FnMut(&VersionRange) -> bool) -> Option<&'a VersionRange> {
+    match self {
+      Self::All(constraints) => constraints.values().find(|range| predicate(range)),
+      Self::Active(constraints) => constraints.iter().copied().find(|range| predicate(range)),
+    }
+  }
+
+  fn highest_inclusive_lower(self) -> Option<&'a PackageVersion> {
+    let mut candidate = None::<&'a PackageVersion>;
+    let mut consider = |range: &'a VersionRange| {
+      if let Some(lower) = &range.lower
+        && lower.inclusive
+        && candidate.is_none_or(|candidate| lower.version > *candidate)
+      {
+        candidate = Some(&lower.version);
+      }
+    };
+    match self {
+      Self::All(constraints) => constraints.values().for_each(&mut consider),
+      Self::Active(constraints) => constraints.iter().copied().for_each(consider),
+    }
+    candidate
+  }
+}
+
 enum MetadataTaskResult {
   Requirements {
     dependencies: Vec<PackageRequirement>,
@@ -5403,7 +5449,7 @@ fn flatten_asset_flags(nodes: &BTreeMap<String, ConstraintNode>, direct: &[Packa
   result
 }
 
-fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageError> {
+fn select_node_version_with_constraints(node: &ConstraintNode, constraints: ConstraintView<'_>) -> Result<NodeSelection, PackageError> {
   fn consider_lower<'a>(candidate: &mut Option<&'a PackageVersion>, range: &'a VersionRange) {
     if let Some(lower) = &range.lower
       && lower.inclusive
@@ -5427,21 +5473,18 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
   }
 
   let preferred = node.direct.as_ref();
-  let allows_prerelease = preferred.map_or_else(
-    || node.constraints.values().any(VersionRange::allows_prerelease),
-    VersionRange::allows_prerelease,
-  );
+  let allows_prerelease = preferred.map_or_else(|| constraints.any(VersionRange::allows_prerelease), VersionRange::allows_prerelease);
   let accepts = |version: &PackageVersion| {
     (version.prerelease().is_none() || allows_prerelease)
-      && node.direct.as_ref().map_or_else(
-        || node.constraints.values().all(|range| range.contains(version)),
-        |direct| direct.contains(version),
-      )
+      && node
+        .direct
+        .as_ref()
+        .map_or_else(|| constraints.all(|range| range.contains(version)), |direct| direct.contains(version))
   };
   if let Some(versions) = &node.available_versions {
     let preference = preferred
       .filter(|range| range.is_floating())
-      .or_else(|| node.constraints.values().find(|range| range.is_floating()));
+      .or_else(|| constraints.first(VersionRange::is_floating));
     let mut selected = None;
     for version in versions.iter().filter(|version| accepts(version)) {
       if preference.is_none() {
@@ -5456,21 +5499,122 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
       .map(NodeSelection::Version)
       .ok_or_else(|| resolution_error(&node.id, "no available package version satisfies the dependency constraints"));
   }
-  if preferred.is_some_and(VersionRange::is_floating) || node.constraints.values().any(VersionRange::is_floating) {
+  if preferred.is_some_and(VersionRange::is_floating) || constraints.any(VersionRange::is_floating) {
     return Ok(NodeSelection::Enumerate);
   }
-  let mut candidate = None::<&PackageVersion>;
-  if let Some(direct) = &node.direct {
+  let candidate = if let Some(direct) = &node.direct {
+    let mut candidate = None;
     consider_lower(&mut candidate, direct);
+    candidate
   } else {
-    for range in node.constraints.values() {
-      consider_lower(&mut candidate, range);
-    }
-  }
+    constraints.highest_inclusive_lower()
+  };
   match candidate {
     Some(candidate) if accepts(candidate) => Ok(NodeSelection::Version(candidate.clone())),
-    Some(_) if node.direct.is_none() => Err(resolution_error(&node.id, "dependency version ranges have no common version")),
     _ => Ok(NodeSelection::Enumerate),
+  }
+}
+
+#[cfg(test)]
+fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageError> {
+  select_node_version_with_constraints(node, ConstraintView::All(&node.constraints))
+}
+
+fn constraint_parent_is_ancestor<'a>(
+  nodes: &'a BTreeMap<String, ConstraintNode>,
+  target: &str,
+  ancestor: &'a str,
+  descendant: &'a str,
+  stack: &mut Vec<&'a str>,
+  visited: &mut Vec<&'a str>,
+) -> bool {
+  stack.clear();
+  visited.clear();
+  stack.push(descendant);
+  while let Some(current) = stack.pop() {
+    if current == ancestor {
+      return true;
+    }
+    if current == target || visited.contains(&current) {
+      continue;
+    }
+    visited.push(current);
+    if let Some(node) = nodes.get(current) {
+      stack.extend(node.constraints.keys().map(String::as_str).filter(|parent| *parent != target));
+    }
+  }
+  false
+}
+
+fn constraint_parent_has_alternate_root_path<'a>(
+  nodes: &'a BTreeMap<String, ConstraintNode>,
+  target: &str,
+  blocked: &str,
+  descendant: &str,
+  stack: &mut Vec<&'a str>,
+  visited: &mut Vec<&'a str>,
+) -> bool {
+  stack.clear();
+  visited.clear();
+  stack.extend(
+    nodes
+      .iter()
+      .filter(|(id, node)| node.direct.is_some() && id.as_str() != blocked)
+      .map(|(id, _)| id.as_str()),
+  );
+  while let Some(current) = stack.pop() {
+    if current == descendant {
+      return true;
+    }
+    if current == target || current == blocked || visited.contains(&current) {
+      continue;
+    }
+    visited.push(current);
+    if let Some(node) = nodes.get(current) {
+      stack.extend(node.dependencies.iter().map(|dependency| dependency.lower_id.as_str()));
+    }
+  }
+  false
+}
+
+fn collect_active_constraints<'a>(
+  nodes: &'a BTreeMap<String, ConstraintNode>,
+  target: &str,
+  active: &mut Vec<&'a VersionRange>,
+  stack: &mut Vec<&'a str>,
+  visited: &mut Vec<&'a str>,
+) {
+  active.clear();
+  let node = &nodes[target];
+  for (parent, range) in &node.constraints {
+    let dominated = node.constraints.keys().any(|candidate| {
+      candidate != parent
+        && constraint_parent_is_ancestor(nodes, target, candidate, parent, stack, visited)
+        && !constraint_parent_is_ancestor(nodes, target, parent, candidate, stack, visited)
+        && !constraint_parent_has_alternate_root_path(nodes, target, candidate, parent, stack, visited)
+    });
+    if !dominated {
+      active.push(range);
+    }
+  }
+}
+
+fn mark_descendant_constraint_targets_dirty(nodes: &BTreeMap<String, ConstraintNode>, root: &str, dirty: &mut BTreeSet<String>) {
+  // Topology changes are uncommon and external graph depth is unbounded, so a
+  // dynamically sized borrowed-identity traversal is required on this path.
+  let mut stack = vec![root];
+  let mut visited = Vec::new();
+  while let Some(current) = stack.pop() {
+    if visited.contains(&current) {
+      continue;
+    }
+    visited.push(current);
+    if let Some(node) = nodes.get(current) {
+      for dependency in &node.dependencies {
+        dirty.insert(dependency.lower_id.clone());
+        stack.push(&dependency.lower_id);
+      }
+    }
   }
 }
 
@@ -5485,6 +5629,11 @@ fn stabilize_constraint_nodes(
       continue;
     };
     if node.direct.is_none() && node.constraints.is_empty() {
+      // Removing the last incoming edge can change which constraints dominate
+      // anywhere below this node even when every selected version stays equal.
+      for dependency in &node.dependencies {
+        mark_descendant_constraint_targets_dirty(nodes, &dependency.lower_id, dirty);
+      }
       let removed = nodes.remove(&lower_id).expect("a checked node exists");
       ready.remove(&lower_id);
       for dependency in removed.dependencies {
@@ -5495,7 +5644,18 @@ fn stabilize_constraint_nodes(
       }
       continue;
     }
-    let selection = select_node_version(node)?;
+    let selection = if node.direct.is_none() && node.central_pin.is_none() && node.constraints.len() > 1 {
+      // Parent count and ancestry depth come from external package metadata.
+      // Allocate only on the multi-parent path; zero/one-parent selection stays
+      // allocation-free and straight-line.
+      let mut active_constraints = Vec::with_capacity(node.constraints.len());
+      let mut ancestry_stack = Vec::new();
+      let mut ancestry_visited = Vec::new();
+      collect_active_constraints(nodes, &lower_id, &mut active_constraints, &mut ancestry_stack, &mut ancestry_visited);
+      select_node_version_with_constraints(node, ConstraintView::Active(&active_constraints))?
+    } else {
+      select_node_version_with_constraints(node, ConstraintView::All(&node.constraints))?
+    };
     let next = match selection {
       NodeSelection::Version(version) => Some(version),
       NodeSelection::Enumerate => None,
@@ -5505,6 +5665,9 @@ fn stabilize_constraint_nodes(
       .is_some_and(|version| node.direct.is_none() && node.central_pin.is_none() && pruning.contains(&lower_id, version));
     if next.is_some() && nodes.get(&lower_id).is_some_and(|node| node.selected == next && node.pruned == pruned) {
       continue;
+    }
+    for dependency in &node.dependencies {
+      mark_descendant_constraint_targets_dirty(nodes, &dependency.lower_id, dirty);
     }
     let node = nodes.get_mut(&lower_id).expect("a checked node exists");
     let previous_dependencies = std::mem::take(&mut node.dependencies);
@@ -5539,18 +5702,17 @@ fn install_node_dependencies(
   nodes: &mut BTreeMap<String, ConstraintNode>,
   dirty: &mut BTreeSet<String>,
 ) -> Result<(), PackageError> {
-  let mut unique = BTreeMap::<String, PackageRequirement>::new();
-  for dependency in dependencies {
-    if let Some(existing) = unique.insert(dependency.lower_id.clone(), dependency.clone())
-      && existing.range != dependency.range
-    {
+  let mut dependencies = dependencies;
+  dependencies.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id));
+  for duplicate in dependencies.windows(2) {
+    if duplicate[0].lower_id == duplicate[1].lower_id && duplicate[0].range != duplicate[1].range {
       return Err(resolution_error(
-        &dependency.id,
+        &duplicate[1].id,
         "a package dependency group contains duplicate identities with different ranges",
       ));
     }
   }
-  let dependencies: Vec<_> = unique.into_values().collect();
+  dependencies.dedup_by(|left, right| left.lower_id == right.lower_id);
   {
     let node = nodes
       .get_mut(lower_id)
@@ -5559,9 +5721,11 @@ fn install_node_dependencies(
       return Ok(());
     }
     node.metadata_version = node.selected.clone();
-    node.dependencies = dependencies.clone();
   }
-  for dependency in dependencies {
+  for dependency in &dependencies {
+    if nodes.get(&dependency.lower_id).is_some_and(|node| node.metadata_version.is_some()) {
+      mark_descendant_constraint_targets_dirty(nodes, &dependency.lower_id, dirty);
+    }
     let central_pin = central_pins
       .binary_search_by(|pin| pin.lower_id.as_str().cmp(&dependency.lower_id))
       .ok()
@@ -5581,9 +5745,10 @@ fn install_node_dependencies(
     if child.central_pin.is_none() {
       child.central_pin = central_pin;
     }
-    child.constraints.insert(lower_id.to_owned(), dependency.range);
-    dirty.insert(dependency.lower_id);
+    child.constraints.insert(lower_id.to_owned(), dependency.range.clone());
+    dirty.insert(dependency.lower_id.clone());
   }
+  nodes.get_mut(lower_id).expect("a checked node exists").dependencies = dependencies;
   Ok(())
 }
 
@@ -8720,6 +8885,32 @@ mod tests {
     }
   }
 
+  fn requirement(id: &str, range: &str) -> PackageRequirement {
+    PackageRequirement {
+      id: id.into(),
+      lower_id: id.to_ascii_lowercase(),
+      range: VersionRange::parse(range).unwrap(),
+      direct: false,
+      include_assets: AssetFlags::ALL,
+      suppress_parent: AssetFlags::NONE,
+    }
+  }
+
+  fn constraint_node(id: &str) -> ConstraintNode {
+    ConstraintNode {
+      id: id.into(),
+      direct: None,
+      central_pin: None,
+      constraints: BTreeMap::new(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: None,
+      pruned: false,
+      generation: 0,
+    }
+  }
+
   fn write_test_package(temp: &TempDirectory, relative: &str, id: &str, version: &str) -> PathBuf {
     let path = temp.0.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -9071,6 +9262,28 @@ mod tests {
   }
 
   #[test]
+  fn exclusive_lower_bound_enumerates_the_lowest_available_version() {
+    let mut node = constraint_node("Common.Package");
+    node.constraints = BTreeMap::from([
+      ("a".into(), VersionRange::parse("(1.0.0,3.0.0)").unwrap()),
+      ("b".into(), VersionRange::parse("[1.0.0,2.0.0]").unwrap()),
+    ]);
+
+    assert!(matches!(select_node_version(&node).unwrap(), NodeSelection::Enumerate));
+
+    node.available_versions = Some(
+      ["1.0.0", "1.1.0", "2.0.0", "3.0.0"]
+        .into_iter()
+        .map(|version| PackageVersion::parse(version).unwrap())
+        .collect(),
+    );
+    let NodeSelection::Version(selected) = select_node_version(&node).unwrap() else {
+      panic!("an exclusive lower bound must select from available versions");
+    };
+    assert_eq!(selected.normalized, "1.1.0");
+  }
+
+  #[test]
   fn direct_dependency_wins_over_a_transitive_minimum() {
     let node = ConstraintNode {
       id: "Direct.Package".into(),
@@ -9089,6 +9302,136 @@ mod tests {
       panic!("an exact direct dependency selects without enumeration");
     };
     assert_eq!(selected.normalized, "1.0.0");
+  }
+
+  #[test]
+  fn direct_dependency_wins_inside_a_package_subgraph() {
+    let mut top = constraint_node("Top.Package");
+    top.direct = Some(VersionRange::exact(PackageVersion::parse("1.0.0").unwrap()));
+    top.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    top.metadata_version = top.selected.clone();
+    top.dependencies = vec![requirement("Common.Package", "1.0"), requirement("Deep.Package", "1.0")];
+
+    let mut deep = constraint_node("Deep.Package");
+    deep.constraints.insert("top.package".into(), VersionRange::parse("1.0").unwrap());
+    deep.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    deep.metadata_version = deep.selected.clone();
+    deep.dependencies = vec![requirement("Common.Package", "2.0")];
+
+    let mut common = constraint_node("Common.Package");
+    common.constraints = BTreeMap::from([
+      ("deep.package".into(), VersionRange::parse("2.0").unwrap()),
+      ("top.package".into(), VersionRange::parse("1.0").unwrap()),
+    ]);
+    let mut nodes = BTreeMap::from([("common.package".into(), common), ("deep.package".into(), deep), ("top.package".into(), top)]);
+    let mut dirty = BTreeSet::from(["common.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &PackagePruning::default()).unwrap();
+
+    assert_eq!(nodes["common.package"].selected.as_ref().unwrap().normalized, "1.0.0");
+  }
+
+  #[test]
+  fn cousin_constraints_at_different_depths_still_converge() {
+    let mut left = constraint_node("Left.Package");
+    left.direct = Some(VersionRange::parse("1.0").unwrap());
+    left.dependencies = vec![requirement("Common.Package", "1.0")];
+
+    let mut right = constraint_node("Right.Package");
+    right.direct = Some(VersionRange::parse("1.0").unwrap());
+    right.dependencies = vec![requirement("Bridge.Package", "1.0")];
+
+    let mut bridge = constraint_node("Bridge.Package");
+    bridge.constraints.insert("right.package".into(), VersionRange::parse("1.0").unwrap());
+    bridge.dependencies = vec![requirement("Common.Package", "2.0")];
+
+    let mut common = constraint_node("Common.Package");
+    common.constraints = BTreeMap::from([
+      ("bridge.package".into(), VersionRange::parse("2.0").unwrap()),
+      ("left.package".into(), VersionRange::parse("1.0").unwrap()),
+    ]);
+    let mut nodes = BTreeMap::from([
+      ("bridge.package".into(), bridge),
+      ("common.package".into(), common),
+      ("left.package".into(), left),
+      ("right.package".into(), right),
+    ]);
+    let mut dirty = BTreeSet::from(["common.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &PackagePruning::default()).unwrap();
+
+    assert_eq!(nodes["common.package"].selected.as_ref().unwrap().normalized, "2.0.0");
+  }
+
+  #[test]
+  fn a_shared_direct_parent_stays_a_cousin_in_a_diamond_graph() {
+    let mut provider = constraint_node("Provider.Package");
+    provider.direct = Some(VersionRange::parse("1.0").unwrap());
+    provider.dependencies = vec![requirement("Common.Package", "[1.0,3.0)"), requirement("Relational.Package", "1.0")];
+
+    let mut relational = constraint_node("Relational.Package");
+    relational.direct = Some(VersionRange::parse("1.0").unwrap());
+    relational.constraints.insert("provider.package".into(), VersionRange::parse("1.0").unwrap());
+    relational.dependencies = vec![requirement("Common.Package", "2.0")];
+
+    let mut common = constraint_node("Common.Package");
+    common.constraints = BTreeMap::from([
+      ("provider.package".into(), VersionRange::parse("[1.0,3.0)").unwrap()),
+      ("relational.package".into(), VersionRange::parse("2.0").unwrap()),
+    ]);
+    let mut nodes = BTreeMap::from([
+      ("common.package".into(), common),
+      ("provider.package".into(), provider),
+      ("relational.package".into(), relational),
+    ]);
+    let mut dirty = BTreeSet::from(["common.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &PackagePruning::default()).unwrap();
+
+    assert_eq!(nodes["common.package"].selected.as_ref().unwrap().normalized, "2.0.0");
+  }
+
+  #[test]
+  fn retracting_an_ancestor_edge_rechecks_descendant_conflicts() {
+    let mut ancestor = constraint_node("Ancestor.Package");
+    ancestor.dependencies = vec![requirement("Common.Package", "1.0"), requirement("Switch.Package", "1.0")];
+
+    let mut switch = constraint_node("Switch.Package");
+    switch.direct = Some(VersionRange::exact(PackageVersion::parse("2.0.0").unwrap()));
+    switch.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    switch.metadata_version = switch.selected.clone();
+    switch.dependencies = vec![requirement("Deep.Package", "1.0")];
+    switch.generation = 1;
+
+    let mut deep = constraint_node("Deep.Package");
+    deep.direct = Some(VersionRange::parse("1.0").unwrap());
+    deep.constraints.insert("switch.package".into(), VersionRange::parse("1.0").unwrap());
+    deep.dependencies = vec![requirement("Common.Package", "2.0")];
+    deep.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    deep.metadata_version = deep.selected.clone();
+
+    let mut common = constraint_node("Common.Package");
+    common.constraints = BTreeMap::from([
+      ("ancestor.package".into(), VersionRange::parse("1.0").unwrap()),
+      ("deep.package".into(), VersionRange::parse("2.0").unwrap()),
+    ]);
+    common.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    common.generation = 1;
+    let mut nodes = BTreeMap::from([
+      ("ancestor.package".into(), ancestor),
+      ("common.package".into(), common),
+      ("deep.package".into(), deep),
+      ("switch.package".into(), switch),
+    ]);
+    let mut dirty = BTreeSet::from(["switch.package".into()]);
+    let mut ready = BTreeSet::new();
+
+    stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, &PackagePruning::default()).unwrap();
+
+    assert_eq!(nodes["common.package"].selected.as_ref().unwrap().normalized, "2.0.0");
   }
 
   #[test]
