@@ -14,8 +14,8 @@ use dv_core::{
   PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration,
   ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
   RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
-  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
+  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -72,10 +72,10 @@ Usage:
 
 const PACKAGE_HELP: &str = "\
 Usage:
-  dv restore [PROJECT] [-s|--source SOURCE]... [--packages PATH]
+  dv restore [PROJECT]... [-s|--source SOURCE]... [--packages PATH]
              [--configfile PATH] [--offline] [--interactive]
              [--configuration Debug|Release]
-  dv sync [PROJECT] [-s|--source SOURCE]... [--packages PATH]
+  dv sync [PROJECT]... [-s|--source SOURCE]... [--packages PATH]
           [--configfile PATH] [--offline] [--interactive]
           [--configuration Debug|Release]
 ";
@@ -209,25 +209,67 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     },
   };
   let configuration = options.configuration.unwrap_or(ProjectConfiguration::Debug);
-  let project = match load_project(&current_directory, options.project.as_deref(), configuration) {
-    Ok(project) => project,
-    Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
+  let requested = options
+    .project
+    .iter()
+    .chain(&options.additional_projects)
+    .map(PathBuf::as_path)
+    .collect::<Vec<_>>();
+  let mut projects = Vec::with_capacity(requested.len().max(1));
+  let mut seen = Vec::<PathBuf>::new();
+  let roots = if requested.is_empty() {
+    vec![None]
+  } else {
+    requested.into_iter().map(Some).collect()
   };
+  for requested in roots {
+    let root = match load_project(&current_directory, requested, configuration) {
+      Ok(project) => project,
+      Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
+    };
+    let closure = match evaluate_project_closure(root) {
+      Ok(projects) => projects,
+      Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
+    };
+    for project in closure {
+      match seen.binary_search_by(|path| path.as_path().cmp(project.project_path())) {
+        Ok(_) => {},
+        Err(index) => {
+          seen.insert(index, project.project_path().to_owned());
+          projects.push(project);
+        },
+      }
+    }
+  }
   let options = match normalize_package_options(options, &current_directory, true) {
     Ok(options) => options,
     Err(problem) => return fail(started, json, command, args, diagnostic("DV0002", problem, None, None)),
   };
-  let resolutions = match resolve_package_inputs(&[&project], &options) {
+  let project_refs = projects.iter().collect::<Vec<_>>();
+  let resolutions = match resolve_package_inputs(&project_refs, &options) {
     Ok(resolutions) => resolutions,
     Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
   };
-  let resolution = &resolutions[0];
-  let diagnostics = package_downgrade_diagnostics(resolution);
+  let diagnostics = resolutions.iter().flat_map(package_downgrade_diagnostics).collect::<Vec<_>>();
   if !json {
     write_human_diagnostics(&diagnostics);
-    return write_package_resolution(resolution);
+    for (project, resolution) in projects.iter().zip(&resolutions) {
+      if projects.len() > 1 {
+        println!("Project {}", project.project_path().display());
+      }
+      let _ = write_package_resolution(resolution);
+    }
+    return ExitCode::SUCCESS;
   }
-  succeed_with_diagnostics(started, command, args, diagnostics, package_resolution_payload(&project, resolution))
+  if projects.len() == 1 && diagnostics.is_empty() {
+    return succeed(started, command, args, package_resolution_payload(&projects[0], &resolutions[0]));
+  }
+  let payloads = projects
+    .iter()
+    .zip(&resolutions)
+    .map(|(project, resolution)| package_resolution_payload(project, resolution))
+    .collect();
+  succeed_batch_with_diagnostics(started, command, args, diagnostics, payloads)
 }
 
 fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
@@ -268,6 +310,7 @@ fn install_credential_provider_cancellation() -> Result<Option<PackageCancellati
 
 struct PackageCommandOptions {
   project: Option<PathBuf>,
+  additional_projects: Vec<PathBuf>,
   configuration: Option<ProjectConfiguration>,
   packages_directory: Option<PathBuf>,
   config_file: Option<PathBuf>,
@@ -280,6 +323,7 @@ struct PackageCommandOptions {
 fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageCommandOptions, String> {
   let mut options = PackageCommandOptions {
     project: None,
+    additional_projects: Vec::new(),
     configuration: None,
     packages_directory: None,
     config_file: None,
@@ -364,6 +408,7 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
       "--probe-credentials" if command == "project package-sources" => options.probe_credentials = true,
       value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
       value if options.project.is_none() => options.project = Some(PathBuf::from(value)),
+      value if matches!(command, "restore" | "sync") => options.additional_projects.push(PathBuf::from(value)),
       value => return Err(format!("unexpected {command} argument {value:?}")),
     }
     index += 1;
@@ -1913,17 +1958,16 @@ fn succeed(started: Instant, command: &str, args: Vec<String>, payload: EventPay
   ExitCode::SUCCESS
 }
 
-fn succeed_with_diagnostics(started: Instant, command: &str, args: Vec<String>, diagnostics: Vec<Diagnostic>, payload: EventPayload) -> ExitCode {
-  if diagnostics.is_empty() {
-    return succeed(started, command, args, payload);
-  }
+fn succeed_batch_with_diagnostics(started: Instant, command: &str, args: Vec<String>, diagnostics: Vec<Diagnostic>, payloads: Vec<EventPayload>) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
-  let mut events = Vec::with_capacity(diagnostics.len() + 3);
+  let mut events = Vec::with_capacity(diagnostics.len() + payloads.len() + 2);
   events.push(Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }));
   for diagnostic in diagnostics {
     events.push(Event::new(events.len() as u64, elapsed_us, EventPayload::Diagnostic { diagnostic }));
   }
-  events.push(Event::new(events.len() as u64, elapsed_us, payload));
+  for payload in payloads {
+    events.push(Event::new(events.len() as u64, elapsed_us, payload));
+  }
   events.push(Event::new(
     events.len() as u64,
     elapsed_us,

@@ -6,6 +6,12 @@ The initial evaluator accepts one UTF-8 SDK-style C# project using
 `Microsoft.NET.Sdk`. A caller may pass one `.csproj` path or let `dv` select
 exactly one `.csproj` from the current directory.
 
+Restore expands literal `ProjectReference` paths into one deterministic
+root-first project batch. Each absolute path is evaluated once through a
+sorted command-local seen-path index. Reference order is preserved in the
+output batch; cycles and diamonds terminate at the first previously seen path.
+Every project uses the root command's selected Debug/Release configuration.
+
 Observed fixture data:
 
 - `small-console`: one project, one source, no references;
@@ -57,6 +63,8 @@ directory or project path
   -> sort relative source paths
   -> compact text, item, and target-dimension batches
   -> ProjectSpec
+  -> for restore, breadth-first literal ProjectReference expansion
+  -> root-first unique ProjectSpec batch
 ```
 
 The XML reader borrows the project bytes. A single scratch string is reused for
@@ -88,6 +96,12 @@ predictable for repeated property/item groups. Filesystem entry type and
 extension checks are data-dependent. Parallel traversal is deliberately
 absent: thread creation and merging cost more than the observed one-project
 batch.
+
+Closure expansion reads project-reference spans linearly. The sorted path
+index uses logarithmic lookup and contiguous insertion because project counts
+are externally sized but typically small; it avoids a hash table and produces
+deterministic duplicate removal. Each referenced project owns its immutable
+`ProjectSpec` for the lifetime of the downstream package batch.
 
 ## Output And Lifetime
 

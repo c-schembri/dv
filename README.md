@@ -53,6 +53,9 @@ dv central package restore      29.864 ms median
 dotnet package conflict error  569.423 ms median
 dv package conflict error       13.797 ms median
 
+dotnet two-project restore     700.911 ms median
+dv two-project restore          51.502 ms median
+
 dotnet restore (config stack) 532.948 ms median
 dv restore (config stack)       5.651 ms median
 
@@ -151,6 +154,7 @@ The project is in the first implementation phase.
 | Central versions, overrides, global references, and transitive pinning | Implemented |
 | Lowest-applicable, nested direct-wins, and cousin package convergence | Implemented |
 | Stable package downgrade, conflict, cycle, missing, and compatibility diagnostics | Implemented |
+| Project-reference closure restore with shared package metadata and downloads | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -350,7 +354,7 @@ Initial machine:
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
   metadata, central package management, package conflict resolution, package
-  diagnostics, service-index
+  diagnostics, project-reference package batches, service-index
   capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
@@ -388,6 +392,7 @@ Initial machine:
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
 | Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
+| Restore a two-project shared package graph from a cold local cache | `dotnet restore PackageBatch.csproj --packages .packages --nologo --verbosity quiet` | `dv restore PackageBatch.csproj --packages .packages --offline --json` | 700.911 ms | 51.502 ms | 13.6x | 880.634 ms | 64.606 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -484,7 +489,14 @@ preflight also proves `NU1605`/`DV0413`, `NU1108`/`DV0415`,
 `NU1101`/`DV0416`, `NU1102`/`DV0417`, and `NU1202`/`DV0402`. Successful
 direct-wins warnings must survive `dv`'s native warm lock unchanged. Thirty
 samples measure `569.423 ms` for Microsoft and `13.797 ms` for `dv`
-(`41.3x`) with no network work. The unavailable-pack case
+(`41.3x`) with no network work. The project-batch case evaluates one root,
+walks its two-project reference closure once, and resolves two identical
+eight-package graphs through one command-local metadata table and package
+cache. Preflight requires exact package/version parity for both children,
+three ordered `dv` resolution events including the package-free root, eight
+total archive publications rather than sixteen, and zero HTTP work. Thirty
+cold local-source samples measure `700.911 ms` for Microsoft and `51.502 ms`
+for `dv` (`13.6x`). The unavailable-pack case
 uses an empty checked-in source and isolated package cache; both commands must
 fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -545,6 +557,7 @@ recorded in the curated
 [central package management baseline](docs/performance-baselines/2026-08-01-central-package-management-windows.md),
 [package conflict-resolution baseline](docs/performance-baselines/2026-08-01-package-conflict-resolution-windows.md),
 [package diagnostic baseline](docs/performance-baselines/2026-08-01-package-diagnostics-windows.md),
+[package batch-resolution baseline](docs/performance-baselines/2026-08-01-package-batch-resolution-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -611,6 +624,7 @@ cargo bench-all --case package_reference_metadata --samples 30 --warmups 3
 cargo bench-all --case central_package_management --samples 30 --warmups 3
 cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
 cargo bench-all --case package_diagnostics --samples 30 --warmups 3
+cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3

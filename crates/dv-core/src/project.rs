@@ -865,6 +865,34 @@ pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfigur
   materialize_project(project_path, &project_directory, configuration, raw, central)
 }
 
+/// Evaluates one project-reference closure in deterministic root-first order.
+///
+/// Each project path is evaluated once. Reference order is preserved while
+/// duplicate paths are removed through a sorted command-local path index.
+pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, ProjectError> {
+  let configuration = root.configuration();
+  let mut seen = vec![fs::canonicalize(root.project_path()).map_err(|error| io_error("canonicalize", root.project_path(), error))?];
+  let mut projects = vec![root];
+  let mut cursor = 0usize;
+  while cursor < projects.len() {
+    let references = projects[cursor]
+      .project_references()
+      .map(|reference| projects[cursor].project_directory().join(reference))
+      .collect::<Vec<_>>();
+    for reference in references {
+      let reference = absolute_path(&reference)?;
+      let key = fs::canonicalize(&reference).map_err(|error| io_error("canonicalize", &reference, error))?;
+      match seen.binary_search(&key) {
+        Ok(_) => continue,
+        Err(index) => seen.insert(index, key),
+      }
+      projects.push(evaluate_project_path(&reference, configuration)?);
+    }
+    cursor += 1;
+  }
+  Ok(projects)
+}
+
 fn discover_central_packages(project_directory: &Path) -> Result<RawCentralPackages, ProjectError> {
   let mut directory = Some(project_directory);
   while let Some(current) = directory {
@@ -3008,6 +3036,37 @@ mod tests {
     let package = result.package_references()[0];
     assert_eq!(result.package_id(package), "Example.Package");
     assert_eq!(result.package_version(package), "2.0.0-preview.1");
+  }
+
+  #[test]
+  fn evaluates_a_project_reference_closure_once_in_root_first_order() {
+    let temp = TempDirectory::new();
+    temp.write("Shared/Shared.csproj", &project_xml("", ""));
+    temp.write(
+      "Left/Left.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="../Shared/Shared.csproj" /></ItemGroup>"#),
+    );
+    temp.write(
+      "Right/Right.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="../Shared/Shared.csproj" /></ItemGroup>"#),
+    );
+    let root = temp.write(
+      "App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><ProjectReference Include="Left/Left.csproj" /><ProjectReference Include="Right/Right.csproj" /></ItemGroup>"#,
+      ),
+    );
+
+    let root = evaluate_project_path(&root, ProjectConfiguration::Release).unwrap();
+    let projects = evaluate_project_closure(root).unwrap();
+    let names = projects
+      .iter()
+      .map(|project| project.project_path().file_name().unwrap().to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
+
+    assert_eq!(names, ["App.csproj", "Left.csproj", "Right.csproj", "Shared.csproj"]);
+    assert!(projects.iter().all(|project| project.configuration() == ProjectConfiguration::Release));
   }
 
   #[test]

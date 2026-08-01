@@ -25,3 +25,11 @@ checks cycle (`NU1108`/`DV0415`), missing package (`NU1101`/`DV0416`), missing
 version (`NU1102`/`DV0417`), and incompatible framework
 (`NU1202`/`DV0402`) failures. The successful direct-wins project emits
 `DV0413` from both cold resolution and the native warm lock.
+
+`PackageBatch.csproj` references two child projects with identical cousin and
+diamond graphs. Each child selects the same eight identities from the shared
+fifteen-archive feed. The cold benchmark removes package caches, project
+outputs, and locks before every sample. Microsoft restores the root project;
+`dv` expands the literal project-reference closure and emits the package-free
+root followed by both child resolutions. Preflight requires exact child graph
+parity, 16 resolved rows, only eight archive publications, and zero HTTP work.

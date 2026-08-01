@@ -71,6 +71,7 @@ Invalid input behavior:
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `package_conflict_resolution` | fifteen deterministic local archives and a populated package cache; restore outputs and locks removed per sample | process launch, nested direct-wins, cousin and diamond convergence, stale-edge retraction, eleven-package materialization, and output |
 | `package_diagnostics` | eight deterministic local archives; isolated packages, outputs, and locks removed per sample | process launch, project/config parsing, local discovery and publication, cousin constraint convergence, expected-failure classification, and output |
+| `package_batch_resolution` | one root plus two package-bearing references, fifteen deterministic local archives, empty isolated package cache, outputs, and locks | process launch, root-first closure evaluation, two eight-package graphs, one shared metadata session, eight archive publications, three events, and output |
 | `nuget_config_hierarchy` | six machine/user/repository configs, populated isolated package cache, matching native lock | process launch, platform config discovery/merge, project evaluation, one-package locked validation, and output |
 | `nuget_config_merge` | four machine/user/repository configs with keyed overrides and environment values, populated isolated package cache, matching native lock | process launch, config discovery, keyed merge/expansion, one-package locked validation, and output |
 | `nuget_source_sections` | four config levels with package/audit sources, protocols, disabled state, and nested mappings; populated isolated package cache and matching native lock | process launch, typed source-policy merge, mapping construction, one-package locked validation, and output |
@@ -117,6 +118,7 @@ directional decisions.`
 | `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
 | `package-conflict-resolution` | 1 project, 15 local archives, 11 selected identities, one nested downgrade, different-depth and alternate-root cousin convergence, and one retracted stale edge | advanced NuGet graph conflict selection without network variance | executable for both tools with exact version-batch preflight |
 | `package-conflict-resolution` diagnostic projects | 5 projects, 8 local archives, exact cousin conflict, cycle, absent identity, absent version, and incompatible TFM | stable structured failure categories and cold diagnostic latency without network variance | executable for both tools with six Microsoft/`dv` diagnostic-category pairs and cold/warm warning preflight |
+| `package-conflict-resolution` batch projects | 1 root, 2 project-reference children, 15 available local archives, 8 selected identities per child | project-closure ordering plus command-local metadata/download deduplication | executable for both tools with exact child graph parity, 16-row/eight-publication evidence, and zero-request preflight |
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-source-mapping` | 1 `net10.0` project, 1 exact package request, empty cache, 1 unreachable v3 source, and 1 nonmatching mapping pattern | mapping-before-discovery behavior and typed unmapped failure | executable for both tools with expected-failure, diagnostic, and zero-request preflight |
@@ -290,6 +292,14 @@ and must pass the category/field parity gate before timing:
 
 ```text
 cargo bench-all --case package_diagnostics --samples 30 --warmups 3
+```
+
+Measure a cold project-reference package batch. Both tools evaluate the same
+root and two children; the harness requires exact child graphs and one archive
+publication per unique package before timing:
+
+```text
+cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
 ```
 
 Measure one live, uncached v3 service-index request and exact capability

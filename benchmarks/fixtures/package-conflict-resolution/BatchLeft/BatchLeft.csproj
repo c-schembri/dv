@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Cousin.Left" Version="[1.0.0]" />
+    <PackageReference Include="Cousin.Right" Version="[1.0.0]" />
+    <PackageReference Include="Diamond.Provider" Version="[1.0.0]" />
+    <PackageReference Include="Diamond.Relational" Version="[1.0.0]" />
+  </ItemGroup>
+</Project>

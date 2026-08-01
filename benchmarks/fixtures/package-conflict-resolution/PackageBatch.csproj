@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="BatchLeft/BatchLeft.csproj" />
+    <ProjectReference Include="BatchRight/BatchRight.csproj" />
+  </ItemGroup>
+</Project>

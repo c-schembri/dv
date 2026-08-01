@@ -812,6 +812,7 @@ pub struct PackageResolution {
   cache_hits: u32,
   downloaded_packages: u32,
   network_requests: u32,
+  shared_metadata_hits: u32,
   downloaded_bytes: u64,
 }
 
@@ -1112,6 +1113,11 @@ impl PackageResolution {
   /// Returns HTTP request count, including service discovery.
   pub fn network_requests(&self) -> u32 {
     self.network_requests
+  }
+
+  #[cfg(test)]
+  fn shared_metadata_hits(&self) -> u32 {
+    self.shared_metadata_hits
   }
 
   /// Returns HTTP response-body and local source archive bytes read.
@@ -1969,6 +1975,7 @@ struct ResolvedGraph {
   packages: BTreeMap<String, WorkPackage>,
   source_work: Vec<SourceWork>,
   downgrades: Vec<ResolvedDowngrade>,
+  shared_metadata_hits: u32,
 }
 
 struct ResolvedDowngrade {
@@ -1981,6 +1988,184 @@ struct ResolvedDowngrade {
 struct GraphRoots<'a> {
   direct: &'a [PackageRequirement],
   central_pins: &'a [CentralPackagePin],
+}
+
+struct GraphContext<'a> {
+  config: &'a NugetConfiguration,
+  options: &'a PackageResolveOptions,
+  target: TargetFramework,
+  target_text: &'a str,
+  pruning: &'a PackagePruning,
+  batch_metadata: &'a mut BatchMetadataCache,
+}
+
+/// One command-local parsed dependency row. The sorted batch is searched by
+/// target, identity, then exact version. Each row is 40 bytes; eight rows span
+/// five assumed 64-byte cache lines. Identity/version text shares one scope
+/// buffer, while variable external dependencies own one boxed batch and are
+/// cloned only into a project's independently mutable graph.
+struct BatchMetadataEntry {
+  target: TargetFramework,
+  lower_id: TextSpan,
+  version: TextSpan,
+  dependencies: Box<[PackageRequirement]>,
+}
+
+const _: () = assert!(size_of::<BatchMetadataEntry>() == 40);
+const _: () = assert!(align_of::<BatchMetadataEntry>() == align_of::<usize>());
+
+struct BatchMetadataScope {
+  cache_root: PathBuf,
+  fallback_roots: Arc<[PathBuf]>,
+  text: TextTable,
+  entries: Vec<BatchMetadataEntry>,
+  packages: Vec<Option<BatchCachedPackage>>,
+}
+
+struct BatchCachedPackage {
+  root: PathBuf,
+  hash: String,
+  origin: Option<PackageSource>,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<BatchCachedPackage>() == 88);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<BatchCachedPackage>() == align_of::<usize>());
+
+impl BatchCachedPackage {
+  fn from_cached(package: &CachedPackage) -> Self {
+    Self {
+      root: package.root.clone(),
+      hash: package.hash.clone(),
+      origin: package.origin.clone(),
+    }
+  }
+
+  fn materialize(&self) -> CachedPackage {
+    CachedPackage {
+      root: self.root.clone(),
+      hash: self.hash.clone(),
+      dependencies: None,
+      cache_hit: true,
+      source_work: None,
+      failed_source_work: Box::new([]),
+      origin: self.origin.clone(),
+    }
+  }
+}
+
+#[derive(Default)]
+struct BatchMetadataCache {
+  scopes: Vec<BatchMetadataScope>,
+}
+
+impl BatchMetadataCache {
+  fn scope_mut(&mut self, config: &NugetConfiguration) -> &mut BatchMetadataScope {
+    let index = self
+      .scopes
+      .iter()
+      .position(|scope| scope.cache_root == config.cache_root && scope.fallback_roots == config.fallback_roots)
+      .unwrap_or_else(|| {
+        self.scopes.push(BatchMetadataScope {
+          cache_root: config.cache_root.clone(),
+          fallback_roots: Arc::clone(&config.fallback_roots),
+          text: TextTable::with_capacity(0),
+          entries: Vec::new(),
+          packages: Vec::new(),
+        });
+        self.scopes.len() - 1
+      });
+    &mut self.scopes[index]
+  }
+
+  fn get(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str) -> Option<Vec<PackageRequirement>> {
+    let scope = self.scope_mut(config);
+    let index = scope
+      .entries
+      .binary_search_by(|entry| {
+        entry
+          .target
+          .cmp(&target)
+          .then_with(|| scope.text.get(entry.lower_id).cmp(lower_id))
+          .then_with(|| scope.text.get(entry.version).cmp(version))
+      })
+      .ok()?;
+    Some(scope.entries[index].dependencies.to_vec())
+  }
+
+  fn package(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str) -> Option<CachedPackage> {
+    let scope = self.scope_mut(config);
+    let index = scope
+      .entries
+      .binary_search_by(|entry| {
+        entry
+          .target
+          .cmp(&target)
+          .then_with(|| scope.text.get(entry.lower_id).cmp(lower_id))
+          .then_with(|| scope.text.get(entry.version).cmp(version))
+      })
+      .ok()?;
+    scope.packages[index].as_ref().map(BatchCachedPackage::materialize)
+  }
+
+  fn insert(
+    &mut self,
+    config: &NugetConfiguration,
+    target: TargetFramework,
+    lower_id: &str,
+    version: &str,
+    dependencies: &[PackageRequirement],
+    package: Option<&CachedPackage>,
+  ) -> Result<(), PackageError> {
+    let scope = self.scope_mut(config);
+    let index = scope.entries.binary_search_by(|entry| {
+      entry
+        .target
+        .cmp(&target)
+        .then_with(|| scope.text.get(entry.lower_id).cmp(lower_id))
+        .then_with(|| scope.text.get(entry.version).cmp(version))
+    });
+    if let Ok(index) = index {
+      if scope.packages[index].is_none() {
+        scope.packages[index] = package.map(BatchCachedPackage::from_cached);
+      }
+      return Ok(());
+    }
+    let index = index.expect_err("an absent batch metadata key has an insertion index");
+    let lower_id = scope.text.push(lower_id)?;
+    let version = scope.text.push(version)?;
+    scope.entries.insert(
+      index,
+      BatchMetadataEntry {
+        target,
+        lower_id,
+        version,
+        dependencies: dependencies.into(),
+      },
+    );
+    scope.packages.insert(index, package.map(BatchCachedPackage::from_cached));
+    Ok(())
+  }
+
+  fn insert_package(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str, package: &CachedPackage) {
+    let scope = self.scope_mut(config);
+    if let Ok(index) = scope.entries.binary_search_by(|entry| {
+      entry
+        .target
+        .cmp(&target)
+        .then_with(|| scope.text.get(entry.lower_id).cmp(lower_id))
+        .then_with(|| scope.text.get(entry.version).cmp(version))
+    }) {
+      scope.packages[index] = Some(BatchCachedPackage::from_cached(package));
+    }
+  }
+}
+
+#[derive(Default)]
+struct PackageBatchContext {
+  runtime: Option<tokio::runtime::Runtime>,
+  metadata: BatchMetadataCache,
 }
 
 /// Cold graph state is identity-ordered and owned by the resolver task. Parent
@@ -2660,15 +2845,17 @@ struct LockRuntimeTarget {
 
 /// Resolves exact package graphs for an evaluated project batch.
 ///
-/// A batch of one is the current CLI case. Empty or package-free projects do
-/// not read configuration, inspect caches, or access the network.
+/// Restore supplies one root-first project-reference closure. Empty or
+/// package-free projects do not read configuration, inspect caches, or access
+/// the network. Cold projects share one runtime and parsed metadata session.
 pub fn resolve_package_inputs(projects: &[&ProjectSpec], options: &PackageResolveOptions) -> Result<Vec<PackageResolution>, PackageError> {
   let mut resolutions = Vec::with_capacity(projects.len());
+  let mut batch = PackageBatchContext::default();
   for project in projects {
     if project.package_references().is_empty() {
       resolutions.push(empty_resolution(project)?);
     } else {
-      resolutions.push(resolve_project(project, options)?);
+      resolutions.push(resolve_project(project, options, &mut batch)?);
     }
   }
   Ok(resolutions)
@@ -2823,7 +3010,7 @@ async fn inspect_source_batch(
   })
 }
 
-fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Result<PackageResolution, PackageError> {
+fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions, batch: &mut PackageBatchContext) -> Result<PackageResolution, PackageError> {
   let config = discover_configuration(
     project.project_directory(),
     options.packages_directory.as_deref(),
@@ -2844,27 +3031,36 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   }
 
   let client = http_client(config.proxy.as_ref())?;
-  let runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(ASYNC_RUNTIME_WORKERS)
-    .enable_all()
-    .build()
-    .map_err(|error| PackageError::new(PackageErrorKind::Io, "package scheduler", format!("failed to create async runtime: {error}")))?;
+  if batch.runtime.is_none() {
+    batch.runtime = Some(
+      tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(ASYNC_RUNTIME_WORKERS)
+        .enable_all()
+        .build()
+        .map_err(|error| PackageError::new(PackageErrorKind::Io, "package scheduler", format!("failed to create async runtime: {error}")))?,
+    );
+  }
+  let runtime = batch.runtime.as_ref().expect("the package runtime was initialized");
   let graph = runtime.block_on(resolve_streaming_graph(
     &client,
     GraphRoots {
       direct: &direct,
       central_pins: &central_pins,
     },
-    &config,
-    options,
-    target,
-    target_text,
-    &pruning,
+    GraphContext {
+      config: &config,
+      options,
+      target,
+      target_text,
+      pruning: &pruning,
+      batch_metadata: &mut batch.metadata,
+    },
   ))?;
   let ResolvedGraph {
     packages: resolved,
     source_work,
     downgrades,
+    shared_metadata_hits,
   } = graph;
 
   validate_acyclic(&resolved)?;
@@ -2906,6 +3102,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     &resolved,
     &source_work,
     &downgrades,
+    shared_metadata_hits,
   )?;
   if options.write_lock {
     write_lock(&resolution)?;
@@ -5331,15 +5528,15 @@ fn with_trailing_slash(mut value: String) -> String {
   value
 }
 
-async fn resolve_streaming_graph(
-  client: &reqwest::Client,
-  roots: GraphRoots<'_>,
-  config: &NugetConfiguration,
-  options: &PackageResolveOptions,
-  target: TargetFramework,
-  target_text: &str,
-  pruning: &PackagePruning,
-) -> Result<ResolvedGraph, PackageError> {
+async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>, context: GraphContext<'_>) -> Result<ResolvedGraph, PackageError> {
+  let GraphContext {
+    config,
+    options,
+    target,
+    target_text,
+    pruning,
+    batch_metadata,
+  } = context;
   let mut nodes = BTreeMap::<String, ConstraintNode>::new();
   let mut dirty = BTreeSet::new();
   for request in roots.direct {
@@ -5365,6 +5562,7 @@ async fn resolve_streaming_graph(
   let mut endpoints: Option<LazyServiceEndpoints> = None;
   let mut source_work = source_work_table(config.sources.len())?;
   let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
+  let mut shared_metadata_hits = 0u32;
   let mut tasks = JoinSet::new();
   let mut in_flight = BTreeSet::new();
   while !ready.is_empty() || !tasks.is_empty() {
@@ -5387,6 +5585,17 @@ async fn resolve_streaming_graph(
         direct: node.direct.is_some(),
         central_transitive: node.direct.is_none() && node.central_pin.is_some(),
       });
+      let generation = node.generation;
+      if let Some(request) = &request
+        && let Some(dependencies) = batch_metadata.get(config, target, &lower_id, &request.version)
+      {
+        shared_metadata_hits = shared_metadata_hits
+          .checked_add(1)
+          .ok_or_else(|| resolution_error(&lower_id, "shared package metadata hit count overflow"))?;
+        install_node_dependencies(&lower_id, generation, dependencies, roots.central_pins, &mut nodes, &mut dirty)?;
+        stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
+        continue;
+      }
       // Exact cache misses can delegate selection directly to endpoint
       // discovery. Ranged identities need this precheck so an unmapped but
       // already cached version batch remains source-independent like NuGet.
@@ -5430,7 +5639,6 @@ async fn resolve_streaming_graph(
       let task_temp_root = config.temp_root.clone();
       let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
-      let generation = node.generation;
       let task_version = request.as_ref().map(|request| request.version.clone());
       let task_target = target;
       in_flight.insert(lower_id.clone());
@@ -5452,6 +5660,10 @@ async fn resolve_streaming_graph(
         .await;
         (lower_id, generation, task_version, result)
       });
+    }
+
+    if tasks.is_empty() {
+      continue;
     }
 
     let (lower_id, generation, task_version, result) = tasks.join_next().await.ok_or_else(package_worker_stopped)?.map_err(|error| {
@@ -5497,6 +5709,9 @@ async fn resolve_streaming_graph(
         }
         if let Some(work) = task_work {
           merge_source_work(&mut source_work, work, &lower_id)?;
+        }
+        if let Some(version) = task_version.as_deref() {
+          batch_metadata.insert(config, target, &lower_id, version, &dependencies, package.as_ref())?;
         }
         if let Some(package) = package
           && let Some(version) = task_version
@@ -5554,6 +5769,10 @@ async fn resolve_streaming_graph(
     while acquisition_tasks.len() < MAX_DOWNLOAD_WORKERS
       && let Some((_, request)) = acquisition.pop_first()
     {
+      if let Some(cached) = batch_metadata.package(config, target, &request.lower_id, &request.version) {
+        acquired.insert(request.lower_id.clone(), (request, cached));
+        continue;
+      }
       let task_client = client.clone();
       let task_cache_root = config.cache_root.clone();
       let task_fallback_roots = Arc::clone(&config.fallback_roots);
@@ -5580,6 +5799,9 @@ async fn resolve_streaming_graph(
         (request, result)
       });
     }
+    if acquisition_tasks.is_empty() {
+      continue;
+    }
     let (request, cached) = acquisition_tasks
       .join_next()
       .await
@@ -5592,6 +5814,7 @@ async fn resolve_streaming_graph(
     if let Some(work) = cached.source_work {
       merge_source_work(&mut source_work, work, &request.lower_id)?;
     }
+    batch_metadata.insert_package(config, target, &request.lower_id, &request.version, &cached);
     acquired.insert(request.lower_id.clone(), (request, cached));
   }
 
@@ -5608,6 +5831,7 @@ async fn resolve_streaming_graph(
     packages: resolved,
     source_work,
     downgrades,
+    shared_metadata_hits,
   })
 }
 
@@ -8378,6 +8602,7 @@ fn materialize_resolution(
   work: &BTreeMap<String, WorkPackage>,
   source_work: &[SourceWork],
   downgrades: &[ResolvedDowngrade],
+  shared_metadata_hits: u32,
 ) -> Result<PackageResolution, PackageError> {
   let indices: BTreeMap<&str, u32> = work.keys().enumerate().map(|(index, id)| (id.as_str(), index as u32)).collect();
   let estimated = work
@@ -8659,6 +8884,7 @@ fn materialize_resolution(
     cache_hits,
     downloaded_packages: work.len() as u32 - cache_hits,
     network_requests,
+    shared_metadata_hits,
     downloaded_bytes,
   })
 }
@@ -8784,6 +9010,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     cache_hits: 0,
     downloaded_packages: 0,
     network_requests: 0,
+    shared_metadata_hits: 0,
     downloaded_bytes: 0,
   })
 }
@@ -8973,6 +9200,7 @@ fn read_warm_lock(
     &work,
     &source_work,
     &downgrades,
+    0,
   )
   .map(Some)
 }
@@ -9214,6 +9442,11 @@ impl TextTable {
     let len = u32_len(value.len(), "package text value")?;
     self.text.push_str(value);
     Ok(TextSpan { start, len })
+  }
+
+  fn get(&self, span: TextSpan) -> &str {
+    let start = span.start as usize;
+    &self.text[start..start + span.len as usize]
   }
 
   fn push_path(&mut self, path: &Path) -> Result<TextSpan, PackageError> {
@@ -12071,6 +12304,103 @@ mod tests {
       assert!(!resolution.package_is_direct(child));
       assert!(resolution.package_is_central_transitive(child));
     }
+  }
+
+  #[test]
+  fn project_batch_reuses_parsed_metadata_and_publishes_one_archive() {
+    let temp = TempDirectory::new();
+    let project_xml = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Shared.Package" Version="1.0.0" /></ItemGroup></Project>"#;
+    temp.write("left/Program.cs", "");
+    temp.write("right/Program.cs", "");
+    let left_path = temp.write("left/Left.csproj", project_xml);
+    let right_path = temp.write("right/Right.csproj", project_xml);
+    write_test_package(&temp, "feed/Shared.Package.1.0.0.nupkg", "Shared.Package", "1.0.0");
+    let left = evaluate_project_path(&left_path, ProjectConfiguration::Debug).unwrap();
+    let right = evaluate_project_path(&right_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      sources: vec![temp.0.join("feed").to_string_lossy().into_owned()],
+      offline: true,
+      write_lock: false,
+      ..PackageResolveOptions::default()
+    };
+
+    let resolutions = resolve_package_inputs(&[&left, &right], &options).unwrap();
+
+    assert_eq!(resolutions[0].downloaded_packages(), 1);
+    assert_eq!(resolutions[0].shared_metadata_hits(), 0);
+    assert_eq!(resolutions[1].cache_hits(), 1);
+    assert_eq!(resolutions[1].shared_metadata_hits(), 1);
+    assert_eq!(resolutions[0].package_id(resolutions[0].packages()[0]), "Shared.Package");
+    assert_eq!(resolutions[1].package_id(resolutions[1].packages()[0]), "Shared.Package");
+  }
+
+  #[test]
+  fn project_batch_partitions_dependency_metadata_by_target() {
+    let temp = TempDirectory::new();
+    temp.write("net8/Program.cs", "");
+    temp.write("net10/Program.cs", "");
+    let net8_path = temp.write(
+      "net8/Net8.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Meta.Package" Version="1.0.0" /></ItemGroup></Project>"#,
+    );
+    let net10_path = temp.write(
+      "net10/Net10.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Meta.Package" Version="1.0.0" /></ItemGroup></Project>"#,
+    );
+    for (id, nuspec) in [
+      (
+        "meta.package",
+        r#"<package><metadata><id>Meta.Package</id><version>1.0.0</version><dependencies>
+<group targetFramework="net8.0"><dependency id="Child.Eight" version="1.0.0" /></group>
+<group targetFramework="net10.0"><dependency id="Child.Ten" version="1.0.0" /></group>
+</dependencies></metadata></package>"#,
+      ),
+      (
+        "child.eight",
+        r#"<package><metadata><id>Child.Eight</id><version>1.0.0</version></metadata></package>"#,
+      ),
+      (
+        "child.ten",
+        r#"<package><metadata><id>Child.Ten</id><version>1.0.0</version></metadata></package>"#,
+      ),
+    ] {
+      let root = format!("packages/{id}/1.0.0");
+      temp.write(&format!("{root}/{id}.nuspec"), nuspec);
+      temp.write(&format!("{root}/{id}.1.0.0.nupkg"), "");
+      temp.write(&format!("{root}/{id}.1.0.0.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+    }
+    temp.write("packages/child.eight/1.0.0/lib/net8.0/Child.Eight.dll", "");
+    temp.write("packages/child.ten/1.0.0/lib/net10.0/Child.Ten.dll", "");
+    let net8 = evaluate_project_path(&net8_path, ProjectConfiguration::Debug).unwrap();
+    let net10 = evaluate_project_path(&net10_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      offline: true,
+      write_lock: false,
+      ..PackageResolveOptions::default()
+    };
+
+    let resolutions = resolve_package_inputs(&[&net8, &net10], &options).unwrap();
+    let identities = resolutions
+      .iter()
+      .map(|resolution| {
+        resolution
+          .packages()
+          .iter()
+          .copied()
+          .map(|package| resolution.package_id(package))
+          .collect::<Vec<_>>()
+      })
+      .collect::<Vec<_>>();
+
+    assert_eq!(identities[0], ["Child.Eight", "Meta.Package"]);
+    assert_eq!(identities[1], ["Child.Ten", "Meta.Package"]);
+    assert_eq!(resolutions[1].shared_metadata_hits(), 0);
   }
 
   #[test]

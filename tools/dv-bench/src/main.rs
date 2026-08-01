@@ -40,6 +40,7 @@ enum CaseKind {
   PackageReferenceMetadata,
   CentralPackageManagement,
   PackageConflictResolution,
+  PackageBatchResolution,
   PackageDiagnostics,
   PackageSyncWarm,
   NugetConfigHierarchy,
@@ -304,6 +305,12 @@ const DOTNET_CASES: &[Case] = &[
       "--verbosity",
       "quiet",
     ],
+    implemented: true,
+  },
+  Case {
+    name: "package_batch_resolution",
+    kind: CaseKind::PackageBatchResolution,
+    args: &["restore", "PackageBatch.csproj", "--packages", ".packages", "--nologo", "--verbosity", "quiet"],
     implemented: true,
   },
   Case {
@@ -685,6 +692,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_batch_resolution",
+    kind: CaseKind::PackageBatchResolution,
+    args: &["restore", "PackageBatch.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_diagnostics",
     kind: CaseKind::PackageDiagnostics,
     args: &["restore", "ConflictFailure.csproj", "--packages", ".packages", "--offline", "--json"],
@@ -1033,9 +1046,12 @@ fn run() -> Result<()> {
   if options
     .case
     .as_deref()
-    .is_none_or(|case| matches!(case, "package_conflict_resolution" | "package_diagnostics"))
+    .is_none_or(|case| matches!(case, "package_conflict_resolution" | "package_batch_resolution" | "package_diagnostics"))
   {
     verify_package_conflict_resolution(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_batch_resolution") {
+    verify_package_batch_resolution(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_diagnostics") {
     verify_package_diagnostics(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
@@ -2489,24 +2505,7 @@ fn verify_package_conflict_resolution(repository: &Path, dv_executable: &Path, f
     })
     .collect::<Result<Vec<_>>>()?;
   dv.sort_unstable();
-  let expected = [
-    ("Cousin.Current", "1.0.0"),
-    ("Cousin.Deep", "1.0.0"),
-    ("Cousin.Leaf", "2.0.0"),
-    ("Cousin.Left", "1.0.0"),
-    ("Cousin.Right", "1.0.0"),
-    ("Diamond.Leaf", "2.0.0"),
-    ("Diamond.Provider", "1.0.0"),
-    ("Diamond.Relational", "1.0.0"),
-    ("Direct.Deep", "1.0.0"),
-    ("Direct.Leaf", "1.0.0"),
-    ("Direct.Top", "1.0.0"),
-  ];
-  let mut expected = expected
-    .into_iter()
-    .map(|(id, version)| (id.to_owned(), version.to_owned()))
-    .collect::<Vec<_>>();
-  expected.sort_unstable();
+  let expected = expected_conflict_packages();
   if microsoft != expected || dv != expected {
     return Err(format!("package conflict selection differs: expected={expected:?} Microsoft={microsoft:?} dv={dv:?}").into());
   }
@@ -2540,6 +2539,161 @@ fn validate_downgrade_warning(output: &str) -> Result<()> {
     }
   }
   Ok(())
+}
+
+fn verify_package_batch_resolution(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-package-batch-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  reset_fixture(fixture, &root)?;
+  for package in CONFLICT_PACKAGES {
+    write_conflict_package(&root.join("feed"), package)?;
+  }
+  let reference = Command::new("dotnet")
+    .args([
+      "restore",
+      "PackageBatch.csproj",
+      "--packages",
+      "dotnet-batch-packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ])
+    .current_dir(&root)
+    .output()?;
+  check_output(
+    reference,
+    Path::new("dotnet"),
+    &["restore", "PackageBatch.csproj"],
+    "Microsoft package batch oracle",
+  )?;
+
+  let expected = expected_batch_packages();
+  for relative in ["BatchLeft/obj/project.assets.json", "BatchRight/obj/project.assets.json"] {
+    let assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join(relative))?)?;
+    let mut actual = assets
+      .get("libraries")
+      .and_then(serde_json::Value::as_object)
+      .ok_or("Microsoft package batch oracle omitted libraries")?
+      .keys()
+      .map(|key| {
+        key
+          .split_once('/')
+          .map(|(id, version)| (id.to_owned(), version.to_owned()))
+          .ok_or_else(|| format!("Microsoft package batch library has no version: {key}").into())
+      })
+      .collect::<Result<Vec<_>>>()?;
+    actual.sort_unstable();
+    if actual != expected {
+      return Err(format!("Microsoft package batch differs: expected={expected:?} actual={actual:?}").into());
+    }
+  }
+
+  let actual = Command::new(dv_executable)
+    .args(["restore", "PackageBatch.csproj", "--packages", "dv-batch-packages", "--offline", "--json"])
+    .current_dir(&root)
+    .output()?;
+  check_output(actual.clone(), dv_executable, &["restore", "PackageBatch.csproj"], "dv package batch oracle")?;
+  let events = String::from_utf8(actual.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let resolutions = events
+    .iter()
+    .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .collect::<Vec<_>>();
+  if resolutions.len() != 3 {
+    return Err(format!("dv package batch emitted {} resolution events instead of three", resolutions.len()).into());
+  }
+  if resolutions[0]
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .is_none_or(|packages| !packages.is_empty())
+  {
+    return Err("dv package batch root should have an empty package graph".into());
+  }
+  let mut downloaded = 0u64;
+  for (index, resolution) in resolutions.iter().enumerate().skip(1) {
+    let mut packages = resolution
+      .get("packages")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("dv package batch resolution omitted packages")?
+      .iter()
+      .map(|package| {
+        Ok((
+          package
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("dv batch package omitted id")?
+            .to_owned(),
+          package
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("dv batch package omitted version")?
+            .to_owned(),
+        ))
+      })
+      .collect::<Result<Vec<_>>>()?;
+    packages.sort_unstable();
+    if packages != expected {
+      return Err(format!("dv package batch project {index} differs: expected={expected:?} actual={packages:?}").into());
+    }
+    if resolution.get("network_requests").and_then(serde_json::Value::as_u64) != Some(0) {
+      return Err("dv package batch unexpectedly used HTTP".into());
+    }
+    downloaded += resolution
+      .get("downloaded_packages")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or("dv package batch omitted downloaded_packages")?;
+  }
+  if downloaded != expected.len() as u64 || resolutions[2].get("cache_hits").and_then(serde_json::Value::as_u64) != Some(expected.len() as u64) {
+    return Err(
+      format!(
+        "dv package batch did not deduplicate archive publication: downloaded={downloaded} second={}",
+        resolutions[2]
+      )
+      .into(),
+    );
+  }
+  Ok(())
+}
+
+fn expected_conflict_packages() -> Vec<(String, String)> {
+  let mut expected = [
+    ("Cousin.Current", "1.0.0"),
+    ("Cousin.Deep", "1.0.0"),
+    ("Cousin.Leaf", "2.0.0"),
+    ("Cousin.Left", "1.0.0"),
+    ("Cousin.Right", "1.0.0"),
+    ("Diamond.Leaf", "2.0.0"),
+    ("Diamond.Provider", "1.0.0"),
+    ("Diamond.Relational", "1.0.0"),
+    ("Direct.Deep", "1.0.0"),
+    ("Direct.Leaf", "1.0.0"),
+    ("Direct.Top", "1.0.0"),
+  ]
+  .into_iter()
+  .map(|(id, version)| (id.to_owned(), version.to_owned()))
+  .collect::<Vec<_>>();
+  expected.sort_unstable();
+  expected
+}
+
+fn expected_batch_packages() -> Vec<(String, String)> {
+  let mut expected = [
+    ("Cousin.Current", "1.0.0"),
+    ("Cousin.Deep", "1.0.0"),
+    ("Cousin.Leaf", "2.0.0"),
+    ("Cousin.Left", "1.0.0"),
+    ("Cousin.Right", "1.0.0"),
+    ("Diamond.Leaf", "2.0.0"),
+    ("Diamond.Provider", "1.0.0"),
+    ("Diamond.Relational", "1.0.0"),
+  ]
+  .into_iter()
+  .map(|(id, version)| (id.to_owned(), version.to_owned()))
+  .collect::<Vec<_>>();
+  expected.sort_unstable();
+  expected
 }
 
 fn verify_package_diagnostics(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -4321,6 +4475,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageReferenceMetadata
       | CaseKind::CentralPackageManagement
       | CaseKind::PackageConflictResolution
+      | CaseKind::PackageBatchResolution
       | CaseKind::PackageDiagnostics
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
@@ -4682,6 +4837,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics) {
     prepare_package_conflict_resolution(executable, workspace, matches!(case.kind, CaseKind::PackageDiagnostics))?;
+  }
+  if matches!(case.kind, CaseKind::PackageBatchResolution) {
+    prepare_package_batch_resolution(workspace)?;
   }
   if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
@@ -5102,6 +5260,15 @@ fn prepare_package_conflict_resolution(executable: &Path, workspace: &Path, diag
   reset_package_conflict_iteration(workspace)
 }
 
+fn prepare_package_batch_resolution(workspace: &Path) -> Result<()> {
+  let feed = workspace.join("feed");
+  remove_generated_path(&feed)?;
+  for package in CONFLICT_PACKAGES {
+    write_conflict_package(&feed, package)?;
+  }
+  reset_package_batch_iteration(workspace)
+}
+
 fn prepare_nuget_request_budget(workspace: &Path) -> Result<()> {
   for relative in [
     ".seed",
@@ -5517,6 +5684,22 @@ fn reset_package_diagnostic_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_package_batch_iteration(workspace: &Path) -> Result<()> {
+  for relative in [
+    ".packages",
+    "obj",
+    "BatchLeft/obj",
+    "BatchLeft/dv.lock.json",
+    "BatchLeft/packages.lock.json",
+    "BatchRight/obj",
+    "BatchRight/dv.lock.json",
+    "BatchRight/packages.lock.json",
+  ] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn remove_generated_path(path: &Path) -> Result<()> {
   const RETRIES: [Duration; 4] = [
     Duration::from_millis(10),
@@ -5559,6 +5742,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::PackageConflictResolution => reset_package_conflict_iteration(workspace),
+    CaseKind::PackageBatchResolution => reset_package_batch_iteration(workspace),
     CaseKind::PackageDiagnostics => reset_package_diagnostic_iteration(workspace),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetFloatingVersion => reset_nuget_floating_iteration(workspace),
@@ -5628,7 +5812,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
-    CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics => fixtures.package_conflict_resolution,
+    CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => fixtures.package_conflict_resolution,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
@@ -5662,7 +5846,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
-    CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics => Some("package-conflict-resolution"),
+    CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => Some("package-conflict-resolution"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
@@ -5726,7 +5910,13 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   if !is_dotnet(executable) && matches!(case.kind, CaseKind::NugetSourceTelemetry) {
     validate_source_telemetry(&output.stdout)?;
   }
-  let work = if matches!(case.kind, CaseKind::NugetSourceMapping) {
+  let work = if !is_dotnet(executable) && matches!(case.kind, CaseKind::PackageBatchResolution) {
+    let evidence = parse_package_batch_work_evidence(&output.stdout)?;
+    if evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(8) || evidence.resolved_packages != Some(16) {
+      return Err(format!("package-batch sample did not resolve two graphs through eight unique local archives: {evidence:?}").into());
+    }
+    Some(evidence)
+  } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     Some(WorkEvidence {
       network_requests: Some(0),
       downloaded_bytes: Some(0),
@@ -5842,6 +6032,62 @@ fn parse_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
         .transpose()?
         .ok_or("dv package event omitted packages")?,
     ),
+  })
+}
+
+fn parse_package_batch_work_evidence(stdout: &[u8]) -> Result<WorkEvidence> {
+  let mut network_requests = 0u64;
+  let mut downloaded_bytes = 0u64;
+  let mut downloaded_packages = 0u64;
+  let mut resolved_packages = 0u64;
+  let mut resolutions = 0usize;
+  for event in std::str::from_utf8(stdout)?.lines().map(serde_json::from_str::<serde_json::Value>) {
+    let event = event?;
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("package_resolution_created") {
+      continue;
+    }
+    resolutions += 1;
+    network_requests = network_requests
+      .checked_add(
+        event
+          .get("network_requests")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or("dv package batch omitted network_requests")?,
+      )
+      .ok_or("dv package batch request count overflow")?;
+    downloaded_bytes = downloaded_bytes
+      .checked_add(
+        event
+          .get("downloaded_bytes")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or("dv package batch omitted downloaded_bytes")?,
+      )
+      .ok_or("dv package batch byte count overflow")?;
+    downloaded_packages = downloaded_packages
+      .checked_add(
+        event
+          .get("downloaded_packages")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or("dv package batch omitted downloaded_packages")?,
+      )
+      .ok_or("dv package batch download count overflow")?;
+    resolved_packages = resolved_packages
+      .checked_add(
+        event
+          .get("packages")
+          .and_then(serde_json::Value::as_array)
+          .map_or(0, |packages| packages.len() as u64),
+      )
+      .ok_or("dv package batch resolved count overflow")?;
+  }
+  if resolutions != 3 {
+    return Err(format!("dv package batch emitted {resolutions} resolution events instead of three").into());
+  }
+  Ok(WorkEvidence {
+    network_requests: Some(network_requests),
+    downloaded_bytes: Some(downloaded_bytes),
+    downloaded_packages: Some(downloaded_packages),
+    resolved_packages: Some(resolved_packages),
   })
 }
 
@@ -6508,6 +6754,7 @@ fn case_label(case: &str) -> &str {
     "package_reference_metadata" => "PackageReference metadata",
     "central_package_management" => "Central package management",
     "package_conflict_resolution" => "Package conflict resolution",
+    "package_batch_resolution" => "Two-project package batch",
     "package_diagnostics" => "Package constraint diagnostic",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",

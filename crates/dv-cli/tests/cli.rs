@@ -361,6 +361,47 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 }
 
 #[test]
+fn restore_accepts_a_project_batch_and_emits_one_resolution_per_project() {
+  let temp = TempDirectory::new();
+  let project = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Sample.Package" Version="1.2.3" /></ItemGroup></Project>"#;
+  temp.write("left/Program.cs", "");
+  temp.write("right/Program.cs", "");
+  temp.write("left/Left.csproj", project);
+  temp.write("right/Right.csproj", project);
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><ProjectReference Include="left/Left.csproj" /><ProjectReference Include="right/Right.csproj" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "packages/sample.package/1.2.3/sample.package.nuspec",
+    r#"<package><metadata><id>Sample.Package</id><version>1.2.3</version></metadata></package>"#,
+  );
+  temp.write("packages/sample.package/1.2.3/sample.package.1.2.3.nupkg", "");
+  temp.write(
+    "packages/sample.package/1.2.3/sample.package.1.2.3.nupkg.sha512",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  );
+  temp.write("packages/sample.package/1.2.3/.dv.metadata.json", "{}");
+  temp.write("packages/sample.package/1.2.3/lib/net10.0/Sample.Package.dll", "");
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert_eq!(stdout.matches("\"type\":\"package_resolution_created\"").count(), 3);
+  assert!(stdout.contains("App.csproj"));
+  assert!(stdout.contains("Left.csproj"));
+  assert!(stdout.contains("Right.csproj"));
+  assert!(stdout.contains("\"outcome\":\"succeeded\""));
+}
+
+#[test]
 fn restore_reports_unmapped_package_before_source_discovery() {
   let temp = TempDirectory::new();
   temp.write(

@@ -38,7 +38,7 @@ pub use package::{
 };
 pub use project::{
   CentralPackageVersion, FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError,
-  ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, evaluate_project, evaluate_project_path,
+  ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, evaluate_project, evaluate_project_closure, evaluate_project_path,
 };
 pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};

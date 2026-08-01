@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 /// A recognized target-framework family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FrameworkFamily {
   /// Modern unified .NET (`net5.0` and later).
   Net,
@@ -14,7 +14,7 @@ pub enum FrameworkFamily {
 }
 
 /// Parsed target-framework data shared by evaluation and downstream planners.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TargetFramework {
   family: FrameworkFamily,
   major: u16,

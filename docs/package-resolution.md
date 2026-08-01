@@ -137,6 +137,7 @@ asset nor a dependency remain incompatible.
 
 ```text
 ProjectSpec batch + resolve options
+  -> preserve input project order and allocate one command session
   -> merge typed source and cache configuration
   -> select SDK-owned package-pruning data for the target framework
   -> validate a matching dv.lock.json and immutable cache entries
@@ -145,6 +146,7 @@ ProjectSpec batch + resolve options
   -> seed a bounded queue with direct package constraints
   -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
+  -> retain exact target/id/version dependency metadata for later projects
   -> merge dependency identities and conflicts through one deterministic owner
   -> reject empty constraint intersections before source enumeration
   -> classify final direct-wins downgrades into an ordered cold warning batch
@@ -174,6 +176,25 @@ No worker mutates these records, so extra cache-line alignment would consume
 memory without preventing false sharing. `ASSUMPTION: the benchmark host has
 64-byte data cache lines - affects layout analysis only; no correctness or
 alignment decision depends on it.`
+
+Projects retain independent constraint graphs and are resolved in input order.
+The command session owns one Tokio runtime plus a small storage-scope batch.
+Each scope owns a sorted contiguous metadata table keyed by target framework,
+normalized identity, and exact version. `BatchMetadataEntry` is 40 bytes with
+8-byte alignment on the 64-bit benchmark target. The four-field record keeps
+the target and two text spans inline beside one externally sized dependency
+batch. Eight observed fixture rows occupy 320 bytes, or five assumed 64-byte
+cache lines, excluding the shared text buffer and dependency storage. A cache
+hit clones the parsed requirements into the next project's independently
+mutable graph without reopening or reparsing the nuspec. Storage scope includes
+the writable cache and ordered fallback roots, while the target key prevents
+dependency-group reuse across TFMs.
+
+Project graphs converge sequentially. This deliberately avoids duplicate
+downloads, publication races, graph locks, and completion-order instability;
+already published immutable archives become cache hits for later projects.
+Within one graph, independent I/O remains bounded and concurrent. The session
+and metadata table die after the project batch is materialized.
 
 Zero- and one-parent identities take the straight-line selection path without
 ancestry storage. Multi-parent identities compact active range references into
@@ -226,9 +247,9 @@ Assuming the benchmark machine's
 observed 64-byte cache line, eight spans fit per line. Reporters and compiler
 planning scan only the ranges they consume.
 
-The cold scheduler uses a two-thread Tokio runtime and one `JoinSet` capped at
-twenty-four active package tasks. The runtime exists only after the warm-lock
-path misses. One scheduler owner merges completed manifests into
+The cold scheduler uses one command-scoped two-thread Tokio runtime and a
+`JoinSet` capped at twenty-four active package tasks. The runtime exists only
+after a project misses its warm-lock path. One scheduler owner merges completed manifests into
 identity-ordered maps and immediately submits newly discovered dependencies
 when capacity exists. Completion order affects which eligible transfer starts
 next but cannot affect final package order, version-conflict text, graph
@@ -423,6 +444,20 @@ cargo bench-all --case package_diagnostics --samples 30 --warmups 3
 
 The curated distribution is retained in the
 [package diagnostic baseline](performance-baselines/2026-08-01-package-diagnostics-windows.md).
+
+The project-batch case evaluates one root and its two literal project
+references, then restores two identical eight-package graphs from an empty
+global package cache and a deterministic local feed. Preflight compares each
+child's complete identity/version batch with Microsoft, requires the
+package-free root plus both child events in root-first order, and proves only
+eight archives are published for 16 resolved rows with zero HTTP requests:
+
+```powershell
+cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[package batch-resolution baseline](performance-baselines/2026-08-01-package-batch-resolution-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties

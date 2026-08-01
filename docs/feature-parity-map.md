@@ -946,8 +946,17 @@ boundary, not final drop-in parity.
   preflight proves the matching `NU1605`, `NU1107`, `NU1108`, `NU1101`,
   `NU1102`, and `NU1202` categories. Thirty cold local-source samples measure
   `569.423 ms` for Microsoft versus `13.797 ms` for `dv` (`41.3x`). `P1`
-- [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
-  downloads are deduplicated. `P2`
+- [x] `RES-009` Restore evaluates literal project-reference closures once in
+  deterministic root-first order and resolves the resulting `ProjectSpec`
+  batch through one command-scoped Tokio runtime. Exact package dependency
+  metadata is retained in a sorted 40-byte-row cache keyed by storage scope,
+  target, identity, and version, with identity/version text stored as compact
+  spans into one scope buffer. Each project keeps an independently mutable
+  graph while immutable archives publish once into the shared cache. A
+  Microsoft-oracled two-project cold local graph verifies both eight-package
+  selections, three ordered `dv` project events, 16 resolved rows, eight total
+  publications, and zero HTTP work. Thirty Windows samples measure
+  `700.911 ms` for Microsoft versus `51.502 ms` for `dv` (`13.6x`). `P2`
 - [~] `RES-010` Parse `.nuspec` dependency groups without confusing later
   `frameworkReferences` groups with dependency groups. Framework assemblies
   remain incomplete. `P1`
