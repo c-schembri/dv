@@ -514,9 +514,18 @@ contracts.
   for `dv`, a `25.2x` median improvement. SDK query, MSBuild, NuGet, VSTest,
   and later workflow transforms remain bounded by their owning rows rather
   than being falsely claimed by the Phase 1 proof. `P1-P4`
-- [ ] `DROP-020` Maintain golden argv, environment, stdin, stdout, stderr, exit,
+- [~] `DROP-020` Maintain golden argv, environment, stdin, stdout, stderr, exit,
   filesystem, process, and network traces for real CI/build-script
-  substitutions. `P1-P5`
+  substitutions. The schema-version-1 corpus covers the repository's real
+  selected-SDK and valid offline-restore CI commands. A typed verifier pins
+  reference/candidate argv, nine ordered environment overrides, explicit empty
+  stdin, normalized stdout/stderr, exit zero, and sorted filesystem deltas.
+  The timed restore changes only the executable token and resets its identical
+  package-free input outside the interval. Fifty Windows samples measured
+  `626.828 ms` for `dotnet` and `7.507 ms` for `dv`, an `83.5x` median
+  improvement. Process-tree and network observation remain explicitly `TBI`
+  under issue 0009 rather than being inferred as zero. Build/run/test traces
+  and cross-platform process/network observers remain open. `P1-P5`
 - [ ] `DROP-021` Add a `dv compat check` command that scans scripts and project
   inputs, reports unsupported invocation rows without executing them, and
   identifies the exact compatibility manifest version. `P2`

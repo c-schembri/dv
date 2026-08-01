@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "github-actions-sdk-selection",
+      "source": "compatibility/scripts/phase1-github-actions.yml",
+      "reference_argv": ["dotnet", "--version"],
+      "candidate_argv": ["dv", "--compat", "dotnet", "--version"],
+      "environment_overrides": [
+        { "name": "DOTNET_CLI_TELEMETRY_OPTOUT", "value": "1" },
+        { "name": "DOTNET_NOLOGO", "value": "1" },
+        { "name": "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "value": "1" },
+        { "name": "NO_COLOR", "value": "1" },
+        { "name": "HTTP_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "HTTPS_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "ALL_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "NO_PROXY", "value": "" },
+        { "name": "NUGET_PACKAGES", "value": "$WORKSPACE/.packages" }
+      ],
+      "stdin_utf8": "",
+      "input_filesystem": "identical",
+      "expected": {
+        "reference": {
+          "stdout_utf8": "$SELECTED_SDK$PLATFORM_EOL",
+          "stderr_utf8": "",
+          "exit_code": 0,
+          "filesystem_delta": [],
+          "process_trace": "TBI",
+          "network_trace": "TBI"
+        },
+        "candidate": {
+          "stdout_utf8": "$SELECTED_SDK\n",
+          "stderr_utf8": "",
+          "exit_code": 0,
+          "filesystem_delta": [],
+          "process_trace": "TBI",
+          "network_trace": "TBI"
+        }
+      }
+    },
+    {
+      "id": "github-actions-offline-restore",
+      "source": "compatibility/scripts/phase1-github-actions.yml",
+      "reference_argv": [
+        "dotnet",
+        "restore",
+        "SmallConsole.csproj",
+        "--packages",
+        ".packages",
+        "--source",
+        "offline-source",
+        "--verbosity",
+        "quiet"
+      ],
+      "candidate_argv": [
+        "dv",
+        "restore",
+        "SmallConsole.csproj",
+        "--packages",
+        ".packages",
+        "--source",
+        "offline-source",
+        "--verbosity",
+        "quiet"
+      ],
+      "environment_overrides": [
+        { "name": "DOTNET_CLI_TELEMETRY_OPTOUT", "value": "1" },
+        { "name": "DOTNET_NOLOGO", "value": "1" },
+        { "name": "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "value": "1" },
+        { "name": "NO_COLOR", "value": "1" },
+        { "name": "HTTP_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "HTTPS_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "ALL_PROXY", "value": "http://127.0.0.1:9" },
+        { "name": "NO_PROXY", "value": "" },
+        { "name": "NUGET_PACKAGES", "value": "$WORKSPACE/.packages" }
+      ],
+      "stdin_utf8": "",
+      "input_filesystem": "identical",
+      "expected": {
+        "reference": {
+          "stdout_utf8": "",
+          "stderr_utf8": "",
+          "exit_code": 0,
+          "filesystem_delta": [
+            { "path": "obj", "kind": "directory", "change": "created" },
+            { "path": "obj/SmallConsole.csproj.nuget.dgspec.json", "kind": "file", "change": "created" },
+            { "path": "obj/SmallConsole.csproj.nuget.g.props", "kind": "file", "change": "created" },
+            { "path": "obj/SmallConsole.csproj.nuget.g.targets", "kind": "file", "change": "created" },
+            { "path": "obj/project.assets.json", "kind": "file", "change": "created" },
+            { "path": "obj/project.nuget.cache", "kind": "file", "change": "created" }
+          ],
+          "process_trace": "TBI",
+          "network_trace": "TBI"
+        },
+        "candidate": {
+          "stdout_utf8": "Package resolution\n  Packages       0\n  Cache hits     0\n  Downloaded     0\n  HTTP requests  0\n  Source bytes   0\n  Compile assets 0\n  Runtime assets 0\n  Resource assets 0\n  Content files   0\n  Build imports   0\n  Runtime targets 0\n  Framework refs  0\n  Framework asm   0\n  Target         net10.0\n  Source          (v3)\n  Cache          \n  Lock           <WORKSPACE>/dv.lock.json\n",
+          "stderr_utf8": "",
+          "exit_code": 0,
+          "filesystem_delta": [],
+          "process_trace": "TBI",
+          "network_trace": "TBI"
+        }
+      }
+    }
+  ]
+}

@@ -38,8 +38,8 @@ has not passed.
 The ordering input is one 468-row parity ledger:
 
 - 72 rows are implemented;
-- 30 rows have partial foundations;
-- 366 rows are missing;
+- 31 rows have partial foundations;
+- 365 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -161,6 +161,12 @@ The Phase 1 `build`, `restore`, `run`, and `test` spellings plus native `sync`
 now expose one allocation-free borrowed transform view. Exact equality covers
 the request and globals, semantic operands, child tail, and environment
 directives while ignoring only cold spelling/profile provenance.
+The versioned golden-trace corpus now verifies real CI selected-SDK and valid
+offline-restore substitutions across argv, controlled environment, stdin,
+streams, exit, and sorted filesystem deltas. The restore benchmark changes
+only the executable token and resets identical inputs outside timing. Process
+and network observation remain explicit TBI dimensions until event-driven
+cross-platform observers exist.
 The broader workflow-dependent surface of `DROP-016` remains partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command

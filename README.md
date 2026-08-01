@@ -486,6 +486,10 @@ Microsoft publishes no equivalent query. See the
 [compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
 Reference-compatible help has like-for-like, zero-mutation evidence in the
 [compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
+The first versioned real-CI substitution corpus covers SDK selection and a
+valid offline restore; the timed restore has like-for-like evidence in the
+[golden-trace baseline](docs/performance-baselines/2026-08-02-cli-golden-trace-windows.md).
+Process and network observation remain explicitly TBI.
 Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
 Canonical/compatibility typed-transform equality has like-for-like pre-I/O
@@ -532,6 +536,7 @@ Initial machine:
 | Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 63.347 ms | 4.501 ms | 14.1x | 66.926 ms | 5.029 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the exact `dotnet` compatibility spelling | `dotnet --version` | `dv --compat dotnet --version` | 63.402 ms | 5.088 ms | 12.5x | 65.472 ms | 5.718 ms |
+| Replay the versioned golden CI offline restore | `dotnet restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | `dv restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | 626.828 ms | 7.507 ms | 83.5x | 2658.372 ms | 9.153 ms |
 | Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
@@ -815,6 +820,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
+cargo bench-all --case cli_golden_trace --samples 50 --warmups 10
 cargo bench-all --case cli_compat_help --samples 50 --warmups 10
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_transform_equivalence --samples 50 --warmups 10

@@ -55,6 +55,7 @@ Invalid input behavior:
 | Case | State before timed interval | Timed work |
 |---|---|---|
 | `sdk_current` | no project state | process launch, SDK discovery, and selection |
+| `cli_golden_trace` | fresh `small-console` fixture, empty local source, and isolated package directory; schema-1 SDK/restore trace preflight and fixture reset outside timing | process launch, controlled trace environment, valid zero-package offline restore, output capture, and sample validation |
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_protocol_version` | immutable `small-console` directory; three-native-alias schema preflight outside timing | `dv` process launch and one validated schema-19 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
@@ -203,10 +204,11 @@ Measure only SDK selection:
 cargo bench-all --case sdk_current --dv target/release/dv
 ```
 
-Measure cancellation-ready startup and SDK selection:
+Measure cancellation-ready startup, then the real offline-restore CI trace:
 
 ```text
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
+cargo bench-all --case cli_golden_trace --samples 50 --warmups 10
 ```
 
 Measure invocation environment precedence and redaction through identical

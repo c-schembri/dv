@@ -16,14 +16,82 @@ use std::{
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+const PHASE_ONE_CI_TRACE: &str = include_str!("../../../compatibility/traces/phase1-ci.json");
+const PHASE_ONE_CI_SCRIPT: &str = include_str!("../../../compatibility/scripts/phase1-github-actions.yml");
+const GOLDEN_TRACE_ENVIRONMENT: &[(&str, &str)] = &[
+  ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+  ("DOTNET_NOLOGO", "1"),
+  ("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"),
+  ("NO_COLOR", "1"),
+  ("HTTP_PROXY", "http://127.0.0.1:9"),
+  ("HTTPS_PROXY", "http://127.0.0.1:9"),
+  ("ALL_PROXY", "http://127.0.0.1:9"),
+  ("NO_PROXY", ""),
+  ("NUGET_PACKAGES", "$WORKSPACE/.packages"),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenTraceFile {
+  schema_version: u16,
+  cases: Box<[GoldenTraceCase]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenTraceCase {
+  id: String,
+  source: String,
+  reference_argv: Box<[String]>,
+  candidate_argv: Box<[String]>,
+  environment_overrides: Box<[GoldenEnvironmentOverride]>,
+  stdin_utf8: String,
+  input_filesystem: String,
+  expected: GoldenTraceExpected,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenEnvironmentOverride {
+  name: String,
+  value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenTraceExpected {
+  reference: GoldenObservation,
+  candidate: GoldenObservation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenObservation {
+  stdout_utf8: String,
+  stderr_utf8: String,
+  exit_code: i32,
+  filesystem_delta: Box<[GoldenFileChange]>,
+  process_trace: String,
+  network_trace: String,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct GoldenFileChange {
+  path: String,
+  kind: String,
+  change: String,
+}
 
 #[derive(Clone, Copy)]
 enum CaseKind {
   Startup,
   CliUnknownOption,
+  CliGoldenTrace,
   CliCommandNormalization,
   CliTransformEquivalence,
   CliModeClassification,
@@ -139,6 +207,21 @@ const DOTNET_CASES: &[Case] = &[
     name: "sdk_current_compat",
     kind: CaseKind::Startup,
     args: &["--version"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_golden_trace",
+    kind: CaseKind::CliGoldenTrace,
+    args: &[
+      "restore",
+      "SmallConsole.csproj",
+      "--packages",
+      ".packages",
+      "--source",
+      "offline-source",
+      "--verbosity",
+      "quiet",
+    ],
     implemented: true,
   },
   Case {
@@ -825,6 +908,21 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_golden_trace",
+    kind: CaseKind::CliGoldenTrace,
+    args: &[
+      "restore",
+      "SmallConsole.csproj",
+      "--packages",
+      ".packages",
+      "--source",
+      "offline-source",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "cli_compat_help",
     kind: CaseKind::Startup,
     args: &["--compat", "dotnet", "build", "-?"],
@@ -1369,6 +1467,9 @@ fn run() -> Result<()> {
   {
     verify_sdk_selection(&dv_executable, &fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_golden_trace") {
+    verify_golden_trace_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-golden-trace"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_cancellation") {
     verify_cancellation_boundary(&dv_executable, &fixture)?;
   }
@@ -1585,6 +1686,230 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "--version"], fixture)?;
   if dotnet_version != compatibility_version {
     return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
+  }
+  Ok(())
+}
+
+fn verify_golden_trace_boundary(dv_executable: &Path, fixture: &Path, workspace: &Path) -> Result<()> {
+  let trace: GoldenTraceFile = serde_json::from_str(PHASE_ONE_CI_TRACE)?;
+  validate_golden_trace_contract(&trace)?;
+  for case in &trace.cases {
+    let reference_workspace = workspace.join(format!("{}-reference", case.id));
+    let candidate_workspace = workspace.join(format!("{}-candidate", case.id));
+    prepare_golden_trace_workspace(fixture, &reference_workspace, case)?;
+    prepare_golden_trace_workspace(fixture, &candidate_workspace, case)?;
+    let reference_before = snapshot_tree(&reference_workspace)?;
+    let candidate_before = snapshot_tree(&candidate_workspace)?;
+    if reference_before != candidate_before {
+      return Err(format!("{} did not start both tools from an identical filesystem", case.id).into());
+    }
+
+    let reference = run_golden_trace_command(Path::new("dotnet"), &case.reference_argv[1..], &case.stdin_utf8, &reference_workspace)?;
+    let selected_sdk = (case.id == "github-actions-sdk-selection")
+      .then(|| std::str::from_utf8(&reference.stdout).map(|text| text.trim_end_matches(['\r', '\n']).to_owned()))
+      .transpose()?;
+    let reference_after = snapshot_tree(&reference_workspace)?;
+    validate_golden_observation(
+      &reference,
+      &case.expected.reference,
+      &reference_workspace,
+      &reference_before,
+      &reference_after,
+      selected_sdk.as_deref(),
+    )?;
+
+    let candidate = run_golden_trace_command(dv_executable, &case.candidate_argv[1..], &case.stdin_utf8, &candidate_workspace)?;
+    let candidate_after = snapshot_tree(&candidate_workspace)?;
+    validate_golden_observation(
+      &candidate,
+      &case.expected.candidate,
+      &candidate_workspace,
+      &candidate_before,
+      &candidate_after,
+      selected_sdk.as_deref(),
+    )?;
+  }
+  Ok(())
+}
+
+fn validate_golden_trace_contract(trace: &GoldenTraceFile) -> Result<()> {
+  if trace.schema_version != 1
+    || trace.cases.len() != 2
+    || trace.cases[0].id != "github-actions-sdk-selection"
+    || trace.cases[1].id != "github-actions-offline-restore"
+  {
+    return Err("Phase 1 CI trace must contain the ordered schema-version-1 SDK and restore cases".into());
+  }
+  for case in &trace.cases {
+    if case.source != "compatibility/scripts/phase1-github-actions.yml"
+      || !case.stdin_utf8.is_empty()
+      || case.input_filesystem != "identical"
+      || case.reference_argv.first().map(String::as_str) != Some("dotnet")
+      || case.candidate_argv.first().map(String::as_str) != Some("dv")
+      || case.environment_overrides.len() != GOLDEN_TRACE_ENVIRONMENT.len()
+      || !case
+        .environment_overrides
+        .iter()
+        .zip(GOLDEN_TRACE_ENVIRONMENT)
+        .all(|(actual, expected)| actual.name == expected.0 && actual.value == expected.1)
+      || [&case.expected.reference, &case.expected.candidate]
+        .into_iter()
+        .any(|expected| expected.process_trace != "TBI" || expected.network_trace != "TBI")
+    {
+      return Err(format!("{} drifted from the schema-version-1 trace contract", case.id).into());
+    }
+    let reference_command = case.reference_argv.join(" ");
+    let expected_script_line = format!("run: {reference_command}");
+    if !PHASE_ONE_CI_SCRIPT
+      .lines()
+      .any(|line| line.trim().strip_prefix("- ") == Some(expected_script_line.as_str()))
+    {
+      return Err(format!("{} is not present in the checked-in CI script fixture", case.id).into());
+    }
+  }
+  if trace.cases[0].reference_argv.as_ref() != ["dotnet", "--version"]
+    || trace.cases[0].candidate_argv.as_ref() != ["dv", "--compat", "dotnet", "--version"]
+    || trace.cases[1].reference_argv[1..] != trace.cases[1].candidate_argv[1..]
+  {
+    return Err("the restore trace must change only the executable token; the SDK query must use its explicit compatibility form".into());
+  }
+  Ok(())
+}
+
+fn prepare_golden_trace_workspace(fixture: &Path, workspace: &Path, case: &GoldenTraceCase) -> Result<()> {
+  reset_fixture(fixture, workspace)?;
+  if case.id == "github-actions-offline-restore" {
+    fs::create_dir(workspace.join("offline-source"))?;
+  }
+  Ok(())
+}
+
+fn run_golden_trace_command(executable: &Path, arguments: &[String], stdin: &str, cwd: &Path) -> Result<Output> {
+  let mut command = Command::new(executable);
+  command
+    .args(arguments)
+    .current_dir(cwd)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+  apply_golden_trace_environment(&mut command, cwd);
+  let mut child = command.spawn()?;
+  child.stdin.take().expect("piped stdin exists").write_all(stdin.as_bytes())?;
+  Ok(child.wait_with_output()?)
+}
+
+fn apply_golden_trace_environment(command: &mut Command, workspace: &Path) {
+  for (name, value) in GOLDEN_TRACE_ENVIRONMENT {
+    if let Some(suffix) = value.strip_prefix("$WORKSPACE") {
+      command.env(name, format!("{}{suffix}", workspace.display()));
+    } else {
+      command.env(name, value);
+    }
+  }
+}
+
+fn validate_golden_observation(
+  output: &Output,
+  expected: &GoldenObservation,
+  workspace: &Path,
+  before: &TreeSnapshot,
+  after: &TreeSnapshot,
+  selected_sdk: Option<&str>,
+) -> Result<()> {
+  let stdout = normalize_golden_text(&output.stdout, workspace)?;
+  let stderr = normalize_golden_text(&output.stderr, workspace)?;
+  let expected_stdout = expand_golden_text(&expected.stdout_utf8, selected_sdk)?;
+  let expected_stderr = expand_golden_text(&expected.stderr_utf8, selected_sdk)?;
+  if output.status.code() != Some(expected.exit_code) || stdout != expected_stdout || stderr != expected_stderr {
+    return Err(
+      format!(
+        "golden observation mismatch: status={:?}, stdout={stdout:?}, stderr={stderr:?}",
+        output.status.code()
+      )
+      .into(),
+    );
+  }
+  let delta = golden_tree_delta(before, after);
+  if delta.as_slice() != expected.filesystem_delta.as_ref() {
+    return Err(format!("golden filesystem delta mismatch: {delta:?}").into());
+  }
+  Ok(())
+}
+
+fn normalize_golden_text(bytes: &[u8], workspace: &Path) -> Result<String> {
+  let normalized = std::str::from_utf8(bytes)?.replace('\\', "/");
+  let workspace = workspace.to_string_lossy().replace('\\', "/");
+  Ok(normalized.replace(&workspace, "<WORKSPACE>"))
+}
+
+fn expand_golden_text(template: &str, selected_sdk: Option<&str>) -> Result<String> {
+  let mut text = template.replace("$PLATFORM_EOL", if cfg!(windows) { "\r\n" } else { "\n" });
+  if text.contains("$SELECTED_SDK") {
+    text = text.replace("$SELECTED_SDK", selected_sdk.ok_or("selected-SDK placeholder used outside the SDK trace")?);
+  }
+  Ok(text)
+}
+
+fn golden_tree_delta(before: &TreeSnapshot, after: &TreeSnapshot) -> Vec<GoldenFileChange> {
+  let mut delta = Vec::new();
+  let mut before_index = 0;
+  let mut after_index = 0;
+  while before_index < before.len() || after_index < after.len() {
+    match (before.get(before_index), after.get(after_index)) {
+      (Some((before_path, before_bytes)), Some((after_path, after_bytes))) => match before_path.cmp(after_path) {
+        std::cmp::Ordering::Less => {
+          delta.push(golden_file_change(before_path, before_bytes, "deleted"));
+          before_index += 1;
+        },
+        std::cmp::Ordering::Greater => {
+          delta.push(golden_file_change(after_path, after_bytes, "created"));
+          after_index += 1;
+        },
+        std::cmp::Ordering::Equal => {
+          if before_bytes != after_bytes {
+            delta.push(golden_file_change(after_path, after_bytes, "modified"));
+          }
+          before_index += 1;
+          after_index += 1;
+        },
+      },
+      (Some((path, bytes)), None) => {
+        delta.push(golden_file_change(path, bytes, "deleted"));
+        before_index += 1;
+      },
+      (None, Some((path, bytes))) => {
+        delta.push(golden_file_change(path, bytes, "created"));
+        after_index += 1;
+      },
+      (None, None) => break,
+    }
+  }
+  delta
+}
+
+fn golden_file_change(path: &Path, bytes: &Option<Vec<u8>>, change: &str) -> GoldenFileChange {
+  GoldenFileChange {
+    path: path.to_string_lossy().replace('\\', "/"),
+    kind: if bytes.is_some() { "file" } else { "directory" }.into(),
+    change: change.into(),
+  }
+}
+
+fn validate_golden_trace_sample(output: &Output, reference: bool) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err("golden trace sample did not preserve the successful empty-stderr contract".into());
+  }
+  let text = std::str::from_utf8(&output.stdout)?;
+  if reference {
+    if !text.is_empty() {
+      return Err(format!("reference golden restore emitted unexpected stdout: {text:?}").into());
+    }
+  } else if !text.starts_with("Package resolution\n")
+    || !text.contains("  Packages       0\n")
+    || !text.contains("  HTTP requests  0\n")
+    || !text.contains("  Target         net10.0\n")
+  {
+    return Err(format!("candidate golden restore emitted invalid zero-package evidence: {text:?}").into());
   }
   Ok(())
 }
@@ -6225,6 +6550,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetClientCertificates
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
+      | CaseKind::CliGoldenTrace
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
       | CaseKind::CliTransformEquivalence
@@ -7672,6 +7998,11 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
+    CaseKind::CliGoldenTrace => {
+      reset_fixture(fixture, workspace)?;
+      fs::create_dir(workspace.join("offline-source"))?;
+      Ok(())
+    },
     CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
     | CaseKind::CliTransformEquivalence
@@ -7848,6 +8179,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let started = Instant::now();
   let mut command = Command::new(executable);
   command.args(case.args).current_dir(cwd);
+  if case.name == "cli_golden_trace" {
+    apply_golden_trace_environment(&mut command, cwd);
+  }
   if matches!(case.kind, CaseKind::CliEnvironment) {
     apply_invocation_environment(&mut command);
   }
@@ -7877,6 +8211,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_protocol_version_output(&output, case.args)?;
   } else if case.name == "cli_compat_manifest" {
     validate_compatibility_manifest_output(&output)?;
+  } else if case.name == "cli_golden_trace" {
+    validate_golden_trace_sample(&output, is_dotnet(executable))?;
   } else if case.name == "cli_compat_help" {
     validate_compatibility_help_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackDiagnostic) {
@@ -8794,6 +9130,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
+    "cli_golden_trace" => "Golden CI substitution trace",
     "cli_compat_help" => "Compatibility help",
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
@@ -8918,6 +9255,21 @@ fn ensure_workspace_is_safe(repository: &Path, workspace: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn phase_one_ci_golden_trace_is_typed_and_explicit_about_missing_observers() {
+    let trace: GoldenTraceFile = serde_json::from_str(PHASE_ONE_CI_TRACE).unwrap();
+
+    assert_eq!(trace.schema_version, 1);
+    assert_eq!(trace.cases.len(), 2);
+    validate_golden_trace_contract(&trace).unwrap();
+    for case in &trace.cases {
+      assert_eq!(case.expected.reference.process_trace, "TBI");
+      assert_eq!(case.expected.reference.network_trace, "TBI");
+      assert_eq!(case.expected.candidate.process_trace, "TBI");
+      assert_eq!(case.expected.candidate.network_trace, "TBI");
+    }
+  }
 
   #[test]
   fn percentile_statistics_sort_raw_samples() {
