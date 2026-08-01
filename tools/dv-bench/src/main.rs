@@ -23,6 +23,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(Clone, Copy)]
 enum CaseKind {
   Startup,
+  CliUnknownOption,
   RidGraph,
   ProjectEvaluate,
   PackageReferenceConditions,
@@ -128,6 +129,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "sdk_current_compat",
     kind: CaseKind::Startup,
     args: &["--version"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_unknown_option",
+    kind: CaseKind::CliUnknownOption,
+    args: &["build", "--definitely-unknown"],
     implemented: true,
   },
   Case {
@@ -730,6 +737,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_unknown_option",
+    kind: CaseKind::CliUnknownOption,
+    args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["sdk", "compatible-rids", "linux-musl-x64"],
@@ -1184,6 +1197,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat")) {
     verify_sdk_selection(&dv_executable, &fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
+    verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
   }
@@ -1347,6 +1363,46 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "sdk", "current"], fixture)?;
   if dotnet_version != compatibility_version {
     return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
+  }
+  Ok(())
+}
+
+fn verify_unknown_option_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  const ARGS: &[&str] = &["build", "--definitely-unknown"];
+  for (executable, name, reference) in [(Path::new("dotnet"), "dotnet", true), (dv_executable, "dv", false)] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(ARGS).current_dir(&workspace).output()?;
+    validate_unknown_option_failure(&output, reference)?;
+    let after = snapshot_tree(&workspace)?;
+    if before != after {
+      return Err(format!("{name} unknown-option preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_unknown_option_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("unknown-option command unexpectedly succeeded".into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    let lower = text.to_ascii_lowercase();
+    if output.status.code() != Some(1) || !text.contains("MSB1001") || !lower.contains("unknown switch") || !text.contains("--definitely-unknown") {
+      return Err(format!("dotnet unknown-option oracle omitted MSB1001/Unknown switch: {text}").into());
+    }
+  } else {
+    if output.status.code() != Some(2) {
+      return Err(format!("dv unknown-option command returned {:?} instead of 2", output.status.code()).into());
+    }
+    if !output.stdout.is_empty() || !text.contains("error[DV0002]") || !text.contains("unknown build option \"--definitely-unknown\"") {
+      return Err(format!("dv unknown-option diagnostic did not match the typed CLI boundary: {text}").into());
+    }
+    if text.contains("error[DV01") || text.contains("error[DV02") {
+      return Err(format!("dv unknown-option command performed discovery before rejection: {text}").into());
+    }
   }
   Ok(())
 }
@@ -5167,6 +5223,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetClientCertificates
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
+      | CaseKind::CliUnknownOption
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -6596,7 +6653,8 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
-    CaseKind::RidGraph
+    CaseKind::CliUnknownOption
+    | CaseKind::RidGraph
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -6784,6 +6842,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
   if matches!(case.kind, CaseKind::PackDiagnostic) {
     validate_pack_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliUnknownOption) {
+    validate_unknown_option_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -7395,6 +7455,30 @@ fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
   copy_directory(source, destination)
 }
 
+type TreeSnapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+fn snapshot_tree(root: &Path) -> Result<TreeSnapshot> {
+  fn visit(root: &Path, directory: &Path, entries: &mut TreeSnapshot) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+      let entry = entry?;
+      let path = entry.path();
+      let relative = path.strip_prefix(root)?.to_owned();
+      if entry.file_type()?.is_dir() {
+        entries.push((relative, None));
+        visit(root, &path, entries)?;
+      } else {
+        entries.push((relative, Some(fs::read(path)?)));
+      }
+    }
+    Ok(())
+  }
+
+  let mut entries = Vec::new();
+  visit(root, root, &mut entries)?;
+  entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+  Ok(entries)
+}
+
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
   fs::create_dir_all(destination)?;
   let storage_policy_root = source.join("StoragePolicy.csproj").is_file();
@@ -7652,6 +7736,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
+    "cli_unknown_option" => "Unknown-option rejection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",

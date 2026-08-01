@@ -23,6 +23,9 @@ dv project inspect              3.846 ms median
 dotnet named project query    328.778 ms median
 dv project --project            6.204 ms median
 
+dotnet reject unknown option  146.054 ms median
+dv reject unknown option         4.827 ms median
+
 dotnet conditional references 288.983 ms median
 dv conditional references       4.765 ms median
 
@@ -150,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, global output policy, compatibility exit profiles, and self-version | Implemented |
+| Lossless typed CLI, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -382,7 +385,8 @@ Initial machine:
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
-  project evaluation, named project selection, conditional references, runtime evaluation, warm and cold runtime-pack inventory
+  project evaluation, named project selection, unknown-option rejection,
+  conditional references, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
@@ -405,6 +409,7 @@ Initial machine:
 | Select current SDK | `dotnet --version` | `dv sdk current` | 69.660 ms | 6.102 ms | 11.4x | 72.407 ms | 7.247 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
+| Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 146.054 ms | 4.827 ms | 30.3x | 152.690 ms | 6.424 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate a named project selection | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect --project SmallConsole.csproj --json` | 328.778 ms | 6.204 ms | 53.0x | 502.383 ms | 8.214 ms |
@@ -449,7 +454,8 @@ Initial machine:
 | Validate warm locked packages | `dotnet restore PackageConsole.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageConsole.csproj --packages .packages --offline --json` | 521.346 ms | 7.362 ms | 70.8x | 560.223 ms | 8.206 ms |
 <!-- LIKE_FOR_LIKE_BENCHMARKS_END -->
 
-Before measuring, the harness verifies SDK text and compares every requested
+Before measuring, the harness verifies SDK text, checks unknown-option exit and
+diagnostic identity without workspace mutation, and compares every requested
 project property plus the ordered compile-item identities. The named-selection
 case applies that same gate through `--project`; malformed and mixed selectors
 are covered separately by CLI tests. The RID graph case
@@ -603,6 +609,7 @@ an actual Microsoft host launch. Exact commands are printed in benchmark output 
 recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
 [project selection baseline](docs/performance-baselines/2026-08-01-project-selection-windows.md),
+[unknown-option baseline](docs/performance-baselines/2026-08-01-unknown-option-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
 [runtime pack baseline](docs/performance-baselines/2026-08-01-runtime-pack-windows.md),
@@ -673,6 +680,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
+cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case project_select_named --samples 30 --warmups 3

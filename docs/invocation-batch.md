@@ -86,6 +86,28 @@ allocation. Command operands are borrowed. Event strings remain a cold,
 output-only allocation required by the JSON schema and are not created for
 human output.
 
+## Unknown Option Boundary
+
+`CLI-011` rejects an unrecognized global option during the initial linear
+argument scan. Leaf, SDK, project, build-plan, restore, and sync parsers reject
+their own unrecognized options before current-directory, SDK, project,
+filesystem, or network discovery. A valid global option may still be
+interspersed because the invocation batch removes its index without copying
+the underlying OS token.
+
+The successful SDK path normalizes into one borrowed `SdkRequest` singleton.
+It performs no dynamic allocation and reads only the command and required RID
+operand. Diagnostic strings and context allocate only on rejection. Build
+option parsing now precedes its explicit unimplemented-operation boundary, so
+malformed syntax cannot be hidden by `DV0003`.
+
+The retained oracle keeps `build --definitely-unknown` identical after the
+executable token. .NET 10 reports `MSB1001`; `dv` reports `DV0002`. Before and
+after snapshots prove that neither command creates, removes, or changes a file
+or directory in the input workspace. Integration tests repeat the
+no-discovery assertion with malformed `global.json` and project inputs across
+every active command family.
+
 ## Boundaries
 
 - Command names and text-only SDK operands must be valid Unicode.
@@ -135,3 +157,10 @@ Thirty retained samples after three warm-ups measured `65.901 ms` median and
 `67.752 ms` p95 for `dotnet`, and `5.225 ms` median and `6.202 ms` p95 for
 `dv`, a `12.6x` median improvement. The raw samples are
 `benchmarks/results/baseline-1785569009.json`.
+
+The unknown-option case compares the identical argument vector `build
+--definitely-unknown` after replacing only the executable token. Thirty
+retained samples after three warm-ups measured `dotnet` at `146.054 ms` median
+and `152.690 ms` p95, and `dv` at `4.827 ms` median and `6.424 ms` p95. `dv`
+was `30.3x` faster at the median. Raw samples are retained as
+`benchmarks/results/baseline-1785575360.json`.

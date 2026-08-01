@@ -104,10 +104,28 @@ fn main() -> ExitCode {
   let command_args = invocation.command_arguments();
   match request.command() {
     CommandKind::Help => {
+      if let Some(problem) = unexpected_leaf_argument("help", command_args) {
+        return reject(
+          started,
+          globals,
+          "help",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv --help` without command operands.")),
+        );
+      }
       print!("{HELP}");
       ExitCode::SUCCESS
     },
     CommandKind::Version => {
+      if let Some(problem) = unexpected_leaf_argument("version", command_args) {
+        return reject(
+          started,
+          globals,
+          "version",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv --version` without command operands.")),
+        );
+      }
       println!("dv {}", env!("CARGO_PKG_VERSION"));
       ExitCode::SUCCESS
     },
@@ -179,6 +197,20 @@ fn main() -> ExitCode {
       ),
     ),
   }
+}
+
+fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> Option<String> {
+  let mut unexpected = None;
+  for argument in arguments.iter() {
+    match argument.to_str() {
+      Some(value) if value.starts_with('-') => return Some(format!("unknown {command} option {value:?}")),
+      Some(value) => {
+        unexpected.get_or_insert_with(|| format!("unexpected {command} argument {value:?}"));
+      },
+      None => return Some(format!("unexpected non-Unicode {command} argument {:?}", argument.to_string_lossy())),
+    }
+  }
+  unexpected
 }
 
 fn run_package_command(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
@@ -541,7 +573,20 @@ fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, bu
     print!("{BUILD_HELP}");
     return ExitCode::SUCCESS;
   }
-  if !build_args.iter().any(|argument| argument == "--plan") {
+  let plan_requested = build_args.iter().any(|argument| argument == "--plan");
+  let (requested_path, configuration) = match parse_project_args(build_args, true, "build") {
+    Ok(options) => options,
+    Err(problem) => {
+      return reject(
+        started,
+        globals,
+        "build",
+        args,
+        diagnostic("DV0002", problem, None, Some("Use `dv build --help` to inspect the accepted arguments.")),
+      );
+    },
+  };
+  if !plan_requested {
     return unsupported(
       started,
       globals,
@@ -555,18 +600,6 @@ fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, bu
       ),
     );
   }
-  let (requested_path, configuration) = match parse_project_args(build_args, true) {
-    Ok(options) => options,
-    Err(problem) => {
-      return reject(
-        started,
-        globals,
-        "build --plan",
-        args,
-        diagnostic("DV0002", problem, None, Some("Use `dv build --help` to inspect the accepted arguments.")),
-      );
-    },
-  };
   let current_directory = match env::current_dir() {
     Ok(directory) => directory,
     Err(error) => {
@@ -834,67 +867,118 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
 }
 
 fn run_sdk(started: Instant, globals: InvocationOptions, args: Vec<String>, sdk_args: CommandArguments<'_>) -> ExitCode {
-  let mut semantic = sdk_args.iter();
-  let first = semantic.next();
-  let second = semantic.next();
-  let has_more = semantic.next().is_some();
-  let first_text = match first {
-    Some(argument) => match argument.to_str() {
-      Some(value) => Some(value),
-      None => return reject(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
-    },
-    None => None,
+  let request = match parse_sdk_request(sdk_args) {
+    Ok(request) => request,
+    Err(diagnostic) => return reject(started, globals, "sdk", args, *diagnostic),
   };
-  let second_text = match second {
-    Some(argument) => match argument.to_str() {
-      Some(value) => Some(value),
-      None => return reject(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
-    },
-    None => None,
-  };
-  match (first_text, second_text, has_more) {
-    (None, None, false) => {
+  match request {
+    SdkRequest::Help => {
       print!("{SDK_HELP}");
       ExitCode::SUCCESS
     },
-    (Some("help" | "--help" | "-h"), None, false) => {
-      print!("{SDK_HELP}");
-      ExitCode::SUCCESS
-    },
-    (Some("current"), None, false) => sdk_current(started, globals, args),
-    (Some("list"), None, false) => sdk_list(started, globals, args),
-    (Some("compatible-rids"), Some(runtime_identifier), false) => sdk_compatible_rids(started, globals, args, runtime_identifier),
-    (Some("compatible-rids"), _, _) => reject(
-      started,
-      globals,
-      "sdk compatible-rids",
-      args,
-      diagnostic(
-        "DV0002",
-        "sdk compatible-rids requires exactly one runtime identifier",
-        None,
-        Some("Use `dv sdk compatible-rids RID`."),
-      ),
-    ),
-    _ => {
-      let subcommand = first_text.unwrap_or("<missing>");
-      reject(
-        started,
-        globals,
-        "sdk",
-        args,
-        diagnostic(
-          "DV0001",
-          format!("unknown sdk command {subcommand:?}"),
-          Some(ContextField {
-            name: "command".into(),
-            value: format!("sdk {subcommand}"),
-          }),
-          Some("Use `dv sdk --help` to list SDK commands."),
-        ),
-      )
-    },
+    SdkRequest::Current => sdk_current(started, globals, args),
+    SdkRequest::List => sdk_list(started, globals, args),
+    SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(started, globals, args, runtime_identifier),
   }
+}
+
+// A parsed SDK invocation is a true singleton; the RID remains borrowed from
+// the process-lifetime argument batch and successful parsing allocates nothing.
+#[derive(Clone, Copy)]
+enum SdkRequest<'a> {
+  Help,
+  Current,
+  List,
+  CompatibleRids(&'a str),
+}
+
+fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, Box<Diagnostic>> {
+  let Some(command) = arguments.first() else {
+    return Ok(SdkRequest::Help);
+  };
+  let command = command
+    .to_str()
+    .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(command, "SDK command")))?;
+  if matches!(command, "help" | "--help" | "-h") {
+    return match unexpected_leaf_argument("sdk help", arguments.slice_from(1)) {
+      None => Ok(SdkRequest::Help),
+      Some(problem) => Err(Box::new(diagnostic(
+        "DV0002",
+        problem,
+        None,
+        Some("Use `dv sdk --help` without additional operands."),
+      ))),
+    };
+  }
+  if command.starts_with('-') {
+    return Err(unknown_sdk_option_diagnostic("sdk", command));
+  }
+
+  match command {
+    "current" | "list" => {
+      let request = if command == "current" { SdkRequest::Current } else { SdkRequest::List };
+      let mut unexpected = None;
+      for argument in arguments.slice_from(1).iter() {
+        let value = argument
+          .to_str()
+          .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "SDK argument")))?;
+        if value.starts_with('-') {
+          return Err(unknown_sdk_option_diagnostic(&format!("sdk {command}"), value));
+        }
+        unexpected.get_or_insert(value);
+      }
+      match unexpected {
+        None => Ok(request),
+        Some(value) => Err(Box::new(diagnostic(
+          "DV0002",
+          format!("sdk {command} does not accept argument {value:?}"),
+          None,
+          Some("Use `dv sdk --help` to inspect the accepted arguments."),
+        ))),
+      }
+    },
+    "compatible-rids" => {
+      for argument in arguments.slice_from(1).iter() {
+        let value = argument
+          .to_str()
+          .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "runtime identifier")))?;
+        if value.starts_with('-') {
+          return Err(unknown_sdk_option_diagnostic("sdk compatible-rids", value));
+        }
+      }
+      if arguments.len() != 2 {
+        return Err(Box::new(diagnostic(
+          "DV0002",
+          "sdk compatible-rids requires exactly one runtime identifier",
+          None,
+          Some("Use `dv sdk compatible-rids RID`."),
+        )));
+      }
+      let runtime_identifier = arguments.get(1).and_then(OsStr::to_str).expect("compatible RID was validated as Unicode");
+      Ok(SdkRequest::CompatibleRids(runtime_identifier))
+    },
+    _ => Err(Box::new(diagnostic(
+      "DV0001",
+      format!("unknown sdk command {command:?}"),
+      Some(ContextField {
+        name: "command".into(),
+        value: format!("sdk {command}"),
+      }),
+      Some("Use `dv sdk --help` to list SDK commands."),
+    ))),
+  }
+}
+
+fn unknown_sdk_option_diagnostic(command: &str, option: &str) -> Box<Diagnostic> {
+  Box::new(diagnostic(
+    "DV0002",
+    format!("unknown {command} option {option:?}"),
+    Some(ContextField {
+      name: "option".into(),
+      value: option.into(),
+    }),
+    Some("Use `dv sdk --help` to inspect the accepted arguments."),
+  ))
 }
 
 fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
@@ -1038,12 +1122,38 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
       );
     },
   };
+  if subcommand.starts_with('-') && !matches!(subcommand, "--help" | "-h") {
+    return reject(
+      started,
+      globals,
+      "project",
+      args,
+      diagnostic(
+        "DV0002",
+        format!("unknown project option {subcommand:?}"),
+        None,
+        Some("Use `dv project --help` to inspect the accepted arguments."),
+      ),
+    );
+  }
   let operands = project_args.slice_from(1);
+  if matches!(subcommand, "help" | "--help" | "-h") {
+    if let Some(problem) = unexpected_leaf_argument("project help", operands) {
+      return reject(
+        started,
+        globals,
+        "project help",
+        args,
+        diagnostic("DV0002", problem, None, Some("Use `dv project --help` without additional operands.")),
+      );
+    }
+    print!("{PROJECT_HELP}");
+    return ExitCode::SUCCESS;
+  }
   let mut semantic_operands = operands.iter();
-  if matches!(subcommand, "help" | "--help" | "-h")
-    || (matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
-      && matches!(semantic_operands.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h"))
-      && semantic_operands.next().is_none())
+  if matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
+    && matches!(semantic_operands.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h"))
+    && semantic_operands.next().is_none()
   {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
@@ -1075,7 +1185,7 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
     );
   }
 
-  let (requested_path, configuration) = match parse_project_args(operands, false) {
+  let (requested_path, configuration) = match parse_project_args(operands, false, "project inspect") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1522,7 +1632,7 @@ fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> R
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
-fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
+fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool, command: &str) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
   let mut project = ProjectSelection::default();
   let mut configuration = ProjectConfiguration::Debug;
   let mut index = 0;
@@ -1530,7 +1640,7 @@ fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool) ->
     let argument = arguments.get(index).expect("bounded project option index is valid");
     match argument.to_str() {
       Some("--plan") if ignore_plan => {},
-      Some("-h" | "--help" | "help") => return Err("help must be requested as `dv project --help`".into()),
+      Some("-h" | "--help" | "help") => return Err(format!("help must be requested as `dv {command} --help`")),
       Some("--project") => {
         let path = take_project_value(arguments, &mut index, ignore_plan)?;
         project.select_named(path)?;
@@ -1544,12 +1654,12 @@ fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool) ->
           .ok_or("--configuration requires valid Unicode text")?;
         configuration = ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?;
       },
-      Some(value) if value.starts_with('-') => return Err(format!("unknown project option {value:?}")),
+      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
       _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
       _ if matches!(project, ProjectSelection::Named(_)) => {
         return Err("--project cannot be combined with a positional project or solution path".into());
       },
-      _ => return Err(format!("unexpected project argument {:?}", argument.to_string_lossy())),
+      _ => return Err(format!("unexpected {command} argument {:?}", argument.to_string_lossy())),
     }
     index += 1;
   }
@@ -2303,7 +2413,7 @@ mod argument_tests {
   fn project_path_operands_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), path.clone()]);
-    let (parsed, configuration) = parse_project_args(batch.command_arguments(), false).unwrap();
+    let (parsed, configuration) = parse_project_args(batch.command_arguments(), false, "project inspect").unwrap();
 
     assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
     assert_eq!(configuration, ProjectConfiguration::Debug);
@@ -2313,7 +2423,7 @@ mod argument_tests {
   fn named_project_paths_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), OsString::from("--project"), path.clone()]);
-    let (parsed, _) = parse_project_args(batch.command_arguments(), false).unwrap();
+    let (parsed, _) = parse_project_args(batch.command_arguments(), false, "project inspect").unwrap();
 
     assert!(matches!(parsed, ProjectSelection::Named(_)));
     assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
@@ -2337,7 +2447,7 @@ mod argument_tests {
       vec!["project", "--project", "--configuration", "Release"],
     ] {
       let batch = InvocationBatch::capture(arguments.into_iter().map(OsString::from));
-      assert!(parse_project_args(batch.command_arguments(), false).is_err());
+      assert!(parse_project_args(batch.command_arguments(), false, "project inspect").is_err());
     }
   }
 
@@ -2377,7 +2487,7 @@ mod argument_tests {
   #[test]
   fn build_plan_marker_does_not_become_an_option_value() {
     let batch = InvocationBatch::capture(["build", "--configuration", "--plan", "Release"].map(OsString::from));
-    let (_, configuration) = parse_project_args(batch.command_arguments(), true).unwrap();
+    let (_, configuration) = parse_project_args(batch.command_arguments(), true, "build").unwrap();
 
     assert_eq!(configuration, ProjectConfiguration::Release);
   }

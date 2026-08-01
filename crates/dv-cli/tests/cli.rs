@@ -77,6 +77,68 @@ fn malformed_globals_fail_before_project_discovery() {
 }
 
 #[test]
+fn unknown_options_fail_at_the_active_command_boundary_before_io() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ definitely not JSON");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  for arguments in [
+    vec!["--definitely-unknown"],
+    vec!["--version", "--definitely-unknown"],
+    vec!["--help", "--definitely-unknown"],
+    vec!["sdk", "--help", "--definitely-unknown"],
+    vec!["sdk", "current", "--definitely-unknown"],
+    vec!["sdk", "current", "unexpected", "--definitely-unknown"],
+    vec!["sdk", "list", "--definitely-unknown"],
+    vec!["sdk", "compatible-rids", "--definitely-unknown"],
+    vec!["sdk", "compatible-rids", "linux-x64", "--definitely-unknown"],
+    vec!["project", "--definitely-unknown"],
+    vec!["project", "--help", "--definitely-unknown"],
+    vec!["project", "inspect", "--definitely-unknown"],
+    vec!["project", "frameworks", "--definitely-unknown"],
+    vec!["project", "runtime-packs", "--definitely-unknown"],
+    vec!["project", "package-sources", "--definitely-unknown"],
+    vec!["build", "--definitely-unknown"],
+    vec!["build", "--plan", "--definitely-unknown"],
+    vec!["restore", "--definitely-unknown"],
+    vec!["sync", "--definitely-unknown"],
+  ] {
+    let output = dv().args(&arguments).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "arguments={arguments:?}");
+    assert!(output.stdout.is_empty(), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0002]"), "arguments={arguments:?}: {stderr}");
+    assert!(stderr.contains("unknown"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV01"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV02"), "arguments={arguments:?}: {stderr}");
+  }
+
+  assert!(!temp.0.join("obj").exists());
+  assert!(!temp.0.join(".packages").exists());
+}
+
+#[test]
+fn compatibility_unknown_options_use_reference_failure_exit_without_io() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ definitely not JSON");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  let output = dv()
+    .args(["--compat", "dotnet", "build", "--definitely-unknown"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(1));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("error[DV0002]"));
+  assert!(stderr.contains("unknown build option \"--definitely-unknown\""));
+  assert!(!stderr.contains("error[DV01"));
+  assert!(!stderr.contains("error[DV02"));
+  assert!(!temp.0.join("obj").exists());
+}
+
+#[test]
 fn explicit_color_policy_affects_only_human_diagnostics() {
   let colored = dv().args(["frobnicate", "--color"]).output().unwrap();
   let plain = dv().args(["frobnicate", "--no-color"]).output().unwrap();

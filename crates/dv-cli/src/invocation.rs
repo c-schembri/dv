@@ -275,6 +275,14 @@ impl InvocationBatch {
         },
         Ok(None) => {
           if command_index.is_none() {
+            let argument = raw_arguments.get(index).expect("global option index is valid");
+            if argument
+              .to_str()
+              .is_some_and(|value| value.starts_with('-') && matches!(classify_command(argument), CommandKind::Unknown))
+            {
+              option_error = Some(format!("unknown global option {:?}", argument.to_string_lossy()));
+              break;
+            }
             command_index = Some(index);
           } else if let Some(indices) = &mut semantic_indices {
             indices.push(index);
@@ -592,6 +600,24 @@ mod tests {
       assert_eq!(batch.request().command, CommandKind::InvalidOptions);
       assert!(batch.option_error().is_some());
     }
+  }
+
+  #[test]
+  fn unknown_global_options_fail_before_command_classification() {
+    for arguments in [
+      vec![OsString::from("--definitely-unknown")],
+      vec![OsString::from("--quiet"), OsString::from("--definitely-unknown"), OsString::from("sdk")],
+    ] {
+      let batch = InvocationBatch::capture(arguments);
+      assert_eq!(batch.request().command, CommandKind::InvalidOptions);
+      assert_eq!(batch.option_error(), Some("unknown global option \"--definitely-unknown\""));
+      assert!(batch.command_os().is_none());
+    }
+
+    let help = InvocationBatch::capture([OsString::from("--help")]);
+    let version = InvocationBatch::capture([OsString::from("--version")]);
+    assert_eq!(help.request().command, CommandKind::Help);
+    assert_eq!(version.request().command, CommandKind::Version);
   }
 
   #[test]

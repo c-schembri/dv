@@ -289,8 +289,17 @@ contracts.
 - [ ] `CLI-010` Support configuration, framework, runtime, architecture,
   operating-system, output, artifacts-path, and no-restore selectors
   consistently across applicable commands. `P2`
-- [ ] `CLI-011` Reject unknown options at the same command boundary as the
-  reference tool, before unrelated filesystem or network work. `P1`
+- [x] `CLI-011` Reject unknown options at the same command boundary as the
+  reference tool, before unrelated filesystem or network work. The initial
+  linear argument pass rejects unknown global options, and the active help,
+  version, SDK, project, build, restore, and sync boundaries reject their own
+  unknown options before current-directory, project, SDK, or NuGet discovery.
+  SDK parsing produces one borrowed typed request and allocates nothing on its
+  successful path. A malformed project/global fixture covers every active
+  boundary and compatibility exit code; the benchmark preflight additionally
+  requires Microsoft's `MSB1001`, `dv`'s `DV0002`, the exact option spelling,
+  and an unchanged workspace. Thirty warm Windows samples measure `146.054 ms`
+  for Microsoft versus `4.827 ms` for `dv` (`30.3x`). `P1`
 - [ ] `CLI-012` Preserve arguments after `--` byte-for-byte for child
   application and test processes. `P1`
 - [ ] `CLI-013` Define environment-variable precedence and redact secrets from
