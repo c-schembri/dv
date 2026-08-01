@@ -4907,7 +4907,7 @@ fn config_path_in(directory: &Path) -> Option<PathBuf> {
         }
       }
     }
-    return selected.map_or(Some(path), |(_, actual)| Some(actual));
+    selected.map_or(Some(path), |(_, actual)| Some(actual))
   }
   #[cfg(not(target_os = "macos"))]
   {
@@ -13569,6 +13569,17 @@ mod tests {
         "drive/repository/src/nuget.config",
       ]
     );
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn nuget_config_discovery_preserves_macos_directory_entry_casing() {
+    let temp = TempDirectory::new();
+    temp.write("NuGet.Config", "<configuration />");
+
+    let path = config_path_in(&temp.0).unwrap();
+
+    assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("NuGet.Config")));
   }
 
   #[test]
