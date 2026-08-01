@@ -6,7 +6,8 @@ separate open rows in the parity map.
 
 ## Observed Input
 
-The input is the operating system argument vector after `argv[0]`. The current
+The input is the operating system argument vector after `argv[0]` plus the
+three invocation controls `DV_COLOR`, `DV_VERBOSITY`, and `NO_COLOR`. The current
 CLI integration corpus contains 31 literal argument batches with 2 to 10 tokens
 and a mean of 5.03 tokens; the no-argument and one-argument help/version paths
 are covered separately. Token byte lengths are external and unbounded by the
@@ -16,17 +17,24 @@ repository corpus.
 contiguous OS-owned token batch is preferable to a fixed maximum - affects the
 single process-lifetime allocation, not parsing correctness.`
 
+`ASSUMPTION: representative run/test invocations carry at most four explicit
+child-environment edits - affects only the inline allocation crossover; larger
+batches preserve behavior through contiguous spill storage.`
+
 ## Transform
 
-1. `args_os` -> an inline zero/one-token form or one `Box<[OsString]>` for a
+1. Three exact environment lookups -> a five-byte typed default policy; raw
+   values are parsed and discarded immediately.
+2. `args_os` -> an inline zero/one-token form or one `Box<[OsString]>` for a
    multi-token batch, retaining the exact platform encoding.
-2. One linear, predictable scan -> typed global output policy and first
+3. One linear, predictable scan -> typed global output policy and first
    semantic token.
-3. First semantic token -> a typed native or explicit compatibility request before SDK,
+4. First semantic token -> a typed native or explicit compatibility request before SDK,
    current-directory, project, filesystem, process, or network access.
-4. Command operands -> borrowed views. Text-only positions reject invalid
+5. Command operands -> borrowed views. Text-only positions reject invalid
    Unicode; path positions construct `PathBuf` directly from the OS string.
-5. JSON reporting -> display strings allocated only at the reporting edge.
+6. JSON reporting -> display strings allocated and secret-shaped values
+   redacted only at the reporting edge.
 
 The raw batch is owned for the process invocation and dropped on exit. Operand
 views never outlive it. Empty operands are retained. Unknown commands and
@@ -56,6 +64,61 @@ before discovery because color cannot affect a JSON-only invocation. Missing,
 non-Unicode, and unsupported verbosity values are rejected at the same boundary.
 Top-level help and self-version remain typed command requests and perform no
 SDK, current-directory, filesystem, process, or network work.
+
+`CLI-013` applies environment defaults after the argument scan, so the parser
+knows which dimensions an explicit command-line option replaced. Precedence is
+built-in defaults, then a non-empty `NO_COLOR`, then `DV_COLOR` or
+`DV_VERBOSITY`, then command-line output options. `DV_COLOR` accepts
+`auto|always|never`; `DV_VERBOSITY` accepts the same five typed levels as
+`--verbosity`. A higher-priority command option makes a malformed lower input
+irrelevant. Otherwise invalid or non-Unicode environment data produces a
+pre-discovery usage failure that names only the variable, never its value.
+
+The transient environment policy is five bytes with byte alignment and compile
+time layout checks. Safe values become enums immediately; invalid raw values
+are dropped without entering a diagnostic. Unset variables allocate nothing.
+The 16-byte invocation request and its common dispatch/cache behavior remain
+unchanged.
+
+At the output edge, JSON argument materialization preserves argument count and
+order while replacing separated and combined API keys, passwords, tokens,
+credentials, secret property assignments, URL userinfo, and URL query or
+fragment data with `<redacted>`. Human rejection paths use the same bounded
+classifier before formatting user-controlled option, command, or operand text.
+The classifier uses a 64-byte stack normalization buffer; only an actually
+redacted JSON string allocates beyond the event schema's existing string batch.
+NuGet credentials continue through their narrower zeroizing owners and never
+enter this invocation batch.
+
+For child processes, `run` and `test` collect a separate command-lifetime
+overlay in increasing precedence order: ambient inheritance, global
+`[env:NAME=VALUE]` directives, launch-profile values, and finally
+`-e|--environment NAME=VALUE`. Equal-source inputs retain their original order,
+so the final occurrence wins without sorting or hashing. Ambient values are
+inherited rather than copied. Launch-profile ingestion is reserved in the
+typed source order and lands with the runner; until then it contributes no
+edits.
+
+The common batch borrows up to four 24-byte edits in a fixed inline array and
+allocates only when a command supplies more. Compile-time checks keep each edit
+pointer-aligned and the complete plan within two assumed 64-byte cache lines.
+Names and values continue to point at the invocation batch, secret
+classification is stored as one bit of state, and debug/reporting views never
+expose sensitive values. Environment directives are removed from semantic
+operands; commands other than `run` and
+`test` reject them rather than silently ignoring an unsupported overlay.
+Arguments after `--` remain opaque internally and are redacted only when the
+event reporter materializes its public string batch. Applying the plan to an
+actual child remains part of the pending runner workflow.
+
+Edit capture is linear with predictable option-form branches. Execution can
+apply the already precedence-ordered records sequentially, leaving the OS
+child-environment map to perform final replacement. Assignments must be valid
+Unicode `NAME=VALUE`, names must be non-empty, neither name nor value may
+contain NUL, and the split offset must fit `u32`; malformed or out-of-range
+inputs reject before SDK, project, filesystem, process, or network work. Values
+may be empty. Windows name comparison is ASCII case-insensitive; Unix
+comparison is case-sensitive.
 
 `CLI-007` adds a one-byte compatibility mode selected by `--compat
 dotnet|msbuild|nuget|vstest`. It follows the same linear scan and indexed-view
@@ -206,3 +269,28 @@ predictable delimiter check therefore shows no practical common-path
 regression. `dotnet --version` measured `77.833 ms`, so `dv` remained `12.8x`
 faster on the like-for-like SDK result. Raw control samples are
 `benchmarks/results/sdk-current-cli012-control.json`.
+
+The `CLI-013` oracle gives both executables the identical argument vector
+`build --definitely-unknown` and environment batch `NO_COLOR` (with a secret
+sentinel), `DV_COLOR=never`, and `DV_VERBOSITY=normal`. .NET 10 retains its
+`MSB1001` failure and `dv` retains `DV0002`; preflight rejects ANSI output,
+sentinel disclosure, and any workspace mutation. Thirty retained samples after
+three warm-ups measured Microsoft at `134.218 ms` median and `150.374 ms` p95,
+and `dv` at `5.503 ms` median and `6.314 ms` p95. `dv` was `24.4x` faster at
+the median. The complete stable batch spans `130.490-153.938 ms` for Microsoft
+and `4.542-6.896 ms` for `dv`; no retained sample was removed. Raw samples are
+`benchmarks/results/cli-environment-cli013-final.json`.
+
+Preflight separately builds the .NET 10 child oracle and proves that ambient
+`DV_CLI013_ORACLE=ambient`, `[env:...=directive]`, and
+`--environment ...=command-line` select `command-line`. The application sees
+the secret sentinel but reports only its presence. `dv` reaches the typed run
+boundary with three edits, one sensitive edit, and no
+secret text in schema-18 output.
+
+The common no-environment SDK control measured `dotnet --version` at
+`68.493 ms` median and `70.539 ms` p95, and `dv sdk current` at `5.596 ms`
+median and `5.980 ms` p95 (`12.2x`). This remains below the earlier published
+`6.102 ms` `dv` median, so the three exact environment lookups show no practical
+startup regression. Raw samples are
+`benchmarks/results/sdk-current-cli013-control.json`.

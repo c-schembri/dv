@@ -1,9 +1,12 @@
 use std::{
+  env,
   ffi::{OsStr, OsString},
   mem::{align_of, size_of},
   num::NonZeroUsize,
   ops::Index,
 };
+
+use crate::{environment::directive_assignment, output};
 
 pub(crate) const COMMAND_SYNTAX_VERSION: u16 = 1;
 
@@ -59,6 +62,60 @@ pub(crate) enum DiagnosticVerbosity {
   Normal,
   Detailed,
   Diagnostic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum EnvironmentSetting<T> {
+  Missing,
+  Value(T),
+  Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InvocationEnvironment {
+  color: EnvironmentSetting<ColorChoice>,
+  verbosity: EnvironmentSetting<DiagnosticVerbosity>,
+  no_color: bool,
+}
+
+const _: () = assert!(size_of::<InvocationEnvironment>() == 5);
+const _: () = assert!(align_of::<InvocationEnvironment>() == 1);
+
+impl InvocationEnvironment {
+  fn capture() -> Self {
+    Self::capture_with(|name| env::var_os(name))
+  }
+
+  fn capture_with(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Self {
+    let color = lookup("DV_COLOR").map_or(EnvironmentSetting::Missing, |value| match value.to_str() {
+      Some("auto") => EnvironmentSetting::Value(ColorChoice::Auto),
+      Some("always") => EnvironmentSetting::Value(ColorChoice::Always),
+      Some("never") => EnvironmentSetting::Value(ColorChoice::Never),
+      _ => EnvironmentSetting::Invalid,
+    });
+    let verbosity = lookup("DV_VERBOSITY").map_or(EnvironmentSetting::Missing, |value| match value.to_str() {
+      Some("quiet") => EnvironmentSetting::Value(DiagnosticVerbosity::Quiet),
+      Some("minimal") => EnvironmentSetting::Value(DiagnosticVerbosity::Minimal),
+      Some("normal") => EnvironmentSetting::Value(DiagnosticVerbosity::Normal),
+      Some("detailed") => EnvironmentSetting::Value(DiagnosticVerbosity::Detailed),
+      Some("diagnostic") => EnvironmentSetting::Value(DiagnosticVerbosity::Diagnostic),
+      _ => EnvironmentSetting::Invalid,
+    });
+    let no_color = lookup("NO_COLOR").is_some_and(|value| !value.is_empty());
+
+    Self { color, verbosity, no_color }
+  }
+}
+
+impl Default for InvocationEnvironment {
+  fn default() -> Self {
+    Self {
+      color: EnvironmentSetting::Missing,
+      verbosity: EnvironmentSetting::Missing,
+      no_color: false,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -236,6 +293,14 @@ impl RawArguments {
     one.into_iter().chain(many)
   }
 
+  fn len(&self) -> usize {
+    match self {
+      Self::Empty => 0,
+      Self::One(_) => 1,
+      Self::Many(arguments) => arguments.len(),
+    }
+  }
+
   fn get(&self, index: usize) -> Option<&OsString> {
     match self {
       Self::Empty => None,
@@ -260,15 +325,26 @@ impl RawArguments {
 }
 
 impl InvocationBatch {
+  #[cfg(test)]
   pub(crate) fn capture(arguments: impl IntoIterator<Item = OsString>) -> Self {
+    Self::capture_with_environment(arguments, InvocationEnvironment::default())
+  }
+
+  pub(crate) fn capture_process(arguments: impl IntoIterator<Item = OsString>) -> Self {
+    Self::capture_with_environment(arguments, InvocationEnvironment::capture())
+  }
+
+  fn capture_with_environment(arguments: impl IntoIterator<Item = OsString>, environment: InvocationEnvironment) -> Self {
     let raw_arguments = RawArguments::capture(arguments);
     let mut globals = GlobalOptions::default();
     let mut mode = InvocationMode::Native;
     let mut compat_explicit = false;
     let mut color_explicit = false;
+    let mut verbosity_explicit = false;
     let mut command_index = None;
     let mut semantic_indices = None::<SemanticIndices>;
     let mut forwarded_index = None;
+    let mut environment_directive_seen = false;
     let mut option_error = None;
     let mut index = 0;
     while raw_arguments.get(index).is_some() {
@@ -278,8 +354,21 @@ impl InvocationBatch {
         forwarded_index = NonZeroUsize::new(index + 1);
         break;
       }
-      match parse_global_option(&raw_arguments, index, &mut globals, &mut mode, &mut compat_explicit, &mut color_explicit) {
+      let environment_directive = raw_arguments
+        .get(index)
+        .and_then(|argument| argument.to_str())
+        .is_some_and(|value| value.starts_with("[env:"));
+      match parse_global_option(
+        &raw_arguments,
+        index,
+        &mut globals,
+        &mut mode,
+        &mut compat_explicit,
+        &mut color_explicit,
+        &mut verbosity_explicit,
+      ) {
         Ok(Some(width)) => {
+          environment_directive_seen |= environment_directive;
           if let Some(command) = command_index
             && semantic_indices.is_none()
           {
@@ -298,7 +387,7 @@ impl InvocationBatch {
               .to_str()
               .is_some_and(|value| value.starts_with('-') && matches!(classify_command(argument), CommandKind::Unknown))
             {
-              option_error = Some(format!("unknown global option {:?}", argument.to_string_lossy()));
+              option_error = Some(format!("unknown global option {}", output::quoted_os_argument(argument)));
               break;
             }
             command_index = Some(index);
@@ -312,6 +401,30 @@ impl InvocationBatch {
           break;
         },
       }
+    }
+    if option_error.is_none() && !color_explicit {
+      match environment.color {
+        EnvironmentSetting::Missing => {
+          if environment.no_color {
+            globals.color = ColorChoice::Never;
+          }
+        },
+        EnvironmentSetting::Value(color) => globals.color = color,
+        EnvironmentSetting::Invalid => option_error = Some("DV_COLOR must be auto, always, or never".into()),
+      }
+    }
+    if option_error.is_none() && !verbosity_explicit {
+      match environment.verbosity {
+        EnvironmentSetting::Missing => {},
+        EnvironmentSetting::Value(verbosity) => globals.verbosity = verbosity,
+        EnvironmentSetting::Invalid => option_error = Some("DV_VERBOSITY must be quiet, minimal, normal, detailed, or diagnostic".into()),
+      }
+    }
+    if option_error.is_none()
+      && environment_directive_seen
+      && !command_index.is_some_and(|index| accepts_forwarded_arguments(raw_arguments.get(index).expect("command index is valid")))
+    {
+      option_error = Some("environment directives are supported only by run and test".into());
     }
     if option_error.is_none() && globals.json && color_explicit {
       option_error = Some("explicit color options cannot be combined with --json".into());
@@ -371,13 +484,22 @@ impl InvocationBatch {
     })
   }
 
+  pub(crate) fn environment_directives(&self) -> impl Iterator<Item = &str> {
+    let end = self.forwarded_index.map_or(self.raw_arguments.len(), |index| index.get() - 1);
+    self
+      .raw_arguments
+      .iter()
+      .take(end)
+      .filter_map(|argument| argument.to_str().and_then(|value| directive_assignment(value).ok().flatten()))
+  }
+
   pub(crate) fn option_error(&self) -> Option<&str> {
     self.option_error.as_deref()
   }
 
   pub(crate) fn event_arguments(&self, include: bool) -> Vec<String> {
     if include {
-      self.raw_arguments.iter().map(|argument| argument.to_string_lossy().into_owned()).collect()
+      output::redact_argument_batch(self.raw_arguments.iter().map(OsString::as_os_str), self.raw_arguments.len())
     } else {
       Vec::new()
     }
@@ -485,12 +607,19 @@ fn parse_global_option(
   mode: &mut InvocationMode,
   compat_explicit: &mut bool,
   color_explicit: &mut bool,
+  verbosity_explicit: &mut bool,
 ) -> Result<Option<usize>, String> {
   let argument = arguments.get(index).expect("global option index is valid");
   match argument.to_str() {
     Some("--json") => globals.json = true,
-    Some("--verbose") => globals.verbosity = DiagnosticVerbosity::Detailed,
-    Some("--quiet") => globals.verbosity = DiagnosticVerbosity::Quiet,
+    Some("--verbose") => {
+      globals.verbosity = DiagnosticVerbosity::Detailed;
+      *verbosity_explicit = true;
+    },
+    Some("--quiet") => {
+      globals.verbosity = DiagnosticVerbosity::Quiet;
+      *verbosity_explicit = true;
+    },
     Some("--color") => {
       globals.color = ColorChoice::Always;
       *color_explicit = true;
@@ -520,10 +649,15 @@ fn parse_global_option(
         .get(index + 1)
         .ok_or("--verbosity requires quiet, minimal, normal, detailed, or diagnostic")?;
       globals.verbosity = parse_verbosity(value)?;
+      *verbosity_explicit = true;
       return Ok(Some(2));
     },
     Some(value) if value.starts_with("--verbosity=") => {
       globals.verbosity = parse_verbosity(OsStr::new(&value["--verbosity=".len()..]))?;
+      *verbosity_explicit = true;
+    },
+    Some(value) if value.starts_with("[env:") => {
+      directive_assignment(value).map_err(|error| error.to_string())?;
     },
     _ => return Ok(None),
   }
@@ -536,7 +670,7 @@ fn parse_compatibility_mode(value: &OsStr) -> Result<InvocationMode, String> {
     Some("msbuild") => Ok(InvocationMode::Msbuild),
     Some("nuget") => Ok(InvocationMode::Nuget),
     Some("vstest") => Ok(InvocationMode::Vstest),
-    _ => Err(format!("unsupported compatibility mode {:?}", value.to_string_lossy())),
+    _ => Err(format!("unsupported compatibility mode {:?}", output::redact_argument_text(value))),
   }
 }
 
@@ -547,7 +681,7 @@ fn parse_verbosity(value: &OsStr) -> Result<DiagnosticVerbosity, String> {
     Some("normal") => Ok(DiagnosticVerbosity::Normal),
     Some("detailed") => Ok(DiagnosticVerbosity::Detailed),
     Some("diagnostic") => Ok(DiagnosticVerbosity::Diagnostic),
-    _ => Err(format!("unsupported diagnostic verbosity {:?}", value.to_string_lossy())),
+    _ => Err(format!("unsupported diagnostic verbosity {:?}", output::redact_argument_text(value))),
   }
 }
 
@@ -587,6 +721,146 @@ mod tests {
     assert_eq!(batch.raw_arguments(), ["--json", "restore", "", "App.csproj"]);
     assert!(batch.event_arguments(false).is_empty());
     assert_eq!(batch.event_arguments(true), ["--json", "restore", "", "App.csproj"]);
+  }
+
+  #[test]
+  fn command_line_output_controls_override_the_typed_environment_batch() {
+    let environment = InvocationEnvironment::capture_with(|name| match name {
+      "DV_COLOR" => Some("always".into()),
+      "DV_VERBOSITY" => Some("diagnostic".into()),
+      "NO_COLOR" => Some("present".into()),
+      _ => None,
+    });
+    let inherited = InvocationBatch::capture_with_environment([OsString::from("version")], environment);
+    let overridden = InvocationBatch::capture_with_environment(["--no-color", "--verbosity", "minimal", "version"].map(OsString::from), environment);
+
+    assert_eq!(inherited.request().options().color(), ColorChoice::Always);
+    assert_eq!(inherited.request().options().verbosity(), DiagnosticVerbosity::Diagnostic);
+    assert_eq!(overridden.request().options().color(), ColorChoice::Never);
+    assert_eq!(overridden.request().options().verbosity(), DiagnosticVerbosity::Minimal);
+
+    let standard = InvocationEnvironment::capture_with(|name| (name == "NO_COLOR").then(|| "1".into()));
+    let no_color = InvocationBatch::capture_with_environment([OsString::from("version")], standard);
+    assert_eq!(no_color.request().options().color(), ColorChoice::Never);
+  }
+
+  #[test]
+  fn overridden_environment_errors_never_retain_the_supplied_value() {
+    let environment = InvocationEnvironment::capture_with(|name| match name {
+      "DV_COLOR" => Some("color-environment-secret".into()),
+      "DV_VERBOSITY" => Some("verbosity-environment-secret".into()),
+      _ => None,
+    });
+    let overridden = InvocationBatch::capture_with_environment(["--color", "--quiet", "version"].map(OsString::from), environment);
+    assert_eq!(overridden.request().command(), CommandKind::Version);
+    assert!(overridden.option_error().is_none());
+
+    let invalid = InvocationBatch::capture_with_environment([OsString::from("version")], environment);
+    assert_eq!(invalid.request().command(), CommandKind::InvalidOptions);
+    assert_eq!(invalid.option_error(), Some("DV_COLOR must be auto, always, or never"));
+    assert!(!invalid.option_error().unwrap().contains("environment-secret"));
+
+    let non_unicode = InvocationEnvironment::capture_with(|name| (name == "DV_VERBOSITY").then(non_unicode_argument));
+    let invalid = InvocationBatch::capture_with_environment([OsString::from("version")], non_unicode);
+    assert_eq!(invalid.request().command(), CommandKind::InvalidOptions);
+    assert_eq!(
+      invalid.option_error(),
+      Some("DV_VERBOSITY must be quiet, minimal, normal, detailed, or diagnostic")
+    );
+  }
+
+  #[test]
+  fn structured_argument_reporting_redacts_sensitive_shapes_in_place() {
+    let batch = InvocationBatch::capture(
+      [
+        "--json",
+        "frobnicate",
+        "--api-key",
+        "separate-secret",
+        "--client-secret=joined-secret",
+        "-p:Password=property-secret",
+        "NuGetPackageSourceCredentials_private=credential-secret",
+        "https://user:password@example.test/v3/index.json?sig=query-secret#fragment",
+        "ordinary",
+      ]
+      .map(OsString::from),
+    );
+
+    assert_eq!(
+      batch.event_arguments(true),
+      [
+        "--json",
+        "frobnicate",
+        "--api-key",
+        "<redacted>",
+        "--client-secret=<redacted>",
+        "-p:Password=<redacted>",
+        "NuGetPackageSourceCredentials_private=<redacted>",
+        "https://example.test/v3/index.json",
+        "ordinary",
+      ]
+    );
+  }
+
+  #[test]
+  fn unknown_combined_secret_options_are_redacted_before_diagnostics() {
+    let batch = InvocationBatch::capture([OsString::from("--api-key=diagnostic-secret")]);
+
+    assert_eq!(batch.request().command(), CommandKind::InvalidOptions);
+    assert_eq!(batch.option_error(), Some("unknown global option \"--api-key=<redacted>\""));
+  }
+
+  #[test]
+  fn environment_directives_are_typed_globals_but_forwarded_values_stay_opaque() {
+    let batch = InvocationBatch::capture(
+      [
+        "[env:PUBLIC=directive]",
+        "run",
+        "--environment",
+        "DV_TOKEN=command-secret",
+        "--",
+        "[env:FORWARDED_TOKEN=opaque-secret]",
+      ]
+      .map(OsString::from),
+    );
+
+    assert_eq!(batch.environment_directives().collect::<Vec<_>>(), ["PUBLIC=directive"]);
+    assert_eq!(
+      batch.command_arguments().iter().collect::<Vec<_>>(),
+      [OsStr::new("--environment"), OsStr::new("DV_TOKEN=command-secret")]
+    );
+    assert_eq!(
+      batch.forwarded_arguments().unwrap().as_slice(),
+      [OsString::from("[env:FORWARDED_TOKEN=opaque-secret]")]
+    );
+    assert_eq!(
+      batch.event_arguments(true),
+      [
+        "[env:PUBLIC=directive]",
+        "run",
+        "--environment",
+        "DV_TOKEN=<redacted>",
+        "--",
+        "[env:FORWARDED_TOKEN=<redacted>]",
+      ]
+    );
+  }
+
+  #[test]
+  fn malformed_environment_directives_fail_without_echoing_values() {
+    for directive in ["[env:MISSING]", "[env:=directive-secret]", "[env:TOKEN=unterminated-secret"] {
+      let batch = InvocationBatch::capture([OsString::from(directive), OsString::from("run")]);
+      assert_eq!(batch.request().command(), CommandKind::InvalidOptions);
+      assert!(!batch.option_error().unwrap().contains("secret"));
+    }
+  }
+
+  #[test]
+  fn environment_directives_reject_non_child_commands_instead_of_becoming_noops() {
+    let batch = InvocationBatch::capture([OsString::from("[env:PUBLIC=value]"), OsString::from("sdk"), OsString::from("current")]);
+
+    assert_eq!(batch.request().command(), CommandKind::InvalidOptions);
+    assert_eq!(batch.option_error(), Some("environment directives are supported only by run and test"));
   }
 
   #[test]

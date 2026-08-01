@@ -24,6 +24,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 enum CaseKind {
   Startup,
   CliUnknownOption,
+  CliEnvironment,
   CliForwarding,
   RidGraph,
   ProjectEvaluate,
@@ -136,6 +137,12 @@ const DOTNET_CASES: &[Case] = &[
   Case {
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
+    args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_environment",
+    kind: CaseKind::CliEnvironment,
     args: &["build", "--definitely-unknown"],
     implemented: true,
   },
@@ -751,6 +758,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_environment",
+    kind: CaseKind::CliEnvironment,
+    args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_forwarding",
     kind: CaseKind::CliForwarding,
     args: &["--json", "run", "--", "alpha", "", "--color", "two words"],
@@ -1216,6 +1229,14 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
     verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_environment") {
+    verify_environment_boundary(
+      &dv_executable,
+      &fixture,
+      &argument_forwarding_fixture,
+      &workspace.join("verify-cli-environment"),
+    )?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_forwarding") {
     verify_forwarding_boundary(&dv_executable, &argument_forwarding_fixture, &workspace.join("verify-cli-forwarding"))?;
   }
@@ -1421,6 +1442,153 @@ fn validate_unknown_option_failure(output: &Output, reference: bool) -> Result<(
     }
     if text.contains("error[DV01") || text.contains("error[DV02") {
       return Err(format!("dv unknown-option command performed discovery before rejection: {text}").into());
+    }
+  }
+  Ok(())
+}
+
+const ENVIRONMENT_BENCHMARK_SECRET: &str = "environment-benchmark-secret";
+const CHILD_ENVIRONMENT_SECRET: &str = "child-environment-benchmark-secret";
+
+fn apply_invocation_environment(command: &mut Command) {
+  command
+    .env("NO_COLOR", ENVIRONMENT_BENCHMARK_SECRET)
+    .env("DV_COLOR", "never")
+    .env("DV_VERBOSITY", "normal");
+}
+
+fn verify_environment_boundary(dv_executable: &Path, fixture: &Path, child_fixture: &Path, verification: &Path) -> Result<()> {
+  const ARGS: &[&str] = &["build", "--definitely-unknown"];
+  for (executable, name, reference) in [(Path::new("dotnet"), "dotnet", true), (dv_executable, "dv", false)] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let mut command = Command::new(executable);
+    command.args(ARGS).current_dir(&workspace);
+    apply_invocation_environment(&mut command);
+    let output = command.output()?;
+    validate_environment_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} environment preflight mutated the input workspace").into());
+    }
+  }
+
+  let child_workspace = verification.join("child");
+  reset_fixture(child_fixture, &child_workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "ArgumentForwarding.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &child_workspace,
+    "environment precedence oracle build",
+  )?;
+  let reference = Command::new("dotnet")
+    .args([
+      "[env:DV_CLI013_ORACLE=directive]",
+      "run",
+      "--project",
+      "ArgumentForwarding.csproj",
+      "--configuration",
+      "Release",
+      "--no-build",
+      "--no-restore",
+      "--environment",
+      "DV_CLI013_ORACLE=command-line",
+      "--environment",
+      "DV_CLI013_TOKEN=child-environment-benchmark-secret",
+      "--",
+      "environment",
+    ])
+    .env("DV_CLI013_ORACLE", "ambient")
+    .current_dir(&child_workspace)
+    .output()?;
+  validate_child_environment_reference(&reference)?;
+
+  let actual = Command::new(dv_executable)
+    .args([
+      "--json",
+      "[env:DV_CLI013_ORACLE=directive]",
+      "run",
+      "--environment",
+      "DV_CLI013_ORACLE=command-line",
+      "--environment",
+      "DV_CLI013_TOKEN=child-environment-benchmark-secret",
+      "--",
+      "environment",
+    ])
+    .env("DV_CLI013_ORACLE", "ambient")
+    .current_dir(&child_workspace)
+    .output()?;
+  validate_child_environment_dv(&actual)
+}
+
+fn validate_environment_failure(output: &Output, reference: bool) -> Result<()> {
+  validate_unknown_option_failure(output, reference)?;
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if text.contains(ENVIRONMENT_BENCHMARK_SECRET) {
+    return Err("environment precedence output exposed the environment sentinel".into());
+  }
+  if text.contains('\u{1b}') {
+    return Err("NO_COLOR environment precedence emitted an ANSI escape sequence".into());
+  }
+  Ok(())
+}
+
+fn validate_child_environment_reference(output: &Output) -> Result<()> {
+  if !output.status.success() {
+    return Err(
+      format!(
+        "Microsoft child-environment oracle failed with status {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  if value.get("selected").and_then(serde_json::Value::as_str) != Some("command-line")
+    || value.get("secretPresent").and_then(serde_json::Value::as_bool) != Some(true)
+  {
+    return Err(format!("Microsoft child-environment precedence differs: {value}").into());
+  }
+  if String::from_utf8_lossy(&output.stdout).contains(CHILD_ENVIRONMENT_SECRET) {
+    return Err("Microsoft child-environment oracle printed its secret sentinel".into());
+  }
+  Ok(())
+}
+
+fn validate_child_environment_dv(output: &Output) -> Result<()> {
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(format!("dv child-environment boundary returned status {:?}", output.status.code()).into());
+  }
+  let text = String::from_utf8_lossy(&output.stdout);
+  if text.contains(CHILD_ENVIRONMENT_SECRET) || !text.contains("DV_CLI013_TOKEN=<redacted>") {
+    return Err(format!("dv child-environment reporter did not contain its secret sentinel: {text}").into());
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv child-environment boundary omitted its diagnostic")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0003") {
+    return Err("dv child-environment boundary did not reach the typed run request".into());
+  }
+  for (name, expected) in [("environment_edit_count", "3"), ("sensitive_environment_edit_count", "1")] {
+    let actual = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+      context.iter().find_map(|field| {
+        (field.get("name").and_then(serde_json::Value::as_str) == Some(name))
+          .then(|| field.get("value").and_then(serde_json::Value::as_str))
+          .flatten()
+      })
+    });
+    if actual != Some(expected) {
+      return Err(format!("dv child-environment boundary reported {name}={actual:?}, expected {expected}").into());
     }
   }
   Ok(())
@@ -5360,6 +5528,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
       | CaseKind::CliUnknownOption
+      | CaseKind::CliEnvironment
       | CaseKind::CliForwarding
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
@@ -6799,6 +6968,7 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::CliUnknownOption
+    | CaseKind::CliEnvironment
     | CaseKind::CliForwarding
     | CaseKind::RidGraph
     | CaseKind::ProjectEvaluate
@@ -6966,6 +7136,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let started = Instant::now();
   let mut command = Command::new(executable);
   command.args(case.args).current_dir(cwd);
+  if matches!(case.kind, CaseKind::CliEnvironment) {
+    apply_invocation_environment(&mut command);
+  }
   if matches!(
     case.kind,
     CaseKind::NugetConfigHierarchy
@@ -6992,6 +7165,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliEnvironment) {
+    validate_environment_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliForwarding) {
     validate_forwarding_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
@@ -7887,6 +8062,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
     "cli_unknown_option" => "Unknown-option rejection",
+    "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",

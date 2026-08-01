@@ -7,9 +7,13 @@ use std::{
   time::Instant,
 };
 
+mod environment;
 mod invocation;
+mod output;
 
+use environment::{ChildEnvironmentPlan, EnvironmentError};
 use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, FailureClass, InvocationBatch, InvocationOptions};
+use output::redact_argument_text;
 
 use dv_core::{
   CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
@@ -52,6 +56,15 @@ Output:
   --quiet                 Show errors only
   --verbosity LEVEL       quiet|minimal|normal|detailed|diagnostic
   --color | --no-color    Always or never color human diagnostics
+
+Environment:
+  DV_COLOR                auto|always|never (overrides NO_COLOR)
+  DV_VERBOSITY            quiet|minimal|normal|detailed|diagnostic
+  NO_COLOR                Non-empty disables color by default
+  Command-line output options override environment defaults
+  [env:NAME=VALUE]        Add a child process environment overlay
+  -e, --environment NAME=VALUE
+                          Add a highest-precedence run/test environment value
 ";
 
 const SDK_HELP: &str = "\
@@ -97,7 +110,7 @@ Usage:
 
 fn main() -> ExitCode {
   let started = Instant::now();
-  let invocation = InvocationBatch::capture(env::args_os().skip(1));
+  let invocation = InvocationBatch::capture_process(env::args_os().skip(1));
   let request = invocation.request();
   let globals = request.options();
   let json = globals.json();
@@ -146,6 +159,7 @@ fn main() -> ExitCode {
           invocation.event_arguments(json),
           command_args,
           invocation.forwarded_arguments(),
+          ChildEnvironmentPlan::capture(invocation.environment_directives(), command_args),
         );
       }
       unsupported(
@@ -166,6 +180,7 @@ fn main() -> ExitCode {
     },
     CommandKind::Unknown => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
+      let redacted = redact_argument_text(OsStr::new(command));
       reject(
         started,
         globals,
@@ -173,10 +188,10 @@ fn main() -> ExitCode {
         invocation.event_arguments(json),
         diagnostic(
           "DV0001",
-          format!("unknown command {command:?}"),
+          format!("unknown command {redacted:?}"),
           Some(ContextField {
             name: "command".into(),
-            value: command.into(),
+            value: redacted.into_owned(),
           }),
           Some("Use --help to list available commands."),
         ),
@@ -216,7 +231,25 @@ fn unsupported_child_command(
   args: Vec<String>,
   _command_args: CommandArguments<'_>,
   forwarded_args: Option<invocation::ForwardedArguments<'_>>,
+  environment: Result<ChildEnvironmentPlan<'_>, EnvironmentError>,
 ) -> ExitCode {
+  let environment = match environment {
+    Ok(environment) => environment,
+    Err(error) => {
+      return reject(
+        started,
+        globals,
+        command,
+        args,
+        diagnostic(
+          "DV0002",
+          error.to_string(),
+          None,
+          Some("Use NAME=VALUE with [env:NAME=VALUE], -e, or --environment."),
+        ),
+      );
+    },
+  };
   let mut problem = diagnostic(
     "DV0003",
     format!("command {command:?} is not implemented yet"),
@@ -232,6 +265,16 @@ fn unsupported_child_command(
       value: forwarded.as_slice().len().to_string(),
     });
   }
+  if environment.edit_count() != 0 {
+    problem.context.push(ContextField {
+      name: "environment_edit_count".into(),
+      value: environment.edit_count().to_string(),
+    });
+    problem.context.push(ContextField {
+      name: "sensitive_environment_edit_count".into(),
+      value: environment.sensitive_edit_count().to_string(),
+    });
+  }
   unsupported(started, globals, command, args, problem)
 }
 
@@ -239,11 +282,11 @@ fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> O
   let mut unexpected = None;
   for argument in arguments.iter() {
     match argument.to_str() {
-      Some(value) if value.starts_with('-') => return Some(format!("unknown {command} option {value:?}")),
+      Some(value) if value.starts_with('-') => return Some(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       Some(value) => {
-        unexpected.get_or_insert_with(|| format!("unexpected {command} argument {value:?}"));
+        unexpected.get_or_insert_with(|| format!("unexpected {command} argument {:?}", redact_argument_text(OsStr::new(value))));
       },
-      None => return Some(format!("unexpected non-Unicode {command} argument {:?}", argument.to_string_lossy())),
+      None => return Some(format!("unexpected non-Unicode {command} argument {:?}", redact_argument_text(argument))),
     }
   }
   unexpected
@@ -464,14 +507,16 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+        options.configuration =
+          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
       },
       Some(value) if value.starts_with("--configuration=") => {
         if options.configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
         let value = &value["--configuration=".len()..];
-        options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+        options.configuration =
+          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
       },
       Some("--project") => {
         let path = take_project_value(arguments, &mut index, false)?;
@@ -537,7 +582,7 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
       Some("--offline") => options.offline = true,
       Some("--interactive") => options.interactive = true,
       Some("--probe-credentials") if command == "project package-sources" => options.probe_credentials = true,
-      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
+      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       _ if matches!(options.project, ProjectSelection::CurrentDirectory) => options.project.select_positional(argument)?,
       _ if matches!(command, "restore" | "sync") && options.project.is_positional() => {
         if argument.is_empty() {
@@ -548,7 +593,7 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
       _ if matches!(options.project, ProjectSelection::Named(_)) => {
         return Err("--project cannot be combined with a positional project or solution path".into());
       },
-      _ => return Err(format!("unexpected {command} argument {:?}", argument.to_string_lossy())),
+      _ => return Err(format!("unexpected {command} argument {:?}", redact_argument_text(argument))),
     }
     index += 1;
   }
@@ -947,7 +992,7 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
     };
   }
   if command.starts_with('-') {
-    return Err(unknown_sdk_option_diagnostic("sdk", command));
+    return Err(unknown_sdk_option_diagnostic("sdk", OsStr::new(command)));
   }
 
   match command {
@@ -959,7 +1004,7 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
           .to_str()
           .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "SDK argument")))?;
         if value.starts_with('-') {
-          return Err(unknown_sdk_option_diagnostic(&format!("sdk {command}"), value));
+          return Err(unknown_sdk_option_diagnostic(&format!("sdk {command}"), argument));
         }
         unexpected.get_or_insert(value);
       }
@@ -967,7 +1012,7 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
         None => Ok(request),
         Some(value) => Err(Box::new(diagnostic(
           "DV0002",
-          format!("sdk {command} does not accept argument {value:?}"),
+          format!("sdk {command} does not accept argument {:?}", redact_argument_text(OsStr::new(value))),
           None,
           Some("Use `dv sdk --help` to inspect the accepted arguments."),
         ))),
@@ -979,7 +1024,7 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
           .to_str()
           .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "runtime identifier")))?;
         if value.starts_with('-') {
-          return Err(unknown_sdk_option_diagnostic("sdk compatible-rids", value));
+          return Err(unknown_sdk_option_diagnostic("sdk compatible-rids", argument));
         }
       }
       if arguments.len() != 2 {
@@ -993,25 +1038,29 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
       let runtime_identifier = arguments.get(1).and_then(OsStr::to_str).expect("compatible RID was validated as Unicode");
       Ok(SdkRequest::CompatibleRids(runtime_identifier))
     },
-    _ => Err(Box::new(diagnostic(
-      "DV0001",
-      format!("unknown sdk command {command:?}"),
-      Some(ContextField {
-        name: "command".into(),
-        value: format!("sdk {command}"),
-      }),
-      Some("Use `dv sdk --help` to list SDK commands."),
-    ))),
+    _ => {
+      let command = redact_argument_text(OsStr::new(command));
+      Err(Box::new(diagnostic(
+        "DV0001",
+        format!("unknown sdk command {command:?}"),
+        Some(ContextField {
+          name: "command".into(),
+          value: format!("sdk {command}"),
+        }),
+        Some("Use `dv sdk --help` to list SDK commands."),
+      )))
+    },
   }
 }
 
-fn unknown_sdk_option_diagnostic(command: &str, option: &str) -> Box<Diagnostic> {
+fn unknown_sdk_option_diagnostic(command: &str, option: &OsStr) -> Box<Diagnostic> {
+  let option = redact_argument_text(option);
   Box::new(diagnostic(
     "DV0002",
     format!("unknown {command} option {option:?}"),
     Some(ContextField {
       name: "option".into(),
-      value: option.into(),
+      value: option.into_owned(),
     }),
     Some("Use `dv sdk --help` to inspect the accepted arguments."),
   ))
@@ -1159,6 +1208,7 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
     },
   };
   if subcommand.starts_with('-') && !matches!(subcommand, "--help" | "-h") {
+    let subcommand = redact_argument_text(OsStr::new(subcommand));
     return reject(
       started,
       globals,
@@ -1204,6 +1254,7 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
     return project_package_sources(started, globals, args, operands);
   }
   if subcommand != "inspect" {
+    let subcommand = redact_argument_text(OsStr::new(subcommand));
     return reject(
       started,
       globals,
@@ -1647,21 +1698,25 @@ fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> R
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+        configuration =
+          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
       },
       Some(value) if value.starts_with("--configuration=") => {
         if configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
         let value = &value["--configuration=".len()..];
-        configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+        configuration =
+          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
       },
-      Some(value) if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
+      Some(value) if value.starts_with('-') => {
+        return Err(format!("unknown project {command} option {:?}", redact_argument_text(argument)));
+      },
       _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
       _ if matches!(project, ProjectSelection::Named(_)) => {
         return Err("--project cannot be combined with a positional project or solution path".into());
       },
-      _ => return Err(format!("unexpected project {command} argument {:?}", argument.to_string_lossy())),
+      _ => return Err(format!("unexpected project {command} argument {:?}", redact_argument_text(argument))),
     }
     index += 1;
   }
@@ -1688,14 +1743,15 @@ fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool, co
         let value = take_semantic_value(arguments, &mut index, ignore_plan, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        configuration = ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?;
+        configuration =
+          ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?;
       },
-      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
+      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
       _ if matches!(project, ProjectSelection::Named(_)) => {
         return Err("--project cannot be combined with a positional project or solution path".into());
       },
-      _ => return Err(format!("unexpected {command} argument {:?}", argument.to_string_lossy())),
+      _ => return Err(format!("unexpected {command} argument {:?}", redact_argument_text(argument))),
     }
     index += 1;
   }
@@ -2372,7 +2428,7 @@ fn non_unicode_argument_diagnostic(argument: &OsStr, meaning: &str) -> Diagnosti
     format!("{meaning} must be valid Unicode text"),
     Some(ContextField {
       name: "argument".into(),
-      value: argument.to_string_lossy().into_owned(),
+      value: redact_argument_text(argument).into_owned(),
     }),
     Some("Use lossless OS paths only in command positions documented as paths."),
   )

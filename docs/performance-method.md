@@ -56,6 +56,7 @@ Invalid input behavior:
 |---|---|---|
 | `sdk_current` | no project state | process launch, SDK discovery, and selection |
 | `cli_version` | none | `dv` process launch and self-version output |
+| `cli_environment` | immutable `small-console` fixture; identical `NO_COLOR`, `DV_COLOR`, and `DV_VERBOSITY` values | process launch, typed environment precedence, pre-I/O unknown-option rejection, ANSI suppression, and secret-free failure output |
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
@@ -111,6 +112,7 @@ directional decisions.`
 | Fixture | Concrete data | Primary question | Status |
 |---|---|---|---|
 | `small-console` | 1 project, 1 source, 0 packages | fixed startup and no-op cost | executable |
+| `argument-forwarding` | 1 `net10.0` executable that reports either exact arguments or one public environment selection plus secret presence | lossless child arguments and ambient/directive/command-line environment precedence | executable through .NET 10; `dv` pre-launch boundaries are typed while child execution is TBI |
 | `rid-graph-oracle` | selected SDK graph, official `NuGet.Packaging` parser/expander, `linux-musl-x64` query | graph compatibility parity and one-shot latency | executable for both tools with exact sequence preflight |
 | `runtime-project` | 1 project, 1 selected RID, 3 ordered RID expansion values | compact target expansion and selected-index lookup | executable with property parity preflight |
 | `runtime-pack-project` | 1 `net10.0` executable, `win-x64`, 172 managed runtime assets, 15 native assets, and 1 apphost template | manifest-driven pack/RID/asset selection | executable for both tools with complete pack and asset parity preflight |
@@ -188,6 +190,13 @@ Measure only SDK selection:
 
 ```text
 cargo bench-all --case sdk_current --dv target/release/dv
+```
+
+Measure invocation environment precedence and redaction through identical
+reference/dv process inputs:
+
+```text
+cargo bench-all --case cli_environment --samples 30 --warmups 3
 ```
 
 Measure SDK-owned portable RID expansion:

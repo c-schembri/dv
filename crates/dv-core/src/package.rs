@@ -1,5 +1,4 @@
 use std::{
-  borrow::Cow,
   cmp::Ordering,
   collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
   env,
@@ -39,7 +38,7 @@ use crate::{
   discover_sdks,
   framework_reference::package_pruning_runtime_names,
   legacy_pruning::{LegacyPrunePackage, PruningFramework, exact_legacy_pruning, nearest_legacy_pruning},
-  load_portable_runtime_graph,
+  load_portable_runtime_graph, redact_url_for_output,
 };
 
 #[path = "package_signature.rs"]
@@ -2834,23 +2833,6 @@ impl HttpOrigin {
   }
 }
 
-fn redact_report_location(value: &str) -> Cow<'_, str> {
-  if !value.bytes().any(|byte| matches!(byte, b'@' | b'?' | b'#')) {
-    return Cow::Borrowed(value);
-  }
-  let Ok(mut url) = reqwest::Url::parse(value) else {
-    return Cow::Borrowed(value);
-  };
-  if !matches!(url.scheme(), "http" | "https") {
-    return Cow::Borrowed(value);
-  }
-  let _ = url.set_username("");
-  let _ = url.set_password(None);
-  url.set_query(None);
-  url.set_fragment(None);
-  Cow::Owned(url.into())
-}
-
 #[derive(Default)]
 struct SourceCredentialBatch {
   entries: Box<[Option<Arc<SourceCredential>>]>,
@@ -3297,15 +3279,15 @@ async fn inspect_source_batch(
       ] {
         for endpoint in services.values(capability) {
           endpoint_rows.push(PackageServiceEndpointRecord {
-            location: text.push(redact_report_location(endpoint).as_ref())?,
+            location: text.push(redact_url_for_output(endpoint).as_ref())?,
             kind,
           });
         }
       }
     }
     source_rows.push(PackageSourceRecord {
-      name: text.push(redact_report_location(name).as_ref())?,
-      location: text.push(redact_report_location(&source.url).as_ref())?,
+      name: text.push(redact_url_for_output(name).as_ref())?,
+      location: text.push(redact_url_for_output(&source.url).as_ref())?,
       endpoints: ItemRange {
         start,
         len: u32_len(endpoint_rows.len() - start as usize, "package-source endpoint range")?,
@@ -3405,7 +3387,7 @@ fn resolve_project(
   let (source_name, raw_source_location, source_protocol) = selected_source.map_or(("", DEFAULT_SOURCE, NugetProtocol::V3), |(name, source)| {
     (name.as_str(), source.url.as_str(), source.protocol)
   });
-  let source_location = redact_report_location(raw_source_location);
+  let source_location = redact_url_for_output(raw_source_location);
   let resolution = materialize_resolution(
     ResolutionContext {
       project,
@@ -4043,7 +4025,7 @@ fn command_line_sources(
       (name.clone(), source.clone())
     } else {
       (
-        redact_report_location(value).into_owned(),
+        redact_url_for_output(value).into_owned(),
         PackageSource::parse(value.clone(), None, false, false, Path::new("--source"), project_directory)?,
       )
     };
@@ -7960,7 +7942,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
   let package_metadata = serde_json::json!({
     "schemaVersion": 1,
     "sha512": &downloaded.hash,
-    "source": redact_report_location(downloaded.endpoint.source()),
+    "source": redact_url_for_output(downloaded.endpoint.source()),
     "protocol": downloaded.endpoint.protocol().as_str(),
   });
   fs::write(
@@ -8486,7 +8468,7 @@ fn package_blocking_task_error(error: tokio::task::JoinError) -> PackageError {
 
 fn network_error(context: impl Into<String>, message: impl Into<String>) -> PackageError {
   let context = context.into();
-  let redacted = redact_report_location(&context);
+  let redacted = redact_url_for_output(&context);
   let message = message.into();
   let message = if redacted == context { message } else { message.replace(&context, &redacted) };
   PackageError::new(PackageErrorKind::Network, redacted, message)
@@ -10208,7 +10190,7 @@ fn materialize_resolution(
   let target_framework_span = table.push(context.target_framework)?;
   let runtime_identifier_span = table.push(context.runtime_identifier.unwrap_or(""))?;
   let runtime_graph_fingerprint_span = table.push(context.runtime_graph_fingerprint)?;
-  let source_name_span = table.push(redact_report_location(context.source_name).as_ref())?;
+  let source_name_span = table.push(redact_url_for_output(context.source_name).as_ref())?;
   let source_location_span = table.push(context.source_location)?;
   let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
   let central_package_fingerprint_span = table.push(context.central_package_fingerprint)?;
@@ -10239,7 +10221,7 @@ fn materialize_resolution(
     materialized_source_work.push(PackageSourceWorkRecord {
       downloaded_bytes: work.downloaded_bytes,
       duration_us: work.duration_us,
-      name: table.push(redact_report_location(name).as_ref())?,
+      name: table.push(redact_url_for_output(name).as_ref())?,
       requests: work.requests,
       protocol: source.protocol,
     });
@@ -10693,7 +10675,7 @@ fn read_warm_lock(
   let selected_source = config
     .sources
     .iter()
-    .find(|(_, source)| redact_report_location(&source.url) == lock.source && source.protocol == lock.source_protocol);
+    .find(|(_, source)| redact_url_for_output(&source.url) == lock.source && source.protocol == lock.source_protocol);
   if lock.schema_version != LOCK_SCHEMA_VERSION
     || lock.target_framework != target_text
     || lock.runtime_identifier.as_deref() != project.runtime_identifier()
@@ -12292,7 +12274,7 @@ mod tests {
     assert!(inventory.source_downloaded_bytes(0) > 0);
     assert!(inventory.source_duration_us(0) > 0);
     assert!(!inventory.text.contains("secret"));
-    assert!(matches!(redact_report_location(DEFAULT_SOURCE), Cow::Borrowed(_)));
+    assert!(matches!(redact_url_for_output(DEFAULT_SOURCE), std::borrow::Cow::Borrowed(_)));
     worker.join().unwrap();
   }
 

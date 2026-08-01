@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 17;
+pub const EVENT_SCHEMA_VERSION: u16 = 18;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -312,7 +312,7 @@ pub enum EventPayload {
   CommandStarted {
     /// Stable command name.
     command: String,
-    /// Command arguments after the executable name.
+    /// Command arguments after the executable name, with sensitive values redacted.
     args: Vec<String>,
   },
   /// A batch of work is about to execute.

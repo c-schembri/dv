@@ -1,5 +1,6 @@
 # Argument forwarding fixture
 
-The .NET 10 oracle prints its managed application argument vector as JSON.
-Benchmark setup builds it outside the timed interval; timed Microsoft samples
-use `dotnet run --no-build --no-restore` so the forwarded tail is observable.
+The .NET 10 oracle prints its managed application argument vector as JSON. An
+`environment` sentinel instead reports the selected public precedence value and
+whether a secret value arrived, without printing that value. Benchmark setup
+builds the fixture outside the timed interval.

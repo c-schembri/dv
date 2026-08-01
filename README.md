@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
+| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -203,6 +203,22 @@ policy before command discovery. Native failures retain exit code 2; current
 reference-profile failures return 1. The selector adds no allocation and is
 removed from the typed command operands during the initial linear argument
 scan. Full drop-in grammar and output-layout work remains in progress.
+
+Human output defaults can be set with `DV_COLOR=auto|always|never` and
+`DV_VERBOSITY=quiet|minimal|normal|detailed|diagnostic`; a non-empty
+`NO_COLOR` supplies the standard lower-priority no-color default. Explicit
+command-line output options win. Invalid environment values fail before
+discovery without echoing their contents. Human diagnostics and JSON argument
+events redact sensitive option values, secret property assignments, URL
+userinfo, and query/fragment data before they reach a writer.
+
+`run` and `test` also type child-process environment overlays with Microsoft
+precedence: ambient values, `[env:NAME=VALUE]` directives, launch-profile
+values, then `-e|--environment NAME=VALUE`. Equal-source entries are applied
+left to right, so the last value wins. The plan borrows up to four edits
+without allocating and never reports secret values. Launch-profile loading and
+the child launch itself remain part of the pending run/test workflow, so this
+foundation never claims that a TBI child ran.
 
 `dv sdk compatible-rids RID` loads the selected SDK's portable RID graph as
 data and returns NuGet-compatible breadth-first fallbacks. The compiled graph
@@ -415,6 +431,7 @@ Initial machine:
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 146.054 ms | 4.827 ms | 30.3x | 152.690 ms | 6.424 ms |
+| Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate a named project selection | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect --project SmallConsole.csproj --json` | 328.778 ms | 6.204 ms | 53.0x | 502.383 ms | 8.214 ms |
@@ -615,6 +632,7 @@ recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
 [project selection baseline](docs/performance-baselines/2026-08-01-project-selection-windows.md),
 [unknown-option baseline](docs/performance-baselines/2026-08-01-unknown-option-windows.md),
+[invocation environment baseline](docs/performance-baselines/2026-08-01-cli-environment-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
 [runtime pack baseline](docs/performance-baselines/2026-08-01-runtime-pack-windows.md),
@@ -686,6 +704,7 @@ cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
+cargo bench-all --case cli_environment --samples 30 --warmups 3
 cargo bench-all --case cli_forwarding --samples 30 --warmups 5
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3

@@ -201,6 +201,173 @@ fn explicit_color_policy_affects_only_human_diagnostics() {
 }
 
 #[test]
+fn invocation_environment_has_explicit_precedence_and_secret_free_errors() {
+  let environment_selected = dv()
+    .arg("frobnicate")
+    .env("NO_COLOR", "no-color-environment-secret")
+    .env("DV_COLOR", "always")
+    .output()
+    .unwrap();
+  assert_eq!(environment_selected.status.code(), Some(2));
+  let stderr = String::from_utf8(environment_selected.stderr).unwrap();
+  assert!(stderr.contains("\u{1b}[31m"));
+  assert!(!stderr.contains("environment-secret"));
+
+  let command_line_selected = dv()
+    .args(["--no-color", "--quiet", "frobnicate"])
+    .env("NO_COLOR", "no-color-environment-secret")
+    .env("DV_COLOR", "always")
+    .env("DV_VERBOSITY", "diagnostic")
+    .output()
+    .unwrap();
+  assert_eq!(command_line_selected.status.code(), Some(2));
+  let stderr = String::from_utf8(command_line_selected.stderr).unwrap();
+  assert!(!stderr.contains('\u{1b}'));
+  assert!(!stderr.contains("environment-secret"));
+
+  let invalid = dv()
+    .args(["--json", "frobnicate"])
+    .env("DV_COLOR", "color-environment-secret")
+    .output()
+    .unwrap();
+  assert_eq!(invalid.status.code(), Some(2));
+  assert!(invalid.stderr.is_empty());
+  let stdout = String::from_utf8(invalid.stdout).unwrap();
+  assert!(stdout.contains("DV_COLOR must be auto, always, or never"));
+  assert!(!stdout.contains("environment-secret"));
+
+  let ignored_invalid = dv()
+    .args(["--color", "--quiet", "frobnicate"])
+    .env("DV_COLOR", "color-environment-secret")
+    .env("DV_VERBOSITY", "verbosity-environment-secret")
+    .output()
+    .unwrap();
+  assert_eq!(ignored_invalid.status.code(), Some(2));
+  let stderr = String::from_utf8(ignored_invalid.stderr).unwrap();
+  assert!(stderr.contains("unknown command"));
+  assert!(!stderr.contains("DV_COLOR must"));
+  assert!(!stderr.contains("environment-secret"));
+}
+
+#[test]
+fn sensitive_cli_inputs_are_redacted_from_human_and_json_output() {
+  let json = dv()
+    .args([
+      "--json",
+      "frobnicate",
+      "--api-key",
+      "separate-cli-secret",
+      "--client-secret=joined-cli-secret",
+      "-p:Password=property-cli-secret",
+      "https://user:password@example.test/v3/index.json?sig=query-cli-secret#fragment",
+    ])
+    .output()
+    .unwrap();
+  assert_eq!(json.status.code(), Some(2));
+  assert!(json.stderr.is_empty());
+  let stdout = String::from_utf8(json.stdout).unwrap();
+  for secret in [
+    "separate-cli-secret",
+    "joined-cli-secret",
+    "property-cli-secret",
+    "password",
+    "query-cli-secret",
+  ] {
+    assert!(!stdout.contains(secret), "JSON output exposed {secret:?}: {stdout}");
+  }
+  assert!(stdout.contains("<redacted>"));
+
+  let human = dv().args(["sdk", "current", "--api-key=human-cli-secret"]).output().unwrap();
+  assert_eq!(human.status.code(), Some(2));
+  let stderr = String::from_utf8(human.stderr).unwrap();
+  assert!(stderr.contains("--api-key=<redacted>"));
+  assert!(!stderr.contains("human-cli-secret"));
+
+  let human_url = dv()
+    .args(["project", "https://user:password@example.test/path?sig=human-url-secret"])
+    .output()
+    .unwrap();
+  assert_eq!(human_url.status.code(), Some(2));
+  let stderr = String::from_utf8(human_url.stderr).unwrap();
+  assert!(stderr.contains("https://example.test/path"));
+  assert!(!stderr.contains("password"));
+  assert!(!stderr.contains("human-url-secret"));
+}
+
+#[test]
+fn child_environment_precedence_is_typed_and_reporter_views_are_redacted() {
+  let output = dv()
+    .args([
+      "--json",
+      "[env:PUBLIC_VALUE=directive]",
+      "run",
+      "--environment",
+      "PUBLIC_VALUE=command-line",
+      "--environment=DV_TOKEN=command-secret",
+      "--",
+      "DV_PASSWORD=forwarded-secret",
+    ])
+    .env("PUBLIC_VALUE", "ambient")
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(output.stderr.is_empty());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(!stdout.contains("command-secret"));
+  assert!(!stdout.contains("forwarded-secret"));
+  assert!(stdout.contains("DV_TOKEN=<redacted>"));
+  assert!(stdout.contains("DV_PASSWORD=<redacted>"));
+
+  let events: Vec<serde_json::Value> = stdout.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+  let diagnostic = events.iter().find(|event| event["type"] == "diagnostic").unwrap();
+  assert_eq!(diagnostic["diagnostic"]["code"], "DV0003");
+  let context = diagnostic["diagnostic"]["context"].as_array().unwrap();
+  assert!(context.iter().any(|field| field["name"] == "environment_edit_count" && field["value"] == "3"));
+  assert!(
+    context
+      .iter()
+      .any(|field| field["name"] == "sensitive_environment_edit_count" && field["value"] == "1")
+  );
+}
+
+#[test]
+fn malformed_environment_inputs_fail_before_discovery_without_echoing_values() {
+  let root = TempDirectory::new();
+  root.write("global.json", "{ malformed");
+
+  for arguments in [
+    vec!["[env:=directive-secret]", "run"],
+    vec!["test", "--environment", "=command-secret"],
+    vec!["run", "--environment"],
+  ] {
+    let output = dv().args(arguments).current_dir(&root.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(text.contains("error[DV0002]"), "{text}");
+    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains("global.json"), "{text}");
+  }
+}
+
+#[test]
+fn child_environment_directives_reject_non_child_commands_before_discovery() {
+  let root = TempDirectory::new();
+  root.write("global.json", "{ malformed");
+
+  let output = dv()
+    .args(["[env:PUBLIC_VALUE=directive]", "sdk", "current"])
+    .current_dir(&root.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("environment directives are supported only by run and test"), "{stderr}");
+  assert!(!stderr.contains("global.json"), "{stderr}");
+}
+
+#[test]
 fn sdk_help_exposes_portable_runtime_compatibility() {
   let output = dv().args(["sdk", "--help"]).output().unwrap();
 
@@ -257,7 +424,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":17"));
+  assert!(lines[0].contains("\"schema_version\":18"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -1077,6 +1244,22 @@ fn package_source_credentials_report_only_the_authentication_kind() {
   for secret in ["environment-user", "environment-pat", "config-decoy-user", "config-decoy-secret"] {
     assert!(!stdout.contains(secret));
     assert!(!stderr.contains(secret));
+  }
+
+  let human = dv()
+    .args(["project", "package-sources", "App.csproj", "--offline"])
+    .env(
+      "NuGetPackageSourceCredentials_private",
+      "Username=environment-user;Password=environment-pat;ValidAuthenticationTypes=basic",
+    )
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+  assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
+  let human = format!("{}{}", String::from_utf8_lossy(&human.stdout), String::from_utf8_lossy(&human.stderr));
+  assert!(human.contains("private (v3, basic,"), "{human}");
+  for secret in ["environment-user", "environment-pat", "config-decoy-user", "config-decoy-secret"] {
+    assert!(!human.contains(secret));
   }
   assert!(!temp.0.join("dv.lock.json").exists());
 }

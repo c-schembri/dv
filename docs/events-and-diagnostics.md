@@ -55,6 +55,11 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
+Schema 18 changes `command_started.args` to an explicitly reporter-safe view:
+argument count and order remain stable, while sensitive assignments/options
+and credential-bearing URL components are replaced before serialization. The
+lossless process-owned OS argument batch is unchanged and never becomes the
+wire representation.
 Schema 15 adds the evaluated central policy/version batch to
 `project_evaluated` and a `central_transitive` role bit to each resolved package.
 Schema 14 added configuration-selected conditional project, package, and

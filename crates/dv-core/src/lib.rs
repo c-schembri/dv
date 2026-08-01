@@ -10,6 +10,7 @@ mod legacy_pruning;
 mod pack_requirement;
 mod package;
 mod project;
+mod redaction;
 mod reporter;
 mod runtime_graph;
 mod runtime_pack;
@@ -42,6 +43,7 @@ pub use project::{
   CentralPackageVersion, FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError,
   ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, evaluate_project, evaluate_project_closure, evaluate_project_path,
 };
+pub use redaction::redact_url_for_output;
 pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};
 pub use runtime_pack::{RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, plan_runtime_packs};

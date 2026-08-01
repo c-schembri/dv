@@ -312,8 +312,27 @@ contracts.
   `dv` typed handoff at `5.606 ms` (`8.0x` lower), but this is explicitly not a
   like-for-like execution claim: child launch remains in the ordered run/test
   workflows. `P1`
-- [ ] `CLI-013` Define environment-variable precedence and redact secrets from
-  all output modes. `P1`
+- [x] `CLI-013` Define environment-variable precedence and redact secrets from
+  all output modes. The process boundary reads `DV_COLOR`, `DV_VERBOSITY`, and
+  `NO_COLOR` exactly once into a five-byte typed policy: explicit command-line
+  output options beat `DV_*`, which beats the standard `NO_COLOR` default,
+  which beats built-ins. Invalid or non-Unicode values retain no supplied text
+  and fail before discovery unless a higher-priority command option replaces
+  them. Child-process overlays use ambient, `[env:NAME=VALUE]`, launch-profile,
+  then `-e|--environment NAME=VALUE` precedence with stable last-wins ordering.
+  The command-lifetime plan borrows four 24-byte edits inline and spills only
+  beyond that bound; directives fail explicitly on commands that cannot
+  consume them. Launch-profile ingestion and child launch remain in their
+  ordered run/test rows. A .NET 10 child oracle proves
+  ambient/directive/command-line precedence without printing its secret.
+  Human diagnostics and schema-18 JSON argument events redact
+  separated/combined API keys, passwords, tokens, credentials, secret MSBuild
+  properties, and parsed URL userinfo/query/fragment data before writing.
+  Existing NuGet environment credentials remain zeroized and report only
+  authentication kind. The identical `build --definitely-unknown` timed oracle
+  proves reference failure, no ANSI, no sentinel disclosure, and no workspace
+  mutation. Thirty warm Windows samples measure Microsoft at `134.218 ms` and
+  `dv` at `5.503 ms` (`24.4x` faster). `P1`
 - [ ] `CLI-014` Install Ctrl+C/SIGINT cancellation before starting work and
   propagate a bounded cancellation deadline to children. `P1`
 - [ ] `CLI-015` Preserve child exit codes where the command contract requires
