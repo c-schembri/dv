@@ -3154,7 +3154,7 @@ mod tests {
     let project = temp.write("Unreadable.csproj", "<Project />");
     let original_permissions = fs::metadata(&project).unwrap().permissions();
     let mut unreadable_permissions = original_permissions.clone();
-    unreadable_permissions.set_mode(0);
+    unreadable_permissions.set_mode(0o0);
     fs::set_permissions(&project, unreadable_permissions).unwrap();
 
     let result = evaluate_project_path(&project, ProjectConfiguration::Debug);
