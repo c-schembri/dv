@@ -258,6 +258,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "dotnet_runtime_inventory_arch",
+    kind: CaseKind::CliDriverInventory,
+    args: &["--list-runtimes", "--arch", "x86"],
+    implemented: true,
+  },
+  Case {
     name: "cli_command_normalization",
     kind: CaseKind::CliCommandNormalization,
     args: &["restore", "--definitely-unknown"],
@@ -971,6 +977,12 @@ const DV_CASES: &[Case] = &[
     name: "dotnet_runtime_inventory",
     kind: CaseKind::CliDriverInventory,
     args: &["--compat", "dotnet", "--list-runtimes"],
+    implemented: true,
+  },
+  Case {
+    name: "dotnet_runtime_inventory_arch",
+    kind: CaseKind::CliDriverInventory,
+    args: &["--compat", "dotnet", "--list-runtimes", "--arch", "x86"],
     implemented: true,
   },
   Case {
@@ -2132,8 +2144,30 @@ fn verify_driver_inventory_boundary(dv_executable: &Path, fixture: &Path) -> Res
   ] {
     let reference = Command::new("dotnet").args(reference_arguments).current_dir(fixture).output()?;
     let candidate = Command::new(dv_executable).args(candidate_arguments).current_dir(fixture).output()?;
-    validate_driver_inventory_output(&reference)?;
-    validate_driver_inventory_output(&candidate)?;
+    validate_driver_inventory_output(&reference, false)?;
+    validate_driver_inventory_output(&candidate, false)?;
+    let reference_text = normalized_text(&reference.stdout)?;
+    let candidate_text = normalized_text(&candidate.stdout)?;
+    if reference_text != candidate_text {
+      return Err(format!("{label} differs between Microsoft and dv:\nreference={reference_text:?}\ncandidate={candidate_text:?}").into());
+    }
+  }
+  for (reference_arguments, candidate_arguments, label) in [
+    (
+      &["--list-sdks", "--arch", "x86"][..],
+      &["--compat", "dotnet", "--list-sdks", "--arch", "x86"][..],
+      "x86 SDK inventory",
+    ),
+    (
+      &["--list-runtimes", "--arch", "x86"][..],
+      &["--compat", "dotnet", "--list-runtimes", "--arch", "x86"][..],
+      "x86 runtime inventory",
+    ),
+  ] {
+    let reference = Command::new("dotnet").args(reference_arguments).current_dir(fixture).output()?;
+    let candidate = Command::new(dv_executable).args(candidate_arguments).current_dir(fixture).output()?;
+    validate_driver_inventory_output(&reference, true)?;
+    validate_driver_inventory_output(&candidate, true)?;
     let reference_text = normalized_text(&reference.stdout)?;
     let candidate_text = normalized_text(&candidate.stdout)?;
     if reference_text != candidate_text {
@@ -2146,7 +2180,7 @@ fn verify_driver_inventory_boundary(dv_executable: &Path, fixture: &Path) -> Res
   Ok(())
 }
 
-fn validate_driver_inventory_output(output: &Output) -> Result<()> {
+fn validate_driver_inventory_output(output: &Output, allow_empty: bool) -> Result<()> {
   if !output.status.success() || !output.stderr.is_empty() {
     return Err(
       format!(
@@ -2160,7 +2194,7 @@ fn validate_driver_inventory_output(output: &Output) -> Result<()> {
   }
   let text = normalized_text(&output.stdout)?;
   let lines = text.lines().collect::<Vec<_>>();
-  if lines.is_empty() || lines.iter().any(|line| !line.contains(" [") || !line.ends_with(']')) {
+  if (!allow_empty && lines.is_empty()) || lines.iter().any(|line| !line.contains(" [") || !line.ends_with(']')) {
     return Err(format!("driver inventory did not contain ordered version/path rows: {text:?}").into());
   }
   Ok(())
@@ -8419,7 +8453,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   } else if matches!(case.kind, CaseKind::CliOptionEffects) {
     validate_option_effect_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliDriverInventory) {
-    validate_driver_inventory_output(&output)?;
+    validate_driver_inventory_output(&output, case.name == "dotnet_runtime_inventory_arch")?;
   } else if matches!(case.kind, CaseKind::CliCommandNormalization) {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliTransformEquivalence) {
@@ -9336,6 +9370,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_option_effects" => "Child option effect boundary",
     "dotnet_runtime_inventory" => "Installed runtime inventory",
+    "dotnet_runtime_inventory_arch" => "x86 runtime inventory",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_transform_equivalence" => "Typed transform equivalence",
     "cli_mode_classification" => "Invocation mode classification",

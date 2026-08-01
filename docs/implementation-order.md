@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 74 rows are implemented;
+- 75 rows are implemented;
 - 33 rows have partial foundations;
-- 361 rows are missing;
+- 360 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -154,10 +154,11 @@ Native tool-version aliases normalize to one typed request and event shape;
 the dotnet `--version` compatibility form selects the SDK exactly like its
 Microsoft reference command. Profile-aware help uses static text before SDK or
 project discovery, and SDK info labels both compatibility and canonical syntax.
-The first `DNCLI-001` executable slice also maps current-architecture
-`--list-sdks` and `--list-runtimes` to bounded native inventories with exact
-.NET 10 text rows. Architecture selectors and the remaining root-driver
-surface remain open.
+The first `DNCLI-001` executable slice maps `--list-sdks` and
+`--list-runtimes` to bounded native inventories with exact .NET 10 text rows.
+Its typed `--arch <arch>` selector resolves current and registered alternate
+installations plus supported platform defaults. The remaining root-driver
+surface remains open.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
 NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
 parity records with explicit per-dimension support state.

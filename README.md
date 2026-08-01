@@ -18,6 +18,11 @@ dotnet --list-runtimes          4.618 ms median
 dv --compat dotnet
   --list-runtimes               4.551 ms median
 
+dotnet --list-runtimes
+  --arch x86                    8.539 ms median
+dv --compat dotnet
+  --list-runtimes --arch x86    5.760 ms median
+
 dotnet build -?               135.885 ms median
 dv --compat dotnet build -?     5.518 ms median
 
@@ -162,7 +167,7 @@ The project is in the first implementation phase.
 |---|---|
 | Lossless typed CLI, profile/platform lexical rules, command-spelling normalization, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
 | Installed SDK discovery | Implemented |
-| Current-architecture SDK/runtime inventory through `dotnet` spellings | Initial implementation |
+| Current and architecture-selected SDK/runtime inventory through `dotnet` spellings | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
 | TFM/RID/configuration conditional references | Implemented |
@@ -208,12 +213,14 @@ SDK discovery supports all documented roll-forward policies, prerelease
 filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
 
-Current-architecture `dotnet --list-sdks` and `dotnet --list-runtimes` queries
-are executable through `dv --compat dotnet` with exact ordered text rows. The
+`dotnet --list-sdks` and `dotnet --list-runtimes` queries are executable through
+`dv --compat dotnet` with exact ordered text rows. A typed, case-insensitive
+`--arch <arch>` selector follows .NET 10 registered-root precedence and only
+the platform-supported default cross-architecture layouts; a missing alternate
+installation yields the same successful empty inventory as Microsoft. The
 runtime inventory packs four 16-byte records per assumed 64-byte cache line and
-writes one buffered output batch; incomplete SDK directories are ignored. The
-[design contract](docs/dotnet-driver-inventory.md) keeps architecture selection
-and full host provenance explicit rather than guessing.
+writes one buffered output batch; incomplete SDK directories are ignored. See
+the [design contract](docs/dotnet-driver-inventory.md).
 
 Use `--compat dotnet|msbuild|nuget|vstest` to select a pinned reference exit
 policy before command discovery. A 45-byte read-only matrix covers success,
@@ -438,6 +445,9 @@ cargo run -p dv-cli --release -- sdk runtimes
 # Use the exact dotnet replacement spelling
 target\release\dv.exe --compat dotnet --list-runtimes
 
+# Select another installed architecture
+target\release\dv.exe --compat dotnet --list-runtimes --arch x86
+
 # Show SDK selection details and both accepted command spellings
 cargo run -p dv-cli --release -- sdk info
 
@@ -512,6 +522,8 @@ Microsoft publishes no equivalent query. See the
 [compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
 Current-architecture SDK and runtime inventory has byte-equivalent, zero-write
 evidence in the [dotnet inventory baseline](docs/performance-baselines/2026-08-02-dotnet-driver-inventory-windows.md).
+Architecture-selected inventory has equivalent registered-root and empty-root
+evidence in the [architecture inventory baseline](docs/performance-baselines/2026-08-02-dotnet-driver-inventory-arch-windows.md).
 Reference-compatible help has like-for-like, zero-mutation evidence in the
 [compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
 The first versioned real-CI substitution corpus covers SDK selection and a
@@ -555,8 +567,8 @@ Initial machine:
   case; command normalization, cancellation-ready SDK selection, compiler
   planning, and cold/warm signed-package validation use 5 warm-ups; invocation
   mode, exit policy, lexical preservation, option effects, and route precedence
-  use 50 retained samples after 10 warm-ups; runtime inventory uses 200 retained
-  samples after 20 warm-ups; 10
+  use 50 retained samples after 10 warm-ups; current and x86 runtime inventory
+  use 200 retained samples after 20 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -569,6 +581,7 @@ Initial machine:
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the exact `dotnet` compatibility spelling | `dotnet --version` | `dv --compat dotnet --version` | 63.402 ms | 5.088 ms | 12.5x | 65.472 ms | 5.718 ms |
 | List installed shared runtimes through the exact `dotnet` compatibility spelling | `dotnet --list-runtimes` | `dv --compat dotnet --list-runtimes` | 4.618 ms | 4.551 ms | 1.01x | 5.911 ms | 5.500 ms |
+| List installed x86 shared runtimes through an architecture-selected root | `dotnet --list-runtimes --arch x86` | `dv --compat dotnet --list-runtimes --arch x86` | 8.539 ms | 5.760 ms | 1.48x | 10.646 ms | 7.334 ms |
 | Replay the versioned golden CI offline restore | `dotnet restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | `dv restore SmallConsole.csproj --packages .packages --source offline-source --verbosity quiet` | 626.828 ms | 7.507 ms | 83.5x | 2658.372 ms | 9.153 ms |
 | Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
@@ -855,6 +868,7 @@ cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case dotnet_runtime_inventory --samples 200 --warmups 20
+cargo bench-all --case dotnet_runtime_inventory_arch --samples 200 --warmups 20
 cargo bench-all --case cli_golden_trace --samples 50 --warmups 10
 cargo bench-all --case cli_compat_help --samples 50 --warmups 10
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5

@@ -9,7 +9,7 @@
       "path": [],
       "canonical_path": ["sdk"],
       "status": "partial",
-      "parity_rows": ["DNCLI-001", "SDK-005", "SDK-007"],
+      "parity_rows": ["DNCLI-001", "SDK-005", "SDK-006", "SDK-007"],
       "dimensions": {
         "options": "partial",
         "arguments": "missing",

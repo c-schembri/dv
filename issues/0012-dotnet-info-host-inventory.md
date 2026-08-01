@@ -1,19 +1,18 @@
-# Complete dotnet info and architecture inventory
+# Complete dotnet info host inventory
 
 ## Question
 
-Which hostfxr, hostpolicy, architecture, RID, workload, commit, MSBuild, and
-installation-provenance inputs are required to reproduce the script-consumed
-sections of .NET 10 `dotnet --info` and architecture-selected inventory queries
-without loading Microsoft managed tooling?
+Which hostfxr, hostpolicy, RID, workload, commit, MSBuild, and installation-
+provenance inputs are required to reproduce the script-consumed sections of
+.NET 10 `dotnet --info` without loading Microsoft managed tooling?
 
 ## Why this remains open
 
-`--list-sdks` and `--list-runtimes` now have exact current-architecture rows,
-but `--info` combines host-native state, SDK files, workload manifests, OS
-metadata, architecture registration, and `global.json` selection. Guessing or
-omitting those fields would make `DNCLI-001` look complete while scripts still
-observe different data.
+`--list-sdks` and `--list-runtimes` now have exact current and selected-
+architecture rows, but `--info` combines host-native state, SDK files, workload
+manifests, OS metadata, all-architecture registration, and `global.json`
+selection. Guessing or omitting those fields would make `DNCLI-001` look
+complete while scripts still observe different data.
 
 ## Required evidence
 

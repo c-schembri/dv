@@ -9,9 +9,89 @@ use std::{
 
 use serde::Deserialize;
 
+#[cfg(not(windows))]
+use std::io::BufRead;
+
+#[cfg(windows)]
+use winreg::{
+  RegKey,
+  enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY},
+};
+
 const NO_PRERELEASE: u16 = u16::MAX;
 const MAX_SDK_INSTALLATIONS: usize = 4_096;
 const MAX_RUNTIME_INSTALLATIONS: usize = 4_096;
+
+/// A host architecture accepted by the .NET muxer inventory commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DotnetArchitecture {
+  Arm,
+  Arm64,
+  ArmV6,
+  LoongArch64,
+  Ppc64Le,
+  RiscV64,
+  S390X,
+  X64,
+  X86,
+  Wasm,
+}
+
+const _: () = assert!(size_of::<DotnetArchitecture>() == 1);
+const _: () = assert!(align_of::<DotnetArchitecture>() == 1);
+
+impl DotnetArchitecture {
+  /// Parses the case-insensitive architecture names accepted by .NET 10.
+  pub fn parse(value: &str) -> Option<Self> {
+    [
+      ("arm", Self::Arm),
+      ("arm64", Self::Arm64),
+      ("armv6", Self::ArmV6),
+      ("loongarch64", Self::LoongArch64),
+      ("ppc64le", Self::Ppc64Le),
+      ("riscv64", Self::RiscV64),
+      ("s390x", Self::S390X),
+      ("x64", Self::X64),
+      ("x86", Self::X86),
+      ("wasm", Self::Wasm),
+    ]
+    .into_iter()
+    .find_map(|(name, architecture)| value.eq_ignore_ascii_case(name).then_some(architecture))
+  }
+
+  /// Returns the stable lowercase .NET architecture name.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Arm => "arm",
+      Self::Arm64 => "arm64",
+      Self::ArmV6 => "armv6",
+      Self::LoongArch64 => "loongarch64",
+      Self::Ppc64Le => "ppc64le",
+      Self::RiscV64 => "riscv64",
+      Self::S390X => "s390x",
+      Self::X64 => "x64",
+      Self::X86 => "x86",
+      Self::Wasm => "wasm",
+    }
+  }
+
+  /// Returns the architecture of the running `dv` process when representable.
+  pub fn current() -> Option<Self> {
+    match env::consts::ARCH {
+      "arm" => Some(Self::Arm),
+      "aarch64" => Some(Self::Arm64),
+      "loongarch64" => Some(Self::LoongArch64),
+      "powerpc64" => Some(Self::Ppc64Le),
+      "riscv64" => Some(Self::RiscV64),
+      "s390x" => Some(Self::S390X),
+      "x86_64" => Some(Self::X64),
+      "x86" => Some(Self::X86),
+      "wasm32" | "wasm64" => Some(Self::Wasm),
+      _ => None,
+    }
+  }
+}
 
 /// A parsed .NET SDK version with its original display text.
 #[derive(Clone, Debug)]
@@ -360,6 +440,16 @@ pub fn discover_installed_sdks() -> Result<InstalledSdkInventory, SdkError> {
   Ok(InstalledSdkInventory { roots, installations })
 }
 
+/// Lists SDK installations for a requested .NET host architecture.
+pub fn discover_installed_sdks_for_architecture(architecture: DotnetArchitecture) -> Result<InstalledSdkInventory, SdkError> {
+  if DotnetArchitecture::current() == Some(architecture) {
+    return discover_installed_sdks();
+  }
+  let roots = discover_architecture_roots(architecture);
+  let installations = discover_installations(&roots)?;
+  Ok(InstalledSdkInventory { roots, installations })
+}
+
 /// Lists installed shared frameworks from the active host-root batch.
 pub fn discover_runtimes() -> Result<RuntimeInventory, SdkError> {
   let roots = discover_host_roots();
@@ -370,6 +460,14 @@ pub fn discover_runtimes() -> Result<RuntimeInventory, SdkError> {
     ));
   }
   discover_runtimes_in_owned_roots(roots)
+}
+
+/// Lists shared frameworks for a requested .NET host architecture.
+pub fn discover_runtimes_for_architecture(architecture: DotnetArchitecture) -> Result<RuntimeInventory, SdkError> {
+  if DotnetArchitecture::current() == Some(architecture) {
+    return discover_runtimes();
+  }
+  discover_runtimes_in_owned_roots(discover_architecture_roots(architecture))
 }
 
 /// Lists installed shared frameworks from explicit host roots.
@@ -588,6 +686,81 @@ fn discover_host_roots() -> Vec<PathBuf> {
   }
 
   roots
+}
+
+fn discover_architecture_roots(architecture: DotnetArchitecture) -> Vec<PathBuf> {
+  let mut roots = Vec::with_capacity(1);
+  if let Some(root) = registered_architecture_root(architecture) {
+    roots.push(root);
+    return roots;
+  }
+  if let Some(root) = default_architecture_root(architecture)
+    && root.is_dir()
+  {
+    roots.push(root);
+  }
+  roots
+}
+
+#[cfg(windows)]
+fn registered_architecture_root(architecture: DotnetArchitecture) -> Option<PathBuf> {
+  let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+    .open_subkey_with_flags(
+      format!(r"SOFTWARE\dotnet\Setup\InstalledVersions\{}", architecture.as_str()),
+      KEY_READ | KEY_WOW64_32KEY,
+    )
+    .ok()?;
+  let location: String = key.get_value("InstallLocation").ok()?;
+  (!location.is_empty()).then(|| PathBuf::from(location))
+}
+
+#[cfg(not(windows))]
+fn registered_architecture_root(architecture: DotnetArchitecture) -> Option<PathBuf> {
+  let path = PathBuf::from(format!("/etc/dotnet/install_location_{}", architecture.as_str()));
+  let file = fs::File::open(path).ok()?;
+  let mut line = String::with_capacity(128);
+  io::BufReader::new(file).read_line(&mut line).ok()?;
+  if line.ends_with('\n') {
+    line.pop();
+  }
+  (!line.is_empty()).then(|| PathBuf::from(line))
+}
+
+#[cfg(windows)]
+fn default_architecture_root(architecture: DotnetArchitecture) -> Option<PathBuf> {
+  let current = DotnetArchitecture::current()?;
+  let program_files = match (current, architecture) {
+    (DotnetArchitecture::X64, DotnetArchitecture::X86) => env::var_os("ProgramFiles(x86)")?,
+    (DotnetArchitecture::Arm64, DotnetArchitecture::X64) => env::var_os("ProgramFiles")?,
+    (DotnetArchitecture::X86, DotnetArchitecture::X64) => env::var_os("ProgramW6432")?,
+    (DotnetArchitecture::X64, DotnetArchitecture::Arm64) if windows_native_architecture_is_arm64() => env::var_os("ProgramFiles")?,
+    _ => return None,
+  };
+  let mut root = PathBuf::from(program_files);
+  root.push("dotnet");
+  if current == DotnetArchitecture::Arm64 && architecture == DotnetArchitecture::X64 {
+    root.push("x64");
+  }
+  Some(root)
+}
+
+#[cfg(windows)]
+fn windows_native_architecture_is_arm64() -> bool {
+  ["PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"]
+    .into_iter()
+    .filter_map(env::var_os)
+    .any(|value| value.eq_ignore_ascii_case("ARM64"))
+}
+
+#[cfg(all(not(windows), target_os = "macos"))]
+fn default_architecture_root(architecture: DotnetArchitecture) -> Option<PathBuf> {
+  (DotnetArchitecture::current() == Some(DotnetArchitecture::Arm64) && architecture == DotnetArchitecture::X64)
+    .then(|| PathBuf::from("/usr/local/share/dotnet/x64"))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const fn default_architecture_root(_architecture: DotnetArchitecture) -> Option<PathBuf> {
+  None
 }
 
 fn dotnet_architecture() -> Option<&'static str> {
@@ -926,6 +1099,28 @@ mod tests {
   use super::*;
 
   static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+  #[test]
+  fn dotnet_architecture_names_match_the_host_contract_without_allocation() {
+    for (name, architecture) in [
+      ("arm", DotnetArchitecture::Arm),
+      ("arm64", DotnetArchitecture::Arm64),
+      ("armv6", DotnetArchitecture::ArmV6),
+      ("loongarch64", DotnetArchitecture::LoongArch64),
+      ("ppc64le", DotnetArchitecture::Ppc64Le),
+      ("riscv64", DotnetArchitecture::RiscV64),
+      ("s390x", DotnetArchitecture::S390X),
+      ("x64", DotnetArchitecture::X64),
+      ("x86", DotnetArchitecture::X86),
+      ("wasm", DotnetArchitecture::Wasm),
+    ] {
+      assert_eq!(DotnetArchitecture::parse(name), Some(architecture));
+      assert_eq!(DotnetArchitecture::parse(&name.to_ascii_uppercase()), Some(architecture));
+      assert_eq!(architecture.as_str(), name);
+    }
+    assert_eq!(DotnetArchitecture::parse("amd64"), None);
+    assert_eq!(DotnetArchitecture::parse(""), None);
+  }
 
   struct TempDirectory(PathBuf);
 

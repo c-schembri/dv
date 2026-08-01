@@ -563,17 +563,19 @@ contracts.
 - [~] `DNCLI-001` Support global `--info`, `--version`, `--list-sdks`,
   `--list-runtimes`, architecture selection, diagnostics, help, and verbosity
   with compatible text layouts where scripts consume them. The executable
-  `--list-sdks` and `--list-runtimes` queries now produce the exact current-
-  architecture .NET 10 row order and text layout without launching a managed
-  process. Native `sdk runtimes` uses the same typed runtime inventory, while
-  the existing `sdk list` remains selection-aware; JSON emits one schema-21
-  batch. Incomplete SDK directories are
-  excluded using the same `dotnet.dll` completeness boundary. Architecture
-  selectors, complete `--info`, diagnostics, and the remaining root grammar
-  stay explicit unfinished work. Two hundred warm Windows samples measured
-  Microsoft at `4.618 ms` median and `5.911 ms` p95 versus `4.551 ms` and
-  `5.500 ms` for `dv`, a `1.01x` median improvement at the native process-start
-  floor. `P1/P4`
+  `--list-sdks` and `--list-runtimes` queries now produce the exact .NET 10 row
+  order and text layout without launching a managed process. The optional,
+  case-insensitive `--arch <arch>` selector uses the current host root when it
+  matches the process and otherwise resolves the architecture-specific
+  Windows registry or Unix registration before platform-supported defaults.
+  Native `sdk runtimes` uses the same typed runtime inventory, while the
+  existing `sdk list` remains selection-aware; JSON emits one schema-21 batch.
+  Incomplete SDK directories are excluded using the same `dotnet.dll`
+  completeness boundary. Complete `--info`, diagnostics, and the remaining
+  root-driver grammar stay explicit unfinished work. Two hundred warm Windows
+  x86-inventory samples measured Microsoft at `8.539 ms` median and `10.646 ms`
+  p95 versus `5.760 ms` and `7.334 ms` for `dv`, a `1.48x` median improvement.
+  `P1/P4`
 - [ ] `DNCLI-002` Support `build`, `clean`, `new`, `pack`, `publish`,
   `restore`, `run`, `test`, `vstest`, `msbuild`, `sdk check`, `sln`, and
   managed-application execution entry points. `P1-P5`
@@ -1650,8 +1652,12 @@ boundary, not final drop-in parity.
 - [x] `SDK-004` Apply .NET 10 `paths`, `$host$`, comments, and custom error
   message.
 - [x] `SDK-005` List and select installed SDKs without a managed process.
-- [ ] `SDK-006` Match `--list-sdks --arch` and architecture-specific roots.
-  `P2`
+- [x] `SDK-006` Match `--list-sdks --arch` and architecture-specific roots.
+  The ten .NET 10 architecture names are parsed into a one-byte typed selector
+  without heap allocation. Current-architecture queries retain active-host
+  precedence; other architectures use registered installation roots first,
+  then only Microsoft-supported Windows/macOS default layouts. Missing
+  alternate installations succeed with an empty inventory. `P2`
 - [~] `SDK-007` Inventory shared frameworks, hostfxr, hostpolicy, architecture,
   RID, and install provenance. Shared frameworks are now enumerated once into
   16-byte records backed by one contiguous text arena, sorted by host-root,

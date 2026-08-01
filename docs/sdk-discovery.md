@@ -3,8 +3,8 @@
 `dv sdk current` selects a .NET SDK without launching `dotnet`, MSBuild, or any
 managed process. `dv sdk list` exposes the complete installed SDK batch;
 `dv sdk runtimes` exposes installed shared frameworks. The compatible
-`--list-sdks` and `--list-runtimes` forms render the same current-architecture
-rows as the .NET 10 driver.
+`--list-sdks` and `--list-runtimes` forms render the same rows as the .NET 10
+driver and accept its case-insensitive `--arch <arch>` selector.
 
 `dv sdk compatible-rids RID` reuses that selection and loads the installation's
 portable runtime graph natively. Its compact graph and breadth-first semantics
@@ -48,7 +48,9 @@ Outputs:
 The inventory owns all paths and version text. It is immutable after discovery
 and lives for one command. Full SDK and runtime paths are constructed only at
 the reporting edge. The compatible installed-SDK and runtime transforms do not
-read `global.json` or apply selection policy; the selection-aware native
+read `global.json` or apply selection policy. For a different architecture they
+use the .NET host registration before supported platform defaults and return an
+empty batch when that architecture is not installed. The selection-aware native
 `sdk list` continues to use the full policy above.
 
 ## Runtime Inventory Layout
@@ -65,8 +67,8 @@ the records-per-line count and is validated under issue 0003.`
 
 The query installs no cancellation handler because it is a bounded, read-only
 inventory operation. It launches no process, reads no project or `global.json`,
-and performs no network work. Architecture-specific roots and hostfxr,
-hostpolicy, RID, and provenance inventory remain explicit follow-on work.
+and performs no network work. Hostfxr, hostpolicy, RID, and provenance
+inventory remain explicit follow-on work.
 
 ## Supported Policy
 

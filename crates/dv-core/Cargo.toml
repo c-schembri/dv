@@ -28,6 +28,7 @@ zip.workspace = true
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1.29"
 windows-dpapi = "0.2.0"
+winreg = "0.56.0"
 
 [lints]
 workspace = true

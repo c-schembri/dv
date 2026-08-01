@@ -62,6 +62,7 @@ Invalid input behavior:
 | `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,192-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_compat_check` | immutable 195-byte workflow and 278-byte SDK project; event/version/count/exit/no-write preflight outside timing | `dv` process launch, bounded reads, literal script/XML scan, static manifest-index classification, and one validated schema-21 event batch; Microsoft has no equivalent non-executing scanner and reports TBI |
 | `dotnet_runtime_inventory` | installed host inventory; exact SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, current-architecture shared-framework enumeration, semantic ordering, and compatible text output |
+| `dotnet_runtime_inventory_arch` | registered x86 host inventory; exact current/x86 SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, 32-bit registry-root selection, x86 shared-framework enumeration, semantic ordering, and compatible text output |
 | `cli_compat_help` | immutable `small-console` fixture; successful output-shape and zero-mutation preflight outside timing | process launch, profile-aware static help dispatch, output validation, and no SDK/project/filesystem/network discovery |
 | `cli_option_effects` | immutable `small-console` fixture; tree snapshot and exact exit/sentinel/diagnostic preflight outside timing | process launch, one-pass typed child-option parsing, pre-I/O unknown-option rejection, and output validation |
 | `cli_command_normalization` | immutable `small-console` fixture; tree snapshot and typed invalid-option parity preflight outside timing | process launch, lossless command capture, `dotnet restore`/`dv sync` normalization boundary, pre-I/O rejection, and output validation |
@@ -234,6 +235,7 @@ cargo bench-all --case cli_exit_policy --samples 50 --warmups 10
 cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 cargo bench-all --case dotnet_runtime_inventory --samples 200 --warmups 20
+cargo bench-all --case dotnet_runtime_inventory_arch --samples 200 --warmups 20
 ```
 
 Measure the independently versioned command-syntax and JSON protocol query:

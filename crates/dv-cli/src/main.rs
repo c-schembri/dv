@@ -21,15 +21,15 @@ use output::redact_argument_text;
 
 use dv_core::{
   CancellationToken, CentralPackageVersionEvent, ChildExitPolicy, ChildTermination, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind,
-  CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload,
+  CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, DotnetArchitecture, Event, EventPayload,
   FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind,
   PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
   PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
   ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
   RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
-  discover_installed_sdks, discover_runtimes, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
-  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
-  resolve_package_inputs_with_runtime_graph, write_json_lines,
+  discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture, discover_sdks, evaluate_project,
+  evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
+  plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -344,33 +344,44 @@ fn run() -> ExitCode {
       )
     },
     CommandKind::SdkList => {
-      if let Some(problem) = unexpected_leaf_argument(globals, "--list-sdks", command_args) {
-        return reject(
-          started,
-          globals,
-          "sdk list",
-          invocation.event_arguments(json),
-          diagnostic("DV0002", problem, None, Some("Use `dv --compat dotnet --list-sdks` without command operands.")),
-        );
-      }
-      sdk_installations(started, globals, invocation.event_arguments(json))
+      let architecture = match parse_inventory_architecture(globals, "--list-sdks", command_args) {
+        Ok(architecture) => architecture,
+        Err(problem) => {
+          return reject(
+            started,
+            globals,
+            "sdk list",
+            invocation.event_arguments(json),
+            diagnostic(
+              "DV0002",
+              problem,
+              None,
+              Some("Use `--arch <arm|arm64|armv6|loongarch64|ppc64le|riscv64|s390x|x64|x86|wasm>`."),
+            ),
+          );
+        },
+      };
+      sdk_installations(started, globals, invocation.event_arguments(json), architecture)
     },
     CommandKind::RuntimeList => {
-      if let Some(problem) = unexpected_leaf_argument(globals, "--list-runtimes", command_args) {
-        return reject(
-          started,
-          globals,
-          "sdk runtimes",
-          invocation.event_arguments(json),
-          diagnostic(
-            "DV0002",
-            problem,
-            None,
-            Some("Use `dv --compat dotnet --list-runtimes` without command operands."),
-          ),
-        );
-      }
-      runtime_installations(started, globals, invocation.event_arguments(json))
+      let architecture = match parse_inventory_architecture(globals, "--list-runtimes", command_args) {
+        Ok(architecture) => architecture,
+        Err(problem) => {
+          return reject(
+            started,
+            globals,
+            "sdk runtimes",
+            invocation.event_arguments(json),
+            diagnostic(
+              "DV0002",
+              problem,
+              None,
+              Some("Use `--arch <arm|arm64|armv6|loongarch64|ppc64le|riscv64|s390x|x64|x86|wasm>`."),
+            ),
+          );
+        },
+      };
+      runtime_installations(started, globals, invocation.event_arguments(json), architecture)
     },
     CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
@@ -850,6 +861,37 @@ fn unexpected_leaf_argument(globals: InvocationOptions, command: &str, arguments
     }
   }
   unexpected
+}
+
+fn parse_inventory_architecture(globals: InvocationOptions, command: &str, arguments: CommandArguments<'_>) -> Result<Option<DotnetArchitecture>, String> {
+  if arguments.is_empty() {
+    return Ok(None);
+  }
+  let Some(option) = arguments.first().and_then(OsStr::to_str) else {
+    return Err(format!("unexpected non-Unicode {command} option {:?}", redact_argument_text(&arguments[0])));
+  };
+  if !option.eq_ignore_ascii_case("--arch") {
+    return Err(if globals.argument_is_option(&arguments[0]) {
+      format!("unknown {command} option {:?}", redact_argument_text(&arguments[0]))
+    } else {
+      format!("unexpected {command} argument {:?}", redact_argument_text(&arguments[0]))
+    });
+  }
+  if arguments.len() == 1 {
+    return Err(format!("{command} option --arch requires an architecture"));
+  }
+  if arguments.len() != 2 {
+    return Err(format!("{command} option --arch may be specified only once"));
+  }
+  let Some(value) = arguments.get(1).and_then(OsStr::to_str) else {
+    return Err(format!("{command} option --arch requires a Unicode architecture"));
+  };
+  DotnetArchitecture::parse(value).map(Some).ok_or_else(|| {
+    format!(
+      "unknown architecture: {}",
+      redact_argument_text(arguments.get(1).expect("architecture argument exists"))
+    )
+  })
 }
 
 fn first_unsupported_option(globals: InvocationOptions, command: &str, arguments: CommandArguments<'_>) -> Option<String> {
@@ -1547,7 +1589,7 @@ fn run_sdk(
     },
     SdkRequest::Current => sdk_current(started, globals, args, cancellation.expect("SDK current installs cancellation")),
     SdkRequest::List => sdk_list(started, globals, args, cancellation.expect("SDK list installs cancellation")),
-    SdkRequest::Runtimes => runtime_installations(started, globals, args),
+    SdkRequest::Runtimes => runtime_installations(started, globals, args, None),
     SdkRequest::Info => sdk_info(started, globals, args, cancellation.expect("SDK info installs cancellation")),
     SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(
       started,
@@ -1776,8 +1818,8 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, can
   succeed(started, "sdk list", args, payload)
 }
 
-fn sdk_installations(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
-  let inventory = match discover_installed_sdks() {
+fn sdk_installations(started: Instant, globals: InvocationOptions, args: Vec<String>, architecture: Option<DotnetArchitecture>) -> ExitCode {
+  let inventory = match architecture.map_or_else(discover_installed_sdks, discover_installed_sdks_for_architecture) {
     Ok(inventory) => inventory,
     Err(error) => return fail(started, globals, "sdk list", args, sdk_root_diagnostic(error)),
   };
@@ -1824,8 +1866,8 @@ fn sdk_installations(started: Instant, globals: InvocationOptions, args: Vec<Str
   }
 }
 
-fn runtime_installations(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
-  let inventory = match discover_runtimes() {
+fn runtime_installations(started: Instant, globals: InvocationOptions, args: Vec<String>, architecture: Option<DotnetArchitecture>) -> ExitCode {
+  let inventory = match architecture.map_or_else(discover_runtimes, discover_runtimes_for_architecture) {
     Ok(inventory) => inventory,
     Err(error) => return fail(started, globals, "sdk runtimes", args, sdk_root_diagnostic(error)),
   };
@@ -3453,6 +3495,27 @@ mod argument_tests {
     use std::os::unix::ffi::OsStringExt;
 
     OsString::from_vec(vec![b'p', 0x80])
+  }
+
+  #[test]
+  fn inventory_architecture_is_one_typed_case_insensitive_selector() {
+    for command in ["--list-sdks", "--list-runtimes"] {
+      let batch = InvocationBatch::capture(["--compat", "dotnet", command, "--ARCH", "X86"].map(OsString::from));
+      assert_eq!(
+        parse_inventory_architecture(batch.options(), command, batch.command_arguments()),
+        Ok(Some(DotnetArchitecture::X86))
+      );
+
+      for arguments in [
+        vec!["--compat", "dotnet", command, "--arch"],
+        vec!["--compat", "dotnet", command, "--arch", "amd64"],
+        vec!["--compat", "dotnet", command, "--arch=x86"],
+        vec!["--compat", "dotnet", command, "--arch", "x86", "--arch", "x64"],
+      ] {
+        let batch = InvocationBatch::capture(arguments.into_iter().map(OsString::from));
+        assert!(parse_inventory_architecture(batch.options(), command, batch.command_arguments()).is_err());
+      }
+    }
   }
 
   #[test]

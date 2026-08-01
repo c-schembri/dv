@@ -56,6 +56,7 @@ pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};
 pub use runtime_pack::{RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, plan_runtime_packs};
 pub use sdk::{
-  InstalledSdkInventory, RuntimeInstallation, RuntimeInventory, SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion, discover_installed_sdks,
-  discover_runtimes, discover_runtimes_in_roots, discover_sdks, discover_sdks_in_roots,
+  DotnetArchitecture, InstalledSdkInventory, RuntimeInstallation, RuntimeInventory, SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion,
+  discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture, discover_runtimes_in_roots,
+  discover_sdks, discover_sdks_in_roots,
 };

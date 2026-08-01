@@ -1023,6 +1023,56 @@ fn dotnet_inventory_queries_match_the_reference_row_shapes() {
 }
 
 #[test]
+fn dotnet_inventory_architecture_selects_the_current_host_root() {
+  let architecture = match env::consts::ARCH {
+    "arm" => "arm",
+    "aarch64" => "arm64",
+    "loongarch64" => "loongarch64",
+    "powerpc64" => "ppc64le",
+    "riscv64" => "riscv64",
+    "s390x" => "s390x",
+    "x86_64" => "x64",
+    "x86" => "x86",
+    "wasm32" | "wasm64" => "wasm",
+    unsupported => panic!("unsupported test architecture {unsupported}"),
+  };
+  let uppercase_architecture = architecture.to_ascii_uppercase();
+  let temp = TempDirectory::new();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
+  fs::create_dir_all(temp.0.join("shared/Microsoft.NETCore.App/10.0.0")).unwrap();
+  fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
+  #[cfg(windows)]
+  let expected_root = temp.0.clone();
+  #[cfg(not(windows))]
+  let expected_root = fs::canonicalize(&temp.0).unwrap();
+
+  let sdks = dv()
+    .args(["--compat", "dotnet", "--list-sdks", "--ARCH", &uppercase_architecture])
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+  assert!(sdks.status.success(), "{}", String::from_utf8_lossy(&sdks.stderr));
+  assert_eq!(
+    String::from_utf8(sdks.stdout).unwrap(),
+    format!("10.0.100 [{}]\n", expected_root.join("sdk").display())
+  );
+
+  let runtimes = dv()
+    .args(["--compat", "dotnet", "--list-runtimes", "--arch", architecture])
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+  assert!(runtimes.status.success(), "{}", String::from_utf8_lossy(&runtimes.stderr));
+  assert_eq!(
+    String::from_utf8(runtimes.stdout).unwrap(),
+    format!(
+      "Microsoft.NETCore.App 10.0.0 [{}]\n",
+      expected_root.join("shared").join("Microsoft.NETCore.App").display()
+    )
+  );
+}
+
+#[test]
 fn runtime_inventory_json_uses_the_shared_event_batch() {
   let output = dv().args(["--compat", "dotnet", "--list-runtimes", "--json"]).output().unwrap();
 
