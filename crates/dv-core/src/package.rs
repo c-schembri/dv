@@ -5,6 +5,7 @@ use std::{
   error::Error,
   fmt::{self, Write as _},
   fs,
+  future::Future,
   io::{self, Read, Write},
   mem::{align_of, size_of},
   path::{Component, Path, PathBuf},
@@ -32,8 +33,8 @@ use zip::ZipArchive;
 use package_signature::{FingerprintAlgorithm, SignaturePolicy, TrustedCertificate, TrustedSigner, TrustedSignerKind};
 
 use crate::{
-  BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
-  PackageCancellation, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
+  BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CancellationToken, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
+  ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
   credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
   discover_sdks,
   framework_reference::package_pruning_runtime_names,
@@ -611,8 +612,8 @@ pub struct PackageResolveOptions {
   /// Acquire provider credentials while inspecting sources without making an
   /// HTTP request. Intended for diagnostics and like-for-like measurement.
   pub probe_credentials: bool,
-  /// Cooperative cancellation observed by credential-provider subprocesses.
-  pub cancellation: Option<PackageCancellation>,
+  /// Command cancellation observed by package work and child processes.
+  pub cancellation: Option<CancellationToken>,
   /// Receives provider log messages only in interactive mode.
   pub credential_provider_log_sink: Option<CredentialProviderLogSink>,
 }
@@ -3140,9 +3141,11 @@ pub fn resolve_package_inputs_with_runtime_graph(
   runtime_graph: Option<&RuntimeIdentifierGraph>,
   inventory: Option<&SdkInventory>,
 ) -> Result<Vec<PackageResolution>, PackageError> {
+  check_package_cancellation(options.cancellation.as_ref())?;
   let mut resolutions = Vec::with_capacity(projects.len());
   let mut batch = PackageBatchContext::default();
   for project in projects {
+    check_package_cancellation(options.cancellation.as_ref())?;
     if project.package_references().is_empty() {
       resolutions.push(empty_resolution(project)?);
     } else {
@@ -3165,6 +3168,7 @@ pub fn resolve_package_inputs_with_runtime_graph(
 /// through a bounded task set, then compacted in project/configuration order.
 /// Local and v2 sources require no network work and have empty endpoint ranges.
 pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResolveOptions) -> Result<Vec<PackageSourceInventory>, PackageError> {
+  check_package_cancellation(options.cancellation.as_ref())?;
   if projects.is_empty() {
     return Ok(Vec::new());
   }
@@ -3181,6 +3185,7 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
     })?;
   let mut inventories = Vec::with_capacity(projects.len());
   for project in projects {
+    check_package_cancellation(options.cancellation.as_ref())?;
     let config = discover_configuration(
       project.project_directory(),
       options.packages_directory.as_deref(),
@@ -3196,6 +3201,7 @@ pub fn inspect_package_sources(projects: &[&ProjectSpec], options: &PackageResol
       !options.offline,
       options.probe_credentials,
       config.http_policy.with_offline(options.offline),
+      options.cancellation.as_ref(),
     ))?);
   }
   Ok(inventories)
@@ -3208,7 +3214,9 @@ async fn inspect_source_batch(
   allow_network: bool,
   probe_credentials: bool,
   http_policy: PackageHttpPolicy,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<PackageSourceInventory, PackageError> {
+  check_package_cancellation(cancellation)?;
   let mut discovered = std::iter::repeat_with(|| None)
     .take(sources.len())
     .collect::<Vec<Option<(NugetServiceEndpoints, HttpWork)>>>();
@@ -3235,12 +3243,24 @@ async fn inspect_source_batch(
       while next < jobs.len() && tasks.len() < MAX_DOWNLOAD_WORKERS {
         let (index, source, credential) = jobs[next].clone();
         let client = client.clone();
-        tasks.spawn(async move { (index, fetch_v3_service_index(&client, credential.as_deref(), &source).await) });
+        let cancellation = cancellation.cloned();
+        tasks.spawn(async move {
+          (
+            index,
+            fetch_v3_service_index(&client, credential.as_deref(), &source, cancellation.as_ref()).await,
+          )
+        });
         next += 1;
       }
-      let (index, result) = tasks
-        .join_next()
-        .await
+      let joined = tasks.join_next();
+      let joined = match cancellation {
+        Some(cancellation) => tokio::select! {
+          result = joined => result,
+          _ = cancellation.cancelled() => return Err(package_cancelled_error()),
+        },
+        None => joined.await,
+      };
+      let (index, result) = joined
         .ok_or_else(|| PackageError::new(PackageErrorKind::Io, "package-source scheduler", "service-index task set ended early"))?
         .map_err(|error| PackageError::new(PackageErrorKind::Io, "package-source scheduler", format!("service-index task failed: {error}")))?;
       discovered[index] = Some(result?);
@@ -5899,13 +5919,14 @@ struct LazyServiceEndpoints {
 
 struct ServiceDiscoveryOptions<'a> {
   source_work: &'a mut [SourceWork],
+  cancellation: Option<&'a CancellationToken>,
   worker_budget: u8,
   allow_network: bool,
 }
 
 const _: () = assert!(size_of::<LazyServiceEndpoints>() == 40);
 const _: () = assert!(align_of::<LazyServiceEndpoints>() == 8);
-const _: () = assert!(size_of::<ServiceDiscoveryOptions>() == 24);
+const _: () = assert!(size_of::<ServiceDiscoveryOptions>() == 32);
 const _: () = assert!(align_of::<ServiceDiscoveryOptions>() == 8);
 
 impl LazyServiceEndpoints {
@@ -5925,9 +5946,11 @@ impl LazyServiceEndpoints {
     package_id: &str,
     options: ServiceDiscoveryOptions<'_>,
   ) -> Result<(), PackageError> {
+    check_package_cancellation(options.cancellation)?;
     debug_assert!(options.worker_budget > 0);
     let worker_budget = usize::from(options.worker_budget.max(1));
     let allow_network = options.allow_network;
+    let cancellation = options.cancellation;
     let source_work = options.source_work;
     let required_rank = mapping.and_then(|mapping| mapping.required_rank(package_id));
     if mapping.is_some() && required_rank.is_none() {
@@ -5992,12 +6015,13 @@ impl LazyServiceEndpoints {
           break;
         };
         let client = client.clone();
+        let cancellation = cancellation.cloned();
         tasks.spawn(async move {
-          let result = fetch_v3_service_index(&client, credential.as_deref(), &source).await;
+          let result = fetch_v3_service_index(&client, credential.as_deref(), &source, cancellation.as_ref()).await;
           (index, source, credential, result)
         });
       }
-      let Some(result) = tasks.join_next().await else {
+      let Some(result) = await_with_cancellation(cancellation, tasks.join_next()).await? else {
         break;
       };
       completed
@@ -6145,8 +6169,9 @@ async fn fetch_v3_service_index(
   client: &reqwest::Client,
   credential: Option<&SourceCredential>,
   source: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<(NugetServiceEndpoints, HttpWork), PackageError> {
-  let payload = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index").await?;
+  let payload = get_bytes(client, credential, source, MAX_JSON_BYTES, "NuGet service index", cancellation).await?;
   let document: serde_json::Value =
     serde_json::from_slice(&payload.value).map_err(|error| network_error(source, format!("invalid NuGet service-index JSON: {error}")))?;
   let security_flags = credential.map_or(0, |credential| credential.security_flags);
@@ -6416,6 +6441,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
               worker_budget: u8::try_from(MAX_DOWNLOAD_WORKERS - tasks.len()).expect("package worker budget fits u8"),
               allow_network: !options.offline,
               source_work: &mut source_work,
+              cancellation: options.cancellation.as_ref(),
             },
           )
           .await?;
@@ -6428,6 +6454,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let task_signature_policy = Arc::clone(&config.signature_policy);
+      let task_cancellation = options.cancellation.clone();
       let task_version = request.as_ref().map(|request| request.version.clone());
       let task_target = target;
       in_flight.insert(lower_id.clone());
@@ -6437,6 +6464,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
           fallback_roots: &task_fallback_roots,
           temp_root: &task_temp_root,
           signature_policy: &task_signature_policy,
+          cancellation: task_cancellation.as_ref(),
         };
         let result = load_node_metadata(
           &task_client,
@@ -6456,13 +6484,16 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       continue;
     }
 
-    let (lower_id, generation, task_version, result) = tasks.join_next().await.ok_or_else(package_worker_stopped)?.map_err(|error| {
-      PackageError::new(
-        PackageErrorKind::Io,
-        "package scheduler",
-        format!("package metadata task stopped before the graph completed: {error}"),
-      )
-    })?;
+    let (lower_id, generation, task_version, result) = await_with_cancellation(options.cancellation.as_ref(), tasks.join_next())
+      .await?
+      .ok_or_else(package_worker_stopped)?
+      .map_err(|error| {
+        PackageError::new(
+          PackageErrorKind::Io,
+          "package scheduler",
+          format!("package metadata task stopped before the graph completed: {error}"),
+        )
+      })?;
     in_flight.remove(&lower_id);
     let stale = nodes.get(&lower_id).is_none_or(|node| node.generation != generation);
     let result = match result {
@@ -6576,6 +6607,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
       let task_signature_policy = Arc::clone(&config.signature_policy);
+      let task_cancellation = options.cancellation.clone();
       let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
       acquisition_tasks.spawn(async move {
         let storage = PackageStorage {
@@ -6583,6 +6615,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
           fallback_roots: &task_fallback_roots,
           temp_root: &task_temp_root,
           signature_policy: &task_signature_policy,
+          cancellation: task_cancellation.as_ref(),
         };
         let result = ensure_package(
           &task_client,
@@ -6600,9 +6633,8 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
     if acquisition_tasks.is_empty() {
       continue;
     }
-    let (request, cached) = acquisition_tasks
-      .join_next()
-      .await
+    let (request, cached) = await_with_cancellation(options.cancellation.as_ref(), acquisition_tasks.join_next())
+      .await?
       .ok_or_else(package_worker_stopped)?
       .map_err(package_blocking_task_error)?;
     let cached = cached?;
@@ -7102,12 +7134,12 @@ struct PackageStorage<'a> {
   fallback_roots: &'a [PathBuf],
   temp_root: &'a Path,
   signature_policy: &'a Arc<SignaturePolicy>,
+  cancellation: Option<&'a CancellationToken>,
 }
 
-const _: () = assert!(size_of::<PackageStorage<'_>>() == 7 * size_of::<usize>());
 const _: () = assert!(align_of::<PackageStorage<'_>>() == align_of::<usize>());
 
-const _: () = assert!(size_of::<PackageStorage<'static>>() == 56);
+const _: () = assert!(size_of::<PackageStorage<'static>>() == 64);
 const _: () = assert!(align_of::<PackageStorage<'static>>() == align_of::<usize>());
 
 async fn load_node_metadata(
@@ -7211,7 +7243,15 @@ async fn load_node_metadata(
         let package_base = services.package_base_address().expect("v3 endpoint discovery requires package content");
         let separator = if package_base.ends_with('/') { "" } else { "/" };
         let url = format!("{package_base}{separator}{lower_id}/index.json");
-        let payload = get_optional_bytes(client, endpoint.credential(), &url, MAX_JSON_BYTES, "NuGet package version index").await?;
+        let payload = get_optional_bytes(
+          client,
+          endpoint.credential(),
+          &url,
+          MAX_JSON_BYTES,
+          "NuGet package version index",
+          storage.cancellation,
+        )
+        .await?;
         source_work.push(SourceWork {
           downloaded_bytes: payload.work.downloaded_bytes,
           duration_us: payload.work.duration_us,
@@ -7231,7 +7271,7 @@ async fn load_node_metadata(
         }
       },
       ServiceEndpoint::V2 { base, .. } => {
-        let batch = enumerate_v2_versions(client, endpoint.credential(), base, lower_id).await?;
+        let batch = enumerate_v2_versions(client, endpoint.credential(), base, lower_id, storage.cancellation).await?;
         versions.extend(batch.versions);
         source_work.push(SourceWork {
           downloaded_bytes: batch.work.downloaded_bytes,
@@ -7272,6 +7312,7 @@ async fn enumerate_v2_versions(
   credential: Option<&SourceCredential>,
   base: &str,
   lower_id: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<VersionBatch, PackageError> {
   let security_flags = credential.map_or(0, |credential| credential.security_flags);
   let mut url = format!("{base}FindPackagesById()?id='{lower_id}'&semVerLevel=2.0.0");
@@ -7285,7 +7326,7 @@ async fn enumerate_v2_versions(
     if visited.len() > MAX_ARCHIVE_ENTRIES {
       return Err(network_error(&url, "NuGet v2 version enumeration exceeds the page count limit"));
     }
-    let payload = get_optional_bytes(client, credential, &url, MAX_JSON_BYTES, "NuGet v2 version page").await?;
+    let payload = get_optional_bytes(client, credential, &url, MAX_JSON_BYTES, "NuGet v2 version page", cancellation).await?;
     work.merge(payload.work, &url)?;
     let Some(body) = payload.value else {
       break;
@@ -7599,8 +7640,9 @@ async fn get_optional_bytes(
   url: &str,
   limit: u64,
   kind: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<HttpPayload<Option<Vec<u8>>>, PackageError> {
-  let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
+  let mut response = send_authenticated(client, credential, url, "HTTP request", cancellation).await?;
   if response.status() == reqwest::StatusCode::NOT_FOUND {
     let work = response.work(0);
     return Ok(HttpPayload { value: None, work });
@@ -7647,6 +7689,7 @@ async fn ensure_package(
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
+  check_package_cancellation(storage.cancellation)?;
   if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
     let request = request.clone();
     let signature_policy = Arc::clone(storage.signature_policy);
@@ -7747,6 +7790,7 @@ async fn download_and_publish(
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
+  check_package_cancellation(storage.cancellation)?;
   if matches!(endpoint, ServiceEndpoint::Local { .. }) {
     let archive = local_package_path(endpoint, request)?.ok_or_else(|| {
       PackageError::new(
@@ -7765,7 +7809,7 @@ async fn download_and_publish(
   }
   let metadata = match endpoint {
     ServiceEndpoint::Local { .. } => unreachable!("local package acquisition returned above"),
-    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, endpoint.credential(), request, base).await?,
+    ServiceEndpoint::V2 { base, .. } => v2_package_metadata(client, endpoint.credential(), request, base, storage.cancellation).await?,
     ServiceEndpoint::V3 { services, .. } => v3_package_metadata(
       request,
       services.package_base_address().expect("v3 endpoint discovery requires package content"),
@@ -7788,7 +7832,7 @@ async fn download_and_publish(
   let scratch_guard = TempGuard(Some(scratch_root.clone()));
   let nupkg_name = format!("{}.{}.nupkg", request.lower_id, request.version);
   let scratch_nupkg = scratch_root.join(&nupkg_name);
-  let (hash, package_work) = download_package(client, endpoint.credential(), &metadata.content_url, &scratch_nupkg).await?;
+  let (hash, package_work) = download_package(client, endpoint.credential(), &metadata.content_url, &scratch_nupkg, storage.cancellation).await?;
   let bytes = package_work.downloaded_bytes;
   if let Some(expected) = metadata.expected_size
     && bytes != expected
@@ -8023,9 +8067,10 @@ async fn v2_package_metadata(
   credential: Option<&SourceCredential>,
   request: &PackageRequest,
   base: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<PackageMetadata, PackageError> {
   let metadata_url = format!("{base}Packages(Id='{}',Version='{}')", request.id, request.version);
-  let payload = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata").await?;
+  let payload = get_bytes(client, credential, &metadata_url, MAX_JSON_BYTES, "NuGet v2 metadata", cancellation).await?;
   let security_flags = credential.map_or(0, |credential| credential.security_flags);
   let mut metadata = parse_v2_package_metadata(request, &metadata_url, &payload.value, security_flags)?;
   metadata.work = payload.work;
@@ -8152,8 +8197,9 @@ async fn download_package(
   credential: Option<&SourceCredential>,
   url: &str,
   destination: &Path,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<(String, HttpWork), PackageError> {
-  let mut response = send_authenticated(client, credential, url, "package download").await?;
+  let mut response = send_authenticated(client, credential, url, "package download", cancellation).await?;
   if let Err(error) = response.error_for_status_ref() {
     let work = response.work(0);
     return Err(network_error(url, format!("package download failed: {error}")).with_http_work(work));
@@ -8208,8 +8254,9 @@ async fn get_bytes(
   url: &str,
   limit: u64,
   kind: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<HttpPayload<Vec<u8>>, PackageError> {
-  let mut response = send_authenticated(client, credential, url, "HTTP request").await?;
+  let mut response = send_authenticated(client, credential, url, "HTTP request", cancellation).await?;
   if let Err(error) = response.error_for_status_ref() {
     let work = response.work(0);
     return Err(network_error(url, format!("HTTP request failed: {error}")).with_http_work(work));
@@ -8257,7 +8304,9 @@ async fn send_authenticated(
   credential: Option<&SourceCredential>,
   url: &str,
   operation: &str,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<AuthenticatedResponse, PackageError> {
+  check_package_cancellation(cancellation)?;
   let source = credential;
   let credential = source.filter(|credential| credential.origin.matches(url));
   let client = credential
@@ -8269,32 +8318,47 @@ async fn send_authenticated(
   // global slots while it waits for its own permits.
   let source_permit = match source.and_then(|credential| credential.source_limiter.as_ref()) {
     Some(limiter) => Some(
-      Arc::clone(limiter)
-        .acquire_owned()
-        .await
+      await_with_cancellation(cancellation, Arc::clone(limiter).acquire_owned())
+        .await?
         .map_err(|_| network_error(url, "package-source request limiter closed"))?,
     ),
     None => None,
   };
   let global_permit = match source.and_then(|credential| credential.global_limiter.as_ref()) {
     Some(limiter) => Some(
-      Arc::clone(limiter)
-        .acquire_owned()
-        .await
+      await_with_cancellation(cancellation, Arc::clone(limiter).acquire_owned())
+        .await?
         .map_err(|_| network_error(url, "global package request limiter closed"))?,
     ),
     None => None,
   };
-  send_with_policy(client, credential, url, operation, policy, global_permit, source_permit).await
+  send_with_policy(
+    client,
+    credential,
+    url,
+    operation,
+    policy,
+    RequestPermits {
+      _global: global_permit,
+      _source: source_permit,
+    },
+    cancellation,
+  )
+  .await
+}
+
+struct RequestPermits {
+  _global: Option<OwnedSemaphorePermit>,
+  _source: Option<OwnedSemaphorePermit>,
 }
 
 struct AuthenticatedResponse {
   response: reqwest::Response,
-  _global_permit: Option<OwnedSemaphorePermit>,
-  _source_permit: Option<OwnedSemaphorePermit>,
+  _permits: RequestPermits,
   started: Instant,
   download_timeout: Duration,
   requests: u32,
+  cancellation: Option<CancellationToken>,
 }
 
 impl std::ops::Deref for AuthenticatedResponse {
@@ -8313,8 +8377,8 @@ impl std::ops::DerefMut for AuthenticatedResponse {
 
 impl AuthenticatedResponse {
   async fn chunk(&mut self, url: &str, kind: &str) -> Result<Option<bytes::Bytes>, PackageError> {
-    tokio::time::timeout(self.download_timeout, self.response.chunk())
-      .await
+    await_with_cancellation(self.cancellation.as_ref(), tokio::time::timeout(self.download_timeout, self.response.chunk()))
+      .await?
       .map_err(|_| network_error(url, format!("{kind} response stalled for {} seconds", self.download_timeout.as_secs())))?
       .map_err(|error| network_error(url, format!("read {kind} response: {error}")))
   }
@@ -8334,15 +8398,15 @@ async fn send_with_policy(
   url: &str,
   operation: &str,
   policy: PackageHttpPolicy,
-  global_permit: Option<OwnedSemaphorePermit>,
-  source_permit: Option<OwnedSemaphorePermit>,
+  permits: RequestPermits,
+  cancellation: Option<&CancellationToken>,
 ) -> Result<AuthenticatedResponse, PackageError> {
   let started = Instant::now();
   let mut requests = 0u32;
   'network: for network_attempt in 0..policy.max_tries {
     for authentication_attempt in 0..=2 {
       let (authorization, generation, provider_was_used) = match credential {
-        Some(credential) => credential.authorization_snapshot().await,
+        Some(credential) => await_with_cancellation(cancellation, credential.authorization_snapshot()).await?,
         None => (None, 0, false),
       };
       let mut request = client.get(url);
@@ -8350,7 +8414,11 @@ async fn send_with_policy(
         request = request.header(AUTHORIZATION, authorization);
       }
       requests = requests.checked_add(1).ok_or_else(|| network_error(url, "HTTP request count overflow"))?;
-      let sent = tokio::time::timeout(Duration::from_secs(policy.request_timeout_seconds as u64), request.send()).await;
+      let sent = await_with_cancellation(
+        cancellation,
+        tokio::time::timeout(Duration::from_secs(policy.request_timeout_seconds as u64), request.send()),
+      )
+      .await?;
       let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -8363,7 +8431,7 @@ async fn send_with_policy(
               }),
             );
           }
-          tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
+          await_with_cancellation(cancellation, tokio::time::sleep(exponential_retry_delay(policy, network_attempt))).await?;
           continue 'network;
         },
         Err(_) => {
@@ -8383,16 +8451,19 @@ async fn send_with_policy(
               }),
             );
           }
-          tokio::time::sleep(exponential_retry_delay(policy, network_attempt)).await;
+          await_with_cancellation(cancellation, tokio::time::sleep(exponential_retry_delay(policy, network_attempt))).await?;
           continue 'network;
         },
       };
       if response.status() == reqwest::StatusCode::UNAUTHORIZED && authentication_attempt < 2 {
         let Some(credential) = credential else {
-          return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
+          return Ok(authenticated_response(response, permits, policy, started, requests, cancellation));
         };
-        if credential.acquire_provider(generation, provider_was_used).await?.is_none() {
-          return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
+        if await_with_cancellation(cancellation, credential.acquire_provider(generation, provider_was_used))
+          .await??
+          .is_none()
+        {
+          return Ok(authenticated_response(response, permits, policy, started, requests, cancellation));
         }
         drop(response);
         continue;
@@ -8400,10 +8471,10 @@ async fn send_with_policy(
       if retryable_status(response.status(), policy) && network_attempt + 1 < policy.max_tries {
         let delay = response_retry_delay(&response, policy, network_attempt);
         drop(response);
-        tokio::time::sleep(delay).await;
+        await_with_cancellation(cancellation, tokio::time::sleep(delay)).await?;
         continue 'network;
       }
-      return Ok(authenticated_response(response, global_permit, source_permit, policy, started, requests));
+      return Ok(authenticated_response(response, permits, policy, started, requests, cancellation));
     }
   }
   unreachable!("the bounded transport loop always returns")
@@ -8411,19 +8482,19 @@ async fn send_with_policy(
 
 fn authenticated_response(
   response: reqwest::Response,
-  global_permit: Option<OwnedSemaphorePermit>,
-  source_permit: Option<OwnedSemaphorePermit>,
+  permits: RequestPermits,
   policy: PackageHttpPolicy,
   started: Instant,
   requests: u32,
+  cancellation: Option<&CancellationToken>,
 ) -> AuthenticatedResponse {
   AuthenticatedResponse {
     response,
-    _global_permit: global_permit,
-    _source_permit: source_permit,
+    _permits: permits,
     started,
     download_timeout: Duration::from_secs(policy.download_timeout_seconds as u64),
     requests,
+    cancellation: cancellation.cloned(),
   }
 }
 
@@ -8472,6 +8543,31 @@ fn network_error(context: impl Into<String>, message: impl Into<String>) -> Pack
   let message = message.into();
   let message = if redacted == context { message } else { message.replace(&context, &redacted) };
   PackageError::new(PackageErrorKind::Network, redacted, message)
+}
+
+fn package_cancelled_error() -> PackageError {
+  PackageError::new(PackageErrorKind::Cancelled, "package work", "package work was cancelled")
+}
+
+fn check_package_cancellation(cancellation: Option<&CancellationToken>) -> Result<(), PackageError> {
+  if cancellation.is_some_and(CancellationToken::is_cancelled) {
+    Err(package_cancelled_error())
+  } else {
+    Ok(())
+  }
+}
+
+async fn await_with_cancellation<T>(cancellation: Option<&CancellationToken>, future: impl Future<Output = T>) -> Result<T, PackageError> {
+  match cancellation {
+    Some(cancellation) => {
+      tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(package_cancelled_error()),
+        result = future => Ok(result),
+      }
+    },
+    None => Ok(future.await),
+  }
 }
 
 fn package_credential_provider_error(error: CredentialProviderError) -> PackageError {
@@ -12227,6 +12323,7 @@ mod tests {
         false,
         false,
         DEFAULT_HTTP_POLICY.with_offline(true),
+        None,
       ))
       .unwrap();
     assert_eq!(inventory.source_authentication(0), PackageSourceAuthentication::Basic);
@@ -12264,6 +12361,7 @@ mod tests {
         true,
         false,
         DEFAULT_HTTP_POLICY,
+        None,
       ))
       .unwrap();
 
@@ -12589,6 +12687,7 @@ mod tests {
           worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
           source_work: &mut source_work,
+          cancellation: None,
         },
       ))
       .unwrap();
@@ -12638,6 +12737,7 @@ mod tests {
           worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
           source_work: &mut source_work,
+          cancellation: None,
         },
       ))
       .unwrap_err();
@@ -12664,6 +12764,7 @@ mod tests {
           worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
           source_work: &mut source_work,
+          cancellation: None,
         },
       ))
       .unwrap();
@@ -12701,6 +12802,7 @@ mod tests {
           worker_budget: MAX_DOWNLOAD_WORKERS as u8,
           allow_network: true,
           source_work: &mut source_work,
+          cancellation: None,
         },
       ))
       .unwrap_err();
@@ -12754,6 +12856,7 @@ mod tests {
           fallback_roots: &[],
           temp_root: &temp_root,
           signature_policy: &signature_policy,
+          cancellation: None,
         },
         &[unrelated_endpoint],
         Some(&mapping),
@@ -12816,6 +12919,7 @@ mod tests {
           fallback_roots: &[],
           temp_root: &temp_root,
           signature_policy: &signature_policy,
+          cancellation: None,
         },
         &[],
         Some(&mapping),
@@ -13138,7 +13242,15 @@ mod tests {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
     let mut response = runtime
-      .block_on(send_with_policy(&client, None, &url, "test request", policy, None, None))
+      .block_on(send_with_policy(
+        &client,
+        None,
+        &url,
+        "test request",
+        policy,
+        RequestPermits { _global: None, _source: None },
+        None,
+      ))
       .unwrap();
     let body = runtime.block_on(response.chunk(&url, "test")).unwrap().unwrap();
 
@@ -13192,6 +13304,7 @@ mod tests {
           fallback_roots: &[],
           temp_root: &temp.0.join("scratch"),
           signature_policy: &signature_policy,
+          cancellation: None,
         },
         &endpoints,
         None,
@@ -13384,13 +13497,80 @@ mod tests {
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let mut response = runtime
-      .block_on(send_with_policy(&client, None, &url, "test request", policy, None, None))
+      .block_on(send_with_policy(
+        &client,
+        None,
+        &url,
+        "test request",
+        policy,
+        RequestPermits { _global: None, _source: None },
+        None,
+      ))
       .unwrap();
 
     let error = runtime.block_on(response.chunk(&url, "test")).unwrap_err();
 
     assert!(error.to_string().contains("stalled for 1 seconds"));
     worker.join().unwrap();
+  }
+
+  #[test]
+  fn cancellation_interrupts_an_in_flight_http_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+      let mut request = [0u8; 1024];
+      let _ = stream.read(&mut request).unwrap();
+      ready_tx.send(()).unwrap();
+      let _ = stream.read(&mut request);
+    });
+    let token = CancellationToken::new();
+    let signal = token.clone();
+    let requester = thread::spawn(move || {
+      ready_rx.recv().unwrap();
+      signal.request();
+    });
+    let client = reqwest::Client::builder().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let started = Instant::now();
+
+    let error = match runtime.block_on(send_with_policy(
+      &client,
+      None,
+      &format!("http://{address}/stall"),
+      "test request",
+      DEFAULT_HTTP_POLICY,
+      RequestPermits { _global: None, _source: None },
+      Some(&token),
+    )) {
+      Ok(_) => panic!("cancelled HTTP request unexpectedly completed"),
+      Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), PackageErrorKind::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    requester.join().unwrap();
+    worker.join().unwrap();
+  }
+
+  #[test]
+  fn pre_cancelled_package_batch_stops_before_work() {
+    let cancellation = CancellationToken::new();
+    cancellation.request();
+    let options = PackageResolveOptions {
+      cancellation: Some(cancellation),
+      ..PackageResolveOptions::default()
+    };
+
+    let error = match inspect_package_sources(&[], &options) {
+      Ok(_) => panic!("pre-cancelled package batch unexpectedly completed"),
+      Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), PackageErrorKind::Cancelled);
   }
 
   #[test]
@@ -13658,7 +13838,7 @@ mod tests {
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
     let error = runtime
-      .block_on(enumerate_v2_versions(&client, None, &format!("http://{address}/"), "sample.package"))
+      .block_on(enumerate_v2_versions(&client, None, &format!("http://{address}/"), "sample.package", None))
       .err()
       .unwrap();
 

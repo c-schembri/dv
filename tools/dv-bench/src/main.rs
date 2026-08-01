@@ -135,6 +135,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_cancellation",
+    kind: CaseKind::Startup,
+    args: &["--version"],
+    implemented: true,
+  },
+  Case {
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
     args: &["build", "--definitely-unknown"],
@@ -752,6 +758,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_cancellation",
+    kind: CaseKind::Startup,
+    args: &["sdk", "current"],
+    implemented: true,
+  },
+  Case {
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
     args: &["build", "--definitely-unknown"],
@@ -1223,8 +1235,21 @@ fn run() -> Result<()> {
   let workspace = repository.join(format!("target/benchmark-work-{}", std::process::id()));
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
-  if options.case.as_deref().is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat")) {
+  if options
+    .case
+    .as_deref()
+    .is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat" | "cli_cancellation"))
+  {
     verify_sdk_selection(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_cancellation") {
+    verify_cancellation_boundary(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref() == Some("cli_cancellation") {
+    let provider_workspace = repository.join(format!("target/benchmark-cli-cancellation-verification-{}", std::process::id()));
+    ensure_workspace_is_safe(&repository, &provider_workspace)?;
+    reset_fixture(&nuget_credential_provider_fixture, &provider_workspace)?;
+    verify_credential_provider_timeout(&dv_executable, &provider_workspace)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
     verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
@@ -1403,6 +1428,42 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "sdk", "current"], fixture)?;
   if dotnet_version != compatibility_version {
     return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
+  }
+  Ok(())
+}
+
+fn verify_cancellation_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let output = Command::new(dv_executable).args(["--json", "run"]).current_dir(fixture).output()?;
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "dv cancellation preflight returned status {:?} with stderr {:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv cancellation preflight omitted its diagnostic")?;
+  let grace = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+    context.iter().find_map(|field| {
+      (field.get("name").and_then(serde_json::Value::as_str) == Some("cancellation_grace_ms"))
+        .then(|| field.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    })
+  });
+  if grace != Some("2000") {
+    return Err(format!("dv child boundary reported the wrong cancellation grace: {grace:?}").into());
   }
   Ok(())
 }
@@ -5107,7 +5168,7 @@ fn verify_credential_provider_timeout(dv_executable: &Path, workspace: &Path) ->
   command.args(args).current_dir(workspace);
   apply_nuget_credential_provider_environment(&mut command, workspace);
   command
-    .env("DV_TEST_PROVIDER_MODE", "hang")
+    .env("DV_TEST_PROVIDER_MODE", "ignore-cancel")
     .env("DV_TEST_PROVIDER_TRACE", &trace)
     .env("NUGET_PLUGIN_REQUEST_TIMEOUT_IN_SECONDS", "1");
   let started = Instant::now();
@@ -5116,8 +5177,10 @@ fn verify_credential_provider_timeout(dv_executable: &Path, workspace: &Path) ->
   if output.status.success() {
     return Err("dv accepted a credential provider which exceeded its request timeout".into());
   }
-  if elapsed > Duration::from_secs(4) {
-    return Err(format!("credential-provider timeout took {elapsed:?}; expected bounded cancellation within four seconds").into());
+  if elapsed < Duration::from_secs(2) || elapsed > Duration::from_secs(5) {
+    return Err(
+      format!("uncooperative credential-provider cleanup took {elapsed:?}; expected forced termination at the two-second cancellation deadline").into(),
+    );
   }
   let stdout = String::from_utf8(output.stdout)?;
   let stderr = String::from_utf8(output.stderr)?;
@@ -8064,6 +8127,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
+    "cli_cancellation" => "Cancellation-ready SDK selection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",

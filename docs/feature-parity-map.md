@@ -219,6 +219,7 @@ prove that nothing changed.
 |---|---|---|
 | Native process startup, help, and version | Implemented | `crates/dv-cli/src/main.rs` |
 | Stable unknown/unsupported command failures | Implemented | CLI tests and `DV0001`-`DV0003` |
+| Command-lifetime cancellation | Implemented | early Ctrl+C/SIGINT handler, cache-aligned token, bounded child deadline, cancellable package I/O |
 | Drop-in command parsing | Initial subset | several `dotnet` command names overlap; no complete tool/version grammar |
 | Installed SDK discovery | Implemented | `crates/dv-core/src/sdk.rs` |
 | `global.json` SDK selection | Implemented | policy and fixture tests |
@@ -333,8 +334,24 @@ contracts.
   proves reference failure, no ANSI, no sentinel disclosure, and no workspace
   mutation. Thirty warm Windows samples measure Microsoft at `134.218 ms` and
   `dv` at `5.503 ms` (`24.4x` faster). `P1`
-- [ ] `CLI-014` Install Ctrl+C/SIGINT cancellation before starting work and
-  propagate a bounded cancellation deadline to children. `P1`
+- [x] `CLI-014` Install Ctrl+C/SIGINT cancellation before starting work and
+  propagate a bounded cancellation deadline to children. Typed invocation is
+  classified before installation so help, version, unknown-command, and
+  global-option failures retain their allocation-free fast path; every
+  work-bearing command installs one
+  handler before SDK, project, filesystem, process, or network work. One
+  64-byte cache-line-aligned state allocation records the first signal against
+  a monotonic epoch, wakes Tokio work, and exposes an absolute two-second child
+  deadline; a second signal forces immediate termination. Package source,
+  retry, response-stream, restore, and credential-provider waits observe the
+  same token. The run/test boundary receives the typed policy while child
+  launch remains ordered under `RUN-006`, `RUN-009`, and `CLI-015`. Unix
+  process tests deliver real SIGINT during stalled HTTP work; all-platform
+  tests cover transitions, deadline stability, diagnostics, and the child
+  boundary. Thirty warm Windows samples measure cancellation-ready SDK
+  selection at `69.974 ms` for Microsoft and `5.554 ms` for `dv` (`12.6x`
+  faster); `dv --version`, which deliberately skips installation, remains
+  `5.062 ms`. `P1`
 - [ ] `CLI-015` Preserve child exit codes where the command contract requires
   it and distinguish launch failure from child failure. `P1`
 - [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,

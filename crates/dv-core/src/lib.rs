@@ -1,5 +1,6 @@
 //! Stable data contracts shared by dv commands and reporters.
 
+mod cancellation;
 mod compiler;
 mod credential_provider;
 mod diagnostic;
@@ -20,8 +21,12 @@ mod sdk;
 /// documents packing evidence only; it does not define a wire or ABI layout.
 pub(crate) const BENCHMARK_CACHE_LINE_BYTES: usize = 64;
 
+pub use cancellation::CancellationToken;
+/// Compatibility name for the package-only cancellation handle shipped by
+/// earlier dv releases.
+pub type PackageCancellation = CancellationToken;
 pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_compiler_inputs, plan_compiler_inputs_with_packages};
-pub use credential_provider::{CredentialProviderLogSink, PackageCancellation};
+pub use credential_provider::CredentialProviderLogSink;
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
   CacheOutcome, CentralPackageVersionEvent, CompilerReferenceAliasEvent, ContentFileEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload,

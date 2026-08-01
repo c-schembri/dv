@@ -42,10 +42,11 @@ precede the command or be interspersed with operands, matching the existing
 global-option policy.
 
 Failures are classified internally as usage, unsupported surface, or operation
-failure before an exit profile is applied. These classes intentionally do not
-guess at test, no-tests, cancellation, or child-process semantics before those
-workflows exist. Their reference-specific policies remain partial under
-`DROP-016`, `CLI-014`, and `CLI-015`.
+failure before an exit profile is applied. `CLI-014` adds a distinct cancelled
+event outcome and `DV0005`, but deliberately retains the current operation
+failure process code. Reference-specific test, no-tests, child-exit, launch
+failure, and cancellation exit policies remain partial under `DROP-016` and
+`CLI-015`.
 
 `--compat` currently changes exit policy only. Full reference grammar,
 diagnostic prose, stdout/stderr formats, automatic executable-token inference,

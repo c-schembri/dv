@@ -301,6 +301,14 @@ provider login messages, while Ctrl+C and NuGet's handshake/request timeouts
 send protocol cancellation, stop, and reap the provider. DLL-only plugins fail
 explicitly because production `dv` never invokes `dotnet` as a fallback.
 
+Work-bearing commands install Ctrl+C/SIGINT handling after typed argument
+classification and before SDK, project, filesystem, child-process, or network
+work. The first signal cancels package and provider waits and starts one
+absolute two-second child-shutdown deadline; the second signal escalates to
+immediate termination. Help, version, malformed global-option, and
+unknown-command paths do not allocate cancellation state or start a handler
+thread.
+
 NuGet `clientCertificates` records bind a source to a bounded relative or
 absolute PFX file, or to a certificate selected by thumbprint from a Windows
 `CurrentUser`/`LocalMachine` store. File secrets and PFX buffers are zeroed,
@@ -399,6 +407,9 @@ The `CLI-012` forwarding parser has a separate structural baseline because
 `dv run` execution remains TBI. It verifies exact `dotnet run --` behavior but
 does not claim like-for-like run performance. See the
 [forwarding baseline](docs/performance-baselines/2026-08-01-cli-forwarding-windows.md).
+The current SDK row includes early handler installation; its deadline and
+signal gates are recorded in the
+[cancellation baseline](docs/performance-baselines/2026-08-01-cli-cancellation-windows.md).
 
 Initial machine:
 
@@ -417,8 +428,8 @@ Initial machine:
   credentials, credential providers, the
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
-  case; compiler planning and cold/warm signed-package validation use 5
-  warm-ups; 10
+  case; cancellation-ready SDK selection, compiler planning, and cold/warm
+  signed-package validation use 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -427,7 +438,7 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
-| Select current SDK | `dotnet --version` | `dv sdk current` | 69.660 ms | 6.102 ms | 11.4x | 72.407 ms | 7.247 ms |
+| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 69.974 ms | 5.554 ms | 12.6x | 78.380 ms | 6.411 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 146.054 ms | 4.827 ms | 30.3x | 152.690 ms | 6.424 ms |
@@ -632,6 +643,7 @@ recorded in the curated
 [compiler baseline](docs/performance-baselines/2026-07-31-windows.md),
 [project selection baseline](docs/performance-baselines/2026-08-01-project-selection-windows.md),
 [unknown-option baseline](docs/performance-baselines/2026-08-01-unknown-option-windows.md),
+[cancellation baseline](docs/performance-baselines/2026-08-01-cli-cancellation-windows.md),
 [invocation environment baseline](docs/performance-baselines/2026-08-01-cli-environment-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
@@ -703,6 +715,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
+cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3
 cargo bench-all --case cli_forwarding --samples 30 --warmups 5

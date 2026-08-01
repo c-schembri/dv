@@ -2,10 +2,7 @@ use std::{
   env, fmt,
   path::{Path, PathBuf},
   process::Stdio,
-  sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-  },
+  sync::Arc,
   time::Duration,
 };
 
@@ -15,17 +12,17 @@ use serde_json::{Map, Value, json};
 use tokio::{
   io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
   process::{Child, ChildStdin, ChildStdout, Command},
-  sync::Notify,
   time::timeout,
 };
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::CancellationToken;
 
 const PLUGIN_PROTOCOL_VERSION: &str = "2.0.0";
 const MINIMUM_PLUGIN_PROTOCOL_VERSION: &str = "1.0.0";
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const CANCEL_GRACE: Duration = Duration::from_millis(250);
 const MAX_MESSAGE_BYTES: u64 = 1 << 20;
 const MAX_LOG_MESSAGE_BYTES: usize = 64 << 10;
 const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
@@ -38,7 +35,7 @@ pub type CredentialProviderLogSink = fn(&str);
 pub(crate) struct CredentialProviderOptions {
   pub(crate) configured: bool,
   pub(crate) interactive: bool,
-  pub(crate) cancellation: Option<PackageCancellation>,
+  pub(crate) cancellation: Option<CancellationToken>,
   pub(crate) log_sink: Option<CredentialProviderLogSink>,
 }
 
@@ -150,57 +147,6 @@ impl From<ProviderError> for CredentialProviderError {
   }
 }
 
-/// Command-lifetime cancellation observed by credential-provider processes.
-#[derive(Clone, Debug)]
-pub struct PackageCancellation {
-  state: Arc<CancellationState>,
-}
-
-#[derive(Debug)]
-struct CancellationState {
-  cancelled: AtomicBool,
-  notify: Notify,
-}
-
-impl PackageCancellation {
-  /// Creates an unset cancellation handle.
-  pub fn new() -> Self {
-    Self {
-      state: Arc::new(CancellationState {
-        cancelled: AtomicBool::new(false),
-        notify: Notify::new(),
-      }),
-    }
-  }
-
-  /// Requests cancellation and wakes provider protocol waits.
-  pub fn cancel(&self) {
-    self.state.cancelled.store(true, Ordering::Release);
-    self.state.notify.notify_waiters();
-  }
-
-  pub(crate) fn is_cancelled(&self) -> bool {
-    self.state.cancelled.load(Ordering::Acquire)
-  }
-
-  async fn cancelled(&self) {
-    if self.is_cancelled() {
-      return;
-    }
-    let notified = self.state.notify.notified();
-    if self.is_cancelled() {
-      return;
-    }
-    notified.await;
-  }
-}
-
-impl Default for PackageCancellation {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
 /// Live sink for provider device-flow or login instructions.
 ///
 /// The callback is cold-path infrastructure and is invoked only for explicit
@@ -235,7 +181,7 @@ pub(crate) struct CredentialProviderSettings {
   handshake_timeout: Duration,
   request_timeout: Duration,
   interactive: bool,
-  cancellation: Option<PackageCancellation>,
+  cancellation: Option<CancellationToken>,
   output: Option<CredentialProviderOutput>,
 }
 
@@ -243,7 +189,7 @@ impl CredentialProviderSettings {
   pub(crate) fn from_environment(
     context: &Path,
     interactive: bool,
-    cancellation: Option<PackageCancellation>,
+    cancellation: Option<CancellationToken>,
     output: Option<CredentialProviderOutput>,
   ) -> Result<Option<Self>, ProviderError> {
     let configured = env::var_os("NUGET_NETCORE_PLUGIN_PATHS").or_else(|| env::var_os("NUGET_PLUGIN_PATHS"));
@@ -280,7 +226,7 @@ impl CredentialProviderSettings {
   }
 
   pub(crate) async fn acquire(&self, uri: &str, is_retry: bool, preferred_provider: Option<usize>) -> Result<ProviderCredential, ProviderError> {
-    if self.cancellation.as_ref().is_some_and(PackageCancellation::is_cancelled) {
+    if self.cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
       return Err(ProviderError::cancelled("credential provider", "credential acquisition was cancelled"));
     }
     if let Some(index) = preferred_provider {
@@ -516,7 +462,7 @@ struct ProviderSession {
   stdin: ChildStdin,
   stdout: BufReader<ChildStdout>,
   next_request_id: u32,
-  cancellation: Option<PackageCancellation>,
+  cancellation: Option<CancellationToken>,
   output: Option<CredentialProviderOutput>,
 }
 
@@ -524,7 +470,7 @@ impl ProviderSession {
   async fn start(
     path: &Path,
     context: &Path,
-    cancellation: Option<PackageCancellation>,
+    cancellation: Option<CancellationToken>,
     output: Option<CredentialProviderOutput>,
   ) -> Result<Self, ProviderError> {
     if !path.is_file() {
@@ -765,10 +711,27 @@ impl ProviderSession {
   }
 
   async fn cancel_and_stop(&mut self, request_id: &str, method: &str) {
-    let _ = self.send(json!({"RequestId": request_id, "Type": "Cancel", "Method": method})).await;
-    let _ = timeout(CANCEL_GRACE, self.child.wait()).await;
-    let _ = self.child.start_kill();
-    let _ = self.child.wait().await;
+    let cancellation = self.cancellation.clone();
+    let grace = cancellation
+      .as_ref()
+      .map_or_else(CancellationToken::default_child_grace, CancellationToken::remaining_child_grace);
+    let cooperative = async {
+      let _ = self.send(json!({"RequestId": request_id, "Type": "Cancel", "Method": method})).await;
+      self.child.wait().await
+    };
+    let exited = match cancellation {
+      Some(cancellation) => {
+        tokio::select! {
+          result = timeout(grace, cooperative) => matches!(result, Ok(Ok(_))),
+          _ = cancellation.forced() => false,
+        }
+      },
+      None => matches!(timeout(grace, cooperative).await, Ok(Ok(_))),
+    };
+    if !exited {
+      let _ = self.child.start_kill();
+      let _ = self.child.wait().await;
+    }
   }
 
   async fn close(&mut self) {
@@ -933,8 +896,8 @@ mod tests {
 
   #[tokio::test]
   async fn cancellation_stops_before_provider_process_start() {
-    let cancellation = PackageCancellation::new();
-    cancellation.cancel();
+    let cancellation = CancellationToken::new();
+    cancellation.request();
     let settings = CredentialProviderSettings {
       paths: Arc::from([PathBuf::from("provider-must-not-start")]),
       context: PathBuf::from("."),

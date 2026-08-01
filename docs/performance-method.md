@@ -55,6 +55,7 @@ Invalid input behavior:
 | Case | State before timed interval | Timed work |
 |---|---|---|
 | `sdk_current` | no project state | process launch, SDK discovery, and selection |
+| `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_environment` | immutable `small-console` fixture; identical `NO_COLOR`, `DV_COLOR`, and `DV_VERBOSITY` values | process launch, typed environment precedence, pre-I/O unknown-option rejection, ANSI suppression, and secret-free failure output |
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
@@ -190,6 +191,12 @@ Measure only SDK selection:
 
 ```text
 cargo bench-all --case sdk_current --dv target/release/dv
+```
+
+Measure cancellation-ready startup and SDK selection:
+
+```text
+cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 ```
 
 Measure invocation environment precedence and redaction through identical

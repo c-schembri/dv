@@ -7,6 +7,7 @@ use std::{
   time::Instant,
 };
 
+mod cancellation;
 mod environment;
 mod invocation;
 mod output;
@@ -16,13 +17,13 @@ use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity
 use output::redact_argument_text;
 
 use dv_core::{
-  CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
-  DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome,
-  PackRequirement, PackageAssetFlags, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution,
-  PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration,
-  ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
-  RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
-  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
+  CancellationToken, CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent,
+  ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind,
+  FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent,
+  PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent,
+  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
+  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
+  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
   load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
   resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
@@ -115,6 +116,25 @@ fn main() -> ExitCode {
   let globals = request.options();
   let json = globals.json();
   let command_args = invocation.command_arguments();
+  let cancellation = if command_requires_cancellation(request.command(), invocation.command_text(), command_args) {
+    match cancellation::install() {
+      Ok(cancellation) => Some(cancellation),
+      Err(problem) => {
+        return reject(
+          started,
+          globals,
+          "<initialization>",
+          invocation.event_arguments(json),
+          diagnostic("DV0004", problem, None, Some("Run dv in a process where it can own the Ctrl+C/SIGINT handler.")),
+        );
+      },
+    }
+  } else {
+    None
+  };
+  if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+    return cancelled(started, globals, "<initialization>", invocation.event_arguments(json));
+  }
   match request.command() {
     CommandKind::Help => {
       if let Some(problem) = unexpected_leaf_argument("help", command_args) {
@@ -142,12 +162,12 @@ fn main() -> ExitCode {
       println!("dv {}", env!("CARGO_PKG_VERSION"));
       ExitCode::SUCCESS
     },
-    CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args),
-    CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args),
-    CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args),
+    CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
+    CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
+    CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Restore | CommandKind::Sync => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      run_package_command(started, globals, command, invocation.event_arguments(json), command_args)
+      run_package_command(started, globals, command, invocation.event_arguments(json), command_args, cancellation.as_ref())
     },
     CommandKind::KnownUnimplemented => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
@@ -157,9 +177,9 @@ fn main() -> ExitCode {
           globals,
           command,
           invocation.event_arguments(json),
-          command_args,
           invocation.forwarded_arguments(),
           ChildEnvironmentPlan::capture(invocation.environment_directives(), command_args),
+          cancellation.as_ref().expect("run/test commands install cancellation"),
         );
       }
       unsupported(
@@ -224,14 +244,39 @@ fn main() -> ExitCode {
   }
 }
 
+fn command_requires_cancellation(command: CommandKind, command_text: Option<&str>, command_args: CommandArguments<'_>) -> bool {
+  let work_command = matches!(
+    command,
+    CommandKind::Sdk | CommandKind::Project | CommandKind::Build | CommandKind::Restore | CommandKind::Sync
+  );
+  (work_command && !command_help_only(command, command_args)) || matches!((command, command_text), (CommandKind::KnownUnimplemented, Some("run" | "test")))
+}
+
+fn command_help_only(command: CommandKind, command_args: CommandArguments<'_>) -> bool {
+  if command_args.is_empty() {
+    return matches!(command, CommandKind::Sdk | CommandKind::Project);
+  }
+  let mut arguments = command_args.iter();
+  if matches!(arguments.next().and_then(OsStr::to_str), Some("help" | "--help" | "-h")) {
+    return arguments.next().is_none();
+  }
+  matches!(command, CommandKind::Project)
+    && matches!(
+      command_args.first().and_then(OsStr::to_str),
+      Some("inspect" | "frameworks" | "runtime-packs" | "package-sources")
+    )
+    && matches!(command_args.get(1).and_then(OsStr::to_str), Some("help" | "--help" | "-h"))
+    && command_args.len() == 2
+}
+
 fn unsupported_child_command(
   started: Instant,
   globals: InvocationOptions,
   command: &str,
   args: Vec<String>,
-  _command_args: CommandArguments<'_>,
   forwarded_args: Option<invocation::ForwardedArguments<'_>>,
   environment: Result<ChildEnvironmentPlan<'_>, EnvironmentError>,
+  cancellation: &CancellationToken,
 ) -> ExitCode {
   let environment = match environment {
     Ok(environment) => environment,
@@ -275,6 +320,10 @@ fn unsupported_child_command(
       value: environment.sensitive_edit_count().to_string(),
     });
   }
+  problem.context.push(ContextField {
+    name: "cancellation_grace_ms".into(),
+    value: cancellation.child_grace().as_millis().to_string(),
+  });
   unsupported(started, globals, command, args, problem)
 }
 
@@ -292,13 +341,21 @@ fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> O
   unexpected
 }
 
-fn run_package_command(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
+fn run_package_command(
+  started: Instant,
+  globals: InvocationOptions,
+  command: &str,
+  args: Vec<String>,
+  command_args: CommandArguments<'_>,
+  cancellation: Option<&CancellationToken>,
+) -> ExitCode {
   let json = globals.json();
   let mut semantic = command_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
   }
+  let cancellation = cancellation.expect("non-help package commands install cancellation");
   let options = match parse_package_args(command, command_args) {
     Ok(options) => options,
     Err(problem) => {
@@ -351,15 +408,18 @@ fn run_package_command(started: Instant, globals: InvocationOptions, command: &s
       }
     }
   }
-  let options = match normalize_package_options(options, &current_directory, true) {
+  let options = match normalize_package_options(options, &current_directory, true, cancellation) {
     Ok(options) => options,
     Err(problem) => return reject(started, globals, command, args, diagnostic("DV0002", problem, None, None)),
   };
   let project_refs = projects.iter().collect::<Vec<_>>();
   let resolutions = match resolve_package_inputs(&project_refs, &options) {
     Ok(resolutions) => resolutions,
-    Err(error) => return fail(started, globals, command, args, package_diagnostic(error)),
+    Err(error) => return package_failure(started, globals, command, args, error),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, command, args);
+  }
   let diagnostics = resolutions.iter().flat_map(package_downgrade_diagnostics).collect::<Vec<_>>();
   if !json {
     write_human_diagnostics(&diagnostics, globals);
@@ -382,8 +442,12 @@ fn run_package_command(started: Instant, globals: InvocationOptions, command: &s
   succeed_batch_with_diagnostics(started, globals, command, args, diagnostics, payloads)
 }
 
-fn normalize_package_options(options: PackageCommandOptions<'_>, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
-  let cancellation = install_credential_provider_cancellation()?;
+fn normalize_package_options(
+  options: PackageCommandOptions<'_>,
+  current_directory: &Path,
+  write_lock: bool,
+  cancellation: &CancellationToken,
+) -> Result<PackageResolveOptions, String> {
   Ok(PackageResolveOptions {
     packages_directory: options
       .packages_directory
@@ -400,22 +464,9 @@ fn normalize_package_options(options: PackageCommandOptions<'_>, current_directo
     write_lock,
     interactive: options.interactive,
     probe_credentials: options.probe_credentials,
-    cancellation,
+    cancellation: Some(cancellation.clone()),
     credential_provider_log_sink: options.interactive.then_some(write_credential_provider_log),
   })
-}
-
-fn install_credential_provider_cancellation() -> Result<Option<PackageCancellation>, String> {
-  let configured = env::var_os("NUGET_NETCORE_PLUGIN_PATHS")
-    .or_else(|| env::var_os("NUGET_PLUGIN_PATHS"))
-    .is_some_and(|paths| !paths.is_empty());
-  if !configured {
-    return Ok(None);
-  }
-  let cancellation = PackageCancellation::new();
-  let signal = cancellation.clone();
-  ctrlc::set_handler(move || signal.cancel()).map_err(|error| format!("failed to install credential-provider cancellation handler: {error}"))?;
-  Ok(Some(cancellation))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -647,13 +698,20 @@ fn write_credential_provider_log(message: &str) {
   let _ = writeln!(io::stderr().lock(), "credential provider: {message}");
 }
 
-fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, build_args: CommandArguments<'_>) -> ExitCode {
+fn run_build(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  build_args: CommandArguments<'_>,
+  cancellation: Option<&CancellationToken>,
+) -> ExitCode {
   let json = globals.json();
   let mut semantic = build_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{BUILD_HELP}");
     return ExitCode::SUCCESS;
   }
+  let cancellation = cancellation.expect("non-help build commands install cancellation");
   let plan_requested = build_args.iter().any(|argument| argument == "--plan");
   let (requested_path, configuration) = match parse_project_args(build_args, true, "build") {
     Ok(options) => options,
@@ -707,6 +765,7 @@ fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, bu
     sources: Vec::new(),
     offline: false,
     write_lock: true,
+    cancellation: Some(cancellation.clone()),
     ..PackageResolveOptions::default()
   };
   let runtime_graph = if !project.package_references().is_empty() && project.runtime_identifier().is_some() {
@@ -719,12 +778,15 @@ fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, bu
   };
   let package_resolutions = match resolve_package_inputs_with_runtime_graph(&[&project], &package_options, runtime_graph.as_ref(), Some(&inventory)) {
     Ok(resolutions) => resolutions,
-    Err(error) => return fail(started, globals, "build --plan", args, package_diagnostic(error)),
+    Err(error) => return package_failure(started, globals, "build --plan", args, error),
   };
   let plans = match plan_compiler_inputs_with_packages(&[&project], &inventory, &package_resolutions) {
     Ok(plans) => plans,
     Err(error) => return fail(started, globals, "build --plan", args, compiler_plan_diagnostic(error)),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "build --plan", args);
+  }
   let plan = &plans[0];
   let packages = &package_resolutions[0];
   if !json {
@@ -947,7 +1009,13 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn run_sdk(started: Instant, globals: InvocationOptions, args: Vec<String>, sdk_args: CommandArguments<'_>) -> ExitCode {
+fn run_sdk(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  sdk_args: CommandArguments<'_>,
+  cancellation: Option<&CancellationToken>,
+) -> ExitCode {
   let request = match parse_sdk_request(sdk_args) {
     Ok(request) => request,
     Err(diagnostic) => return reject(started, globals, "sdk", args, *diagnostic),
@@ -957,9 +1025,15 @@ fn run_sdk(started: Instant, globals: InvocationOptions, args: Vec<String>, sdk_
       print!("{SDK_HELP}");
       ExitCode::SUCCESS
     },
-    SdkRequest::Current => sdk_current(started, globals, args),
-    SdkRequest::List => sdk_list(started, globals, args),
-    SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(started, globals, args, runtime_identifier),
+    SdkRequest::Current => sdk_current(started, globals, args, cancellation.expect("SDK current installs cancellation")),
+    SdkRequest::List => sdk_list(started, globals, args, cancellation.expect("SDK list installs cancellation")),
+    SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(
+      started,
+      globals,
+      args,
+      runtime_identifier,
+      cancellation.expect("SDK RID expansion installs cancellation"),
+    ),
   }
 }
 
@@ -1066,13 +1140,16 @@ fn unknown_sdk_option_diagnostic(command: &str, option: &OsStr) -> Box<Diagnosti
   ))
 }
 
-fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
+fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>, cancellation: &CancellationToken) -> ExitCode {
   let json = globals.json();
   let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
     Err(exit_code) => return exit_code,
   };
   let selected = inventory.selected();
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "sdk current", args);
+  }
 
   if !json {
     println!("{}", selected.version);
@@ -1098,12 +1175,15 @@ fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>) 
   succeed(started, "sdk current", args, payload)
 }
 
-fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
+fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, cancellation: &CancellationToken) -> ExitCode {
   let json = globals.json();
   let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
     Err(exit_code) => return exit_code,
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "sdk list", args);
+  }
 
   if !json {
     for (index, installation) in inventory.installations.iter().enumerate() {
@@ -1137,7 +1217,13 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>) -> 
   succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
 }
 
-fn sdk_compatible_rids(started: Instant, globals: InvocationOptions, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
+fn sdk_compatible_rids(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  runtime_identifier: &str,
+  cancellation: &CancellationToken,
+) -> ExitCode {
   let json = globals.json();
   if runtime_identifier.is_empty() {
     return reject(
@@ -1161,6 +1247,9 @@ fn sdk_compatible_rids(started: Instant, globals: InvocationOptions, args: Vec<S
     Ok(graph) => graph,
     Err(error) => return fail(started, globals, "sdk compatible-rids", args, runtime_graph_diagnostic(error)),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "sdk compatible-rids", args);
+  }
 
   if !json {
     for compatible in graph.compatible_rids(runtime_identifier) {
@@ -1189,7 +1278,13 @@ fn sdk_compatible_rids(started: Instant, globals: InvocationOptions, args: Vec<S
   )
 }
 
-fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn run_project(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  project_args: CommandArguments<'_>,
+  cancellation: Option<&CancellationToken>,
+) -> ExitCode {
   let json = globals.json();
   if project_args.is_empty() {
     print!("{PROJECT_HELP}");
@@ -1244,14 +1339,15 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
   }
+  let cancellation = cancellation.expect("non-help project commands install cancellation");
   if subcommand == "runtime-packs" {
-    return project_runtime_packs(started, globals, args, operands);
+    return project_runtime_packs(started, globals, args, operands, cancellation);
   }
   if subcommand == "frameworks" {
-    return project_frameworks(started, globals, args, operands);
+    return project_frameworks(started, globals, args, operands, cancellation);
   }
   if subcommand == "package-sources" {
-    return project_package_sources(started, globals, args, operands);
+    return project_package_sources(started, globals, args, operands, cancellation);
   }
   if subcommand != "inspect" {
     let subcommand = redact_argument_text(OsStr::new(subcommand));
@@ -1305,6 +1401,9 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project inspect", args, project_diagnostic(error)),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "project inspect", args);
+  }
 
   if !json {
     return write_project(&project);
@@ -1370,7 +1469,13 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
   succeed(started, "project inspect", args, payload)
 }
 
-fn project_package_sources(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_package_sources(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  project_args: CommandArguments<'_>,
+  cancellation: &CancellationToken,
+) -> ExitCode {
   let json = globals.json();
   let parsed = match parse_package_args("project package-sources", project_args) {
     Ok(options) => options,
@@ -1406,14 +1511,17 @@ fn project_package_sources(started: Instant, globals: InvocationOptions, args: V
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project package-sources", args, project_diagnostic(error)),
   };
-  let options = match normalize_package_options(parsed, &current_directory, false) {
+  let options = match normalize_package_options(parsed, &current_directory, false, cancellation) {
     Ok(options) => options,
     Err(problem) => return reject(started, globals, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
   };
   let inventories = match inspect_package_sources(&[&project], &options) {
     Ok(inventories) => inventories,
-    Err(error) => return fail(started, globals, "project package-sources", args, package_diagnostic(error)),
+    Err(error) => return package_failure(started, globals, "project package-sources", args, error),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "project package-sources", args);
+  }
   let inventory = &inventories[0];
   if !json {
     return write_package_sources(inventory);
@@ -1518,7 +1626,13 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn project_frameworks(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_frameworks(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  project_args: CommandArguments<'_>,
+  cancellation: &CancellationToken,
+) -> ExitCode {
   let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
     Ok(options) => options,
@@ -1564,6 +1678,9 @@ fn project_frameworks(started: Instant, globals: InvocationOptions, args: Vec<St
     Ok(plans) => plans,
     Err(error) => return fail(started, globals, "project frameworks", args, framework_reference_diagnostic(error)),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "project frameworks", args);
+  }
   let plan = &plans[0];
 
   if !json {
@@ -1600,7 +1717,13 @@ fn project_frameworks(started: Instant, globals: InvocationOptions, args: Vec<St
   )
 }
 
-fn project_runtime_packs(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_runtime_packs(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  project_args: CommandArguments<'_>,
+  cancellation: &CancellationToken,
+) -> ExitCode {
   let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
@@ -1646,6 +1769,9 @@ fn project_runtime_packs(started: Instant, globals: InvocationOptions, args: Vec
     Ok(plan) => plan,
     Err(error) => return fail(started, globals, "project runtime-packs", args, runtime_pack_diagnostic(error)),
   };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "project runtime-packs", args);
+  }
 
   if !json {
     return write_runtime_pack_plan(&plan);
@@ -2446,7 +2572,44 @@ fn fail(started: Instant, globals: InvocationOptions, command: &str, args: Vec<S
   fail_with_class(started, globals, FailureClass::Operation, command, args, diagnostic)
 }
 
+fn package_failure(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, error: PackageError) -> ExitCode {
+  if error.kind() == PackageErrorKind::Cancelled {
+    cancelled(started, globals, command, args)
+  } else {
+    fail(started, globals, command, args, package_diagnostic(error))
+  }
+}
+
+fn cancelled(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>) -> ExitCode {
+  fail_with_outcome(
+    started,
+    globals,
+    FailureClass::Operation,
+    command,
+    args,
+    diagnostic(
+      "DV0005",
+      "command was cancelled",
+      None,
+      Some("Rerun the command when the interrupted work can complete."),
+    ),
+    Outcome::Cancelled,
+  )
+}
+
 fn fail_with_class(started: Instant, globals: InvocationOptions, class: FailureClass, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_outcome(started, globals, class, command, args, diagnostic, Outcome::Failed)
+}
+
+fn fail_with_outcome(
+  started: Instant,
+  globals: InvocationOptions,
+  class: FailureClass,
+  command: &str,
+  args: Vec<String>,
+  diagnostic: Diagnostic,
+  outcome: Outcome,
+) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let json = globals.json();
 
@@ -2466,7 +2629,7 @@ fn fail_with_class(started: Instant, globals: InvocationOptions, class: FailureC
         EventPayload::CommandFinished {
           command: command.into(),
           duration_us: elapsed_us,
-          outcome: Outcome::Failed,
+          outcome,
         },
       ),
     ];
@@ -2591,5 +2754,37 @@ mod argument_tests {
     assert!(diagnostic_visible(Severity::Warning, DiagnosticVerbosity::Minimal));
     assert!(!diagnostic_visible(Severity::Info, DiagnosticVerbosity::Normal));
     assert!(diagnostic_visible(Severity::Info, DiagnosticVerbosity::Detailed));
+  }
+
+  #[test]
+  fn only_work_bearing_commands_install_cancellation() {
+    fn requires(arguments: &[&str]) -> bool {
+      let batch = InvocationBatch::capture(arguments.iter().map(OsString::from));
+      command_requires_cancellation(batch.request().command(), batch.command_text(), batch.command_arguments())
+    }
+
+    for arguments in [
+      &["sdk", "current"][..],
+      &["project", "inspect", "App.csproj"],
+      &["build", "--plan", "App.csproj"],
+      &["restore", "App.csproj"],
+      &["sync", "App.csproj"],
+      &["run"],
+      &["test"],
+    ] {
+      assert!(requires(arguments), "{arguments:?}");
+    }
+    for arguments in [
+      &["--help"][..],
+      &["--version"],
+      &["sdk"],
+      &["sdk", "--help"],
+      &["project"],
+      &["project", "inspect", "--help"],
+      &["unknown"],
+      &["publish"],
+    ] {
+      assert!(!requires(arguments), "{arguments:?}");
+    }
   }
 }

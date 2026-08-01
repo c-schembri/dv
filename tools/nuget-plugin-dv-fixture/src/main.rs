@@ -67,6 +67,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let message: Incoming = serde_json::from_str(&line)?;
     trace(&message)?;
     if message.message_type == "Cancel" {
+      if mode == "ignore-cancel" {
+        continue;
+      }
       send(
         &mut output,
         &Outgoing {
@@ -81,7 +84,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if message.message_type != "Request" {
       continue;
     }
-    if mode == "hang" && message.method == "GetAuthenticationCredentials" {
+    if matches!(mode.as_str(), "hang" | "ignore-cancel") && message.method == "GetAuthenticationCredentials" {
       continue;
     }
     if message.method == "GetAuthenticationCredentials"

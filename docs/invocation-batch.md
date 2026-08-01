@@ -288,6 +288,16 @@ the secret sentinel but reports only its presence. `dv` reaches the typed run
 boundary with three edits, one sensitive edit, and no
 secret text in schema-18 output.
 
+`CLI-014` consumes the classified request before work begins. SDK, project,
+build, restore/sync, run, and test commands install one command-lifetime
+Ctrl+C/SIGINT token; help, version, malformed, and unknown invocations do not
+pay that allocation or handler-thread cost. The run/test boundary receives the
+same typed token and its fixed two-second child grace. The absolute deadline is
+anchored to the first signal rather than restarted by each child, and a second
+signal changes the policy to immediate termination. Actual child creation and
+reference-specific exit propagation remain in `RUN-006`, `RUN-009`, and
+`CLI-015`.
+
 The common no-environment SDK control measured `dotnet --version` at
 `68.493 ms` median and `70.539 ms` p95, and `dv sdk current` at `5.596 ms`
 median and `5.980 ms` p95 (`12.2x`). This remains below the earlier published
