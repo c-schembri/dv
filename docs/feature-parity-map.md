@@ -308,8 +308,8 @@ contracts.
   nonzero index distinguishes no delimiter from an empty tail without widening
   the hot request; a 64-token test remains one direct slice. The .NET 10 oracle
   proves the same four-argument tail through `dotnet run --`. Thirty warm
-  Windows samples measure direct Microsoft host capture at `50.726 ms` and the
-  `dv` typed handoff at `4.713 ms` (`10.8x` lower), but this is explicitly not a
+  Windows samples measure direct Microsoft host capture at `44.698 ms` and the
+  `dv` typed handoff at `5.606 ms` (`8.0x` lower), but this is explicitly not a
   like-for-like execution claim: child launch remains in the ordered run/test
   workflows. `P1`
 - [ ] `CLI-013` Define environment-variable precedence and redact secrets from
