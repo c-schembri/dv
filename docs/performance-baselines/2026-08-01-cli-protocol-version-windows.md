@@ -26,7 +26,8 @@ C:\Projects\dv\target\release\dv.exe --json --version
 | Microsoft equivalent | TBI | - | - | - |
 | `dv` | 4.479 ms | 5.593 ms | 4.104 ms | 5.724 ms |
 
-Every retained sample is validated as one ordered three-event schema-19 batch
+These original retained samples were validated as one ordered three-event
+schema-19 batch
 reporting command syntax version `1`, event schema version `19`, a non-empty
 tool version, and a successful terminal event. Preflight repeats the contract
 through `version`, `--version`, `-V`, and explicit `dotnet` compatibility

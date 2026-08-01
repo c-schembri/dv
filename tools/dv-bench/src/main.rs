@@ -92,6 +92,7 @@ enum CaseKind {
   Startup,
   CliUnknownOption,
   CliGoldenTrace,
+  CliCompatCheck,
   CliCommandNormalization,
   CliTransformEquivalence,
   CliModeClassification,
@@ -305,6 +306,12 @@ const DOTNET_CASES: &[Case] = &[
   Case {
     name: "cli_compat_manifest",
     kind: CaseKind::Startup,
+    args: &[],
+    implemented: false,
+  },
+  Case {
+    name: "cli_compat_check",
+    kind: CaseKind::CliCompatCheck,
     args: &[],
     implemented: false,
   },
@@ -1073,6 +1080,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_compat_check",
+    kind: CaseKind::CliCompatCheck,
+    args: &["--json", "compat", "check", "ci.yml", "SmallConsole.csproj"],
+    implemented: true,
+  },
+  Case {
     name: "sync_cold",
     kind: CaseKind::RestoreCold,
     args: &["sync", "--json"],
@@ -1478,6 +1491,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_compat_manifest") {
     verify_compatibility_manifest_boundary(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_compat_check") {
+    verify_compatibility_check_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-compat-check"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_compat_help") {
     verify_compatibility_help_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-compat-help"))?;
@@ -2619,7 +2635,7 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
   Ok(())
 }
 
-const EVENT_SCHEMA_VERSION: u64 = 19;
+const EVENT_SCHEMA_VERSION: u64 = 20;
 const COMMAND_SYNTAX_VERSION: u64 = 2;
 const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
 
@@ -2659,7 +2675,7 @@ fn validate_compatibility_manifest_output(output: &Output) -> Result<()> {
   if manifest.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1)
     || manifest.get("manifest_version").and_then(serde_json::Value::as_u64) != Some(1)
     || manifest.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(COMMAND_SYNTAX_VERSION)
-    || manifest.get("event_schema_version").and_then(serde_json::Value::as_u64) != Some(19)
+    || manifest.get("event_schema_version").and_then(serde_json::Value::as_u64) != Some(EVENT_SCHEMA_VERSION)
     || manifest
       .pointer("/reference/dotnet_sdk")
       .and_then(serde_json::Value::as_str)
@@ -2674,6 +2690,55 @@ fn validate_compatibility_manifest_output(output: &Output) -> Result<()> {
       .is_none_or(|rows| rows.len() != 468)
   {
     return Err("compatibility manifest query returned an incomplete or incompatible artifact".into());
+  }
+  Ok(())
+}
+
+fn verify_compatibility_check_boundary(dv_executable: &Path, fixture: &Path, workspace: &Path) -> Result<()> {
+  reset_fixture(fixture, workspace)?;
+  let output = Command::new(dv_executable)
+    .args(["--json", "compat", "check", "ci.yml", "SmallConsole.csproj"])
+    .current_dir(workspace)
+    .output()?;
+  validate_compatibility_check_output(&output)?;
+  if workspace.join("obj").exists() {
+    return Err("compatibility check wrote project artifacts".into());
+  }
+  Ok(())
+}
+
+fn validate_compatibility_check_output(output: &Output) -> Result<()> {
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(format!("compatibility check returned status {:?}", output.status.code()).into());
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  if events.len() != 3
+    || events
+      .iter()
+      .any(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) != Some(EVENT_SCHEMA_VERSION))
+  {
+    return Err("compatibility check returned an invalid event batch".into());
+  }
+  let report = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("compatibility_checked"))
+    .ok_or("compatibility check omitted its report event")?;
+  if report.get("manifest_version").and_then(serde_json::Value::as_u64) != Some(1)
+    || report
+      .get("unsupported_count")
+      .and_then(serde_json::Value::as_u64)
+      .is_none_or(|count| count == 0)
+    || report
+      .get("invocations")
+      .and_then(serde_json::Value::as_array)
+      .is_none_or(|rows| rows.len() != 2)
+  {
+    return Err("compatibility check returned an incomplete report".into());
   }
   Ok(())
 }
@@ -6429,9 +6494,13 @@ fn run_tool(tool_name: &str, executable: &Path, cases: &[Case], options: &Option
   for case in cases.iter().filter(|case| options.case.as_deref().is_none_or(|name| name == case.name)) {
     let case_workspace = workspace.join(case.name);
     let case_fixture = case_fixture(case, fixtures);
-    let command: Vec<String> = std::iter::once(executable.display().to_string())
-      .chain(case.args.iter().map(|value| (*value).into()))
-      .collect();
+    let command: Vec<String> = if !case.implemented && case.args.is_empty() {
+      vec!["TBI (no equivalent command)".into()]
+    } else {
+      std::iter::once(executable.display().to_string())
+        .chain(case.args.iter().map(|value| (*value).into()))
+        .collect()
+    };
 
     if !case.implemented {
       runs.push(Run {
@@ -6551,6 +6620,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
       | CaseKind::CliGoldenTrace
+      | CaseKind::CliCompatCheck
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
       | CaseKind::CliTransformEquivalence
@@ -8003,7 +8073,8 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
       fs::create_dir(workspace.join("offline-source"))?;
       Ok(())
     },
-    CaseKind::CliUnknownOption
+    CaseKind::CliCompatCheck
+    | CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
     | CaseKind::CliTransformEquivalence
     | CaseKind::CliModeClassification
@@ -8211,6 +8282,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_protocol_version_output(&output, case.args)?;
   } else if case.name == "cli_compat_manifest" {
     validate_compatibility_manifest_output(&output)?;
+  } else if matches!(case.kind, CaseKind::CliCompatCheck) {
+    validate_compatibility_check_output(&output)?;
   } else if case.name == "cli_golden_trace" {
     validate_golden_trace_sample(&output, is_dotnet(executable))?;
   } else if case.name == "cli_compat_help" {
@@ -9146,6 +9219,7 @@ fn case_label(case: &str) -> &str {
     "cli_version" => "CLI self-version",
     "cli_protocol_version" => "Syntax + JSON protocol versions",
     "cli_compat_manifest" => "Compatibility manifest query",
+    "cli_compat_check" => "Static compatibility check",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "package_reference_conditions" => "Conditional references",

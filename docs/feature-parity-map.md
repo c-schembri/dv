@@ -376,7 +376,7 @@ contracts.
 - [x] `CLI-017` Version command syntax and JSON compatibility independently so
   a CLI alias does not mutate the event protocol. The 6-byte typed invocation
   request now carries a two-byte syntax-version value while the reporter owns
-  schema version 19. Native `version`, `--version`, and `-V` normalize to one
+  schema version 20. Native `version`, `--version`, and `-V` normalize to one
   tool-version request; explicit dotnet `--version` instead normalizes to the
   selected-SDK request required by the reference command. Raw alias arguments
   remain reporter evidence rather than protocol selection. The
@@ -526,9 +526,23 @@ contracts.
   improvement. Process-tree and network observation remain explicitly `TBI`
   under issue 0009 rather than being inferred as zero. Build/run/test traces
   and cross-platform process/network observers remain open. `P1-P5`
-- [ ] `DROP-021` Add a `dv compat check` command that scans scripts and project
+- [x] `DROP-021` Add a `dv compat check` command that scans scripts and project
   inputs, reports unsupported invocation rows without executing them, and
-  identifies the exact compatibility manifest version. `P2`
+  identifies the exact compatibility manifest version. The bounded path-batch
+  transform accepts SDK-style `.csproj`, GitHub Actions YAML literal `run:`
+  scalars, and line-oriented PowerShell, POSIX shell, cmd, and batch files.
+  It reads each file once, uses a DTD-rejecting XML scan for project shape and
+  `Exec` inputs, classifies commands through a build-generated static index
+  over the embedded manifest, and reports implemented, partial, missing, or
+  uncheckable records in deterministic source order. Dynamic, malformed,
+  oversized, and non-UTF-8 input is rejected or retained as uncheckable rather
+  than guessed. Human and
+  event-schema-20 JSON output consume the same typed report and name embedded
+  compatibility manifest version 1. No discovered command, SDK tool, or
+  network request is executed. The release benchmark measured `4.651 ms`
+  median and `5.668 ms` p95 on Windows across 50 retained samples; Microsoft
+  has no equivalent static compatibility command, so its result is explicitly
+  TBI rather than a false like-for-like ratio. `P2`
 - [ ] `DROP-022` Never claim a command is drop-in compatible while any accepted
   option is ignored; every option must affect the typed request or fail
   explicitly. `P1-P5`

@@ -11,8 +11,12 @@ path = "src/main.rs"
 [dependencies]
 ctrlc.workspace = true
 dv-core = { path = "../dv-core" }
+quick-xml.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
+
+[build-dependencies]
 serde_json.workspace = true
 
 [lints]

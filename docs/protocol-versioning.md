@@ -2,7 +2,7 @@
 
 `CLI-017` gives command grammar and JSON compatibility separate version
 identities. The current command syntax is `2`; the current event schema is
-`19`. A command alias can therefore be added or retired under the syntax
+`20`. A command alias can therefore be added or retired under the syntax
 contract without pretending that the JSON object layout changed.
 
 ## Data Contract
@@ -14,12 +14,16 @@ Human commands pay no formatting, allocation, filesystem, process, or network
 cost for it.
 
 Every JSON event retains the independent top-level `schema_version`. Schema 19
-adds `command_syntax_version` to `command_started` and adds one `tool_version`
+added `command_syntax_version` to `command_started` and one `tool_version`
 payload containing:
 
 - the `dv` executable version;
 - the current command syntax version;
 - the current event schema version.
+
+Schema 20 adds the typed `compatibility_checked` payload for a bounded static
+scan. The syntax remains version 2 because no existing command spelling or
+precedence changed incompatibly.
 
 `dv --json --version` emits exactly `command_started`, `tool_version`, and
 `command_finished`. The normal `dv --version` text remains unchanged.
@@ -45,7 +49,7 @@ is added to the common path.
 ## Verification
 
 Cross-platform CLI tests execute native `version`, `--version`, and `-V`.
-Every native alias must produce the same three-event schema-19 shape, canonical
+Every native alias must produce the same three-event schema-20 shape, canonical
 `version` command, syntax version `2`, and successful terminal event. Under the
 explicit dotnet profile, `--version` instead selects the same SDK as Microsoft
 `dotnet --version`; this compatibility correction is why syntax version 2 is

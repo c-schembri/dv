@@ -1,0 +1,11 @@
+name: compatibility check benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - run: dotnet --version
+      - run: dotnet restore SmallConsole.csproj

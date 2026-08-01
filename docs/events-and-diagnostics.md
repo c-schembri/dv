@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `19`;
+- schema version `20`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 

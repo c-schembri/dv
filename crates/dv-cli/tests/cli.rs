@@ -217,7 +217,7 @@ fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery
   assert_eq!(manifest["schema_version"], 1);
   assert_eq!(manifest["manifest_version"], 1);
   assert_eq!(manifest["command_syntax_version"], 2);
-  assert_eq!(manifest["event_schema_version"], 19);
+  assert_eq!(manifest["event_schema_version"], 20);
   assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
   assert!(manifest["commands"].as_array().unwrap().len() >= 100);
   assert_eq!(manifest["parity_rows"].as_array().unwrap().len(), 468);
@@ -232,6 +232,73 @@ fn malformed_compatibility_manifest_queries_fail_explicitly() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8(output.stderr).unwrap().contains("unknown compat query"));
   }
+}
+
+#[test]
+fn compatibility_check_scans_literal_scripts_and_projects_without_execution() {
+  let temp = TempDirectory::new();
+  let script = temp.write(
+    "ci.yml",
+    r#"steps:
+  - run: dotnet --version
+  - run: dotnet restore App.csproj
+  - run: dotnet clean App.csproj
+  - run: dotnet --version > should-not-exist.txt
+"#,
+  );
+  let project = temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+
+  let output = dv()
+    .arg("--json")
+    .args(["compat", "check"])
+    .arg(&script)
+    .arg(&project)
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  assert!(output.stderr.is_empty());
+  assert!(!temp.0.join("should-not-exist.txt").exists());
+  assert!(!temp.0.join("obj").exists());
+  let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+  assert!(events.iter().all(|event| event["schema_version"] == 20));
+  let report = events.iter().find(|event| event["type"] == "compatibility_checked").unwrap();
+  assert_eq!(report["manifest_version"], 1);
+  assert_eq!(report["inputs"].as_array().unwrap().len(), 2);
+  assert_eq!(report["invocations"].as_array().unwrap().len(), 4);
+  assert_eq!(report["invocations"][0]["support"], "implemented");
+  assert_eq!(report["invocations"][1]["support"], "partial");
+  assert!(report["invocations"][1]["parity_rows"].as_array().unwrap().iter().any(|row| row == "DROP-022"));
+  assert_eq!(report["invocations"][2]["support"], "missing");
+  assert_eq!(report["invocations"][3]["support"], "uncheckable");
+  assert_eq!(events.last().unwrap()["outcome"], "failed");
+}
+
+#[test]
+fn compatibility_check_succeeds_for_fully_supported_literal_inputs() {
+  let temp = TempDirectory::new();
+  let script = temp.write("version.ps1", "dotnet --version\n");
+  let project = temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+
+  let output = dv().args(["compat", "check"]).arg(&script).arg(&project).current_dir(&temp.0).output().unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  assert!(output.stderr.is_empty());
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("Manifest  1"));
+  assert!(stdout.contains("SUPPORTED"));
+  assert!(stdout.contains("2 inputs | 1 invocations | 0 unresolved"));
 }
 
 #[test]
@@ -749,7 +816,7 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":19"));
+  assert!(lines[0].contains("\"schema_version\":20"));
   assert!(lines[0].contains("\"command_syntax_version\":2"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
@@ -773,7 +840,7 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
     assert!(
       events
         .iter()
-        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(19))
+        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(20))
     );
     assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
     assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
@@ -781,7 +848,7 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
     assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
     assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(2));
-    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(19));
+    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(20));
     assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
   }
 }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 19;
+pub const EVENT_SCHEMA_VERSION: u16 = 20;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -304,6 +304,54 @@ pub struct ResolvedPackageEvent {
   pub cache_outcome: CacheOutcome,
 }
 
+/// Compatibility state assigned to one statically inspected input or invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilitySupport {
+  /// The inspected shape is accepted by the current native implementation.
+  Implemented,
+  /// The route exists but retains one or more incomplete compatibility dimensions.
+  Partial,
+  /// The route or project shape is not implemented.
+  Missing,
+  /// Static inspection cannot safely classify the input.
+  Uncheckable,
+}
+
+/// One explicitly supplied or deterministically discovered file inspected by `dv compat check`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompatibilityInputEvent {
+  /// User-visible input path in argument order.
+  pub path: String,
+  /// Stable input kind: `script`, `project`, or `msbuild`.
+  pub kind: String,
+  /// Static support classification.
+  pub support: CompatibilitySupport,
+  /// Bounded explanation which never contains executed output.
+  pub detail: String,
+}
+
+/// One literal tool invocation found in an inspected script.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompatibilityInvocationEvent {
+  /// Index into the ordered compatibility input batch.
+  pub input_index: u32,
+  /// One-based source line.
+  pub line: u32,
+  /// One-based source column.
+  pub column: u32,
+  /// Normalized tool name.
+  pub tool: String,
+  /// Literal source command; it is never executed.
+  pub command: String,
+  /// Static support classification.
+  pub support: CompatibilitySupport,
+  /// Compatibility ledger rows that remain incomplete for this route.
+  pub parity_rows: Vec<String>,
+  /// Classification explanation.
+  pub detail: String,
+}
+
 /// Event variants emitted by command execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -325,6 +373,17 @@ pub enum EventPayload {
     command_syntax_version: u16,
     /// Current JSON event schema version.
     event_schema_version: u16,
+  },
+  /// An ordered path batch was statically inspected without executing discovered commands.
+  CompatibilityChecked {
+    /// Exact compatibility artifact content version used for classification.
+    manifest_version: u16,
+    /// Ordered explicitly supplied inputs.
+    inputs: Vec<CompatibilityInputEvent>,
+    /// Ordered literal invocations discovered in those inputs.
+    invocations: Vec<CompatibilityInvocationEvent>,
+    /// Number of input and invocation records not classified as implemented.
+    unsupported_count: u32,
   },
   /// A batch of work is about to execute.
   WorkStarted {

@@ -192,6 +192,7 @@ The project is in the first implementation phase.
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
 | Generated, versioned compatibility manifest | Implemented |
+| Static compatibility scan for scripts and project inputs | Implemented |
 | Exact package resolution, v2/v3 sources, verified cache, and lock | Initial implementation |
 | Direct Roslyn compilation | Planned |
 | Incremental and no-op builds | Planned |
@@ -228,7 +229,7 @@ states, while Unix signals remain distinct until the owning run/test workflow
 selects an explicit policy. Application launch itself is still planned, so the
 current command surface never claims that a TBI child executed.
 
-Command syntax version `2` and JSON event schema version `19` advance
+Command syntax version `2` and JSON event schema version `20` advance
 independently. `dv --json --version` reports the executable and both protocol
 versions in one validated event batch, while human `dv --version` remains
 unchanged. Native version aliases normalize to the tool-version request;
@@ -265,6 +266,13 @@ environment/exit/output contracts; and every parity row with explicit support
 state. The query does not discover an SDK or parse the manifest at runtime.
 The [manifest contract](docs/compatibility-manifest.md) documents regeneration,
 bounds, and the intentionally explicit missing-work states.
+
+`dv compat check PATH...` scans scripts, directories, and MSBuild project
+inputs against that exact embedded manifest without executing discovered
+commands. It reports source locations, partial/missing rows, dynamic shapes
+that cannot be proven statically, and the manifest version in both human and
+event-schema-20 JSON output. The scan is bounded, deterministic, secret-safe,
+and returns exit `2` while any input or invocation remains unresolved.
 
 Human output defaults can be set with `DV_COLOR=auto|always|never` and
 `DV_VERBOSITY=quiet|minimal|normal|detailed|diagnostic`; a non-empty
@@ -943,6 +951,7 @@ See:
 - [Performance method](docs/performance-method.md)
 - [Events and diagnostics](docs/events-and-diagnostics.md)
 - [Compatibility matrix](docs/compatibility-matrix.md)
+- [Compatibility check](docs/compatibility-check.md)
 - [Direct Roslyn strategy](docs/roslyn-invocation.md)
 
 ## Workspace

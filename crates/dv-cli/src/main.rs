@@ -9,6 +9,7 @@ use std::{
 
 mod cancellation;
 mod compatibility;
+mod compatibility_check;
 mod environment;
 mod invocation;
 mod output;
@@ -51,7 +52,7 @@ Commands:
   publish    Publish deployable output
   sdk        Manage SDKs and runtimes
   project    Inspect project inputs
-  compat     Inspect the versioned compatibility manifest
+  compat     Inspect commands and the versioned compatibility manifest
 
 Output:
   --json                  Emit the versioned JSON event protocol
@@ -74,6 +75,7 @@ Information:
   dv sdk current          Print the selected .NET SDK version
   dv sdk list             List installed .NET SDKs
   dv compat manifest      Print the captured compatibility surface
+  dv compat check PATH... Statically check scripts and project inputs
 ";
 
 const DOTNET_HELP: &str = "\
@@ -178,7 +180,8 @@ Usage:
 
 const COMPAT_HELP: &str = "\
 Usage:
-  dv compat manifest    Write the release compatibility manifest as JSON
+  dv compat manifest       Write the release compatibility manifest as JSON
+  dv compat check PATH...  Check files, directories, scripts, and MSBuild XML
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,7 +341,7 @@ fn run() -> ExitCode {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       run_package_command(started, globals, command, invocation.event_arguments(json), command_args, cancellation.as_ref())
     },
-    CommandKind::Compat => run_compat(started, globals, invocation.event_arguments(json), command_args),
+    CommandKind::Compat => run_compat(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Run | CommandKind::Test => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       if command_help_only(globals, request.command(), command_args) {
@@ -465,11 +468,17 @@ fn command_requires_cancellation(globals: InvocationOptions, command: CommandKin
       | CommandKind::Restore
       | CommandKind::Run
       | CommandKind::Test
-  );
+  ) || (command == CommandKind::Compat && command_args.first().is_some_and(|argument| argument == "check"));
   work_command && !command_help_only(globals, command, command_args)
 }
 
-fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
+fn run_compat(
+  started: Instant,
+  globals: InvocationOptions,
+  args: Vec<String>,
+  command_args: CommandArguments<'_>,
+  cancellation: Option<&CancellationToken>,
+) -> ExitCode {
   let mut semantic = command_args.iter();
   match semantic.next() {
     None => {
@@ -498,6 +507,29 @@ fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, c
         ),
       }
     },
+    Some(value) if value == "check" => {
+      let paths: Vec<PathBuf> = semantic.map(PathBuf::from).collect();
+      let cancellation = cancellation.expect("compat check installs cancellation");
+      match compatibility_check::CompatibilityCheck::scan_paths(&paths, cancellation) {
+        Ok(check) => finish_compatibility_check(started, globals, args, check),
+        Err(error) if error.is_cancelled() => cancelled(started, globals, "compat check", args),
+        Err(error) => fail(
+          started,
+          globals,
+          "compat check",
+          args,
+          diagnostic(
+            "DV0006",
+            format!("compatibility scan failed: {error}"),
+            error.path().map(|path| ContextField {
+              name: "path".into(),
+              value: path.into(),
+            }),
+            Some("Use literal, bounded UTF-8 scripts or well-formed MSBuild XML inputs."),
+          ),
+        ),
+      }
+    },
     Some(value) => reject(
       started,
       globals,
@@ -507,9 +539,55 @@ fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, c
         "DV0002",
         format!("unknown compat query {:?}", redact_argument_text(value)),
         None,
-        Some("Use `dv compat manifest` to emit the current compatibility artifact."),
+        Some("Use `dv compat manifest` or `dv compat check PATH...`."),
       ),
     ),
+  }
+}
+
+fn finish_compatibility_check(started: Instant, globals: InvocationOptions, args: Vec<String>, check: compatibility_check::CompatibilityCheck) -> ExitCode {
+  let has_unsupported = check.has_unsupported();
+  let unsupported_count = check.unsupported_count();
+  if globals.json() {
+    let elapsed_us = micros(started.elapsed());
+    let outcome = if has_unsupported { Outcome::Failed } else { Outcome::Succeeded };
+    let manifest_version = check.manifest_version();
+    let (inputs, invocations) = check.event_data();
+    let events = [
+      Event::new(0, 0, command_started("compat check", args)),
+      Event::new(
+        1,
+        elapsed_us,
+        EventPayload::CompatibilityChecked {
+          manifest_version,
+          inputs,
+          invocations,
+          unsupported_count: unsupported_count as u32,
+        },
+      ),
+      Event::new(
+        2,
+        elapsed_us,
+        EventPayload::CommandFinished {
+          command: "compat check".into(),
+          duration_us: elapsed_us,
+          outcome,
+        },
+      ),
+    ];
+    write_json_lines(&events, io::stdout().lock()).expect("writing structured output to stdout succeeds");
+  } else {
+    let stdout = io::stdout();
+    let color = matches!(globals.color(), ColorChoice::Always) || (matches!(globals.color(), ColorChoice::Auto) && stdout.is_terminal());
+    check
+      .write_human(stdout.lock(), color)
+      .expect("writing compatibility report to stdout succeeds");
+  }
+
+  if has_unsupported {
+    ExitCode::from(globals.exit_code(ExitClass::Unsupported).expect("native compat check owns unsupported exits"))
+  } else {
+    ExitCode::SUCCESS
   }
 }
 

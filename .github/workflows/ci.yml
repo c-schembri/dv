@@ -44,6 +44,8 @@ jobs:
         run: cargo run -p dv-bench -- --case cli_golden_trace --samples 1 --warmups 0 --output target/benchmark-golden-trace-smoke.json
       - name: Run compatibility manifest benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_compat_manifest --samples 1 --warmups 0 --output target/benchmark-compat-manifest-smoke.json
+      - name: Run static compatibility check benchmark smoke test
+        run: cargo run -p dv-bench -- --case cli_compat_check --samples 1 --warmups 0 --output target/benchmark-compat-check-smoke.json
       - name: Run compatibility help benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_compat_help --samples 1 --warmups 0 --output target/benchmark-compat-help-smoke.json
       - name: Run command normalization benchmark smoke test

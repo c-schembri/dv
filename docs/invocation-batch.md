@@ -326,7 +326,7 @@ regresses beyond benchmark noise relative to the prior release baseline.
 ## Independent Protocol Versions
 
 `CLI-017` stores command syntax version 2 as a two-byte transparent value in
-the 6-byte invocation request. Event schema version 19 remains a
+the 6-byte invocation request. Event schema version 20 remains a
 reporter constant. Native `version`, `--version`, and `-V` produce the same
 typed tool-version request. `--compat dotnet --version` produces the typed SDK
 selection request required by the Microsoft spelling. Original tokens remain

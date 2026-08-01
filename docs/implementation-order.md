@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 72 rows are implemented;
+- 73 rows are implemented;
 - 31 rows have partial foundations;
-- 365 rows are missing;
+- 364 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -145,7 +145,7 @@ unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result
 pairs are explicit. Executed child, test, and signal/cancellation semantics
 remain partial with their owning workflows.
-Command syntax version 2 and JSON event schema version 19 are independent.
+Command syntax version 2 and JSON event schema version 20 are independent.
 Native tool-version aliases normalize to one typed request and event shape;
 the dotnet `--version` compatibility form selects the SDK exactly like its
 Microsoft reference command. Profile-aware help uses static text before SDK or
