@@ -539,8 +539,8 @@ contracts.
   than guessed. Human and
   event-schema-20 JSON output consume the same typed report and name embedded
   compatibility manifest version 1. No discovered command, SDK tool, or
-  network request is executed. The release benchmark measured `4.651 ms`
-  median and `5.668 ms` p95 on Windows across 50 retained samples; Microsoft
+  network request is executed. The release benchmark measured `5.791 ms`
+  median and `7.314 ms` p95 on Windows across 50 retained samples; Microsoft
   has no equivalent static compatibility command, so its result is explicitly
   TBI rather than a false like-for-like ratio. `P2`
 - [ ] `DROP-022` Never claim a command is drop-in compatible while any accepted
