@@ -2209,8 +2209,10 @@ struct BatchCachedPackage {
   origin: Option<PackageSource>,
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(target_pointer_width = "64", target_os = "windows"))]
 const _: () = assert!(size_of::<BatchCachedPackage>() == 88);
+#[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
+const _: () = assert!(size_of::<BatchCachedPackage>() == 80);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(align_of::<BatchCachedPackage>() == align_of::<usize>());
 
@@ -2251,8 +2253,10 @@ struct TaskCachedPackage {
   cache_hit: bool,
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(target_pointer_width = "64", target_os = "windows"))]
 const _: () = assert!(size_of::<TaskCachedPackage>() == 96);
+#[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
+const _: () = assert!(size_of::<TaskCachedPackage>() == 88);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(align_of::<TaskCachedPackage>() == align_of::<usize>());
 
