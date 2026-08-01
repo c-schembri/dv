@@ -510,8 +510,8 @@ contracts.
   and environment directives while excluding cold spelling/profile
   provenance. Empty and non-Unicode tokens remain lossless. The view is one
   machine word, allocates nothing, and is used directly by dispatch. Fifty
-  Windows pre-I/O samples measured `139.573 ms` for `dotnet` and `5.513 ms`
-  for `dv`, a `25.3x` median improvement. SDK query, MSBuild, NuGet, VSTest,
+  Windows pre-I/O samples measured `141.390 ms` for `dotnet` and `5.606 ms`
+  for `dv`, a `25.2x` median improvement. SDK query, MSBuild, NuGet, VSTest,
   and later workflow transforms remain bounded by their owning rows rather
   than being falsely claimed by the Phase 1 proof. `P1-P4`
 - [ ] `DROP-020` Maintain golden argv, environment, stdin, stdout, stderr, exit,

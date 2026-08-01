@@ -25,10 +25,10 @@ target\release\dv.exe --compat dotnet restore --definitely-unknown
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| `dotnet` | 139.573 ms | 155.743 ms | 128.030 ms | 164.157 ms |
-| `dv` | 5.513 ms | 6.449 ms | 4.319 ms | 6.559 ms |
+| `dotnet` | 141.390 ms | 163.790 ms | 133.809 ms | 187.782 ms |
+| `dv` | 5.606 ms | 6.352 ms | 4.620 ms | 6.480 ms |
 
-`dv` is `25.3x` faster at the median. Its measured path captures argv once,
+`dv` is `25.2x` faster at the median. Its measured path captures argv once,
 selects the compatibility profile, creates a one-word borrowed transform view,
 and rejects the unknown option. It performs no SDK, project, filesystem,
 network, or managed-process work.

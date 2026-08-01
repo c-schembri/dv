@@ -535,7 +535,7 @@ Initial machine:
 | Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
-| Create the same typed restore transform through compatibility syntax | `dotnet restore --definitely-unknown` | `dv --compat dotnet restore --definitely-unknown` | 139.573 ms | 5.513 ms | 25.3x | 155.743 ms | 6.449 ms |
+| Create the same typed restore transform through compatibility syntax | `dotnet restore --definitely-unknown` | `dv --compat dotnet restore --definitely-unknown` | 141.390 ms | 5.606 ms | 25.2x | 163.790 ms | 6.352 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
 | Preserve missing-project restore failure status | `dotnet restore DefinitelyMissing.csproj` | `dv --compat dotnet restore DefinitelyMissing.csproj` | 122.756 ms | 5.158 ms | 23.8x | 134.338 ms | 6.073 ms |
 | Preserve a combined configuration token before sentinel rejection | `dotnet build -c:Release --definitely-unknown` | `dv --compat dotnet build -c:Release --definitely-unknown` | 141.461 ms | 4.912 ms | 28.8x | 176.976 ms | 6.003 ms |
