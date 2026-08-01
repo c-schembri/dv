@@ -267,7 +267,7 @@ contracts.
 - [x] `CLI-002` Reject non-Unicode command text with a stable diagnostic.
 - [x] `CLI-003` Emit stable exit code 2 for current command failures.
 - [x] `CLI-004` Offer one `--json` event stream for current commands.
-- [ ] `CLI-005` Replace string matching with a typed, batch-first command
+- [x] `CLI-005` Replace string matching with a typed, batch-first command
   request that retains lossless OS arguments where paths require it. `P1`
 - [ ] `CLI-006` Define global `--help`, `--version`, `--json`, `--verbose`,
   `--quiet`, `--color`, `--no-color`, and diagnostic verbosity behavior. `P1`
@@ -304,9 +304,9 @@ contracts.
 - [ ] `DROP-001` Generate a versioned compatibility manifest from the selected
   reference SDK/tool set, covering every command, option alias, argument
   position, default, environment input, exit case, and output format. `P1`
-- [ ] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
+- [~] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
   all accepted tool spellings into one typed command batch. `P1`
-- [ ] `DROP-003` Classify invocation mode deterministically before project,
+- [~] `DROP-003` Classify invocation mode deterministically before project,
   SDK, filesystem, process, or network work. `P1`
 - [ ] `DROP-004` Treat a first token matching a `.csproj`, `.fsproj`, `.vbproj`,
   `.sln`, `.slnx`, `.proj`, `.targets`, or `.props` input plus MSBuild switches

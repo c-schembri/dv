@@ -1,11 +1,15 @@
 use std::{
   env,
-  ffi::OsString,
+  ffi::{OsStr, OsString},
   io::{self, Write},
   path::{Path, PathBuf},
   process::ExitCode,
   time::Instant,
 };
+
+mod invocation;
+
+use invocation::{CommandKind, InvocationBatch};
 
 use dv_core::{
   CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
@@ -83,100 +87,80 @@ Usage:
 
 fn main() -> ExitCode {
   let started = Instant::now();
-  let mut argument_iter = env::args_os().skip(1);
-  let first = argument_iter.next();
-  let second = argument_iter.next();
-
-  if second.is_none() {
-    match first.as_deref() {
-      None => {
-        print!("{HELP}");
-        return ExitCode::SUCCESS;
-      },
-      Some(value) if value == "-h" || value == "--help" || value == "help" => {
-        print!("{HELP}");
-        return ExitCode::SUCCESS;
-      },
-      Some(value) if value == "-V" || value == "--version" || value == "version" => {
-        println!("dv {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-      },
-      Some(_) => {},
-    }
-  }
-
-  let raw_args: Vec<OsString> = first.into_iter().chain(second).chain(argument_iter).collect();
-  let json = raw_args.iter().any(|argument| argument == "--json");
-  let args = match decode_args(&raw_args) {
-    Ok(args) => args,
-    Err(argument) => {
-      return fail(
-        started,
-        json,
-        "<invalid>",
-        Vec::new(),
-        diagnostic(
-          "DV0002",
-          "a command-line argument is not valid Unicode",
-          Some(ContextField {
-            name: "argument".into(),
-            value: argument.to_string_lossy().into_owned(),
-          }),
-          Some("Pass command names and options as valid Unicode text."),
-        ),
-      );
-    },
-  };
-  let semantic_args: Vec<String> = args.iter().filter(|argument| argument.as_str() != "--json").cloned().collect();
-
-  match semantic_args.first().map(String::as_str) {
-    None | Some("-h" | "--help" | "help") => {
+  let invocation = InvocationBatch::capture(env::args_os().skip(1));
+  let request = invocation.request();
+  let json = invocation.json();
+  let command_args = invocation.command_arguments();
+  match request.command() {
+    CommandKind::Help => {
       print!("{HELP}");
       ExitCode::SUCCESS
     },
-    Some("-V" | "--version" | "version") => {
+    CommandKind::Version => {
       println!("dv {}", env!("CARGO_PKG_VERSION"));
       ExitCode::SUCCESS
     },
-    Some("sdk") => run_sdk(started, json, args, &semantic_args[1..]),
-    Some("project") => run_project(started, json, args, &semantic_args[1..]),
-    Some("build") => run_build(started, json, args, &semantic_args[1..]),
-    Some(command @ ("restore" | "sync")) => run_package_command(started, json, command, args, &semantic_args[1..]),
-    Some(command) if is_known_command(command) => fail(
+    CommandKind::Sdk => run_sdk(started, json, invocation.event_arguments(json), command_args),
+    CommandKind::Project => run_project(started, json, invocation.event_arguments(json), command_args),
+    CommandKind::Build => run_build(started, json, invocation.event_arguments(json), command_args),
+    CommandKind::Restore | CommandKind::Sync => {
+      let command = invocation.command_text().expect("classified native commands are Unicode");
+      run_package_command(started, json, command, invocation.event_arguments(json), command_args)
+    },
+    CommandKind::KnownUnimplemented => {
+      let command = invocation.command_text().expect("classified native commands are Unicode");
+      fail(
+        started,
+        json,
+        command,
+        invocation.event_arguments(json),
+        diagnostic(
+          "DV0003",
+          format!("command {command:?} is not implemented yet"),
+          Some(ContextField {
+            name: "command".into(),
+            value: command.into(),
+          }),
+          Some("Use --help to inspect the Phase 0 command surface."),
+        ),
+      )
+    },
+    CommandKind::Unknown => {
+      let command = invocation.command_text().expect("classified native commands are Unicode");
+      fail(
+        started,
+        json,
+        command,
+        invocation.event_arguments(json),
+        diagnostic(
+          "DV0001",
+          format!("unknown command {command:?}"),
+          Some(ContextField {
+            name: "command".into(),
+            value: command.into(),
+          }),
+          Some("Use --help to list available commands."),
+        ),
+      )
+    },
+    CommandKind::InvalidText => fail(
       started,
       json,
-      command,
-      args,
+      "<invalid>",
+      invocation.event_arguments(json),
       diagnostic(
-        "DV0003",
-        format!("command {command:?} is not implemented yet"),
-        Some(ContextField {
-          name: "command".into(),
-          value: command.into(),
-        }),
-        Some("Use --help to inspect the Phase 0 command surface."),
-      ),
-    ),
-    Some(command) => fail(
-      started,
-      json,
-      command,
-      args,
-      diagnostic(
-        "DV0001",
-        format!("unknown command {command:?}"),
-        Some(ContextField {
-          name: "command".into(),
-          value: command.into(),
-        }),
-        Some("Use --help to list available commands."),
+        "DV0002",
+        "command text is not valid Unicode",
+        None,
+        Some("Pass the command name as valid Unicode text."),
       ),
     ),
   }
 }
 
-fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<String>, command_args: &[String]) -> ExitCode {
-  if matches!(command_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
+fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<String>, command_args: &[OsString]) -> ExitCode {
+  let mut semantic = command_args.iter().filter(|argument| *argument != "--json");
+  if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
   }
@@ -321,7 +305,7 @@ struct PackageCommandOptions {
   probe_credentials: bool,
 }
 
-fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageCommandOptions, String> {
+fn parse_package_args(command: &str, arguments: &[OsString]) -> Result<PackageCommandOptions, String> {
   let mut options = PackageCommandOptions {
     project: None,
     additional_projects: Vec::new(),
@@ -335,30 +319,31 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
   };
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].as_str() {
-      "--configuration" if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
-      "--configuration" => {
-        index += 1;
-        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+    match arguments[index].to_str() {
+      Some("--json") => {},
+      Some("--configuration") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration") => {
+        let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
+          .to_str()
+          .ok_or("--configuration requires valid Unicode text")?;
         options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
       },
-      value if value.starts_with("--configuration=") => {
+      Some(value) if value.starts_with("--configuration=") => {
         if options.configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
         let value = &value["--configuration=".len()..];
         options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
       },
-      "--packages" if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
-      "--packages" => {
-        index += 1;
-        let path = arguments.get(index).ok_or("--packages requires a path")?;
+      Some("--packages") if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
+      Some("--packages") => {
+        let path = take_semantic_value(arguments, &mut index, false, "--packages requires a path")?;
         if path.is_empty() {
           return Err("--packages requires a path".into());
         }
         options.packages_directory = Some(PathBuf::from(path));
       },
-      value if value.starts_with("--packages=") => {
+      Some(value) if value.starts_with("--packages=") => {
         if options.packages_directory.is_some() {
           return Err("--packages cannot be specified more than once".into());
         }
@@ -368,16 +353,15 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         }
         options.packages_directory = Some(PathBuf::from(value));
       },
-      "--configfile" if options.config_file.is_some() => return Err("--configfile cannot be specified more than once".into()),
-      "--configfile" => {
-        index += 1;
-        let path = arguments.get(index).ok_or("--configfile requires a path")?;
+      Some("--configfile") if options.config_file.is_some() => return Err("--configfile cannot be specified more than once".into()),
+      Some("--configfile") => {
+        let path = take_semantic_value(arguments, &mut index, false, "--configfile requires a path")?;
         if path.is_empty() {
           return Err("--configfile requires a path".into());
         }
         options.config_file = Some(PathBuf::from(path));
       },
-      value if value.starts_with("--configfile=") => {
+      Some(value) if value.starts_with("--configfile=") => {
         if options.config_file.is_some() {
           return Err("--configfile cannot be specified more than once".into());
         }
@@ -387,16 +371,17 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         }
         options.config_file = Some(PathBuf::from(value));
       },
-      "--source" | "-s" => {
-        index += 1;
-        let source = arguments.get(index).ok_or("--source requires a package source")?;
+      Some("--source" | "-s") => {
+        let source = take_semantic_value(arguments, &mut index, false, "--source requires a package source")?
+          .to_str()
+          .ok_or("--source requires valid Unicode text")?;
         if source.is_empty() {
           return Err("--source requires a package source".into());
         }
         validate_command_source(source)?;
-        options.sources.push(source.clone());
+        options.sources.push(source.to_owned());
       },
-      value if value.starts_with("--source=") || value.starts_with("-s=") => {
+      Some(value) if value.starts_with("--source=") || value.starts_with("-s=") => {
         let source = value.strip_prefix("--source=").or_else(|| value.strip_prefix("-s=")).unwrap_or_default();
         if source.is_empty() {
           return Err("--source requires a package source".into());
@@ -404,17 +389,27 @@ fn parse_package_args(command: &str, arguments: &[String]) -> Result<PackageComm
         validate_command_source(source)?;
         options.sources.push(source.to_owned());
       },
-      "--offline" => options.offline = true,
-      "--interactive" => options.interactive = true,
-      "--probe-credentials" if command == "project package-sources" => options.probe_credentials = true,
-      value if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
-      value if options.project.is_none() => options.project = Some(PathBuf::from(value)),
-      value if matches!(command, "restore" | "sync") => options.additional_projects.push(PathBuf::from(value)),
-      value => return Err(format!("unexpected {command} argument {value:?}")),
+      Some("--offline") => options.offline = true,
+      Some("--interactive") => options.interactive = true,
+      Some("--probe-credentials") if command == "project package-sources" => options.probe_credentials = true,
+      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
+      _ if options.project.is_none() => options.project = Some(PathBuf::from(&arguments[index])),
+      _ if matches!(command, "restore" | "sync") => options.additional_projects.push(PathBuf::from(&arguments[index])),
+      _ => return Err(format!("unexpected {command} argument {:?}", arguments[index].to_string_lossy())),
     }
     index += 1;
   }
   Ok(options)
+}
+
+fn take_semantic_value<'a>(arguments: &'a [OsString], index: &mut usize, ignore_plan: bool, missing: &'static str) -> Result<&'a OsString, &'static str> {
+  loop {
+    *index += 1;
+    let value = arguments.get(*index).ok_or(missing)?;
+    if value != "--json" && (!ignore_plan || value != "--plan") {
+      return Ok(value);
+    }
+  }
 }
 
 fn validate_command_source(source: &str) -> Result<(), String> {
@@ -444,8 +439,9 @@ fn write_credential_provider_log(message: &str) {
   let _ = writeln!(io::stderr().lock(), "credential provider: {message}");
 }
 
-fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[String]) -> ExitCode {
-  if matches!(build_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h")) {
+fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsString]) -> ExitCode {
+  let mut semantic = build_args.iter().filter(|argument| *argument != "--json");
+  if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{BUILD_HELP}");
     return ExitCode::SUCCESS;
   }
@@ -463,8 +459,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
       ),
     );
   }
-  let plan_arguments: Vec<String> = build_args.iter().filter(|argument| argument.as_str() != "--plan").cloned().collect();
-  let (requested_path, configuration) = match parse_project_args(&plan_arguments) {
+  let (requested_path, configuration) = match parse_project_args(build_args, true) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -742,31 +737,38 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn decode_args(raw_args: &[OsString]) -> Result<Vec<String>, &OsString> {
-  raw_args.iter().map(|argument| argument.to_str().map(str::to_owned).ok_or(argument)).collect()
-}
-
-fn is_known_command(command: &str) -> bool {
-  matches!(
-    command,
-    "init" | "add" | "remove" | "restore" | "sync" | "build" | "run" | "test" | "pack" | "publish" | "sdk" | "project"
-  )
-}
-
-fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[String]) -> ExitCode {
-  match sdk_args {
-    [] => {
+fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[OsString]) -> ExitCode {
+  let mut semantic = sdk_args.iter().filter(|argument| *argument != "--json");
+  let first = semantic.next();
+  let second = semantic.next();
+  let has_more = semantic.next().is_some();
+  let first_text = match first {
+    Some(argument) => match argument.to_str() {
+      Some(value) => Some(value),
+      None => return fail(started, json, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
+    },
+    None => None,
+  };
+  let second_text = match second {
+    Some(argument) => match argument.to_str() {
+      Some(value) => Some(value),
+      None => return fail(started, json, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
+    },
+    None => None,
+  };
+  match (first_text, second_text, has_more) {
+    (None, None, false) => {
       print!("{SDK_HELP}");
       ExitCode::SUCCESS
     },
-    [sdk] if sdk == "help" || sdk == "--help" || sdk == "-h" => {
+    (Some("help" | "--help" | "-h"), None, false) => {
       print!("{SDK_HELP}");
       ExitCode::SUCCESS
     },
-    [sdk] if sdk == "current" => sdk_current(started, json, args),
-    [sdk] if sdk == "list" => sdk_list(started, json, args),
-    [sdk, runtime_identifier] if sdk == "compatible-rids" => sdk_compatible_rids(started, json, args, runtime_identifier),
-    [sdk, ..] if sdk == "compatible-rids" => fail(
+    (Some("current"), None, false) => sdk_current(started, json, args),
+    (Some("list"), None, false) => sdk_list(started, json, args),
+    (Some("compatible-rids"), Some(runtime_identifier), false) => sdk_compatible_rids(started, json, args, runtime_identifier),
+    (Some("compatible-rids"), _, _) => fail(
       started,
       json,
       "sdk compatible-rids",
@@ -779,7 +781,7 @@ fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[String])
       ),
     ),
     _ => {
-      let subcommand = sdk_args.first().map_or("<missing>", String::as_str);
+      let subcommand = first_text.unwrap_or("<missing>");
       fail(
         started,
         json,
@@ -919,28 +921,43 @@ fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_
   )
 }
 
-fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
-  if project_args.is_empty()
-    || matches!(project_args, [argument] if matches!(argument.as_str(), "help" | "--help" | "-h"))
-    || matches!(project_args, [inspect, argument] if inspect == "inspect" && matches!(argument.as_str(), "help" | "--help" | "-h"))
-    || matches!(project_args, [frameworks, argument] if frameworks == "frameworks" && matches!(argument.as_str(), "help" | "--help" | "-h"))
-    || matches!(project_args, [packs, argument] if packs == "runtime-packs" && matches!(argument.as_str(), "help" | "--help" | "-h"))
-    || matches!(project_args, [sources, argument] if sources == "package-sources" && matches!(argument.as_str(), "help" | "--help" | "-h"))
+fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
+  let Some(subcommand_index) = project_args.iter().position(|argument| argument != "--json") else {
+    print!("{PROJECT_HELP}");
+    return ExitCode::SUCCESS;
+  };
+  let subcommand = match project_args[subcommand_index].to_str() {
+    Some(value) => value,
+    None => {
+      return fail(
+        started,
+        json,
+        "project",
+        args,
+        non_unicode_argument_diagnostic(&project_args[subcommand_index], "project command"),
+      );
+    },
+  };
+  let operands = &project_args[subcommand_index + 1..];
+  let mut semantic_operands = operands.iter().filter(|argument| *argument != "--json");
+  if matches!(subcommand, "help" | "--help" | "-h")
+    || (matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
+      && matches!(semantic_operands.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h"))
+      && semantic_operands.next().is_none())
   {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
   }
-  if project_args.first().map(String::as_str) == Some("runtime-packs") {
-    return project_runtime_packs(started, json, args, &project_args[1..]);
+  if subcommand == "runtime-packs" {
+    return project_runtime_packs(started, json, args, operands);
   }
-  if project_args.first().map(String::as_str) == Some("frameworks") {
-    return project_frameworks(started, json, args, &project_args[1..]);
+  if subcommand == "frameworks" {
+    return project_frameworks(started, json, args, operands);
   }
-  if project_args.first().map(String::as_str) == Some("package-sources") {
-    return project_package_sources(started, json, args, &project_args[1..]);
+  if subcommand == "package-sources" {
+    return project_package_sources(started, json, args, operands);
   }
-  if project_args.first().map(String::as_str) != Some("inspect") {
-    let subcommand = project_args.first().map_or("<missing>", String::as_str);
+  if subcommand != "inspect" {
     return fail(
       started,
       json,
@@ -958,7 +975,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     );
   }
 
-  let (requested_path, configuration) = match parse_project_args(&project_args[1..]) {
+  let (requested_path, configuration) = match parse_project_args(operands, false) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
@@ -1056,7 +1073,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   succeed(started, "project inspect", args, payload)
 }
 
-fn project_package_sources(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+fn project_package_sources(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
   let parsed = match parse_package_args("project package-sources", project_args) {
     Ok(options) => options,
     Err(problem) => {
@@ -1203,7 +1220,7 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
     Ok(options) => options,
     Err(problem) => {
@@ -1284,7 +1301,7 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
   )
 }
 
-fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[String]) -> ExitCode {
+fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
@@ -1358,54 +1375,58 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
   )
 }
 
-fn parse_pack_plan_args(arguments: &[String], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_pack_plan_args(arguments: &[OsString], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut packages = None;
   let mut configuration = None;
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].as_str() {
-      "--packages" => {
-        index += 1;
-        packages = Some(PathBuf::from(arguments.get(index).ok_or("--packages requires a path")?));
+    match arguments[index].to_str() {
+      Some("--json") => {},
+      Some("--packages") => {
+        packages = Some(PathBuf::from(take_semantic_value(arguments, &mut index, false, "--packages requires a path")?));
       },
-      "--configuration" if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
-      "--configuration" => {
-        index += 1;
-        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+      Some("--configuration") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration") => {
+        let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
+          .to_str()
+          .ok_or("--configuration requires valid Unicode text")?;
         configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
       },
-      value if value.starts_with("--configuration=") => {
+      Some(value) if value.starts_with("--configuration=") => {
         if configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
         let value = &value["--configuration=".len()..];
         configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
       },
-      value if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
-      value if project.is_none() => project = Some(PathBuf::from(value)),
-      value => return Err(format!("unexpected project {command} argument {value:?}")),
+      Some(value) if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
+      _ if project.is_none() => project = Some(PathBuf::from(&arguments[index])),
+      _ => return Err(format!("unexpected project {command} argument {:?}", arguments[index].to_string_lossy())),
     }
     index += 1;
   }
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
-fn parse_project_args(arguments: &[String]) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_project_args(arguments: &[OsString], ignore_plan: bool) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut configuration = ProjectConfiguration::Debug;
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].as_str() {
-      "-h" | "--help" | "help" => return Err("help must be requested as `dv project --help`".into()),
-      "--configuration" => {
-        index += 1;
-        let value = arguments.get(index).ok_or("--configuration requires Debug or Release")?;
+    match arguments[index].to_str() {
+      Some("--json") => {},
+      Some("--plan") if ignore_plan => {},
+      Some("-h" | "--help" | "help") => return Err("help must be requested as `dv project --help`".into()),
+      Some("--configuration") => {
+        let value = take_semantic_value(arguments, &mut index, ignore_plan, "--configuration requires Debug or Release")?
+          .to_str()
+          .ok_or("--configuration requires valid Unicode text")?;
         configuration = ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?;
       },
-      value if value.starts_with('-') => return Err(format!("unknown project option {value:?}")),
-      value if project.is_none() => project = Some(PathBuf::from(value)),
-      value => return Err(format!("unexpected project argument {value:?}")),
+      Some(value) if value.starts_with('-') => return Err(format!("unknown project option {value:?}")),
+      _ if project.is_none() => project = Some(PathBuf::from(&arguments[index])),
+      _ => return Err(format!("unexpected project argument {:?}", arguments[index].to_string_lossy())),
     }
     index += 1;
   }
@@ -2045,6 +2066,18 @@ fn diagnostic(code: &str, message: impl Into<String>, context: Option<ContextFie
   diagnostic
 }
 
+fn non_unicode_argument_diagnostic(argument: &OsStr, meaning: &str) -> Diagnostic {
+  diagnostic(
+    "DV0002",
+    format!("{meaning} must be valid Unicode text"),
+    Some(ContextField {
+      name: "argument".into(),
+      value: argument.to_string_lossy().into_owned(),
+    }),
+    Some("Use lossless OS paths only in command positions documented as paths."),
+  )
+}
+
 fn fail(started: Instant, json: bool, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
 
@@ -2078,4 +2111,57 @@ fn fail(started: Instant, json: bool, command: &str, args: Vec<String>, diagnost
 
 fn micros(duration: std::time::Duration) -> u64 {
   duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod argument_tests {
+  use super::*;
+
+  #[cfg(windows)]
+  fn non_unicode_path() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    OsString::from_wide(&[b'p' as u16, 0xd800])
+  }
+
+  #[cfg(unix)]
+  fn non_unicode_path() -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(vec![b'p', 0x80])
+  }
+
+  #[test]
+  fn project_path_operands_retain_their_os_encoding() {
+    let path = non_unicode_path();
+    let (parsed, configuration) = parse_project_args(std::slice::from_ref(&path), false).unwrap();
+
+    assert_eq!(parsed, Some(PathBuf::from(path)));
+    assert_eq!(configuration, ProjectConfiguration::Debug);
+  }
+
+  #[test]
+  fn option_path_values_retain_their_os_encoding() {
+    let path = non_unicode_path();
+    let arguments = [OsString::from("--packages"), path.clone(), OsString::from("App.csproj")];
+    let parsed = parse_package_args("restore", &arguments).unwrap();
+
+    assert_eq!(parsed.packages_directory, Some(PathBuf::from(path)));
+  }
+
+  #[test]
+  fn global_json_does_not_become_an_option_value() {
+    let arguments = [OsString::from("--packages"), OsString::from("--json"), OsString::from("packages")];
+    let parsed = parse_package_args("restore", &arguments).unwrap();
+
+    assert_eq!(parsed.packages_directory, Some(PathBuf::from("packages")));
+  }
+
+  #[test]
+  fn build_plan_marker_does_not_become_an_option_value() {
+    let arguments = [OsString::from("--configuration"), OsString::from("--plan"), OsString::from("Release")];
+    let (_, configuration) = parse_project_args(&arguments, true).unwrap();
+
+    assert_eq!(configuration, ProjectConfiguration::Release);
+  }
 }

@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 55 rows are implemented;
-- 28 rows have partial foundations;
-- 385 rows are missing;
+- 56 rows are implemented;
+- 30 rows have partial foundations;
+- 382 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -131,6 +131,9 @@ Dominant cost: ZIP/CMS parsing, certificate-chain work, archive bytes read, and
 cache publication. Network work is outside the verification benchmark.
 
 ### Wave 1: Invocation And Manifest Spine
+
+Status: in progress; `CLI-005` is complete and the native foundations of
+`DROP-002` and `DROP-003` are partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command
 batch and can be reached by canonical and supported drop-in spellings.
