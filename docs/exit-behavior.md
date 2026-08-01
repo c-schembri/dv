@@ -44,6 +44,13 @@ non-Unicode, or repeated selector is rejected at that boundary. A selector may
 precede the command or be interspersed with operands, matching the existing
 global-option policy.
 
+`DROP-003` stores scan-only policy in a five-byte, byte-aligned record: three
+global-option bytes, the mode byte, and one explicitness bitset. All eight
+separated/combined selector forms use one selection function, while the common
+native path remains the zero-valued default. The record is transient and adds
+no allocation or persistent request bytes. Executable-name inference is a
+separate source of mode evidence reserved for `DROP-012`.
+
 Failures are classified internally as usage, unsupported surface, or operation
 failure before an exit profile is applied. `CLI-014` adds a distinct cancelled
 event outcome and `DV0005`, but deliberately retains the current operation
@@ -69,4 +76,9 @@ print the same selected SDK before samples are retained. Thirty Windows
 samples after three warm-ups measured `65.901 ms` median and `67.752 ms` p95
 for `dotnet`, versus `5.225 ms` median and `6.202 ms` p95 for `dv`, a `12.6x`
 median improvement. Raw samples are retained in
-`benchmarks/results/baseline-1785569009.json`.
+`benchmarks/results/baseline-1785569009.json`. The later `DROP-003`
+like-for-like rejection benchmark measured `dotnet build
+--definitely-unknown` at `152.984 ms` median and `193.102 ms` p95, versus `dv
+--compat dotnet build --definitely-unknown` at `5.641 ms` median and `6.630 ms`
+p95, a `27.1x` median improvement. Its raw samples are retained in
+`benchmarks/results/2026-08-01-invocation-mode-windows.json`.

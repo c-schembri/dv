@@ -161,6 +161,45 @@ impl GlobalOptions {
 const _: () = assert!(size_of::<GlobalOptions>() == 3);
 const _: () = assert!(align_of::<GlobalOptions>() == 1);
 
+const MODE_EXPLICIT: u8 = 1 << 0;
+const COLOR_EXPLICIT: u8 = 1 << 1;
+const VERBOSITY_EXPLICIT: u8 = 1 << 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InvocationScan {
+  globals: GlobalOptions,
+  mode: InvocationMode,
+  explicit: u8,
+}
+
+impl InvocationScan {
+  fn is_explicit(self, dimension: u8) -> bool {
+    self.explicit & dimension != 0
+  }
+
+  fn select_mode(&mut self, value: &OsStr) -> Result<(), String> {
+    if self.is_explicit(MODE_EXPLICIT) {
+      return Err("--compat may be specified only once".into());
+    }
+    self.mode = parse_compatibility_mode(value)?;
+    self.explicit |= MODE_EXPLICIT;
+    Ok(())
+  }
+}
+
+impl Default for InvocationScan {
+  fn default() -> Self {
+    Self {
+      globals: GlobalOptions::default(),
+      mode: InvocationMode::Native,
+      explicit: 0,
+    }
+  }
+}
+
+const _: () = assert!(size_of::<InvocationScan>() == 5);
+const _: () = assert!(align_of::<InvocationScan>() == 1);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InvocationOptions {
   mode: InvocationMode,
@@ -352,11 +391,7 @@ impl InvocationBatch {
 
   fn capture_with_environment(arguments: impl IntoIterator<Item = OsString>, environment: InvocationEnvironment) -> Self {
     let raw_arguments = RawArguments::capture(arguments);
-    let mut globals = GlobalOptions::default();
-    let mut mode = InvocationMode::Native;
-    let mut compat_explicit = false;
-    let mut color_explicit = false;
-    let mut verbosity_explicit = false;
+    let mut scan = InvocationScan::default();
     let mut command_index = None;
     let mut semantic_indices = None::<SemanticIndices>;
     let mut forwarded_index = None;
@@ -374,15 +409,7 @@ impl InvocationBatch {
         .get(index)
         .and_then(|argument| argument.to_str())
         .is_some_and(|value| value.starts_with("[env:"));
-      match parse_global_option(
-        &raw_arguments,
-        index,
-        &mut globals,
-        &mut mode,
-        &mut compat_explicit,
-        &mut color_explicit,
-        &mut verbosity_explicit,
-      ) {
+      match parse_global_option(&raw_arguments, index, &mut scan) {
         Ok(Some(width)) => {
           environment_directive_seen |= environment_directive;
           if let Some(command) = command_index
@@ -418,21 +445,21 @@ impl InvocationBatch {
         },
       }
     }
-    if option_error.is_none() && !color_explicit {
+    if option_error.is_none() && !scan.is_explicit(COLOR_EXPLICIT) {
       match environment.color {
         EnvironmentSetting::Missing => {
           if environment.no_color {
-            globals.color = ColorChoice::Never;
+            scan.globals.color = ColorChoice::Never;
           }
         },
-        EnvironmentSetting::Value(color) => globals.color = color,
+        EnvironmentSetting::Value(color) => scan.globals.color = color,
         EnvironmentSetting::Invalid => option_error = Some("DV_COLOR must be auto, always, or never".into()),
       }
     }
-    if option_error.is_none() && !verbosity_explicit {
+    if option_error.is_none() && !scan.is_explicit(VERBOSITY_EXPLICIT) {
       match environment.verbosity {
         EnvironmentSetting::Missing => {},
-        EnvironmentSetting::Value(verbosity) => globals.verbosity = verbosity,
+        EnvironmentSetting::Value(verbosity) => scan.globals.verbosity = verbosity,
         EnvironmentSetting::Invalid => option_error = Some("DV_VERBOSITY must be quiet, minimal, normal, detailed, or diagnostic".into()),
       }
     }
@@ -442,7 +469,7 @@ impl InvocationBatch {
     {
       option_error = Some("environment directives are supported only by run and test".into());
     }
-    if option_error.is_none() && globals.json && color_explicit {
+    if option_error.is_none() && scan.globals.json && scan.is_explicit(COLOR_EXPLICIT) {
       option_error = Some("explicit color options cannot be combined with --json".into());
     }
     let command = if option_error.is_some() {
@@ -460,9 +487,9 @@ impl InvocationBatch {
       request: InvocationRequest {
         syntax_version: COMMAND_SYNTAX_VERSION,
         command,
-        globals,
+        globals: scan.globals,
       },
-      mode,
+      mode: scan.mode,
       option_error,
     }
   }
@@ -623,61 +650,45 @@ impl<'a> Iterator for CommandArgumentIter<'a> {
   }
 }
 
-fn parse_global_option(
-  arguments: &RawArguments,
-  index: usize,
-  globals: &mut GlobalOptions,
-  mode: &mut InvocationMode,
-  compat_explicit: &mut bool,
-  color_explicit: &mut bool,
-  verbosity_explicit: &mut bool,
-) -> Result<Option<usize>, String> {
+fn parse_global_option(arguments: &RawArguments, index: usize, scan: &mut InvocationScan) -> Result<Option<usize>, String> {
   let argument = arguments.get(index).expect("global option index is valid");
   match argument.to_str() {
-    Some("--json") => globals.json = true,
+    Some("--json") => scan.globals.json = true,
     Some("--verbose") => {
-      globals.verbosity = DiagnosticVerbosity::Detailed;
-      *verbosity_explicit = true;
+      scan.globals.verbosity = DiagnosticVerbosity::Detailed;
+      scan.explicit |= VERBOSITY_EXPLICIT;
     },
     Some("--quiet") => {
-      globals.verbosity = DiagnosticVerbosity::Quiet;
-      *verbosity_explicit = true;
+      scan.globals.verbosity = DiagnosticVerbosity::Quiet;
+      scan.explicit |= VERBOSITY_EXPLICIT;
     },
     Some("--color") => {
-      globals.color = ColorChoice::Always;
-      *color_explicit = true;
+      scan.globals.color = ColorChoice::Always;
+      scan.explicit |= COLOR_EXPLICIT;
     },
     Some("--no-color") => {
-      globals.color = ColorChoice::Never;
-      *color_explicit = true;
+      scan.globals.color = ColorChoice::Never;
+      scan.explicit |= COLOR_EXPLICIT;
     },
     Some("--compat") => {
-      if *compat_explicit {
-        return Err("--compat may be specified only once".into());
-      }
       let value = arguments.get(index + 1).ok_or("--compat requires dotnet, msbuild, nuget, or vstest")?;
-      *mode = parse_compatibility_mode(value)?;
-      *compat_explicit = true;
+      scan.select_mode(value)?;
       return Ok(Some(2));
     },
     Some(value) if value.starts_with("--compat=") => {
-      if *compat_explicit {
-        return Err("--compat may be specified only once".into());
-      }
-      *mode = parse_compatibility_mode(OsStr::new(&value["--compat=".len()..]))?;
-      *compat_explicit = true;
+      scan.select_mode(OsStr::new(&value["--compat=".len()..]))?;
     },
     Some("--verbosity") => {
       let value = arguments
         .get(index + 1)
         .ok_or("--verbosity requires quiet, minimal, normal, detailed, or diagnostic")?;
-      globals.verbosity = parse_verbosity(value)?;
-      *verbosity_explicit = true;
+      scan.globals.verbosity = parse_verbosity(value)?;
+      scan.explicit |= VERBOSITY_EXPLICIT;
       return Ok(Some(2));
     },
     Some(value) if value.starts_with("--verbosity=") => {
-      globals.verbosity = parse_verbosity(OsStr::new(&value["--verbosity=".len()..]))?;
-      *verbosity_explicit = true;
+      scan.globals.verbosity = parse_verbosity(OsStr::new(&value["--verbosity=".len()..]))?;
+      scan.explicit |= VERBOSITY_EXPLICIT;
     },
     Some(value) if value.starts_with("[env:") => {
       directive_assignment(value).map_err(|error| error.to_string())?;
@@ -1111,15 +1122,29 @@ mod tests {
       ("nuget", InvocationMode::Nuget),
       ("vstest", InvocationMode::Vstest),
     ] {
-      let batch = InvocationBatch::capture([
-        OsString::from("sdk"),
-        OsString::from("--compat"),
-        OsString::from(name),
-        OsString::from("current"),
-      ]);
+      let combined = OsString::from(format!("--compat={name}"));
+      for arguments in [
+        vec![
+          OsString::from("--compat"),
+          OsString::from(name),
+          OsString::from("sdk"),
+          OsString::from("current"),
+        ],
+        vec![
+          OsString::from("sdk"),
+          OsString::from("--compat"),
+          OsString::from(name),
+          OsString::from("current"),
+        ],
+        vec![OsString::from("sdk"), OsString::from("current"), combined.clone()],
+        vec![OsString::from("--quiet"), combined.clone(), OsString::from("sdk"), OsString::from("current")],
+      ] {
+        let batch = InvocationBatch::capture(arguments);
 
-      assert_eq!(batch.options().mode, expected);
-      assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("current")]);
+        assert_eq!(batch.request().command(), CommandKind::Sdk, "{name}");
+        assert_eq!(batch.options().mode, expected, "{name}");
+        assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("current")], "{name}");
+      }
     }
   }
 
@@ -1145,6 +1170,7 @@ mod tests {
         OsString::from("--compat"),
         OsString::from("msbuild"),
       ],
+      vec![OsString::from("--compat"), non_unicode_argument(), OsString::from("sdk")],
     ] {
       let batch = InvocationBatch::capture(arguments);
       assert_eq!(batch.request().command, CommandKind::InvalidOptions);

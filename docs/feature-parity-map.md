@@ -412,8 +412,15 @@ contracts.
   allocation or I/O. Thirty Windows rejection samples measured `121.211 ms`
   for `dotnet restore` and `5.462 ms` for normalized `dv sync`, a `22.2x`
   median improvement; the SDK control remained `13.3x` faster. `P1`
-- [~] `DROP-003` Classify invocation mode deterministically before project,
-  SDK, filesystem, process, or network work. `P1`
+- [x] `DROP-003` Classify invocation mode deterministically before project,
+  SDK, filesystem, process, or network work. Native mode and all eight explicit
+  `--compat` forms converge during the existing linear OS-argument scan. The
+  transient classifier is 5 bytes at byte alignment: three bytes of output
+  policy, one mode byte, and one explicitness bitset. It performs no second
+  scan, allocation, lookup table, filesystem access, or process launch;
+  malformed, non-Unicode, and repeated selectors reject at the same boundary.
+  Fifty like-for-like Windows rejection samples measured `152.984 ms` for
+  `dotnet` and `5.641 ms` for `dv`, a `27.1x` median improvement. `P1`
 - [ ] `DROP-004` Treat a first token matching a `.csproj`, `.fsproj`, `.vbproj`,
   `.sln`, `.slnx`, `.proj`, `.targets`, or `.props` input plus MSBuild switches
   as direct-MSBuild replacement syntax. `P2`

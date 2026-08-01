@@ -203,7 +203,10 @@ Use `--compat dotnet|msbuild|nuget|vstest` to select a pinned reference exit
 policy before command discovery. Native failures retain exit code 2; current
 reference-profile failures return 1. The selector adds no allocation and is
 removed from the typed command operands during the initial linear argument
-scan. Full drop-in grammar and output-layout work remains in progress.
+scan. The scan-only state is a compile-time-checked five-byte record shared
+with global policy, and malformed or duplicate selectors reject before SDK,
+project, filesystem, process, or network work. Full executable-name inference,
+drop-in grammar, and output-layout work remains in progress.
 
 Reaped child processes retain their exact 32-bit exit code instead of passing
 through those failure mappings. Launch and wait failures are separate typed
@@ -449,6 +452,8 @@ Microsoft publishes no equivalent query. See the
 [compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
 Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
+Explicit invocation-mode classification has a like-for-like pre-I/O baseline
+in the [invocation-mode evidence](docs/performance-baselines/2026-08-01-invocation-mode-windows.md).
 
 Initial machine:
 
@@ -482,6 +487,7 @@ Initial machine:
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
+| Select the `dotnet` invocation mode and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 152.984 ms | 5.641 ms | 27.1x | 193.102 ms | 6.630 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
@@ -758,6 +764,7 @@ cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
+cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3

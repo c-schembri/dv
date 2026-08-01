@@ -224,18 +224,25 @@ fn compatibility_unknown_options_use_reference_failure_exit_without_io() {
   temp.write("global.json", "{ definitely not JSON");
   temp.write("Broken.csproj", "<Project><Broken>");
 
-  let output = dv()
-    .args(["--compat", "dotnet", "build", "--definitely-unknown"])
-    .current_dir(&temp.0)
-    .output()
-    .unwrap();
+  for arguments in [
+    vec!["--compat", "dotnet", "build", "--definitely-unknown"],
+    vec!["build", "--compat=msbuild", "--definitely-unknown"],
+    vec!["--compat=nuget", "build", "--definitely-unknown"],
+    vec!["build", "--definitely-unknown", "--compat", "vstest"],
+  ] {
+    let output = dv().args(&arguments).current_dir(&temp.0).output().unwrap();
 
-  assert_eq!(output.status.code(), Some(1));
-  let stderr = String::from_utf8(output.stderr).unwrap();
-  assert!(stderr.contains("error[DV0002]"));
-  assert!(stderr.contains("unknown build option \"--definitely-unknown\""));
-  assert!(!stderr.contains("error[DV01"));
-  assert!(!stderr.contains("error[DV02"));
+    assert_eq!(output.status.code(), Some(1), "arguments={arguments:?}");
+    assert!(output.stdout.is_empty(), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0002]"), "arguments={arguments:?}: {stderr}");
+    assert!(
+      stderr.contains("unknown build option \"--definitely-unknown\""),
+      "arguments={arguments:?}: {stderr}"
+    );
+    assert!(!stderr.contains("error[DV01"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV02"), "arguments={arguments:?}: {stderr}");
+  }
   assert!(!temp.0.join("obj").exists());
 }
 

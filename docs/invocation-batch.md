@@ -28,8 +28,8 @@ batches preserve behavior through contiguous spill storage.`
    values are parsed and discarded immediately.
 2. `args_os` -> an inline zero/one-token form or one `Box<[OsString]>` for a
    multi-token batch, retaining the exact platform encoding.
-3. One linear, predictable scan -> typed global output policy and first
-   semantic token.
+3. One linear, predictable scan -> typed global output policy, invocation
+   mode, and first semantic token.
 4. First semantic token -> one of 14 exact semantic command kinds before SDK,
    current-directory, project, filesystem, process, or network access. The raw
    command index and compatibility provenance stay outside the hot request.
@@ -130,6 +130,16 @@ semantic request; mode plus output policy forms one four-byte options record.
 Exit mappings and their pinned oracle evidence are documented in
 [exit-behavior.md](exit-behavior.md).
 
+`DROP-003` makes this classification an explicit invariant of the first scan.
+Native mode and the four profiles in separated or combined form share one
+five-byte transient record: the three-byte global policy, one mode byte, and
+one bitset byte recording explicit mode/color/verbosity dimensions. Its size
+and byte alignment are compile-time checked. This replaces three independent
+boolean locals without adding persistent state, allocation, a second scan, or
+external work. The common native branch is predictable; selector parsing is a
+rare exact-match branch over one borrowed token. Duplicate, missing,
+unsupported, and non-Unicode values reject rather than selecting a fallback.
+
 ## Layout And Access
 
 `InvocationRequest` is 6 bytes and aligned to 2 on every supported target: a
@@ -207,9 +217,8 @@ environment, cancellation, and child-exit contracts.
 - Paths remain lossless OS strings until consumed by filesystem APIs.
 - The command syntax version is `1` and is independent of the JSON event schema.
 - Every currently accepted alias normalizes to one semantic command kind.
-  Automatic grammar inference and precedence remain partial under `DROP-003`;
-  future compatibility aliases remain explicitly unsupported in their owning
-  `DROP-*` rows.
+  Executable-token inference remains explicitly open under `DROP-012`; future
+  compatibility aliases remain unsupported in their owning `DROP-*` rows.
 - Automatic drop-in forwarding aliases remain open under `DROP-013`; no
   unsupported syntax is silently accepted by this contract.
 
@@ -349,3 +358,12 @@ leaving `dv` `13.1x` faster at the median. Raw samples are retained as
 so `dv` is `22.2x` faster at this like-for-like pre-I/O boundary. The SDK
 control remained `13.3x` faster. Full evidence is retained in the
 [command-normalization baseline](performance-baselines/2026-08-01-cli-command-normalization-windows.md).
+
+`DROP-003` compares `dotnet build --definitely-unknown` with `dv --compat
+dotnet build --definitely-unknown`. Both reject the same invalid option and a
+before/after fixture snapshot proves neither reaches project or SDK discovery.
+Fifty retained samples after ten warm-ups measured `152.984 ms` versus
+`5.641 ms` median and `193.102 ms` versus `6.630 ms` p95, so `dv` is `27.1x`
+faster at this like-for-like boundary. The selected-SDK control remained
+`12.0x` faster. Full evidence is retained in the
+[invocation-mode baseline](performance-baselines/2026-08-01-invocation-mode-windows.md).
