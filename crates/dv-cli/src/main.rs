@@ -24,9 +24,9 @@ use dv_core::{
   PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
   PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
   ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind,
-  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure,
-  evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references,
-  plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
+  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity, discover_sdks, evaluate_project,
+  evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
+  plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -68,12 +68,61 @@ Environment:
   [env:NAME=VALUE]        Add a child process environment overlay
   -e, --environment NAME=VALUE
                           Add a highest-precedence run/test environment value
+
+Information:
+  dv --version            Print the dv tool version
+  dv sdk current          Print the selected .NET SDK version
+  dv sdk list             List installed .NET SDKs
+  dv compat manifest      Print the captured compatibility surface
+";
+
+const DOTNET_HELP: &str = "\
+Selected compatibility profile: dotnet
+Accepted compatibility syntax:
+  dv --compat dotnet --help
+  dv --compat dotnet <command> [options]
+  dv --compat dotnet --version
+  dv --compat dotnet --info
+Canonical dv syntax:
+  dv --help
+  dv <command> [options]
+  dv sdk current
+  dv sdk info
+";
+
+const MSBUILD_HELP: &str = "\
+Selected compatibility profile: msbuild
+Accepted compatibility syntax:
+  dv --compat msbuild /?
+  dv --compat msbuild [MSBUILD-ARGUMENTS]
+Canonical dv syntax:
+  dv build --plan [PROJECT]
+";
+
+const NUGET_HELP: &str = "\
+Selected compatibility profile: nuget
+Accepted compatibility syntax:
+  dv --compat nuget --help
+  dv --compat nuget <command> [options]
+Canonical dv syntax:
+  dv restore [PROJECT]
+  dv pack [PROJECT]
+";
+
+const VSTEST_HELP: &str = "\
+Selected compatibility profile: vstest
+Accepted compatibility syntax:
+  dv --compat vstest /?
+  dv --compat vstest [TEST-CONTAINER] [options]
+Canonical dv syntax:
+  dv test [PROJECT] [options]
 ";
 
 const SDK_HELP: &str = "\
 Usage:
   dv sdk current    Print the selected .NET SDK version
   dv sdk list       List discovered .NET SDKs
+  dv sdk info       Print the selected SDK and installed SDK inventory
   dv sdk compatible-rids RID
                     Print RID fallbacks from the selected SDK graph
 ";
@@ -95,12 +144,15 @@ Usage:
 
 const BUILD_HELP: &str = "\
 Usage:
+  dv --compat dotnet build [PROJECT|SOLUTION] [options]
   dv build --plan [PROJECT|SOLUTION] [--project PATH]
                   [--configuration Debug|Release]
 ";
 
 const PACKAGE_HELP: &str = "\
 Usage:
+  dv --compat dotnet restore [PROJECT|SOLUTION] [options]
+  dv --compat nuget restore [PROJECT|SOLUTION] [options]
   dv restore [PROJECT|SOLUTION]... [--project PATH]
              [-s|--source SOURCE]... [--packages PATH]
              [--configfile PATH] [--offline] [--interactive]
@@ -109,6 +161,19 @@ Usage:
           [-s|--source SOURCE]... [--packages PATH]
           [--configfile PATH] [--offline] [--interactive]
           [--configuration Debug|Release]
+";
+
+const RUN_HELP: &str = "\
+Usage:
+  dv --compat dotnet run [PROJECT] [options] [-- APPLICATION-ARGUMENTS]
+  dv run [PROJECT] [options] [-- APPLICATION-ARGUMENTS]
+";
+
+const TEST_HELP: &str = "\
+Usage:
+  dv --compat dotnet test [PROJECT] [options] [-- TEST-ARGUMENTS]
+  dv --compat vstest [TEST-CONTAINER] [options]
+  dv test [PROJECT] [options] [-- TEST-ARGUMENTS]
 ";
 
 const COMPAT_HELP: &str = "\
@@ -162,7 +227,7 @@ fn run() -> ExitCode {
   let globals = invocation.options();
   let json = globals.json();
   let command_args = invocation.command_arguments();
-  let cancellation = if command_requires_cancellation(request.command(), command_args) {
+  let cancellation = if command_requires_cancellation(globals, request.command(), command_args) {
     match cancellation::install() {
       Ok(cancellation) => Some(cancellation),
       Err(problem) => {
@@ -183,6 +248,17 @@ fn run() -> ExitCode {
   }
   match request.command() {
     CommandKind::Help => {
+      if command_args.is_empty() {
+        write_root_help(globals);
+        return ExitCode::SUCCESS;
+      }
+      if invocation.command_text() == Some("help")
+        && command_args.len() == 1
+        && let Some(help) = command_args.first().and_then(OsStr::to_str).and_then(help_topic)
+      {
+        print!("{help}");
+        return ExitCode::SUCCESS;
+      }
       if let Some(problem) = unexpected_leaf_argument(globals, "help", command_args) {
         return reject(
           started,
@@ -192,8 +268,7 @@ fn run() -> ExitCode {
           diagnostic("DV0002", problem, None, Some("Use `dv --help` without command operands.")),
         );
       }
-      print!("{HELP}");
-      ExitCode::SUCCESS
+      unreachable!("a non-empty help argument batch is rejected")
     },
     CommandKind::Version => {
       if let Some(problem) = unexpected_leaf_argument(globals, "version", command_args) {
@@ -221,6 +296,40 @@ fn run() -> ExitCode {
         ExitCode::SUCCESS
       }
     },
+    CommandKind::SdkVersion => {
+      if let Some(problem) = unexpected_leaf_argument(globals, "--version", command_args) {
+        return reject(
+          started,
+          globals,
+          "sdk current",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv --compat dotnet --version` without command operands.")),
+        );
+      }
+      sdk_current(
+        started,
+        globals,
+        invocation.event_arguments(json),
+        cancellation.as_ref().expect("SDK version installs cancellation"),
+      )
+    },
+    CommandKind::SdkInfo => {
+      if let Some(problem) = unexpected_leaf_argument(globals, "--info", command_args) {
+        return reject(
+          started,
+          globals,
+          "sdk info",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv --compat dotnet --info` without command operands.")),
+        );
+      }
+      sdk_info(
+        started,
+        globals,
+        invocation.event_arguments(json),
+        cancellation.as_ref().expect("SDK info installs cancellation"),
+      )
+    },
     CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
@@ -231,6 +340,10 @@ fn run() -> ExitCode {
     CommandKind::Compat => run_compat(started, globals, invocation.event_arguments(json), command_args),
     CommandKind::Run | CommandKind::Test => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
+      if command_help_only(globals, request.command(), command_args) {
+        print!("{}", if request.command() == CommandKind::Run { RUN_HELP } else { TEST_HELP });
+        return ExitCode::SUCCESS;
+      }
       unsupported_child_command(
         started,
         globals,
@@ -257,6 +370,13 @@ fn run() -> ExitCode {
     | CommandKind::MsbuildInput
     | CommandKind::VstestInput => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
+      if command_args.len() == 1
+        && command_args.first().is_some_and(|argument| globals.argument_is_help(argument))
+        && let Some(help) = unsupported_command_help(request.command())
+      {
+        print!("{help}");
+        return ExitCode::SUCCESS;
+      }
       if let Some(problem) = first_unsupported_option(globals, command, command_args) {
         return reject(
           started,
@@ -333,9 +453,19 @@ fn run() -> ExitCode {
   }
 }
 
-fn command_requires_cancellation(command: CommandKind, command_args: CommandArguments<'_>) -> bool {
-  let work_command = matches!(command, CommandKind::Sdk | CommandKind::Project | CommandKind::Build | CommandKind::Restore);
-  (work_command && !command_help_only(command, command_args)) || matches!(command, CommandKind::Run | CommandKind::Test)
+fn command_requires_cancellation(globals: InvocationOptions, command: CommandKind, command_args: CommandArguments<'_>) -> bool {
+  let work_command = matches!(
+    command,
+    CommandKind::Sdk
+      | CommandKind::SdkVersion
+      | CommandKind::SdkInfo
+      | CommandKind::Project
+      | CommandKind::Build
+      | CommandKind::Restore
+      | CommandKind::Run
+      | CommandKind::Test
+  );
+  work_command && !command_help_only(globals, command, command_args)
 }
 
 fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
@@ -382,12 +512,12 @@ fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, c
   }
 }
 
-fn command_help_only(command: CommandKind, command_args: CommandArguments<'_>) -> bool {
+fn command_help_only(globals: InvocationOptions, command: CommandKind, command_args: CommandArguments<'_>) -> bool {
   if command_args.is_empty() {
     return matches!(command, CommandKind::Sdk | CommandKind::Project);
   }
   let mut arguments = command_args.iter();
-  if matches!(arguments.next().and_then(OsStr::to_str), Some("help" | "--help" | "-h")) {
+  if arguments.next().is_some_and(|argument| globals.argument_is_help(argument)) {
     return arguments.next().is_none();
   }
   matches!(command, CommandKind::Project)
@@ -395,8 +525,45 @@ fn command_help_only(command: CommandKind, command_args: CommandArguments<'_>) -
       command_args.first().and_then(OsStr::to_str),
       Some("inspect" | "frameworks" | "runtime-packs" | "package-sources")
     )
-    && matches!(command_args.get(1).and_then(OsStr::to_str), Some("help" | "--help" | "-h"))
+    && command_args.get(1).is_some_and(|argument| globals.argument_is_help(argument))
     && command_args.len() == 2
+}
+
+fn write_root_help(globals: InvocationOptions) {
+  print!("{HELP}");
+  let compatibility = match globals.compatibility_profile() {
+    Some("dotnet") => DOTNET_HELP,
+    Some("msbuild") => MSBUILD_HELP,
+    Some("nuget") => NUGET_HELP,
+    Some("vstest") => VSTEST_HELP,
+    Some(_) => unreachable!("compatibility profiles are closed"),
+    None => "",
+  };
+  if !compatibility.is_empty() {
+    print!("\n{compatibility}");
+  }
+}
+
+fn help_topic(topic: &str) -> Option<&'static str> {
+  match topic {
+    "build" => Some(BUILD_HELP),
+    "restore" | "sync" => Some(PACKAGE_HELP),
+    "run" => Some(RUN_HELP),
+    "test" => Some(TEST_HELP),
+    "sdk" => Some(SDK_HELP),
+    "project" => Some(PROJECT_HELP),
+    "compat" => Some(COMPAT_HELP),
+    _ => None,
+  }
+}
+
+fn unsupported_command_help(command: CommandKind) -> Option<&'static str> {
+  match command {
+    CommandKind::NugetRestore => Some(PACKAGE_HELP),
+    CommandKind::MsbuildInput => Some(MSBUILD_HELP),
+    CommandKind::VstestInput => Some(TEST_HELP),
+    _ => None,
+  }
 }
 
 fn unsupported_child_command(
@@ -501,7 +668,7 @@ fn run_package_command(
 ) -> ExitCode {
   let json = globals.json();
   let mut semantic = command_args.iter();
-  if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
+  if semantic.next().is_some_and(|argument| globals.argument_is_help(argument)) && semantic.next().is_none() {
     print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
   }
@@ -868,7 +1035,7 @@ fn run_build(
 ) -> ExitCode {
   let json = globals.json();
   let mut semantic = build_args.iter();
-  if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
+  if semantic.next().is_some_and(|argument| globals.argument_is_help(argument)) && semantic.next().is_none() {
     print!("{BUILD_HELP}");
     return ExitCode::SUCCESS;
   }
@@ -1188,6 +1355,7 @@ fn run_sdk(
     },
     SdkRequest::Current => sdk_current(started, globals, args, cancellation.expect("SDK current installs cancellation")),
     SdkRequest::List => sdk_list(started, globals, args, cancellation.expect("SDK list installs cancellation")),
+    SdkRequest::Info => sdk_info(started, globals, args, cancellation.expect("SDK info installs cancellation")),
     SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(
       started,
       globals,
@@ -1205,6 +1373,7 @@ enum SdkRequest<'a> {
   Help,
   Current,
   List,
+  Info,
   CompatibleRids(&'a str),
 }
 
@@ -1215,7 +1384,7 @@ fn parse_sdk_request(globals: InvocationOptions, arguments: CommandArguments<'_>
   let command = command_argument
     .to_str()
     .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(command_argument, "SDK command")))?;
-  if matches!(command, "help" | "--help" | "-h") {
+  if globals.argument_is_help(command_argument) {
     return match unexpected_leaf_argument(globals, "sdk help", arguments.slice_from(1)) {
       None => Ok(SdkRequest::Help),
       Some(problem) => Err(Box::new(diagnostic(
@@ -1231,8 +1400,13 @@ fn parse_sdk_request(globals: InvocationOptions, arguments: CommandArguments<'_>
   }
 
   match command {
-    "current" | "list" => {
-      let request = if command == "current" { SdkRequest::Current } else { SdkRequest::List };
+    "current" | "list" | "info" => {
+      let request = match command {
+        "current" => SdkRequest::Current,
+        "list" => SdkRequest::List,
+        "info" => SdkRequest::Info,
+        _ => unreachable!("the SDK command set is closed"),
+      };
       let mut unexpected = None;
       for argument in arguments.slice_from(1).iter() {
         if globals.argument_is_option(argument) {
@@ -1336,6 +1510,53 @@ fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>, 
   succeed(started, "sdk current", args, payload)
 }
 
+fn sdk_info(started: Instant, globals: InvocationOptions, args: Vec<String>, cancellation: &CancellationToken) -> ExitCode {
+  let json = globals.json();
+  let inventory = match load_sdk_inventory(started, globals, &args) {
+    Ok(inventory) => inventory,
+    Err(exit_code) => return exit_code,
+  };
+  if cancellation.is_cancelled() {
+    return cancelled(started, globals, "sdk info", args);
+  }
+
+  if !json {
+    let selected = inventory.selected();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, ".NET SDK:").expect("writing SDK info to stdout succeeds");
+    writeln!(output, " Version:   {}", selected.version).expect("writing SDK info to stdout succeeds");
+    writeln!(output, " Base Path: {}", inventory.installation_path(selected).display()).expect("writing SDK info to stdout succeeds");
+    writeln!(output, " SDK Root:  {}", inventory.root(selected).display()).expect("writing SDK info to stdout succeeds");
+    match inventory.global_json.as_deref() {
+      Some(path) => writeln!(output, " global.json: {}", path.display()).expect("writing SDK info to stdout succeeds"),
+      None => writeln!(output, " global.json: not found").expect("writing SDK info to stdout succeeds"),
+    }
+    writeln!(output, "\nInstalled SDKs:").expect("writing SDK info to stdout succeeds");
+    for (index, installation) in inventory.installations.iter().enumerate() {
+      let marker = if index == inventory.selected_index { '*' } else { ' ' };
+      writeln!(
+        output,
+        "{marker} {} [{}]",
+        installation.version,
+        inventory.installation_path(installation).display()
+      )
+      .expect("writing SDK info to stdout succeeds");
+    }
+    writeln!(
+      output,
+      "\nAccepted compatibility syntax:\n  dv --compat dotnet --info\nCanonical dv syntax:\n  dv sdk info"
+    )
+    .expect("writing SDK info to stdout succeeds");
+    return ExitCode::SUCCESS;
+  }
+
+  match sdk_inventory_payload(&inventory) {
+    Ok(payload) => succeed(started, "sdk info", args, payload),
+    Err(diagnostic) => fail(started, globals, "sdk info", args, *diagnostic),
+  }
+}
+
 fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, cancellation: &CancellationToken) -> ExitCode {
   let json = globals.json();
   let inventory = match load_sdk_inventory(started, globals, &args) {
@@ -1354,6 +1575,14 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, can
     return ExitCode::SUCCESS;
   }
 
+  let payload = match sdk_inventory_payload(&inventory) {
+    Ok(payload) => payload,
+    Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
+  };
+  succeed(started, "sdk list", args, payload)
+}
+
+fn sdk_inventory_payload(inventory: &SdkInventory) -> Result<EventPayload, Box<Diagnostic>> {
   let installations: Result<Vec<SdkInstallationEvent>, Box<Diagnostic>> = inventory
     .installations
     .iter()
@@ -1367,15 +1596,10 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, can
       })
     })
     .collect();
-  let installations = match installations {
-    Ok(installations) => installations,
-    Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
-  };
-  let global_json = match optional_path_text(inventory.global_json.as_deref(), "global.json") {
-    Ok(path) => path,
-    Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
-  };
-  succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
+  Ok(EventPayload::SdkInventory {
+    installations: installations?,
+    global_json: optional_path_text(inventory.global_json.as_deref(), "global.json")?,
+  })
 }
 
 fn sdk_compatible_rids(
@@ -1464,7 +1688,7 @@ fn run_project(
       );
     },
   };
-  if globals.argument_is_option(subcommand_argument) && !matches!(subcommand, "--help" | "-h") {
+  if globals.argument_is_option(subcommand_argument) && !globals.argument_is_help(subcommand_argument) {
     let subcommand = redact_argument_text(subcommand_argument);
     return reject(
       started,
@@ -1480,7 +1704,7 @@ fn run_project(
     );
   }
   let operands = project_args.slice_from(1);
-  if matches!(subcommand, "help" | "--help" | "-h") {
+  if globals.argument_is_help(subcommand_argument) {
     if let Some(problem) = unexpected_leaf_argument(globals, "project help", operands) {
       return reject(
         started,
@@ -1495,7 +1719,7 @@ fn run_project(
   }
   let mut semantic_operands = operands.iter();
   if matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
-    && matches!(semantic_operands.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h"))
+    && semantic_operands.next().is_some_and(|argument| globals.argument_is_help(argument))
     && semantic_operands.next().is_none()
   {
     print!("{PROJECT_HELP}");
@@ -3027,11 +3251,13 @@ mod argument_tests {
   fn only_work_bearing_commands_install_cancellation() {
     fn requires(arguments: &[&str]) -> bool {
       let batch = InvocationBatch::capture(arguments.iter().map(OsString::from));
-      command_requires_cancellation(batch.request().command(), batch.command_arguments())
+      command_requires_cancellation(batch.options(), batch.request().command(), batch.command_arguments())
     }
 
     for arguments in [
       &["sdk", "current"][..],
+      &["--compat", "dotnet", "--version"],
+      &["--compat", "dotnet", "--info"],
       &["project", "inspect", "App.csproj"],
       &["build", "--plan", "App.csproj"],
       &["restore", "App.csproj"],
@@ -3048,6 +3274,9 @@ mod argument_tests {
       &["sdk", "--help"],
       &["project"],
       &["project", "inspect", "--help"],
+      &["--compat", "dotnet", "build", "-?"],
+      &["--compat", "dotnet", "run", "-h"],
+      &["--compat", "dotnet", "test", "-?"],
       &["unknown"],
       &["publish"],
     ] {

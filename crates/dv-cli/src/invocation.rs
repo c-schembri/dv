@@ -21,7 +21,7 @@ impl CommandSyntaxVersion {
 const _: () = assert!(size_of::<CommandSyntaxVersion>() == 2);
 const _: () = assert!(align_of::<CommandSyntaxVersion>() == 2);
 
-pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(1);
+pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -102,6 +102,8 @@ const _: () = assert!(size_of::<[[u8; EXIT_CLASS_COUNT]; INVOCATION_MODE_COUNT]>
 pub(crate) enum CommandKind {
   Help,
   Version,
+  SdkVersion,
+  SdkInfo,
   Sdk,
   Project,
   Build,
@@ -297,6 +299,10 @@ impl InvocationOptions {
 
   pub(crate) fn argument_is_option(self, argument: &OsStr) -> bool {
     self.mode.argument_is_option(argument)
+  }
+
+  pub(crate) fn argument_is_help(self, argument: &OsStr) -> bool {
+    argument.to_str().is_some_and(|argument| command_help_token(self.mode, argument))
   }
 
   pub(crate) const fn exit_code(self, class: ExitClass) -> Option<u8> {
@@ -881,15 +887,52 @@ fn classify_command(mode: InvocationMode, command: &OsStr) -> CommandKind {
   let Some(command) = command.to_str() else {
     return CommandKind::InvalidText;
   };
+  if root_help_token(mode, command) {
+    return CommandKind::Help;
+  }
   if let Some(row) = ambiguous_command_row(command).or_else(|| nuget_ambiguous_command_row(mode, command)) {
     return AMBIGUOUS_COMMAND_PRECEDENCE[row][mode as usize];
   }
   match mode {
-    InvocationMode::Native | InvocationMode::Dotnet => classify_dotnet_command(command),
+    InvocationMode::Native => classify_native_command(command),
+    InvocationMode::Dotnet => classify_dotnet_compatibility_command(command),
     InvocationMode::Nuget => CommandKind::Unknown,
     InvocationMode::Msbuild => CommandKind::MsbuildInput,
     InvocationMode::Vstest => CommandKind::VstestInput,
   }
+}
+
+fn root_help_token(mode: InvocationMode, argument: &str) -> bool {
+  if command_help_token(mode, argument) {
+    return true;
+  }
+  matches!(mode, InvocationMode::Native | InvocationMode::Dotnet) && argument == "help"
+}
+
+fn command_help_token(mode: InvocationMode, argument: &str) -> bool {
+  let dash = match mode {
+    InvocationMode::Native => matches!(argument, "help" | "-h" | "--help"),
+    InvocationMode::Dotnet => matches!(argument, "-h" | "-?" | "--help"),
+    InvocationMode::Msbuild => matches!(argument, "-?" | "-h") || argument.eq_ignore_ascii_case("-help") || argument.eq_ignore_ascii_case("--help"),
+    InvocationMode::Nuget => matches!(argument, "-?" | "-h" | "--help"),
+    InvocationMode::Vstest => matches!(argument, "-?" | "-h") || argument.eq_ignore_ascii_case("--help"),
+  };
+  dash || windows_slash_help_token(mode, argument)
+}
+
+#[cfg(windows)]
+fn windows_slash_help_token(mode: InvocationMode, argument: &str) -> bool {
+  match mode {
+    InvocationMode::Dotnet => argument == "/?",
+    InvocationMode::Msbuild | InvocationMode::Vstest => matches!(argument, "/?" | "/h") || argument.eq_ignore_ascii_case("/help"),
+    InvocationMode::Nuget => argument == "/?",
+    InvocationMode::Native => false,
+  }
+}
+
+#[cfg(not(windows))]
+const fn windows_slash_help_token(_mode: InvocationMode, _argument: &str) -> bool {
+  false
 }
 
 fn nuget_ambiguous_command_row(mode: InvocationMode, command: &str) -> Option<usize> {
@@ -928,7 +971,7 @@ fn ambiguous_command_row(command: &str) -> Option<usize> {
   }
 }
 
-fn classify_dotnet_command(command: &str) -> CommandKind {
+fn classify_native_command(command: &str) -> CommandKind {
   match command {
     "-h" | "--help" | "help" => CommandKind::Help,
     "-V" | "--version" | "version" => CommandKind::Version,
@@ -942,6 +985,15 @@ fn classify_dotnet_command(command: &str) -> CommandKind {
     "test" => CommandKind::Test,
     "publish" => CommandKind::Publish,
     _ => CommandKind::Unknown,
+  }
+}
+
+fn classify_dotnet_compatibility_command(command: &str) -> CommandKind {
+  match command {
+    "--version" => CommandKind::SdkVersion,
+    "--info" => CommandKind::SdkInfo,
+    "-V" | "version" => CommandKind::Unknown,
+    _ => classify_native_command(command),
   }
 }
 
@@ -1444,6 +1496,62 @@ mod tests {
     assert_eq!(dotnet.request().command(), CommandKind::Unknown);
     assert_eq!(native.request().command(), CommandKind::Unknown);
     assert_eq!(nuget.request().command(), CommandKind::NugetRestore);
+  }
+
+  #[test]
+  fn root_help_forms_follow_the_selected_reference_tool() {
+    for (profile, accepted) in [
+      ("dotnet", &["-h", "-?", "--help", "help"][..]),
+      ("msbuild", &["-h", "-?", "-help", "-Help", "--help", "--Help"][..]),
+      ("nuget", &["-h", "-?", "--help"][..]),
+      ("vstest", &["-h", "-?", "--help", "--Help"][..]),
+    ] {
+      for help in accepted {
+        let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(help)]);
+        assert_eq!(batch.request().command(), CommandKind::Help, "profile {profile}, help {help}");
+      }
+    }
+
+    for (profile, rejected) in [("dotnet", "--Help"), ("msbuild", "help"), ("nuget", "help"), ("vstest", "help")] {
+      let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(rejected)]);
+      assert_ne!(batch.request().command(), CommandKind::Help, "profile {profile}, help {rejected}");
+    }
+  }
+
+  #[test]
+  fn dotnet_version_and_info_select_sdk_queries_without_changing_native_version() {
+    let native = InvocationBatch::capture([OsString::from("--version")]);
+    let sdk_version = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--version")]);
+    let sdk_info = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--info")]);
+
+    assert_eq!(native.request().command(), CommandKind::Version);
+    assert_eq!(InvocationBatch::capture([OsString::from("info")]).request().command(), CommandKind::Unknown);
+    assert_eq!(sdk_version.request().command(), CommandKind::SdkVersion);
+    assert_eq!(sdk_info.request().command(), CommandKind::SdkInfo);
+    let short = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("-V")]);
+    let word = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("version")]);
+    assert_eq!(short.request().command(), CommandKind::InvalidOptions);
+    assert_eq!(word.request().command(), CommandKind::Unknown);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn windows_slash_help_forms_follow_the_selected_reference_tool() {
+    for profile in ["dotnet", "msbuild", "nuget", "vstest"] {
+      let question = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from("/?")]);
+      assert_eq!(question.request().command(), CommandKind::Help, "profile {profile}");
+    }
+    for profile in ["msbuild", "vstest"] {
+      for help in ["/help", "/Help"] {
+        let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(help)]);
+        assert_eq!(batch.request().command(), CommandKind::Help, "profile {profile}, help {help}");
+      }
+    }
+
+    for (profile, rejected) in [("dotnet", "/help"), ("nuget", "/help")] {
+      let batch = InvocationBatch::capture([OsString::from(format!("--compat={profile}")), OsString::from(rejected)]);
+      assert_ne!(batch.request().command(), CommandKind::Help, "profile {profile}, help {rejected}");
+    }
   }
 
   #[cfg(windows)]

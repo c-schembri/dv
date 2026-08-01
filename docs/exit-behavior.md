@@ -108,13 +108,12 @@ selection.
 Integration tests cover every explicit profile, native and compatibility
 failure codes, typed build/restore failures, early invalid-selector rejection,
 and selector removal from a successful SDK command. The like-for-like benchmark
-compares `dotnet --version` with `dv --compat dotnet sdk current`; preflight
+compares `dotnet --version` with `dv --compat dotnet --version`; preflight
 requires both to print the same selected SDK before samples are retained.
-Thirty Windows samples after three warm-ups measured `65.901 ms` median and
-`67.752 ms` p95
-for `dotnet`, versus `5.225 ms` median and `6.202 ms` p95 for `dv`, a `12.6x`
-median improvement. Raw samples are retained in
-`benchmarks/results/baseline-1785569009.json`. The later `DROP-003`
+Fifty Windows samples after ten warm-ups measured `63.402 ms` median and
+`65.472 ms` p95 for `dotnet`, versus `5.088 ms` median and `5.718 ms` p95 for
+`dv`, a `12.5x` median improvement. Raw samples are retained in
+`benchmarks/results/2026-08-02-sdk-current-compat-v2-windows.json`. The later `DROP-003`
 like-for-like rejection benchmark measured `dotnet build
 --definitely-unknown` at `152.984 ms` median and `193.102 ms` p95, versus `dv
 --compat dotnet build --definitely-unknown` at `5.641 ms` median and `6.630 ms`

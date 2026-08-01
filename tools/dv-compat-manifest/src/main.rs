@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-const COMMAND_SYNTAX_VERSION: u16 = 1;
+const COMMAND_SYNTAX_VERSION: u16 = 2;
 const MAX_COMMANDS: usize = 512;
 const MAX_COMMAND_DEPTH: usize = 4;
 const MAX_STREAM_BYTES: usize = 1024 * 1024;

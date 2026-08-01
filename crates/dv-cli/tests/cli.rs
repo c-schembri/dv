@@ -121,6 +121,72 @@ fn help_exposes_the_initial_command_surface() {
 }
 
 #[test]
+fn compatibility_help_forms_expose_profile_and_canonical_syntax_before_io() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ malformed");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  let cases: &[(&str, &[&str], &str, &str)] = &[
+    ("dotnet", &["--compat", "dotnet", "-?"], "dv --compat dotnet <command>", "dv <command>"),
+    (
+      "msbuild",
+      &["--compat", "msbuild", "--Help"],
+      "dv --compat msbuild [MSBUILD-ARGUMENTS]",
+      "dv build --plan",
+    ),
+    ("nuget", &["--compat", "nuget", "-h"], "dv --compat nuget <command>", "dv restore"),
+    ("vstest", &["--compat", "vstest", "--Help"], "dv --compat vstest [TEST-CONTAINER]", "dv test"),
+  ];
+  for (profile, arguments, compatibility, canonical) in cases {
+    let output = dv().args(*arguments).current_dir(&temp.0).output().unwrap();
+    assert!(output.status.success(), "profile {profile}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty(), "profile {profile}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+      stdout.contains(&format!("Selected compatibility profile: {profile}")),
+      "profile {profile}: {stdout}"
+    );
+    assert!(stdout.contains(compatibility), "profile {profile}: {stdout}");
+    assert!(stdout.contains(canonical), "profile {profile}: {stdout}");
+  }
+
+  #[cfg(windows)]
+  for (profile, help) in [("dotnet", "/?"), ("msbuild", "/Help"), ("vstest", "/?")] {
+    let output = dv().args(["--compat", profile, help]).current_dir(&temp.0).output().unwrap();
+    assert!(output.status.success(), "profile {profile}: {}", String::from_utf8_lossy(&output.stderr));
+  }
+
+  assert!(!temp.0.join("obj").exists());
+  assert!(!temp.0.join("dv.lock.json").exists());
+}
+
+#[test]
+fn phase_one_command_help_forms_skip_work_and_show_both_spellings() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ malformed");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  for arguments in [
+    &["--compat", "dotnet", "build", "-?"][..],
+    &["--compat", "dotnet", "restore", "--help"],
+    &["--compat", "dotnet", "run", "-h"],
+    &["--compat", "dotnet", "test", "-?"],
+    &["--compat", "nuget", "restore", "-h"],
+    &["--compat", "dotnet", "help", "build"],
+  ] {
+    let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
+    assert!(output.status.success(), "arguments={arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty(), "arguments={arguments:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("dv --compat"), "arguments={arguments:?}: {stdout}");
+    assert!(stdout.contains("dv "), "arguments={arguments:?}: {stdout}");
+  }
+
+  assert!(!temp.0.join("obj").exists());
+  assert!(!temp.0.join("dv.lock.json").exists());
+}
+
+#[test]
 fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery() {
   let expected = include_bytes!("../../../compatibility/manifest.json");
   let plain = dv().args(["compat", "manifest"]).output().unwrap();
@@ -136,7 +202,7 @@ fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery
   let manifest: serde_json::Value = serde_json::from_slice(expected).unwrap();
   assert_eq!(manifest["schema_version"], 1);
   assert_eq!(manifest["manifest_version"], 1);
-  assert_eq!(manifest["command_syntax_version"], 1);
+  assert_eq!(manifest["command_syntax_version"], 2);
   assert_eq!(manifest["event_schema_version"], 19);
   assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
   assert!(manifest["commands"].as_array().unwrap().len() >= 100);
@@ -670,19 +736,14 @@ fn json_failure_is_a_versioned_event_batch() {
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
   assert!(lines[0].contains("\"schema_version\":19"));
-  assert!(lines[0].contains("\"command_syntax_version\":1"));
+  assert!(lines[0].contains("\"command_syntax_version\":2"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
 
 #[test]
 fn version_aliases_share_one_independently_versioned_json_contract() {
-  for arguments in [
-    &["--json", "version"][..],
-    &["--json", "--version"],
-    &["-V", "--json"],
-    &["--compat", "dotnet", "--json", "version"],
-  ] {
+  for arguments in [&["--json", "version"][..], &["--json", "--version"], &["-V", "--json"]] {
     let output = dv().args(arguments).output().unwrap();
     assert!(output.status.success(), "arguments={arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
     assert!(output.stderr.is_empty(), "arguments={arguments:?}");
@@ -702,10 +763,10 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
     );
     assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
     assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
-    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(1));
+    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(2));
     assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
     assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
-    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(1));
+    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(2));
     assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(19));
     assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
   }
@@ -781,6 +842,42 @@ fn sdk_current_discovers_without_executing_dotnet() {
   assert!(output.status.success());
   assert_eq!(String::from_utf8(output.stdout).unwrap(), "9.0.308\n");
   assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn dotnet_sdk_queries_share_the_canonical_selected_sdk_result() {
+  let compatibility_version = dv().args(["--compat", "dotnet", "--version"]).output().unwrap();
+  let canonical_version = dv().args(["sdk", "current"]).output().unwrap();
+  assert!(compatibility_version.status.success());
+  assert_eq!(compatibility_version.stdout, canonical_version.stdout);
+  assert!(compatibility_version.stderr.is_empty());
+
+  let compatibility_info = dv().args(["--compat", "dotnet", "--info"]).output().unwrap();
+  let canonical_info = dv().args(["sdk", "info"]).output().unwrap();
+  assert!(compatibility_info.status.success());
+  assert_eq!(compatibility_info.stdout, canonical_info.stdout);
+  assert!(compatibility_info.stderr.is_empty());
+  let info = String::from_utf8(compatibility_info.stdout).unwrap();
+  assert!(info.contains("dv --compat dotnet --info"));
+  assert!(info.contains("dv sdk info"));
+}
+
+#[test]
+fn malformed_dotnet_sdk_queries_fail_before_sdk_discovery() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ malformed");
+
+  for (arguments, command) in [
+    (&["--compat", "dotnet", "--version", "unexpected"][..], "--version"),
+    (&["--compat", "dotnet", "--info", "unexpected"][..], "--info"),
+  ] {
+    let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "arguments={arguments:?}");
+    assert!(output.stdout.is_empty(), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(&format!("unexpected {command} argument")), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("global.json"), "arguments={arguments:?}: {stderr}");
+  }
 }
 
 #[test]
@@ -1037,7 +1134,7 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 
   assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
   let stdout = String::from_utf8(alias.stdout).unwrap();
-  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":1,\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":2,\"command\":\"restore\""));
   assert!(stdout.contains("\"type\":\"package_resolution_created\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));

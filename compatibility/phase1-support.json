@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "manifest_version": 1,
-  "dv_command_syntax_version": 1,
+  "dv_command_syntax_version": 2,
   "dv_event_schema_version": 19,
   "commands": [
     {
@@ -9,7 +9,7 @@
       "path": ["build"],
       "canonical_path": ["build"],
       "status": "partial",
-      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
+      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-017", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
       "dimensions": {
         "options": "partial",
         "arguments": "partial",
@@ -24,7 +24,7 @@
       "path": ["restore"],
       "canonical_path": ["restore"],
       "status": "partial",
-      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
+      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-017", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
       "dimensions": {
         "options": "partial",
         "arguments": "partial",
@@ -39,7 +39,7 @@
       "path": ["run"],
       "canonical_path": ["run"],
       "status": "partial",
-      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
+      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-017", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
       "dimensions": {
         "options": "partial",
         "arguments": "partial",
@@ -54,7 +54,7 @@
       "path": ["test"],
       "canonical_path": ["test"],
       "status": "partial",
-      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
+      "parity_rows": ["DROP-002", "DROP-003", "DROP-010", "DROP-011", "DROP-013", "DROP-016", "DROP-017", "DROP-019", "DROP-022", "DNCLI-002", "DNCLI-008", "DNCLI-009"],
       "dimensions": {
         "options": "partial",
         "arguments": "partial",

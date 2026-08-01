@@ -1,14 +1,14 @@
 # Command And Event Protocol Versioning
 
 `CLI-017` gives command grammar and JSON compatibility separate version
-identities. The current command syntax is `1`; the current event schema is
+identities. The current command syntax is `2`; the current event schema is
 `19`. A command alias can therefore be added or retired under the syntax
 contract without pretending that the JSON object layout changed.
 
 ## Data Contract
 
 `CommandSyntaxVersion` is a two-byte transparent value stored inside the
-existing 16-byte `InvocationRequest`. It is assigned during the single linear
+existing 6-byte `InvocationRequest`. It is assigned during the single linear
 argv scan and copied into `command_started` only when JSON output is requested.
 Human commands pay no formatting, allocation, filesystem, process, or network
 cost for it.
@@ -44,11 +44,13 @@ is added to the common path.
 
 ## Verification
 
-Cross-platform CLI tests execute `version`, `--version`, `-V`, and the explicit
-`dotnet` compatibility spelling. Every alias must produce the same three-event
-schema-19 shape, canonical `version` command, syntax version `1`, and successful
-terminal event. The benchmark preflight repeats that check for every alias and
-validates every retained sample.
+Cross-platform CLI tests execute native `version`, `--version`, and `-V`.
+Every native alias must produce the same three-event schema-19 shape, canonical
+`version` command, syntax version `2`, and successful terminal event. Under the
+explicit dotnet profile, `--version` instead selects the same SDK as Microsoft
+`dotnet --version`; this compatibility correction is why syntax version 2 is
+not interchangeable with version 1. The benchmark preflight validates both
+contracts before retaining samples.
 
 Microsoft tooling has no equivalent query for `dv`'s two protocol versions, so
 the dedicated benchmark reports Microsoft as `TBI`; it is not a like-for-like
@@ -60,5 +62,5 @@ Reproduce:
 
 ```powershell
 cargo bench-all --case cli_protocol_version --samples 30 --warmups 5
-cargo bench-all --case sdk_current --samples 30 --warmups 5
+cargo bench-all --case sdk_current_compat --samples 30 --warmups 5
 ```

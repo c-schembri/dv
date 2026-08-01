@@ -374,12 +374,12 @@ contracts.
   quoting, comments, default response-file discovery, opt-out, cycles, and
   size/depth bounds. `P2`
 - [x] `CLI-017` Version command syntax and JSON compatibility independently so
-  a CLI alias does not mutate the event protocol. The 16-byte typed invocation
+  a CLI alias does not mutate the event protocol. The 6-byte typed invocation
   request now carries a two-byte syntax-version value while the reporter owns
-  schema version 19. `version`, `--version`, `-V`, and the explicit `dotnet`
-  compatibility spelling normalize to one typed command and emit the same
-  `command_started`, `tool_version`, and `command_finished` contract; raw alias
-  arguments remain reporter evidence rather than protocol selection. The
+  schema version 19. Native `version`, `--version`, and `-V` normalize to one
+  tool-version request; explicit dotnet `--version` instead normalizes to the
+  selected-SDK request required by the reference command. Raw alias arguments
+  remain reporter evidence rather than protocol selection. The
   structural query measured `4.479 ms` median and `5.593 ms` p95 on Windows;
   Microsoft has no equivalent dual-version query, so its result is explicitly
   TBI. The like-for-like SDK control remains `13.1x` faster. `P1`
@@ -439,7 +439,7 @@ contracts.
   `push`, `list`, `add`, and `update` using an explicit precedence table that
   matches the input shape and never guesses after side effects begin. The
   selected profile and first semantic OS token index a 35-byte read-only
-  matrix and map directly to one of 24 exact one-byte command kinds;
+  matrix and map directly to one of 26 exact one-byte command kinds;
   native/dotnet, NuGet, MSBuild-input, and VSTest-input routes cannot cross
   into one another. NuGet-only `push` and `update` remain unknown without
   NuGet evidence. The six-byte request, one linear scan, and allocation/I/O
@@ -490,9 +490,15 @@ contracts.
   child, test execution, and signal/cancellation parity remain open with their
   owning workflows. A missing-project restore measured `122.756 ms` for
   `dotnet` and `5.158 ms` for `dv`, a `23.8x` median improvement. `P1-P3`
-- [ ] `DROP-017` Make help/version/info output expose both accepted
+- [x] `DROP-017` Make help/version/info output expose both accepted
   compatibility syntax and canonical `dv` syntax without changing the result
-  of reference `--help`, `/?`, or `help` forms. `P1`
+  of reference `--help`, `/?`, or `help` forms. Profile-aware static help
+  accepts the pinned root and Phase 1 command aliases without SDK, project, or
+  filesystem discovery. `dotnet --version` and `--info` compatibility syntax
+  normalizes to `dv sdk current` and `dv sdk info`; the selected SDK version is
+  byte-identical for the version query, and info labels both spellings. Static
+  build help measured `135.885 ms` for `dotnet` and `5.518 ms` for `dv`, a
+  `24.6x` median improvement. `P1`
 - [ ] `DROP-018` Accept deprecated aliases for as long as the pinned reference
   tool does, emit equivalent deprecation diagnostics, and record removals in
   the compatibility manifest. `P5`

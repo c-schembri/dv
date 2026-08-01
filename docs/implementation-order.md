@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 71 rows are implemented;
+- 72 rows are implemented;
 - 29 rows have partial foundations;
-- 368 rows are missing;
+- 367 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -134,7 +134,7 @@ cache publication. Network work is outside the verification benchmark.
 
 Status: in progress; `CLI-005` through `CLI-008`, `CLI-011` through
 `CLI-015`, `CLI-017`, `DROP-001` through `DROP-003`, `DROP-010`, `DROP-011`,
-and `DROP-013` are complete.
+`DROP-013`, and `DROP-017` are complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
@@ -145,14 +145,17 @@ unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result
 pairs are explicit. Executed child, test, and signal/cancellation semantics
 remain partial with their owning workflows.
-Command syntax version 1 and JSON event schema version 19 are independent;
-all supported version aliases normalize to one typed request and event shape.
+Command syntax version 2 and JSON event schema version 19 are independent.
+Native tool-version aliases normalize to one typed request and event shape;
+the dotnet `--version` compatibility form selects the SDK exactly like its
+Microsoft reference command. Profile-aware help uses static text before SDK or
+project discovery, and SDK info labels both compatibility and canonical syntax.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
 NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
 parity records with explicit per-dimension support state.
 All 20 currently accepted native command spellings normalize to 15 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
-24 command kinds in the same six-byte request; raw spelling and compatibility
+26 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
 The broader workflow-dependent surface of `DROP-016` remains partial.
 

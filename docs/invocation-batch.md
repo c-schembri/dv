@@ -30,7 +30,7 @@ batches preserve behavior through contiguous spill storage.`
    multi-token batch, retaining the exact platform encoding.
 3. One linear, predictable scan -> typed global output policy, invocation
    mode, and first semantic token.
-4. Selected profile plus first semantic token -> one of 24 exact routed
+4. Selected profile plus first semantic token -> one of 26 exact routed
    command kinds before SDK,
    current-directory, project, filesystem, process, or network access. The raw
    command index and compatibility provenance stay outside the hot request.
@@ -289,7 +289,7 @@ environment, cancellation, and child-exit contracts.
 
 - Command names and text-only SDK operands must be valid Unicode.
 - Paths remain lossless OS strings until consumed by filesystem APIs.
-- The command syntax version is `1` and is independent of the JSON event schema.
+- The command syntax version is `2` and is independent of the JSON event schema.
 - Every currently accepted alias normalizes to one semantic command kind.
   Executable-token inference remains explicitly open under `DROP-012`; future
   compatibility aliases remain unsupported in their owning `DROP-*` rows.
@@ -302,10 +302,11 @@ regresses beyond benchmark noise relative to the prior release baseline.
 
 ## Independent Protocol Versions
 
-`CLI-017` stores command syntax version 1 as a two-byte transparent value in
+`CLI-017` stores command syntax version 2 as a two-byte transparent value in
 the 6-byte invocation request. Event schema version 19 remains a
-reporter constant. `version`, `--version`, `-V`, and `--compat dotnet version`
-all produce the same typed `version` request; the original alias tokens remain
+reporter constant. Native `version`, `--version`, and `-V` produce the same
+typed tool-version request. `--compat dotnet --version` produces the typed SDK
+selection request required by the Microsoft spelling. Original tokens remain
 only in the reporter-safe argument batch.
 
 Human `dv --version` retains its single-line output and does not allocate an
@@ -346,12 +347,12 @@ p95, a `10.6x` median improvement. The preceding boxed-index run measured
 claimed for the structural allocation removal. The retained inline-index raw
 samples are `benchmarks/results/baseline-1785567618.json`.
 
-The explicit compatibility case compares `dotnet --version` with `dv --compat
-dotnet sdk current` after preflight proves identical selected-SDK output.
-Thirty retained samples after three warm-ups measured `65.901 ms` median and
-`67.752 ms` p95 for `dotnet`, and `5.225 ms` median and `6.202 ms` p95 for
-`dv`, a `12.6x` median improvement. The raw samples are
-`benchmarks/results/baseline-1785569009.json`.
+The explicit compatibility case compares `dotnet --version` with the exact
+`dv --compat dotnet --version` spelling after preflight proves identical
+selected-SDK output. Fifty retained samples after ten warm-ups measured
+`63.402 ms` median and `65.472 ms` p95 for `dotnet`, and `5.088 ms` median and
+`5.718 ms` p95 for `dv`, a `12.5x` median improvement. The raw samples are
+`benchmarks/results/2026-08-02-sdk-current-compat-v2-windows.json`.
 
 The unknown-option case compares the identical argument vector `build
 --definitely-unknown` after replacing only the executable token. Thirty
@@ -414,7 +415,7 @@ median and `5.980 ms` p95 (`12.2x`). This remains below the earlier published
 startup regression. Raw samples are
 `benchmarks/results/sdk-current-cli013-control.json`.
 
-The `CLI-017` structural query validates all four version aliases before
+The `CLI-017` structural query validates all three native version aliases before
 timing `dv --json --version`. Thirty retained samples after five warm-ups
 measured `4.479 ms` median and `5.593 ms` p95. Microsoft has no command that
 reports both its command grammar and dv's JSON event contract, so the harness

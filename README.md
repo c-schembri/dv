@@ -14,6 +14,9 @@ the expensive orchestration around them.
 dotnet --version               63.347 ms median
 dv sdk current                  4.501 ms median
 
+dotnet build -?               135.885 ms median
+dv --compat dotnet build -?     5.518 ms median
+
 dotnet NuGet RID expansion     36.217 ms median
 dv sdk compatible-rids          6.049 ms median
 
@@ -225,14 +228,15 @@ states, while Unix signals remain distinct until the owning run/test workflow
 selects an explicit policy. Application launch itself is still planned, so the
 current command surface never claims that a TBI child executed.
 
-Command syntax version `1` and JSON event schema version `19` advance
+Command syntax version `2` and JSON event schema version `19` advance
 independently. `dv --json --version` reports the executable and both protocol
 versions in one validated event batch, while human `dv --version` remains
-unchanged. Version aliases normalize to the same typed command and cannot
-select a different wire schema.
+unchanged. Native version aliases normalize to the tool-version request;
+`dv --compat dotnet --version` instead selects the same SDK as the Microsoft
+`dotnet --version` query.
 
 All 20 native command spellings currently accepted by `dv` normalize to 15
-native semantic kinds. Profile-aware routing expands that to 24 exact command
+native semantic kinds. Profile-aware routing expands that to 26 exact command
 kinds without enlarging the six-byte request. In particular, `sync` and
 `restore` share one `Restore` request, while NuGet `restore` is a distinct
 pre-I/O route and MSBuild/VSTest words cannot enter the native restore path.
@@ -408,6 +412,9 @@ cargo run -p dv-cli --release -- sdk current
 # List installed SDKs and mark the selected one
 cargo run -p dv-cli --release -- sdk list
 
+# Show SDK selection details and both accepted command spellings
+cargo run -p dv-cli --release -- sdk info
+
 # Emit the versioned JSON event stream
 cargo run -p dv-cli --release -- sdk current --json
 
@@ -477,6 +484,8 @@ baseline because Microsoft has no equivalent dual-version query. See the
 The generated compatibility manifest has its own structural baseline because
 Microsoft publishes no equivalent query. See the
 [compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
+Reference-compatible help has like-for-like, zero-mutation evidence in the
+[compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
 Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
 Explicit invocation-mode classification has a like-for-like pre-I/O baseline
@@ -520,7 +529,8 @@ Initial machine:
 |---|---|---|---:|---:|---:|---:|---:|
 | Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 63.347 ms | 4.501 ms | 14.1x | 66.926 ms | 5.029 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
-| Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
+| Select current SDK through the exact `dotnet` compatibility spelling | `dotnet --version` | `dv --compat dotnet --version` | 63.402 ms | 5.088 ms | 12.5x | 65.472 ms | 5.718 ms |
+| Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
@@ -802,6 +812,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
+cargo bench-all --case cli_compat_help --samples 50 --warmups 10
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
 cargo bench-all --case cli_exit_policy --samples 50 --warmups 10

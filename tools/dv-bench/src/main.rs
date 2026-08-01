@@ -141,6 +141,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_compat_help",
+    kind: CaseKind::Startup,
+    args: &["build", "-?"],
+    implemented: true,
+  },
+  Case {
     name: "cli_cancellation",
     kind: CaseKind::Startup,
     args: &["--version"],
@@ -808,7 +814,13 @@ const DV_CASES: &[Case] = &[
   Case {
     name: "sdk_current_compat",
     kind: CaseKind::Startup,
-    args: &["--compat", "dotnet", "sdk", "current"],
+    args: &["--compat", "dotnet", "--version"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_compat_help",
+    kind: CaseKind::Startup,
+    args: &["--compat", "dotnet", "build", "-?"],
     implemented: true,
   },
   Case {
@@ -1353,6 +1365,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_compat_manifest") {
     verify_compatibility_manifest_boundary(&dv_executable, &fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_compat_help") {
+    verify_compatibility_help_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-compat-help"))?;
+  }
   if options.case.as_deref() == Some("cli_cancellation") {
     let provider_workspace = repository.join(format!("target/benchmark-cli-cancellation-verification-{}", std::process::id()));
     ensure_workspace_is_safe(&repository, &provider_workspace)?;
@@ -1551,9 +1566,53 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   if dotnet_version != dv_version {
     return Err(format!("SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {dv_version:?}").into());
   }
-  let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "sdk", "current"], fixture)?;
+  let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "--version"], fixture)?;
   if dotnet_version != compatibility_version {
     return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
+  }
+  Ok(())
+}
+
+fn verify_compatibility_help_boundary(dv_executable: &Path, fixture: &Path, workspace: &Path) -> Result<()> {
+  reset_fixture(fixture, workspace)?;
+  let before = snapshot_tree(workspace)?;
+  let reference = Command::new("dotnet").args(["build", "-?"]).current_dir(workspace).output()?;
+  validate_compatibility_help_output(&reference, true)?;
+  let after_reference = snapshot_tree(workspace)?;
+  if before != after_reference {
+    return Err("dotnet compatibility-help preflight mutated the input workspace".into());
+  }
+
+  let candidate = Command::new(dv_executable)
+    .args(["--compat", "dotnet", "build", "-?"])
+    .current_dir(workspace)
+    .output()?;
+  validate_compatibility_help_output(&candidate, false)?;
+  if before != snapshot_tree(workspace)? {
+    return Err("dv compatibility-help preflight mutated the input workspace".into());
+  }
+  Ok(())
+}
+
+fn validate_compatibility_help_output(output: &Output, reference: bool) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "compatibility help returned status {:?} with stderr {:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let valid = if reference {
+    stdout.contains("dotnet build")
+  } else {
+    stdout.contains("dv --compat dotnet build") && stdout.contains("dv build --plan")
+  };
+  if !valid {
+    return Err(format!("compatibility help omitted its expected syntax: {stdout}").into());
   }
   Ok(())
 }
@@ -2184,13 +2243,8 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
 }
 
 const EVENT_SCHEMA_VERSION: u64 = 19;
-const COMMAND_SYNTAX_VERSION: u64 = 1;
-const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[
-  &["--json", "version"],
-  &["--json", "--version"],
-  &["-V", "--json"],
-  &["--compat", "dotnet", "--json", "version"],
-];
+const COMMAND_SYNTAX_VERSION: u64 = 2;
+const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
 
 fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
   for arguments in PROTOCOL_VERSION_ALIASES {
@@ -2227,7 +2281,7 @@ fn validate_compatibility_manifest_output(output: &Output) -> Result<()> {
   let manifest: serde_json::Value = serde_json::from_slice(&output.stdout)?;
   if manifest.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1)
     || manifest.get("manifest_version").and_then(serde_json::Value::as_u64) != Some(1)
-    || manifest.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(1)
+    || manifest.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(COMMAND_SYNTAX_VERSION)
     || manifest.get("event_schema_version").and_then(serde_json::Value::as_u64) != Some(19)
     || manifest
       .pointer("/reference/dotnet_sdk")
@@ -7769,6 +7823,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_protocol_version_output(&output, case.args)?;
   } else if case.name == "cli_compat_manifest" {
     validate_compatibility_manifest_output(&output)?;
+  } else if case.name == "cli_compat_help" {
+    validate_compatibility_help_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackDiagnostic) {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
@@ -8682,6 +8738,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current" => "SDK selection",
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
+    "cli_compat_help" => "Compatibility help",
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_mode_classification" => "Invocation mode classification",
