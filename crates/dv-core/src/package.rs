@@ -4887,7 +4887,32 @@ fn config_path_in(directory: &Path) -> Option<PathBuf> {
   } else {
     &CASE_SENSITIVE_NAMES[..]
   };
-  names.iter().map(|name| directory.join(name)).find(|path| path.is_file())
+  let path = names.iter().map(|name| directory.join(name)).find(|path| path.is_file())?;
+  #[cfg(target_os = "macos")]
+  {
+    // The default macOS filesystem is case-insensitive but case-preserving.
+    // Preserve the real directory entry rather than the spelling of our probe.
+    let mut selected = None::<(usize, PathBuf)>;
+    if let Ok(entries) = fs::read_dir(directory) {
+      for entry in entries.flatten() {
+        let Some(name) = entry
+          .file_name()
+          .to_str()
+          .and_then(|name| names.iter().position(|candidate| *candidate == name))
+        else {
+          continue;
+        };
+        if selected.as_ref().is_none_or(|(rank, _)| name < *rank) {
+          selected = Some((name, entry.path()));
+        }
+      }
+    }
+    return selected.map_or(Some(path), |(_, actual)| Some(actual));
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    Some(path)
+  }
 }
 
 fn default_global_packages() -> Option<PathBuf> {
@@ -13525,19 +13550,23 @@ mod tests {
     };
 
     let paths = discover_config_paths(&project_directory, None, &roots).unwrap();
-    let relative = paths.iter().filter_map(|path| path.strip_prefix(&temp.0).ok()).collect::<Vec<_>>();
+    let relative = paths
+      .iter()
+      .filter_map(|path| path.strip_prefix(&temp.0).ok())
+      .map(|path| path.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+      .collect::<Vec<_>>();
 
     assert_eq!(
       relative,
       [
-        Path::new("machine/20.Config"),
-        Path::new("machine/10.config"),
-        Path::new("user/config/20.Config"),
-        Path::new("user/config/10.config"),
-        Path::new("user/NuGet.Config"),
-        Path::new("drive/NuGet.Config"),
-        Path::new("drive/repository/NuGet.Config"),
-        Path::new("drive/repository/src/NuGet.Config"),
+        "machine/20.config",
+        "machine/10.config",
+        "user/config/20.config",
+        "user/config/10.config",
+        "user/nuget.config",
+        "drive/nuget.config",
+        "drive/repository/nuget.config",
+        "drive/repository/src/nuget.config",
       ]
     );
   }
