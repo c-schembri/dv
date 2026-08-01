@@ -57,7 +57,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 5;
+const LOCK_SCHEMA_VERSION: u16 = 6;
 const SERVICE_CAPABILITY_COUNT: usize = 5;
 const PACKAGE_BASE_TYPES: &[&str] = &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"];
 const REGISTRATION_TYPES: &[&str] = &[
@@ -504,6 +504,22 @@ const _: () = assert!(size_of::<DirectPackagePolicy>() == 32);
 const _: () = assert!(align_of::<DirectPackagePolicy>() == 4);
 const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<DirectPackagePolicy>() == 2);
 
+/// One cold successful-restore downgrade warning.
+///
+/// The four spans occupy 32 bytes at four-byte alignment. Warning text shares
+/// the resolution text table and the empty common case retains no row storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageDowngrade {
+  package_id: TextSpan,
+  selected_version: TextSpan,
+  requested_range: TextSpan,
+  requesting_package: TextSpan,
+}
+
+const _: () = assert!(size_of::<PackageDowngrade>() == 32);
+const _: () = assert!(align_of::<PackageDowngrade>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PackageDowngrade>() == 2);
+
 /// The role assigned to an RID-specific runtime target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -787,6 +803,7 @@ pub struct PackageResolution {
   package_assets: Box<[PackageAssets]>,
   package_extended_assets: Box<[PackageExtendedAssets]>,
   direct_policies: Box<[DirectPackagePolicy]>,
+  downgrades: Box<[PackageDowngrade]>,
   dependencies: Box<[u32]>,
   assets: Box<[TextSpan]>,
   asset_ranges: PackageAssetRanges,
@@ -798,7 +815,7 @@ pub struct PackageResolution {
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 352);
+const _: () = assert!(size_of::<PackageResolution>() == 368);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
@@ -948,6 +965,31 @@ impl PackageResolution {
   /// Iterates direct-reference policy rows in package identity order.
   pub fn direct_policies(&self) -> std::ops::Range<usize> {
     0..self.direct_policies.len()
+  }
+
+  /// Returns successful direct-wins downgrade warning rows.
+  pub fn downgrades(&self) -> std::ops::Range<usize> {
+    0..self.downgrades.len()
+  }
+
+  /// Returns the selected package identity for one downgrade.
+  pub fn downgrade_package_id(&self, downgrade: usize) -> &str {
+    self.get(self.downgrades[downgrade].package_id)
+  }
+
+  /// Returns the selected lower version for one downgrade.
+  pub fn downgrade_selected_version(&self, downgrade: usize) -> &str {
+    self.get(self.downgrades[downgrade].selected_version)
+  }
+
+  /// Returns the higher dependency range which was overridden.
+  pub fn downgrade_requested_range(&self, downgrade: usize) -> &str {
+    self.get(self.downgrades[downgrade].requested_range)
+  }
+
+  /// Returns the package which requested the overridden range.
+  pub fn downgrade_requesting_package(&self, downgrade: usize) -> &str {
+    self.get(self.downgrades[downgrade].requesting_package)
   }
 
   /// Returns the resolved package index owned by a direct policy row.
@@ -1179,6 +1221,16 @@ pub enum PackageErrorKind {
   Configuration,
   /// A package identity or version is malformed or conflicts with the graph.
   Resolution,
+  /// Active dependency constraints have no common version.
+  ConstraintConflict,
+  /// A central package pin forces a lower or otherwise incompatible version.
+  Downgrade,
+  /// The dependency graph contains a cycle.
+  DependencyCycle,
+  /// No enabled source contains a requested package identity.
+  PackageNotFound,
+  /// Sources contain the identity but not a version in the requested range.
+  VersionNotFound,
   /// No selected asset group is compatible with the evaluated target.
   Incompatible,
   /// Offline mode encountered a package cache miss.
@@ -1209,9 +1261,19 @@ pub struct PackageError {
   kind: PackageErrorKind,
   context: String,
   message: String,
+  diagnostic: Option<Box<PackageDiagnosticData>>,
   http_work: Option<HttpWork>,
   source_work: Vec<SourceWork>,
 }
+
+#[derive(Debug, Default)]
+struct PackageDiagnosticData {
+  context: Vec<(&'static str, String)>,
+  causes: Vec<String>,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<PackageError>() <= 2 * BENCHMARK_CACHE_LINE_BYTES);
 
 impl PackageError {
   /// Returns the stable failure category.
@@ -1229,9 +1291,48 @@ impl PackageError {
       kind,
       context: context.into(),
       message: message.into(),
+      diagnostic: None,
       http_work: None,
       source_work: Vec::new(),
     }
+  }
+
+  fn with_context(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    self
+      .diagnostic
+      .get_or_insert_with(|| Box::new(PackageDiagnosticData::default()))
+      .context
+      .push((name, value.into()));
+    self
+  }
+
+  fn with_cause(mut self, cause: impl Into<String>) -> Self {
+    self
+      .diagnostic
+      .get_or_insert_with(|| Box::new(PackageDiagnosticData::default()))
+      .causes
+      .push(cause.into());
+    self
+  }
+
+  /// Iterates ordered machine-readable context retained on the cold error path.
+  pub fn diagnostic_context(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+    self
+      .diagnostic
+      .as_ref()
+      .map_or(&[][..], |diagnostic| diagnostic.context.as_slice())
+      .iter()
+      .map(|(name, value)| (*name, value.as_str()))
+  }
+
+  /// Iterates deterministic causal messages from nearest to root cause.
+  pub fn causes(&self) -> impl ExactSizeIterator<Item = &str> {
+    self
+      .diagnostic
+      .as_ref()
+      .map_or(&[][..], |diagnostic| diagnostic.causes.as_slice())
+      .iter()
+      .map(String::as_str)
   }
 
   fn with_http_work(mut self, work: HttpWork) -> Self {
@@ -1652,6 +1753,33 @@ impl VersionRange {
       },
     }
   }
+
+  fn diagnostic_text(&self) -> String {
+    if let (Some(lower), Some(upper)) = (&self.lower, &self.upper)
+      && lower.inclusive
+      && upper.inclusive
+      && lower.version == upper.version
+    {
+      return format!("[{}]", lower.version.normalized);
+    }
+    if self.is_floating() {
+      return format!(
+        "{} (floating)",
+        self.lower.as_ref().expect("a floating range has a lower bound").version.normalized
+      );
+    }
+    let mut text = String::new();
+    text.push(if self.lower.as_ref().is_some_and(|bound| bound.inclusive) { '[' } else { '(' });
+    if let Some(lower) = &self.lower {
+      text.push_str(&lower.version.normalized);
+    }
+    text.push(',');
+    if let Some(upper) = &self.upper {
+      text.push_str(&upper.version.normalized);
+    }
+    text.push(if self.upper.as_ref().is_some_and(|bound| bound.inclusive) { ']' } else { ')' });
+    text
+  }
 }
 
 fn parse_version_bound(value: &str, inclusive: bool, allow_floating: bool) -> Result<VersionBound, PackageError> {
@@ -1840,6 +1968,14 @@ struct CachedPackage {
 struct ResolvedGraph {
   packages: BTreeMap<String, WorkPackage>,
   source_work: Vec<SourceWork>,
+  downgrades: Vec<ResolvedDowngrade>,
+}
+
+struct ResolvedDowngrade {
+  package_id: String,
+  selected_version: String,
+  requested_range: String,
+  requesting_package: String,
 }
 
 struct GraphRoots<'a> {
@@ -1911,6 +2047,45 @@ impl<'a> ConstraintView<'a> {
       Self::Active(constraints) => constraints.iter().copied().for_each(consider),
     }
     candidate
+  }
+
+  fn has_empty_intersection(self) -> bool {
+    let mut lower = None::<&VersionBound>;
+    let mut upper = None::<&VersionBound>;
+    let mut inspect = |range: &'a VersionRange| {
+      if let Some(candidate) = &range.lower
+        && lower
+          .is_none_or(|current| candidate.version > current.version || (candidate.version == current.version && !candidate.inclusive && current.inclusive))
+      {
+        lower = Some(candidate);
+      }
+      if let Some(candidate) = &range.upper
+        && upper
+          .is_none_or(|current| candidate.version < current.version || (candidate.version == current.version && !candidate.inclusive && current.inclusive))
+      {
+        upper = Some(candidate);
+      }
+    };
+    match self {
+      Self::All(constraints) => constraints.values().for_each(&mut inspect),
+      Self::Active(constraints) => constraints.iter().copied().for_each(inspect),
+    }
+    matches!((lower, upper), (Some(lower), Some(upper)) if lower.version > upper.version || (lower.version == upper.version && (!lower.inclusive || !upper.inclusive)))
+  }
+
+  fn diagnostic_ranges(self) -> String {
+    let mut text = String::new();
+    let mut append = |range: &'a VersionRange| {
+      if !text.is_empty() {
+        text.push_str("; ");
+      }
+      text.push_str(&range.diagnostic_text());
+    };
+    match self {
+      Self::All(constraints) => constraints.values().for_each(&mut append),
+      Self::Active(constraints) => constraints.iter().copied().for_each(append),
+    }
+    text
   }
 }
 
@@ -2423,6 +2598,8 @@ struct LockFile {
   central_package_fingerprint: String,
   direct: Vec<LockDirect>,
   packages: Vec<LockPackage>,
+  #[serde(default)]
+  downgrades: Vec<LockDowngrade>,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq)]
@@ -2436,6 +2613,14 @@ struct LockDirect {
 struct LockDependency {
   id: String,
   version: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LockDowngrade {
+  package_id: String,
+  selected_version: String,
+  requested_range: String,
+  requesting_package: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2676,7 +2861,11 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     target_text,
     &pruning,
   ))?;
-  let resolved = graph.packages;
+  let ResolvedGraph {
+    packages: resolved,
+    source_work,
+    downgrades,
+  } = graph;
 
   validate_acyclic(&resolved)?;
   let origin = resolved.values().find_map(|package| package.origin.as_ref());
@@ -2715,7 +2904,8 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       proxy_configured: config.proxy.is_some(),
     },
     &resolved,
-    &graph.source_work,
+    &source_work,
+    &downgrades,
   )?;
   if options.write_lock {
     write_lock(&resolution)?;
@@ -5345,6 +5535,7 @@ async fn resolve_streaming_graph(
       },
     );
   }
+  let downgrades = collect_downgrades(&nodes);
 
   let mut acquisition = BTreeMap::new();
   let mut acquired = BTreeMap::<String, (PackageRequest, CachedPackage)>::new();
@@ -5416,6 +5607,7 @@ async fn resolve_streaming_graph(
   Ok(ResolvedGraph {
     packages: resolved,
     source_work,
+    downgrades,
   })
 }
 
@@ -5462,14 +5654,44 @@ fn select_node_version_with_constraints(node: &ConstraintNode, constraints: Cons
   if node.direct.is_none()
     && let Some(pin) = &node.central_pin
   {
-    return if node.constraints.values().all(|range| range.contains(pin)) {
-      Ok(NodeSelection::Version(pin.clone()))
-    } else {
-      Err(resolution_error(
+    if let Some(required) = node.constraints.values().find(|range| !range.contains(pin)) {
+      return Err(
+        PackageError::new(
+          PackageErrorKind::Downgrade,
+          &node.id,
+          format!(
+            "central package pin selects {} {}, which does not satisfy {}",
+            node.id,
+            pin.normalized,
+            required.diagnostic_text()
+          ),
+        )
+        .with_context("package_id", &node.id)
+        .with_context("selected_version", &pin.normalized)
+        .with_context("required_range", required.diagnostic_text())
+        .with_cause("CentralPackageTransitivePinning forced the selected version"),
+      );
+    }
+    if node.available_versions.as_ref().is_some_and(|versions| versions.binary_search(pin).is_err()) {
+      return Err(version_not_found_error(
         &node.id,
-        "central transitive pin is lower than or incompatible with a dependency requirement",
-      ))
-    };
+        &format!("[{}]", pin.normalized),
+        node.available_versions.as_deref(),
+      ));
+    }
+    return Ok(NodeSelection::Version(pin.clone()));
+  }
+
+  if node.direct.is_none() && constraints.has_empty_intersection() {
+    return Err(
+      PackageError::new(
+        PackageErrorKind::ConstraintConflict,
+        &node.id,
+        format!("dependency constraints for {} have no common version", node.id),
+      )
+      .with_context("package_id", &node.id)
+      .with_context("required_ranges", constraints.diagnostic_ranges()),
+    );
   }
 
   let preferred = node.direct.as_ref();
@@ -5494,10 +5716,14 @@ fn select_node_version_with_constraints(node: &ConstraintNode, constraints: Cons
         selected = Some(version);
       }
     }
-    return selected
-      .cloned()
-      .map(NodeSelection::Version)
-      .ok_or_else(|| resolution_error(&node.id, "no available package version satisfies the dependency constraints"));
+    return selected.cloned().map(NodeSelection::Version).ok_or_else(|| {
+      let requested = if let Some(direct) = &node.direct {
+        direct.diagnostic_text()
+      } else {
+        constraints.diagnostic_ranges()
+      };
+      version_not_found_error(&node.id, &requested, node.available_versions.as_deref())
+    });
   }
   if preferred.is_some_and(VersionRange::is_floating) || constraints.any(VersionRange::is_floating) {
     return Ok(NodeSelection::Enumerate);
@@ -5587,16 +5813,51 @@ fn collect_active_constraints<'a>(
   active.clear();
   let node = &nodes[target];
   for (parent, range) in &node.constraints {
-    let dominated = node.constraints.keys().any(|candidate| {
-      candidate != parent
-        && constraint_parent_is_ancestor(nodes, target, candidate, parent, stack, visited)
-        && !constraint_parent_is_ancestor(nodes, target, parent, candidate, stack, visited)
-        && !constraint_parent_has_alternate_root_path(nodes, target, candidate, parent, stack, visited)
-    });
-    if !dominated {
+    if !constraint_is_dominated(nodes, target, parent, stack, visited) {
       active.push(range);
     }
   }
+}
+
+fn constraint_is_dominated<'a>(
+  nodes: &'a BTreeMap<String, ConstraintNode>,
+  target: &str,
+  parent: &'a str,
+  stack: &mut Vec<&'a str>,
+  visited: &mut Vec<&'a str>,
+) -> bool {
+  nodes[target].constraints.keys().any(|candidate| {
+    candidate != parent
+      && constraint_parent_is_ancestor(nodes, target, candidate, parent, stack, visited)
+      && !constraint_parent_is_ancestor(nodes, target, parent, candidate, stack, visited)
+      && !constraint_parent_has_alternate_root_path(nodes, target, candidate, parent, stack, visited)
+  })
+}
+
+fn collect_downgrades(nodes: &BTreeMap<String, ConstraintNode>) -> Vec<ResolvedDowngrade> {
+  let mut downgrades = Vec::new();
+  let mut stack = Vec::new();
+  let mut visited = Vec::new();
+  for (lower_id, node) in nodes {
+    let Some(selected) = node.selected.as_ref().filter(|_| !node.pruned) else {
+      continue;
+    };
+    for (parent, range) in &node.constraints {
+      if range.contains(selected) {
+        continue;
+      }
+      if node.direct.is_none() && !constraint_is_dominated(nodes, lower_id, parent, &mut stack, &mut visited) {
+        continue;
+      }
+      downgrades.push(ResolvedDowngrade {
+        package_id: node.id.clone(),
+        selected_version: selected.normalized.clone(),
+        requested_range: range.diagnostic_text(),
+        requesting_package: nodes.get(parent).map_or_else(|| parent.clone(), |parent| parent.id.clone()),
+      });
+    }
+  }
+  downgrades
 }
 
 fn mark_descendant_constraint_targets_dirty(nodes: &BTreeMap<String, ConstraintNode>, root: &str, dirty: &mut BTreeSet<String>) {
@@ -5783,6 +6044,23 @@ fn resolution_error(context: impl Into<String>, message: impl Into<String>) -> P
   PackageError::new(PackageErrorKind::Resolution, context, message)
 }
 
+fn version_not_found_error(id: &str, requested: &str, available: Option<&[PackageVersion]>) -> PackageError {
+  let mut error = PackageError::new(
+    PackageErrorKind::VersionNotFound,
+    id,
+    format!("package {id} has no available version satisfying {requested}"),
+  )
+  .with_context("package_id", id)
+  .with_context("required_range", requested);
+  if let Some(versions) = available {
+    error = error.with_context("available_versions", versions.len().to_string());
+    if let Some(nearest) = versions.last() {
+      error = error.with_context("nearest_version", &nearest.normalized);
+    }
+  }
+  error
+}
+
 #[derive(Clone, Copy)]
 struct PackageStorage<'a> {
   cache_root: &'a Path,
@@ -5923,11 +6201,14 @@ async fn load_node_metadata(
   versions.sort_unstable();
   versions.dedup();
   if versions.is_empty() {
-    return Err(PackageError::new(
-      PackageErrorKind::Network,
-      lower_id,
-      format!("no enabled source could enumerate package {lower_id}"),
-    ));
+    return Err(
+      PackageError::new(
+        PackageErrorKind::PackageNotFound,
+        lower_id,
+        format!("no enabled source contains package {lower_id}"),
+      )
+      .with_context("package_id", lower_id),
+    );
   }
   Ok(MetadataTaskResult::Versions { versions, source_work })
 }
@@ -7406,12 +7687,35 @@ fn parse_cached_package(
   request: PackageRequest,
   cached: CachedPackage,
   target: TargetFramework,
-  _target_text: &str,
+  target_text: &str,
   dependencies: Vec<PackageRequest>,
   flags: AssetFlags,
 ) -> Result<WorkPackage, PackageError> {
   let compile_assets = select_if(flags.contains(AssetFlags::COMPILE), || select_compile_assets(&cached.root, target))?;
   let runtime_assets = select_if(flags.contains(AssetFlags::RUNTIME), || select_runtime_assets(&cached.root, target))?;
+  if (flags.contains(AssetFlags::COMPILE) || flags.contains(AssetFlags::RUNTIME))
+    && compile_assets.is_empty()
+    && runtime_assets.is_empty()
+    && let Some(supported) = incompatible_asset_frameworks(&cached.root, target)?
+  {
+    return Err(
+      PackageError::new(
+        PackageErrorKind::Incompatible,
+        format!("{} {}", request.id, request.version),
+        format!(
+          "package {} {} is not compatible with {}; supported frameworks: {}",
+          request.id,
+          request.version,
+          target_text,
+          supported.join(", ")
+        ),
+      )
+      .with_context("package_id", &request.id)
+      .with_context("package_version", &request.version)
+      .with_context("target_framework", target_text)
+      .with_context("supported_frameworks", supported.join(";")),
+    );
+  }
   // Package analyzers are resolved graph-wide by ResolvePackageAssets rather
   // than serialized as a target-library family in project.assets.json.
   let analyzers = select_if(flags.contains(AssetFlags::ANALYZERS), || collect_analyzers(&cached.root))?;
@@ -7464,6 +7768,41 @@ fn parse_cached_package(
     cache_hit: cached.cache_hit,
     origin: cached.origin,
   })
+}
+
+fn incompatible_asset_frameworks(root: &Path, target: TargetFramework) -> Result<Option<Vec<String>>, PackageError> {
+  let mut supported = Vec::new();
+  let mut compatible = false;
+  for category in ["ref", "lib"] {
+    let category = root.join(category);
+    let entries = match fs::read_dir(&category) {
+      Ok(entries) => entries,
+      Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+      Err(error) => return Err(package_io("enumerate package framework assets", &category, error)),
+    };
+    for entry in entries {
+      let entry = entry.map_err(|error| package_io("enumerate package framework assets", &category, error))?;
+      if !entry
+        .file_type()
+        .map_err(|error| package_io("inspect package framework asset", &entry.path(), error))?
+        .is_dir()
+      {
+        continue;
+      }
+      let name = entry.file_name().into_string().map_err(|_| {
+        PackageError::new(
+          PackageErrorKind::NonUnicodePath,
+          entry.path().display().to_string(),
+          "package framework directory is not valid Unicode",
+        )
+      })?;
+      compatible |= framework_score(Some(&name), target).is_some();
+      supported.push(name);
+    }
+  }
+  supported.sort_unstable();
+  supported.dedup();
+  Ok((!compatible && !supported.is_empty()).then_some(supported))
 }
 
 fn select_if<T>(enabled: bool, select: impl FnOnce() -> Result<Vec<T>, PackageError>) -> Result<Vec<T>, PackageError> {
@@ -7601,14 +7940,20 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
     &ungrouped
   } else {
     selected.ok_or_else(|| {
+      let target_framework = canonical_target_framework(target);
+      let supported_frameworks = groups.iter().filter_map(|group| group.framework.as_deref()).collect::<Vec<_>>().join(";");
       PackageError::new(
         PackageErrorKind::Incompatible,
         format!("{} {}", request.id, request.version),
         format!(
-          "package {} {} has no dependency group compatible with the evaluated target",
+          "package {} {} has no dependency group compatible with {target_framework}",
           request.id, request.version
         ),
       )
+      .with_context("package_id", &request.id)
+      .with_context("package_version", &request.version)
+      .with_context("target_framework", target_framework)
+      .with_context("supported_frameworks", supported_frameworks)
     })?
   };
   selected
@@ -7901,6 +8246,15 @@ fn framework_score(framework: Option<&str>, target: TargetFramework) -> Option<u
   }
 }
 
+fn canonical_target_framework(target: TargetFramework) -> String {
+  match target.family() {
+    FrameworkFamily::Net => format!("net{}.{}", target.major(), target.minor()),
+    FrameworkFamily::NetCoreApp => format!("netcoreapp{}.{}", target.major(), target.minor()),
+    FrameworkFamily::NetStandard => format!("netstandard{}.{}", target.major(), target.minor()),
+    FrameworkFamily::NetFramework => format!("net{}{}", target.major(), target.minor()),
+  }
+}
+
 fn dlls_in(directory: &Path) -> Result<Vec<PathBuf>, PackageError> {
   let mut assets = Vec::new();
   for entry in fs::read_dir(directory).map_err(|error| package_io("enumerate package assets", directory, error))? {
@@ -7976,31 +8330,45 @@ fn normalize_version(value: &str) -> Result<String, PackageError> {
 }
 
 fn validate_acyclic(packages: &BTreeMap<String, WorkPackage>) -> Result<(), PackageError> {
-  fn visit(id: &str, packages: &BTreeMap<String, WorkPackage>, visiting: &mut BTreeSet<String>, visited: &mut BTreeSet<String>) -> Result<(), PackageError> {
+  fn visit<'a>(
+    id: &'a str,
+    packages: &'a BTreeMap<String, WorkPackage>,
+    visiting: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+    stack: &mut Vec<&'a str>,
+  ) -> Result<(), PackageError> {
     if visited.contains(id) {
       return Ok(());
     }
-    if !visiting.insert(id.to_owned()) {
-      return Err(PackageError::new(
-        PackageErrorKind::Resolution,
-        id,
-        format!("package dependency cycle includes {id}"),
-      ));
+    if !visiting.insert(id) {
+      let start = stack.iter().position(|entry| *entry == id).unwrap_or(0);
+      let mut cycle = stack[start..].join(" -> ");
+      cycle.push_str(" -> ");
+      cycle.push_str(id);
+      return Err(
+        PackageError::new(PackageErrorKind::DependencyCycle, id, format!("package dependency cycle detected: {cycle}"))
+          .with_context("package_id", id)
+          .with_context("cycle", cycle)
+          .with_cause("package metadata contains a circular dependency chain"),
+      );
     }
+    stack.push(id);
     if let Some(package) = packages.get(id) {
       for dependency in &package.dependencies {
-        visit(&dependency.lower_id, packages, visiting, visited)?;
+        visit(&dependency.lower_id, packages, visiting, visited, stack)?;
       }
     }
+    stack.pop();
     visiting.remove(id);
-    visited.insert(id.to_owned());
+    visited.insert(id);
     Ok(())
   }
 
   let mut visiting = BTreeSet::new();
   let mut visited = BTreeSet::new();
+  let mut stack = Vec::new();
   for id in packages.keys() {
-    visit(id, packages, &mut visiting, &mut visited)?;
+    visit(id, packages, &mut visiting, &mut visited, &mut stack)?;
   }
   Ok(())
 }
@@ -8009,6 +8377,7 @@ fn materialize_resolution(
   context: ResolutionContext<'_>,
   work: &BTreeMap<String, WorkPackage>,
   source_work: &[SourceWork],
+  downgrades: &[ResolvedDowngrade],
 ) -> Result<PackageResolution, PackageError> {
   let indices: BTreeMap<&str, u32> = work.keys().enumerate().map(|(index, id)| (id.as_str(), index as u32)).collect();
   let estimated = work
@@ -8048,6 +8417,10 @@ fn materialize_resolution(
     + context.sources.iter().map(|(name, _)| name.len()).sum::<usize>()
     + context.prune_fingerprint.len()
     + context.central_package_fingerprint.len()
+    + downgrades
+      .iter()
+      .map(|warning| warning.package_id.len() + warning.selected_version.len() + warning.requested_range.len() + warning.requesting_package.len())
+      .sum::<usize>()
     + context
       .project
       .package_references()
@@ -8242,6 +8615,17 @@ fn materialize_resolution(
       private_assets: requirement.suppress_parent,
     });
   }
+  let materialized_downgrades = downgrades
+    .iter()
+    .map(|warning| {
+      Ok(PackageDowngrade {
+        package_id: table.push(&warning.package_id)?,
+        selected_version: table.push(&warning.selected_version)?,
+        requested_range: table.push(&warning.requested_range)?,
+        requesting_package: table.push(&warning.requesting_package)?,
+      })
+    })
+    .collect::<Result<Box<_>, PackageError>>()?;
 
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
@@ -8266,6 +8650,7 @@ fn materialize_resolution(
     package_assets: package_assets.into_boxed_slice(),
     package_extended_assets: package_extended_assets.into_boxed_slice(),
     direct_policies: direct_policies.into_boxed_slice(),
+    downgrades: materialized_downgrades,
     dependencies: dependencies.into_boxed_slice(),
     assets: assets.into_boxed_slice(),
     asset_ranges,
@@ -8380,6 +8765,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     package_assets: Box::new([]),
     package_extended_assets: Box::new([]),
     direct_policies: Box::new([]),
+    downgrades: Box::new([]),
     dependencies: Box::new([]),
     assets: Box::new([]),
     asset_ranges: PackageAssetRanges {
@@ -8446,6 +8832,16 @@ fn read_warm_lock(
     return Ok(None);
   }
   let (source_name, _) = selected_source.expect("selected source was checked");
+  let downgrades = lock
+    .downgrades
+    .into_iter()
+    .map(|warning| ResolvedDowngrade {
+      package_id: warning.package_id,
+      selected_version: warning.selected_version,
+      requested_range: warning.requested_range,
+      requesting_package: warning.requesting_package,
+    })
+    .collect::<Vec<_>>();
 
   let mut work = BTreeMap::new();
   for package in lock.packages {
@@ -8576,6 +8972,7 @@ fn read_warm_lock(
     },
     &work,
     &source_work,
+    &downgrades,
   )
   .map(Some)
 }
@@ -8702,6 +9099,15 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
     central_package_fingerprint: resolution.get(resolution.central_package_fingerprint).into(),
     direct,
     packages,
+    downgrades: resolution
+      .downgrades()
+      .map(|warning| LockDowngrade {
+        package_id: resolution.downgrade_package_id(warning).to_owned(),
+        selected_version: resolution.downgrade_selected_version(warning).to_owned(),
+        requested_range: resolution.downgrade_requested_range(warning).to_owned(),
+        requesting_package: resolution.downgrade_requesting_package(warning).to_owned(),
+      })
+      .collect(),
   };
   let mut bytes = serde_json::to_vec_pretty(&lock).expect("serializing dv package lock succeeds");
   bytes.push(b'\n');
@@ -8911,6 +9317,42 @@ mod tests {
     }
   }
 
+  fn work_package(id: &str, dependencies: &[&str]) -> WorkPackage {
+    WorkPackage {
+      request: PackageRequest {
+        id: id.into(),
+        lower_id: id.to_ascii_lowercase(),
+        version: "1.0.0".into(),
+        direct: false,
+        central_transitive: false,
+      },
+      root: PathBuf::new(),
+      hash: String::new(),
+      dependencies: dependencies
+        .iter()
+        .map(|dependency| PackageRequest {
+          id: (*dependency).into(),
+          lower_id: dependency.to_ascii_lowercase(),
+          version: "1.0.0".into(),
+          direct: false,
+          central_transitive: false,
+        })
+        .collect(),
+      compile_assets: Vec::new(),
+      runtime_assets: Vec::new(),
+      analyzers: Vec::new(),
+      resource_assets: Vec::new(),
+      content_files: Vec::new(),
+      build_assets: Vec::new(),
+      build_multi_targeting_assets: Vec::new(),
+      build_transitive_assets: Vec::new(),
+      native_assets: Vec::new(),
+      runtime_targets: Vec::new(),
+      cache_hit: true,
+      origin: None,
+    }
+  }
+
   fn write_test_package(temp: &TempDirectory, relative: &str, id: &str, version: &str) -> PathBuf {
     let path = temp.0.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8967,8 +9409,74 @@ mod tests {
       Err(error) => error,
       Ok(_) => panic!("an incompatible central pin must fail"),
     };
-    assert_eq!(error.kind(), PackageErrorKind::Resolution);
-    assert!(error.to_string().contains("central transitive pin"));
+    assert_eq!(error.kind(), PackageErrorKind::Downgrade);
+    assert!(error.to_string().contains("central package pin"));
+    assert!(error.diagnostic_context().any(|field| field == ("required_range", "[2.0.0,)")));
+  }
+
+  #[test]
+  fn selector_distinguishes_conflicting_constraints_from_an_absent_version() {
+    let mut conflict = constraint_node("Conflict.Leaf");
+    conflict.constraints.insert("left".into(), VersionRange::parse("[1.0.0]").unwrap());
+    conflict.constraints.insert("right".into(), VersionRange::parse("[2.0.0]").unwrap());
+    conflict.available_versions = Some(["1.0.0", "2.0.0"].into_iter().map(|version| PackageVersion::parse(version).unwrap()).collect());
+    let error = match select_node_version(&conflict) {
+      Err(error) => error,
+      Ok(_) => panic!("disjoint exact constraints must fail"),
+    };
+    assert_eq!(error.kind(), PackageErrorKind::ConstraintConflict);
+
+    let mut missing = constraint_node("Missing.Version");
+    missing.direct = Some(VersionRange::parse("[3.0.0]").unwrap());
+    missing.available_versions = Some(["1.0.0", "2.0.0"].into_iter().map(|version| PackageVersion::parse(version).unwrap()).collect());
+    let error = match select_node_version(&missing) {
+      Err(error) => error,
+      Ok(_) => panic!("an absent direct version must fail"),
+    };
+    assert_eq!(error.kind(), PackageErrorKind::VersionNotFound);
+    assert!(error.diagnostic_context().any(|field| field == ("nearest_version", "2.0.0")));
+  }
+
+  #[test]
+  fn incompatible_asset_groups_report_the_target_and_supported_frameworks() {
+    let temp = TempDirectory::new();
+    temp.write("package/lib/net11.0/Sample.dll", b"assembly");
+    let supported = incompatible_asset_frameworks(&temp.0.join("package"), TargetFramework::parse("net10.0").unwrap())
+      .unwrap()
+      .expect("net11 assets are not compatible with net10");
+    assert_eq!(supported, ["net11.0"]);
+  }
+
+  #[test]
+  fn dependency_cycles_report_the_exact_deterministic_chain() {
+    let packages = BTreeMap::from([
+      ("cycle.a".into(), work_package("Cycle.A", &["Cycle.B"])),
+      ("cycle.b".into(), work_package("Cycle.B", &["Cycle.C"])),
+      ("cycle.c".into(), work_package("Cycle.C", &["Cycle.A"])),
+    ]);
+    let error = validate_acyclic(&packages).expect_err("a dependency cycle must fail");
+    assert_eq!(error.kind(), PackageErrorKind::DependencyCycle);
+    assert!(
+      error
+        .diagnostic_context()
+        .any(|field| field == ("cycle", "cycle.a -> cycle.b -> cycle.c -> cycle.a"))
+    );
+  }
+
+  #[test]
+  fn direct_wins_downgrades_are_compacted_after_graph_convergence() {
+    let mut leaf = constraint_node("Leaf.Package");
+    leaf.direct = Some(VersionRange::parse("[1.0.0]").unwrap());
+    leaf.selected = Some(PackageVersion::parse("1.0.0").unwrap());
+    leaf.constraints.insert("top.package".into(), VersionRange::parse("[2.0.0]").unwrap());
+    let top = constraint_node("Top.Package");
+    let nodes = BTreeMap::from([("leaf.package".into(), leaf), ("top.package".into(), top)]);
+    let warnings = collect_downgrades(&nodes);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].package_id, "Leaf.Package");
+    assert_eq!(warnings[0].selected_version, "1.0.0");
+    assert_eq!(warnings[0].requested_range, "[2.0.0]");
+    assert_eq!(warnings[0].requesting_package, "Top.Package");
   }
 
   #[test]
@@ -11336,6 +11844,52 @@ mod tests {
     let changed = resolve_package_inputs(&[&changed], &options).unwrap().remove(0);
     assert_eq!(changed.compile_assets().len(), 0);
     assert_eq!(changed.runtime_assets().len(), 1);
+  }
+
+  #[test]
+  fn direct_wins_warning_survives_the_warm_lock_without_manifest_io() {
+    let temp = TempDirectory::new();
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Leaf.Package" Version="[1.0.0]" /><PackageReference Include="Top.Package" Version="[1.0.0]" /></ItemGroup></Project>"#,
+    );
+    for (id, manifest) in [
+      (
+        "leaf.package",
+        r#"<package><metadata><id>Leaf.Package</id><version>1.0.0</version></metadata></package>"#,
+      ),
+      (
+        "top.package",
+        r#"<package><metadata><id>Top.Package</id><version>1.0.0</version><dependencies><group targetFramework="net10.0"><dependency id="Leaf.Package" version="[2.0.0]" /></group></dependencies></metadata></package>"#,
+      ),
+    ] {
+      let root = format!("packages/{id}/1.0.0");
+      temp.write(&format!("{root}/{id}.nuspec"), manifest);
+      temp.write(&format!("{root}/{id}.1.0.0.nupkg"), []);
+      temp.write(&format!("{root}/{id}.1.0.0.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+      temp.write(&format!("{root}/lib/net10.0/{id}.dll"), []);
+    }
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      offline: true,
+      write_lock: true,
+      ..PackageResolveOptions::default()
+    };
+
+    let cold = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    fs::remove_file(temp.0.join("packages/top.package/1.0.0/top.package.nuspec")).unwrap();
+    let warm = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+
+    for resolution in [&cold, &warm] {
+      assert_eq!(resolution.downgrades().len(), 1);
+      assert_eq!(resolution.downgrade_package_id(0), "Leaf.Package");
+      assert_eq!(resolution.downgrade_selected_version(0), "1.0.0");
+      assert_eq!(resolution.downgrade_requested_range(0), "[2.0.0]");
+      assert_eq!(resolution.downgrade_requesting_package(0), "Top.Package");
+    }
+    assert_eq!(warm.cache_hits(), 2);
   }
 
   #[test]

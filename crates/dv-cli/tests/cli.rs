@@ -392,6 +392,134 @@ fn restore_reports_unmapped_package_before_source_discovery() {
 }
 
 #[test]
+fn restore_distinguishes_a_missing_identity_from_a_missing_version() {
+  let missing_identity = TempDirectory::new();
+  missing_identity.write("feed/.keep", "");
+  missing_identity.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="local" value="feed" /></packageSources></configuration>"#,
+  );
+  missing_identity.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Absent.Package" Version="[1.0.0]" /></ItemGroup></Project>"#,
+  );
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&missing_identity.0)
+    .output()
+    .unwrap();
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0416\""), "{stdout}");
+  assert!(stdout.contains("\"name\":\"package_id\",\"value\":\"absent.package\""));
+
+  let missing_version = TempDirectory::new();
+  missing_version.write("feed/.keep", "");
+  missing_version.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="local" value="feed" /></packageSources></configuration>"#,
+  );
+  missing_version.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Known.Package" Version="[3.0.0]" /></ItemGroup></Project>"#,
+  );
+  for version in ["1.0.0", "2.0.0"] {
+    let marker = format!("packages/known.package/{version}/.dv.metadata.json");
+    missing_version.write(&marker, "{}");
+  }
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&missing_version.0)
+    .output()
+    .unwrap();
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0417\""), "{stdout}");
+  assert!(stdout.contains("\"name\":\"nearest_version\",\"value\":\"2.0.0\""));
+}
+
+#[test]
+fn restore_reports_incompatible_package_asset_frameworks() {
+  let temp = TempDirectory::new();
+  temp.write("feed/.keep", "");
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="local" value="feed" /></packageSources></configuration>"#,
+  );
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Future.Package" Version="[1.0.0]" /></ItemGroup></Project>"#,
+  );
+  temp.write(
+    "packages/future.package/1.0.0/future.package.nuspec",
+    r#"<package><metadata><id>Future.Package</id><version>1.0.0</version></metadata></package>"#,
+  );
+  temp.write("packages/future.package/1.0.0/future.package.1.0.0.nupkg", "");
+  temp.write(
+    "packages/future.package/1.0.0/future.package.1.0.0.nupkg.sha512",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  );
+  temp.write("packages/future.package/1.0.0/.dv.metadata.json", "{}");
+  temp.write("packages/future.package/1.0.0/lib/net11.0/Future.Package.dll", "");
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0402\""), "{stdout}");
+  assert!(stdout.contains("\"name\":\"target_framework\",\"value\":\"net10.0\""));
+  assert!(stdout.contains("\"name\":\"supported_frameworks\",\"value\":\"net11.0\""));
+}
+
+#[test]
+fn restore_reports_the_complete_dependency_cycle() {
+  let temp = TempDirectory::new();
+  temp.write("feed/.keep", "");
+  temp.write(
+    "NuGet.Config",
+    r#"<configuration><packageSources><clear /><add key="local" value="feed" /></packageSources></configuration>"#,
+  );
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Cycle.A" Version="[1.0.0]" /></ItemGroup></Project>"#,
+  );
+  for (id, lower, dependency) in [("Cycle.A", "cycle.a", "Cycle.B"), ("Cycle.B", "cycle.b", "Cycle.A")] {
+    let root = format!("packages/{lower}/1.0.0");
+    temp.write(
+      &format!("{root}/{lower}.nuspec"),
+      &format!(
+        r#"<package><metadata><id>{id}</id><version>1.0.0</version><dependencies><group targetFramework="net10.0"><dependency id="{dependency}" version="[1.0.0]" /></group></dependencies></metadata></package>"#,
+      ),
+    );
+    temp.write(&format!("{root}/{lower}.1.0.0.nupkg"), "");
+    temp.write(
+      &format!("{root}/{lower}.1.0.0.nupkg.sha512"),
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    );
+    temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+    temp.write(&format!("{root}/lib/net10.0/{id}.dll"), "");
+  }
+
+  let output = dv()
+    .args(["restore", "App.csproj", "--packages", "packages", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"code\":\"DV0415\""), "{stdout}");
+  assert!(stdout.contains("\"name\":\"cycle\",\"value\":\"cycle.a -> cycle.b -> cycle.a\""));
+  assert!(stdout.contains("package metadata contains a circular dependency chain"));
+}
+
+#[test]
 fn explicit_nuget_config_replaces_the_implicit_hierarchy() {
   let temp = TempDirectory::new();
   temp.write(

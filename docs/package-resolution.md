@@ -108,7 +108,7 @@ identity-ordered central version batch. Direct references use their selected
 central value unless `VersionOverride` wins. Matching transitive identities are
 promoted to the exact central version before package metadata is scheduled;
 an incompatible lower pin fails rather than drifting upward. Central-transitive
-packages remain distinct from project-direct packages in lock schema 5 and
+packages remain distinct from project-direct packages in lock schema 6 and
 event schema 15. See the
 [central package management contract](central-package-management.md).
 
@@ -146,6 +146,8 @@ ProjectSpec batch + resolve options
   -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
   -> merge dependency identities and conflicts through one deterministic owner
+  -> reject empty constraint intersections before source enumeration
+  -> classify final direct-wins downgrades into an ordered cold warning batch
   -> retract transitive packages supplied by the selected shared framework
   -> stream each package through SHA-512 into a bounded staging directory
   -> hand completed staging records to bounded blocking archive work
@@ -218,8 +220,9 @@ span allocation. Actual per-package roots and ordered fallback roots are cold
 parallel path-span batches, so fallback support does not enlarge the hot
 package scan. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
 path is an 8-byte offset/length span into one owned UTF-8 buffer. The
-pointer-aligned `PackageResolution` header is 328 bytes after adding the two
-cold root batches, typed policy fields, and source-work batch. Assuming the benchmark machine's
+pointer-aligned `PackageResolution` header is 368 bytes after adding the two
+cold root batches, typed policy fields, source-work batch, and downgrade batch.
+Assuming the benchmark machine's
 observed 64-byte cache line, eight spans fit per line. Reporters and compiler
 planning scan only the ranges they consume.
 
@@ -270,10 +273,27 @@ Each `PackageResolution` owns:
 - dependency indices and one contiguous, explicitly partitioned package-asset
   span batch;
 - computed archive hashes, with source-advertised v2 hashes verified;
+- successful direct-wins downgrade warnings in deterministic package order;
 - cache-hit, download, request, and payload-byte counters;
 - one 32-byte, eight-byte-aligned immutable row per configured source with its
   configuration key, protocol, actual request attempts, source bytes,
   and cumulative source-work microseconds.
+
+Each downgrade is a 32-byte, four-byte-aligned row containing four text spans:
+package identity, selected version, requested range, and requesting package.
+Two rows fit the benchmark host's assumed 64-byte cache line. Text shares the
+resolution buffer and the common no-warning path owns an empty boxed slice,
+so it performs no row allocation. A single post-convergence scan reads package
+constraints linearly and enters the graph ancestry path only for relevant
+transitive multi-parent constraints. Lock schema 6 persists this batch, which
+lets a warm locked restore reproduce `DV0413` without reopening manifests or
+rescanning the graph.
+
+Failures retain their ordered structured fields and causal chain behind one
+optional boxed cold-path record. Ordinary success does not allocate diagnostic
+field or cause vectors. The error header remains bounded to two assumed cache
+lines on 64-bit targets. Human and JSON reporters consume the same fields;
+they do not scrape or reparse the diagnostic message.
 
 Remote tasks account into 24-byte, eight-byte-aligned `HttpWork` and
 `SourceWork` values that travel with existing task results. The deterministic
@@ -303,7 +323,7 @@ them. `dv.lock.json` is project-owned persistent state.
 | Boundary | Diagnostic |
 |---|---|
 | Unsupported configuration or source | `DV0400` |
-| Invalid identity/version, conflict, or cycle | `DV0401` |
+| Invalid identity/version or malformed package requirement | `DV0401` |
 | No compatible supported assets | `DV0402` |
 | Offline cache miss | `DV0403` |
 | HTTP or source metadata failure | `DV0404` |
@@ -315,6 +335,11 @@ them. `dv.lock.json` is project-owned persistent state.
 | Credential-provider discovery or protocol failure | `DV0410` |
 | Package authentication or provider work cancelled | `DV0411` |
 | Uncached identity has no enabled winning source mapping | `DV0412` |
+| Direct-wins or central transitive-pin downgrade | `DV0413` |
+| Package constraints have no common version | `DV0414` |
+| Dependency graph contains a cycle | `DV0415` |
+| Enabled sources do not contain the package identity | `DV0416` |
+| Sources contain the identity but not a requested version | `DV0417` |
 
 Unsupported package build-target execution and signature enforcement fail
 instead of being approximated.
@@ -384,6 +409,20 @@ cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
 
 The curated distribution is retained in the
 [package conflict-resolution baseline](performance-baselines/2026-08-01-package-conflict-resolution-windows.md).
+
+The package-diagnostic case starts both tools with empty package caches and a
+deterministic local feed. Its timed project must fail as Microsoft's `NU1107`
+and `dv`'s structured `DV0414`. Preflight additionally proves matching
+`NU1605`/`DV0413`, `NU1108`/`DV0415`, `NU1101`/`DV0416`,
+`NU1102`/`DV0417`, and `NU1202`/`DV0402` categories, including cold and warm
+direct-wins warnings:
+
+```powershell
+cargo bench-all --case package_diagnostics --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[package diagnostic baseline](performance-baselines/2026-08-01-package-diagnostics-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties

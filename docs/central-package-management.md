@@ -68,9 +68,10 @@ there is no speculative metadata extension surface.
   unsupported imports/elements, malformed XML, and exceeded limits fail before
   package or network work.
 - A central transitive version below or outside a dependency requirement fails
-  as a resolution error instead of silently upgrading or downgrading it.
+  as stable downgrade diagnostic `DV0413` instead of silently upgrading or
+  downgrading it.
 - Central-transitive packages remain distinct from project-direct packages in
-  results, JSON events, human output, and lock schema 5.
+  results, JSON events, human output, and lock schema 6.
 
 The central policy and sorted version batch are SHA-256 fingerprinted into the
 lock. A changed props file that has the same effective selected data retains

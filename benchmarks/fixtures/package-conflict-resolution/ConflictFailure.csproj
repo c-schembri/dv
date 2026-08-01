@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Diagnostic.Left" Version="[1.0.0]" />
+    <PackageReference Include="Diagnostic.Right" Version="[1.0.0]" />
+  </ItemGroup>
+</Project>

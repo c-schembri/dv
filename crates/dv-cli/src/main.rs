@@ -222,10 +222,12 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
   };
   let resolution = &resolutions[0];
+  let diagnostics = package_downgrade_diagnostics(resolution);
   if !json {
+    write_human_diagnostics(&diagnostics);
     return write_package_resolution(resolution);
   }
-  succeed(started, command, args, package_resolution_payload(&project, resolution))
+  succeed_with_diagnostics(started, command, args, diagnostics, package_resolution_payload(&project, resolution))
 }
 
 fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
@@ -1615,14 +1617,14 @@ fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {
 }
 
 fn package_diagnostic(error: PackageError) -> Diagnostic {
-  let context_name = if error.kind() == PackageErrorKind::UnmappedIdentity {
-    "package_id"
-  } else {
-    "context"
-  };
   let code = match error.kind() {
     PackageErrorKind::Configuration => "DV0400",
     PackageErrorKind::Resolution => "DV0401",
+    PackageErrorKind::ConstraintConflict => "DV0414",
+    PackageErrorKind::Downgrade => "DV0413",
+    PackageErrorKind::DependencyCycle => "DV0415",
+    PackageErrorKind::PackageNotFound => "DV0416",
+    PackageErrorKind::VersionNotFound => "DV0417",
     PackageErrorKind::Incompatible => "DV0402",
     PackageErrorKind::OfflineMiss => "DV0403",
     PackageErrorKind::Network => "DV0404",
@@ -1639,6 +1641,11 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     PackageErrorKind::OfflineMiss => Some("Populate the global package cache or rerun without --offline."),
     PackageErrorKind::Configuration => Some("Use an HTTPS NuGet v2/v3 source, a local folder source, and the supported NuGet.Config subset."),
     PackageErrorKind::Incompatible => Some("Use a package with compatible lib or ref assets and no unsupported build/runtime assets."),
+    PackageErrorKind::ConstraintConflict => Some("Reference the package directly with one version that satisfies the dependency graph."),
+    PackageErrorKind::Downgrade => Some("Raise the central package version or disable central transitive pinning for this package."),
+    PackageErrorKind::DependencyCycle => Some("Correct the circular dependency in the package metadata or contact the package owner."),
+    PackageErrorKind::PackageNotFound => Some("Check the package identity and the enabled package sources."),
+    PackageErrorKind::VersionNotFound => Some("Choose an available package version or correct the dependency range."),
     PackageErrorKind::Network => Some("Check source availability, proxy settings, and package identity/version."),
     PackageErrorKind::CredentialProvider => Some("Install a self-contained NuGet V2 credential provider and check its timeout and login policy."),
     PackageErrorKind::Cancelled => Some("Rerun the command when package authentication can complete."),
@@ -1646,15 +1653,60 @@ fn package_diagnostic(error: PackageError) -> Diagnostic {
     PackageErrorKind::Integrity | PackageErrorKind::Archive => Some("Remove the corrupt cache entry and retry from a trusted source."),
     PackageErrorKind::Resolution | PackageErrorKind::Io | PackageErrorKind::NonUnicodePath | PackageErrorKind::TextOverflow => None,
   };
-  diagnostic(
-    code,
-    error.to_string(),
-    Some(ContextField {
-      name: context_name.into(),
-      value: error.context().into(),
-    }),
-    help,
-  )
+  let mut typed_context = error.diagnostic_context().peekable();
+  let fallback_context = typed_context.peek().is_none().then(|| ContextField {
+    name: if error.kind() == PackageErrorKind::UnmappedIdentity {
+      "package_id".into()
+    } else {
+      "context".into()
+    },
+    value: error.context().into(),
+  });
+  let mut result = diagnostic(code, error.to_string(), fallback_context, help);
+  result.context.extend(typed_context.map(|(name, value)| ContextField {
+    name: name.into(),
+    value: value.into(),
+  }));
+  result.causes.extend(error.causes().map(str::to_owned));
+  result
+}
+
+fn package_downgrade_diagnostics(resolution: &PackageResolution) -> Vec<Diagnostic> {
+  resolution
+    .downgrades()
+    .map(|warning| {
+      let package_id = resolution.downgrade_package_id(warning);
+      let selected = resolution.downgrade_selected_version(warning);
+      let requested = resolution.downgrade_requested_range(warning);
+      let requester = resolution.downgrade_requesting_package(warning);
+      let mut diagnostic = Diagnostic::new(
+        DiagnosticCode::parse("DV0413").expect("static diagnostic code is valid"),
+        Severity::Warning,
+        format!("detected package downgrade: {package_id} resolved to {selected} instead of {requested}"),
+      );
+      diagnostic.context.extend([
+        ContextField {
+          name: "package_id".into(),
+          value: package_id.into(),
+        },
+        ContextField {
+          name: "selected_version".into(),
+          value: selected.into(),
+        },
+        ContextField {
+          name: "required_range".into(),
+          value: requested.into(),
+        },
+        ContextField {
+          name: "requesting_package".into(),
+          value: requester.into(),
+        },
+      ]);
+      diagnostic.causes.push(format!("{requester} requires {package_id} {requested}"));
+      diagnostic.help = Some(format!("Reference {package_id} directly at a compatible higher version."));
+      diagnostic
+    })
+    .collect()
 }
 
 fn load_sdk_inventory(started: Instant, json: bool, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
@@ -1861,6 +1913,51 @@ fn succeed(started: Instant, command: &str, args: Vec<String>, payload: EventPay
   ExitCode::SUCCESS
 }
 
+fn succeed_with_diagnostics(started: Instant, command: &str, args: Vec<String>, diagnostics: Vec<Diagnostic>, payload: EventPayload) -> ExitCode {
+  if diagnostics.is_empty() {
+    return succeed(started, command, args, payload);
+  }
+  let elapsed_us = micros(started.elapsed());
+  let mut events = Vec::with_capacity(diagnostics.len() + 3);
+  events.push(Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }));
+  for diagnostic in diagnostics {
+    events.push(Event::new(events.len() as u64, elapsed_us, EventPayload::Diagnostic { diagnostic }));
+  }
+  events.push(Event::new(events.len() as u64, elapsed_us, payload));
+  events.push(Event::new(
+    events.len() as u64,
+    elapsed_us,
+    EventPayload::CommandFinished {
+      command: command.into(),
+      duration_us: elapsed_us,
+      outcome: Outcome::Succeeded,
+    },
+  ));
+  write_json_lines(&events, io::stdout().lock()).expect("writing structured output to stdout succeeds");
+  ExitCode::SUCCESS
+}
+
+fn write_human_diagnostics(diagnostics: &[Diagnostic]) {
+  let mut stderr = io::stderr().lock();
+  for diagnostic in diagnostics {
+    let severity = match diagnostic.severity {
+      Severity::Error => "error",
+      Severity::Warning => "warning",
+      Severity::Info => "info",
+    };
+    writeln!(stderr, "{severity}[{}]: {}", diagnostic.code, diagnostic.message).expect("writing diagnostics to stderr succeeds");
+    for field in &diagnostic.context {
+      writeln!(stderr, "  {}: {}", field.name, field.value).expect("writing diagnostic context succeeds");
+    }
+    for cause in &diagnostic.causes {
+      writeln!(stderr, "  caused by: {cause}").expect("writing diagnostic cause succeeds");
+    }
+    if let Some(help) = &diagnostic.help {
+      writeln!(stderr, "  help: {help}").expect("writing diagnostic help succeeds");
+    }
+  }
+}
+
 fn diagnostic(code: &str, message: impl Into<String>, context: Option<ContextField>, help: Option<&str>) -> Diagnostic {
   let mut diagnostic = Diagnostic::new(DiagnosticCode::parse(code).expect("static diagnostic code is valid"), Severity::Error, message);
   diagnostic.context.extend(context);
@@ -1893,14 +1990,7 @@ fn fail(started: Instant, json: bool, command: &str, args: Vec<String>, diagnost
     ];
     write_json_lines(&events, io::stdout().lock()).expect("writing structured output to stdout succeeds");
   } else {
-    let mut stderr = io::stderr().lock();
-    writeln!(stderr, "error[{}]: {}", diagnostic.code, diagnostic.message).expect("writing diagnostics to stderr succeeds");
-    for field in diagnostic.context {
-      writeln!(stderr, "  {}: {}", field.name, field.value).expect("writing diagnostic context succeeds");
-    }
-    if let Some(help) = diagnostic.help {
-      writeln!(stderr, "  help: {help}").expect("writing diagnostic help succeeds");
-    }
+    write_human_diagnostics(std::slice::from_ref(&diagnostic));
   }
 
   ExitCode::from(2)

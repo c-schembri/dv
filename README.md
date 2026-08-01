@@ -50,6 +50,9 @@ dv PackageReference policy       6.611 ms median
 dotnet central package restore 461.826 ms median
 dv central package restore      29.864 ms median
 
+dotnet package conflict error  569.423 ms median
+dv package conflict error       13.797 ms median
+
 dotnet restore (config stack) 532.948 ms median
 dv restore (config stack)       5.651 ms median
 
@@ -147,6 +150,7 @@ The project is in the first implementation phase.
 | PackageReference asset, warning, alias, and path-property policy | Implemented |
 | Central versions, overrides, global references, and transitive pinning | Implemented |
 | Lowest-applicable, nested direct-wins, and cousin package convergence | Implemented |
+| Stable package downgrade, conflict, cycle, missing, and compatibility diagnostics | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -345,7 +349,8 @@ Initial machine:
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
-  metadata, central package management, package conflict resolution, service-index
+  metadata, central package management, package conflict resolution, package
+  diagnostics, service-index
   capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
@@ -382,6 +387,7 @@ Initial machine:
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
+| Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -471,7 +477,14 @@ direct references, an override, a global SourceLink reference, and a
 `Humanizer.Core` transitive pin. Preflight compares every exact version,
 archive hash, asset family, and Microsoft's `CentralTransitive` lock role.
 The measured medians are `461.826 ms` for Microsoft and `29.864 ms` for `dv`
-(`15.5x`), with zero timed network work. The unavailable-pack case
+(`15.5x`), with zero timed network work. The package-diagnostic case starts
+both tools with an empty package cache and the same eight-archive local feed.
+The timed conflict must fail as Microsoft's `NU1107` and structured `DV0414`;
+preflight also proves `NU1605`/`DV0413`, `NU1108`/`DV0415`,
+`NU1101`/`DV0416`, `NU1102`/`DV0417`, and `NU1202`/`DV0402`. Successful
+direct-wins warnings must survive `dv`'s native warm lock unchanged. Thirty
+samples measure `569.423 ms` for Microsoft and `13.797 ms` for `dv`
+(`41.3x`) with no network work. The unavailable-pack case
 uses an empty checked-in source and isolated package cache; both commands must
 fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -531,6 +544,7 @@ recorded in the curated
 [PackageReference metadata baseline](docs/performance-baselines/2026-08-01-package-reference-metadata-windows.md),
 [central package management baseline](docs/performance-baselines/2026-08-01-central-package-management-windows.md),
 [package conflict-resolution baseline](docs/performance-baselines/2026-08-01-package-conflict-resolution-windows.md),
+[package diagnostic baseline](docs/performance-baselines/2026-08-01-package-diagnostics-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -596,6 +610,7 @@ cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
 cargo bench-all --case package_reference_metadata --samples 30 --warmups 3
 cargo bench-all --case central_package_management --samples 30 --warmups 3
 cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
+cargo bench-all --case package_diagnostics --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3

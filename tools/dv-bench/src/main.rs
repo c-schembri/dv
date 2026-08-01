@@ -40,6 +40,7 @@ enum CaseKind {
   PackageReferenceMetadata,
   CentralPackageManagement,
   PackageConflictResolution,
+  PackageDiagnostics,
   PackageSyncWarm,
   NugetConfigHierarchy,
   NugetConfigMerge,
@@ -302,6 +303,20 @@ const DOTNET_CASES: &[Case] = &[
       "--nologo",
       "--verbosity",
       "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_diagnostics",
+    kind: CaseKind::PackageDiagnostics,
+    args: &[
+      "restore",
+      "ConflictFailure.csproj",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "minimal",
     ],
     implemented: true,
   },
@@ -670,6 +685,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_diagnostics",
+    kind: CaseKind::PackageDiagnostics,
+    args: &["restore", "ConflictFailure.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_config_hierarchy",
     kind: CaseKind::NugetConfigHierarchy,
     args: &["restore", "ConfigHierarchy.csproj", "--offline", "--json"],
@@ -1009,8 +1030,15 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "central_package_management") {
     verify_central_package_management(&repository, &dv_executable, &central_package_management_fixture)?;
   }
-  if options.case.as_deref().is_none_or(|case| case == "package_conflict_resolution") {
+  if options
+    .case
+    .as_deref()
+    .is_none_or(|case| matches!(case, "package_conflict_resolution" | "package_diagnostics"))
+  {
     verify_package_conflict_resolution(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "package_diagnostics") {
+    verify_package_diagnostics(&repository, &dv_executable, &package_conflict_resolution_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "nuget_config_hierarchy") {
     verify_nuget_config_hierarchy(&repository, &dv_executable, &nuget_config_fixture)?;
@@ -1718,6 +1746,88 @@ fn validate_source_mapping_failure(output: &Output, reference: bool) -> Result<(
   Ok(())
 }
 
+fn validate_package_diagnostic(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("package constraint-conflict benchmark unexpectedly succeeded".into());
+  }
+  if reference {
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    if !text.contains("NU1107") || !text.contains("Diagnostic.Leaf") {
+      return Err(format!("Microsoft restore omitted the expected NU1107 constraint conflict: {text}").into());
+    }
+    return Ok(());
+  }
+  if !output.stderr.is_empty() {
+    return Err(format!("dv JSON package diagnostic wrote stderr: {}", String::from_utf8_lossy(&output.stderr)).into());
+  }
+  let diagnostic = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic").cloned())
+    .ok_or("dv restore omitted its constraint-conflict diagnostic")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0414")
+    || diagnostic.get("severity").and_then(serde_json::Value::as_str) != Some("error")
+  {
+    return Err(format!("dv emitted an unstable constraint-conflict diagnostic: {diagnostic}").into());
+  }
+  let context = diagnostic
+    .get("context")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv constraint-conflict diagnostic omitted context")?;
+  for (name, expected) in [("package_id", "Diagnostic.Leaf"), ("required_ranges", "[1.0.0]; [2.0.0]")] {
+    let actual = context.iter().find_map(|field| {
+      (field.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .then(|| field.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    });
+    if actual != Some(expected) {
+      return Err(format!("dv constraint-conflict context {name} mismatch: expected={expected:?} actual={actual:?}").into());
+    }
+  }
+  if diagnostic.get("help").and_then(serde_json::Value::as_str).is_none() {
+    return Err("dv constraint-conflict diagnostic omitted its action".into());
+  }
+  Ok(())
+}
+
+fn validate_reference_package_error(output: &Output, code: &str, identity: &str) -> Result<()> {
+  if output.status.success() {
+    return Err(format!("Microsoft package-error oracle {code} unexpectedly succeeded").into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if !text.contains(code) || !text.contains(identity) {
+    return Err(format!("Microsoft package-error oracle omitted {code} or {identity}: {text}").into());
+  }
+  Ok(())
+}
+
+fn validate_dv_package_error(output: &Output, code: &str, identity: &str) -> Result<()> {
+  if output.status.success() {
+    return Err(format!("dv package-error oracle {code} unexpectedly succeeded").into());
+  }
+  if !output.stderr.is_empty() {
+    return Err(format!("dv JSON package-error oracle wrote stderr: {}", String::from_utf8_lossy(&output.stderr)).into());
+  }
+  let diagnostic = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic").cloned())
+    .ok_or_else(|| format!("dv package-error oracle omitted {code}"))?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some(code)
+    || diagnostic.get("severity").and_then(serde_json::Value::as_str) != Some("error")
+    || !diagnostic.to_string().to_ascii_lowercase().contains(&identity.to_ascii_lowercase())
+  {
+    return Err(format!("dv package-error oracle expected {code} and {identity}: {diagnostic}").into());
+  }
+  Ok(())
+}
+
 fn required_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str> {
   value
     .get(field)
@@ -2302,21 +2412,33 @@ fn verify_package_conflict_resolution(repository: &Path, dv_executable: &Path, f
   for package in CONFLICT_PACKAGES {
     write_conflict_package(&root.join("feed"), package)?;
   }
-  run_checked(
-    Path::new("dotnet"),
-    &[
+  let reference = Command::new("dotnet")
+    .args([
       "restore",
       "ConflictResolution.csproj",
       "--packages",
       "dotnet-packages",
-      "-p:NoWarn=NU1605",
+      "-p:WarningsAsErrors=",
       "--nologo",
       "--verbosity",
-      "quiet",
-    ],
-    &root,
-    "Microsoft package conflict oracle",
-  )?;
+      "minimal",
+    ])
+    .current_dir(&root)
+    .output()?;
+  if !reference.status.success() {
+    return Err(
+      format!(
+        "Microsoft package conflict oracle failed: {}{}",
+        String::from_utf8_lossy(&reference.stdout),
+        String::from_utf8_lossy(&reference.stderr)
+      )
+      .into(),
+    );
+  }
+  let reference_text = format!("{}{}", String::from_utf8_lossy(&reference.stdout), String::from_utf8_lossy(&reference.stderr));
+  if !reference_text.contains("warning NU1605") || !reference_text.contains("Direct.Leaf") {
+    return Err(format!("Microsoft package conflict oracle omitted its NU1605 downgrade warning: {reference_text}").into());
+  }
   let assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join("obj/project.assets.json"))?)?;
   let mut microsoft = assets
     .get("libraries")
@@ -2338,6 +2460,13 @@ fn verify_package_conflict_resolution(repository: &Path, dv_executable: &Path, f
     &["restore", "ConflictResolution.csproj", "--packages", "dv-packages", "--offline", "--json"],
     &root,
   )?;
+  validate_downgrade_warning(&restored)?;
+  let warm = command_text(
+    dv_executable,
+    &["restore", "ConflictResolution.csproj", "--packages", "dv-packages", "--offline", "--json"],
+    &root,
+  )?;
+  validate_downgrade_warning(&warm)?;
   let resolution = json_event(&restored, "package_resolution_created").ok_or("dv conflict restore omitted package_resolution_created")?;
   let mut dv = resolution
     .get("packages")
@@ -2380,6 +2509,93 @@ fn verify_package_conflict_resolution(repository: &Path, dv_executable: &Path, f
   expected.sort_unstable();
   if microsoft != expected || dv != expected {
     return Err(format!("package conflict selection differs: expected={expected:?} Microsoft={microsoft:?} dv={dv:?}").into());
+  }
+  Ok(())
+}
+
+fn validate_downgrade_warning(output: &str) -> Result<()> {
+  let diagnostic = json_event(output, "diagnostic").ok_or("dv conflict restore omitted its downgrade diagnostic")?;
+  if diagnostic.pointer("/diagnostic/code").and_then(serde_json::Value::as_str) != Some("DV0413")
+    || diagnostic.pointer("/diagnostic/severity").and_then(serde_json::Value::as_str) != Some("warning")
+  {
+    return Err(format!("dv emitted an unstable downgrade diagnostic: {diagnostic}").into());
+  }
+  let context = diagnostic
+    .pointer("/diagnostic/context")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv downgrade diagnostic omitted context")?;
+  for (name, expected) in [
+    ("package_id", "Direct.Leaf"),
+    ("selected_version", "1.0.0"),
+    ("required_range", "[2.0.0]"),
+    ("requesting_package", "Direct.Deep"),
+  ] {
+    let actual = context.iter().find_map(|field| {
+      (field.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .then(|| field.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    });
+    if actual != Some(expected) {
+      return Err(format!("dv downgrade context {name} mismatch: expected={expected:?} actual={actual:?}").into());
+    }
+  }
+  Ok(())
+}
+
+fn verify_package_diagnostics(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-package-diagnostic-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  reset_fixture(fixture, &root)?;
+  for package in DIAGNOSTIC_PACKAGES {
+    write_conflict_package(&root.join("feed"), package)?;
+  }
+  write_incompatible_package(&root.join("feed"))?;
+  let reference = Command::new("dotnet")
+    .args([
+      "restore",
+      "ConflictFailure.csproj",
+      "--packages",
+      "dotnet-packages",
+      "--nologo",
+      "--verbosity",
+      "minimal",
+    ])
+    .current_dir(&root)
+    .output()?;
+  validate_package_diagnostic(&reference, true)?;
+
+  let actual = Command::new(dv_executable)
+    .args(["restore", "ConflictFailure.csproj", "--packages", "dv-packages", "--offline", "--json"])
+    .current_dir(&root)
+    .output()?;
+  validate_package_diagnostic(&actual, false)?;
+
+  for (project, reference_code, dv_code, identity) in [
+    ("CycleFailure.csproj", "NU1108", "DV0415", "Diagnostic.Cycle.A"),
+    ("MissingPackageFailure.csproj", "NU1101", "DV0416", "Diagnostic.Absent"),
+    ("MissingVersionFailure.csproj", "NU1102", "DV0417", "Diagnostic.Known"),
+    ("IncompatibleFailure.csproj", "NU1202", "DV0402", "Diagnostic.Future"),
+  ] {
+    remove_generated_path(&root.join("obj"))?;
+    remove_generated_path(&root.join("dv.lock.json"))?;
+    let reference = Command::new("dotnet")
+      .args([
+        "restore",
+        project,
+        "--packages",
+        "dotnet-diagnostic-packages",
+        "--nologo",
+        "--verbosity",
+        "minimal",
+      ])
+      .current_dir(&root)
+      .output()?;
+    validate_reference_package_error(&reference, reference_code, identity)?;
+    let actual = Command::new(dv_executable)
+      .args(["restore", project, "--packages", "dv-diagnostic-packages", "--offline", "--json"])
+      .current_dir(&root)
+      .output()?;
+    validate_dv_package_error(&actual, dv_code, identity)?;
   }
   Ok(())
 }
@@ -4105,6 +4321,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageReferenceMetadata
       | CaseKind::CentralPackageManagement
       | CaseKind::PackageConflictResolution
+      | CaseKind::PackageDiagnostics
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
@@ -4463,8 +4680,8 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       )?;
     }
   }
-  if matches!(case.kind, CaseKind::PackageConflictResolution) {
-    prepare_package_conflict_resolution(executable, workspace)?;
+  if matches!(case.kind, CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics) {
+    prepare_package_conflict_resolution(executable, workspace, matches!(case.kind, CaseKind::PackageDiagnostics))?;
   }
   if matches!(case.kind, CaseKind::BuildNoOp | CaseKind::RunWarm) {
     run_checked(executable, build_args(executable), workspace, "persistent case setup")?;
@@ -4771,6 +4988,44 @@ const CONFLICT_PACKAGES: &[ConflictPackage] = &[
   },
 ];
 
+const DIAGNOSTIC_PACKAGES: &[ConflictPackage] = &[
+  ConflictPackage {
+    id: "Diagnostic.Leaf",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Leaf",
+    version: "2.0.0",
+    dependencies: &[],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Left",
+    version: "1.0.0",
+    dependencies: &[("Diagnostic.Leaf", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Right",
+    version: "1.0.0",
+    dependencies: &[("Diagnostic.Leaf", "[2.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Cycle.A",
+    version: "1.0.0",
+    dependencies: &[("Diagnostic.Cycle.B", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Cycle.B",
+    version: "1.0.0",
+    dependencies: &[("Diagnostic.Cycle.A", "[1.0.0]")],
+  },
+  ConflictPackage {
+    id: "Diagnostic.Known",
+    version: "1.0.0",
+    dependencies: &[],
+  },
+];
+
 fn write_conflict_package(feed: &Path, package: &ConflictPackage) -> Result<()> {
   use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -4794,11 +5049,31 @@ fn write_conflict_package(feed: &Path, package: &ConflictPackage) -> Result<()> 
   Ok(())
 }
 
-fn prepare_package_conflict_resolution(executable: &Path, workspace: &Path) -> Result<()> {
+fn write_incompatible_package(feed: &Path) -> Result<()> {
+  use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+  fs::create_dir_all(feed)?;
+  let mut archive = ZipWriter::new(fs::File::create(feed.join("Diagnostic.Future.1.0.0.nupkg"))?);
+  let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+  archive.start_file("Diagnostic.Future.nuspec", options)?;
+  archive.write_all(
+    br#"<?xml version="1.0"?><package><metadata><id>Diagnostic.Future</id><version>1.0.0</version><authors>dv</authors><description>Incompatible framework oracle.</description></metadata></package>"#,
+  )?;
+  archive.start_file("lib/net11.0/Diagnostic.Future.dll", options)?;
+  archive.write_all(b"deterministic managed assembly placeholder")?;
+  archive.finish()?;
+  Ok(())
+}
+
+fn prepare_package_conflict_resolution(executable: &Path, workspace: &Path, diagnostic: bool) -> Result<()> {
   let feed = workspace.join("feed");
   remove_generated_path(&feed)?;
-  for package in CONFLICT_PACKAGES {
+  for package in if diagnostic { DIAGNOSTIC_PACKAGES } else { CONFLICT_PACKAGES } {
     write_conflict_package(&feed, package)?;
+  }
+  if diagnostic {
+    write_incompatible_package(&feed)?;
+    return reset_package_diagnostic_iteration(workspace);
   }
   if is_dotnet(executable) {
     run_checked(
@@ -5235,6 +5510,13 @@ fn reset_package_conflict_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_package_diagnostic_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", "obj", "dv.lock.json", "packages.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn remove_generated_path(path: &Path) -> Result<()> {
   const RETRIES: [Duration; 4] = [
     Duration::from_millis(10),
@@ -5277,6 +5559,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetHttpPolicy
     | CaseKind::NugetSourceSecurity => Ok(()),
     CaseKind::PackageConflictResolution => reset_package_conflict_iteration(workspace),
+    CaseKind::PackageDiagnostics => reset_package_diagnostic_iteration(workspace),
     CaseKind::NugetLocalSources => reset_nuget_local_iteration(workspace),
     CaseKind::NugetFloatingVersion => reset_nuget_floating_iteration(workspace),
     CaseKind::NugetRequestBudget | CaseKind::NugetSourceTelemetry => reset_nuget_request_budget_iteration(workspace),
@@ -5345,7 +5628,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
-    CaseKind::PackageConflictResolution => fixtures.package_conflict_resolution,
+    CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics => fixtures.package_conflict_resolution,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
@@ -5379,7 +5662,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
-    CaseKind::PackageConflictResolution => Some("package-conflict-resolution"),
+    CaseKind::PackageConflictResolution | CaseKind::PackageDiagnostics => Some("package-conflict-resolution"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
@@ -5432,6 +5715,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
+    validate_package_diagnostic(&output, is_dotnet(executable))?;
   } else {
     check_output(output.clone(), executable, case.args, "measured command")?;
   }
@@ -6223,6 +6508,7 @@ fn case_label(case: &str) -> &str {
     "package_reference_metadata" => "PackageReference metadata",
     "central_package_management" => "Central package management",
     "package_conflict_resolution" => "Package conflict resolution",
+    "package_diagnostics" => "Package constraint diagnostic",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",

@@ -10,8 +10,18 @@ also reaches the project-direct `Diamond.Relational` through
 `Diamond.Provider`; its independent root path keeps its `Diamond.Leaf` 2.0.0
 constraint active as a cousin.
 
-Both tools resolve the same fifteen local archives into eleven selected identities
-from a warm package cache with restore outputs and locks removed before every
-sample. Microsoft restore receives `NoWarn=NU1605` because the SDK promotes
-that valid direct-wins downgrade warning to an error by default; selection is
-still verified before timing.
+Both tools resolve the same fifteen local archives into eleven selected
+identities from a warm package cache with restore outputs and locks removed
+before every sample. Microsoft restore receives `NoWarn=NU1605` because the
+SDK promotes that valid direct-wins downgrade warning to an error by default;
+preflight separately requires the unsuppressed warning and selection before
+timing.
+
+Five additional projects make package diagnostics deterministic. The timed
+`ConflictFailure.csproj` case starts with an empty package cache and resolves
+two incompatible exact leaf constraints from an eight-archive local feed. It
+must fail as Microsoft `NU1107` and structured `dv` `DV0414`. Preflight also
+checks cycle (`NU1108`/`DV0415`), missing package (`NU1101`/`DV0416`), missing
+version (`NU1102`/`DV0417`), and incompatible framework
+(`NU1202`/`DV0402`) failures. The successful direct-wins project emits
+`DV0413` from both cold resolution and the native warm lock.

@@ -937,8 +937,15 @@ boundary, not final drop-in parity.
   identity/version parity across 203 packages. Thirty warm-cache Windows
   samples measure `604.023 ms` for Microsoft versus `16.971 ms` for `dv`
   (`35.6x`). `P1`
-- [~] `RES-008` Emit stable downgrade, constraint conflict, cycle, missing
-  package/version, and incompatible-framework diagnostics. `P1`
+- [x] `RES-008` Package failures retain typed, ordered diagnostic fields behind
+  one optional cold-path allocation. Successful direct-wins downgrades compact
+  into 32-byte rows and persist in lock schema 6, so cold and warm restores emit
+  the same `DV0413` warning without reopening manifests. Constraint conflicts,
+  cycles, missing identities, missing versions, and incompatible frameworks emit
+  `DV0414`, `DV0415`, `DV0416`, `DV0417`, and `DV0402` respectively. Microsoft
+  preflight proves the matching `NU1605`, `NU1107`, `NU1108`, `NU1101`,
+  `NU1102`, and `NU1202` categories. Thirty cold local-source samples measure
+  `569.423 ms` for Microsoft versus `13.797 ms` for `dv` (`41.3x`). `P1`
 - [ ] `RES-009` Resolve all projects/targets as a batch so shared metadata and
   downloads are deduplicated. `P2`
 - [~] `RES-010` Parse `.nuspec` dependency groups without confusing later
@@ -947,7 +954,7 @@ boundary, not final drop-in parity.
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by compatible TFM and NuGet include/exclude
-  propagation. Lock schema 4 and event schema 14 preserve every selected family
+  propagation. Lock schema 6 and event schema 15 preserve every selected family
   in compact per-package ranges. The 203-package massive acceptance graph now
   matches `project.assets.json` across portable asset paths and runtime-target
   RID/type metadata and is benchmarked end to end. Selecting one concrete RID
