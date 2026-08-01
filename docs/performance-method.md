@@ -233,7 +233,7 @@ cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
 cargo bench-all --case cli_exit_policy --samples 50 --warmups 10
 cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
-cargo bench-all --case dotnet_runtime_inventory --samples 50 --warmups 10
+cargo bench-all --case dotnet_runtime_inventory --samples 200 --warmups 20
 ```
 
 Measure the independently versioned command-syntax and JSON protocol query:

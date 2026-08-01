@@ -11,7 +11,7 @@ frameworks and emit byte-identical rows after CRLF normalization.
 - .NET SDK `10.0.100`
 - two complete SDKs and 15 runtimes across three framework families
 - release binaries and maximum Cargo compiler concurrency
-- 50 retained samples after ten warm-ups; warm OS caches
+- 200 retained samples after 20 warm-ups; warm OS caches
 
 ## Commands
 
@@ -22,8 +22,8 @@ C:\Projects\dv\target/release\dv.exe --compat dotnet --list-runtimes
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| Microsoft | 4.942 ms | 5.647 ms | 4.648 ms | 5.759 ms |
-| `dv` | 4.901 ms | 5.525 ms | 4.318 ms | 5.788 ms |
+| Microsoft | 4.618 ms | 5.911 ms | 4.145 ms | 7.117 ms |
+| `dv` | 4.551 ms | 5.500 ms | 4.098 ms | 6.310 ms |
 
 `dv` is **1.01x faster** at the median and also lower at p95. This native
 Microsoft query is already near the Windows process-start floor, so the small
@@ -39,5 +39,5 @@ or network work is included.
 Reproduce:
 
 ```powershell
-cargo bench-all --case dotnet_runtime_inventory --samples 50 --warmups 10 --output benchmarks/results/2026-08-02-dotnet-driver-inventory-windows.json
+cargo bench-all --case dotnet_runtime_inventory --samples 200 --warmups 20 --output benchmarks/results/2026-08-02-dotnet-driver-inventory-windows.json
 ```

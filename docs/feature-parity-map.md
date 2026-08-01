@@ -570,9 +570,9 @@ contracts.
   batch. Incomplete SDK directories are
   excluded using the same `dotnet.dll` completeness boundary. Architecture
   selectors, complete `--info`, diagnostics, and the remaining root grammar
-  stay explicit unfinished work. Fifty warm Windows samples measured
-  Microsoft at `4.942 ms` median and `5.647 ms` p95 versus `4.901 ms` and
-  `5.525 ms` for `dv`, a `1.01x` median improvement at the native process-start
+  stay explicit unfinished work. Two hundred warm Windows samples measured
+  Microsoft at `4.618 ms` median and `5.911 ms` p95 versus `4.551 ms` and
+  `5.500 ms` for `dv`, a `1.01x` median improvement at the native process-start
   floor. `P1/P4`
 - [ ] `DNCLI-002` Support `build`, `clean`, `new`, `pack`, `publish`,
   `restore`, `run`, `test`, `vstest`, `msbuild`, `sdk check`, `sln`, and

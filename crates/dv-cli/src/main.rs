@@ -1,6 +1,7 @@
 use std::{
   env,
   ffi::OsStr,
+  fmt::Write as _,
   io::{self, IsTerminal, Write},
   path::{Path, PathBuf},
   process,

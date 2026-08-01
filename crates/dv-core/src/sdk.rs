@@ -486,11 +486,7 @@ fn discover_runtimes_in_owned_roots(roots: Vec<PathBuf>) -> Result<RuntimeInvent
     }
   }
 
-  Ok(RuntimeInventory {
-    roots,
-    text,
-    installations,
-  })
+  Ok(RuntimeInventory { roots, text, installations })
 }
 
 fn text_range(text: &str, start: u32, len: u16) -> &str {
