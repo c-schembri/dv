@@ -18,8 +18,8 @@ const CHILD_GRACE: Duration = Duration::from_secs(2);
 /// One command-lifetime cooperative cancellation signal.
 ///
 /// One reference-counted allocation is shared by the process signal handler,
-/// async workers, and future child launchers. The state occupies one isolated
-/// cache line so signal writes do not invalidate unrelated hot data.
+/// async workers, and future child launchers. Signal-written atomics begin an
+/// isolated cache-aligned record so they do not share the Arc count line.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
   state: Arc<CancellationState>,
@@ -28,25 +28,26 @@ pub struct CancellationToken {
 #[repr(C, align(64))]
 #[derive(Debug)]
 struct CancellationState {
-  epoch: Instant,
   requested_elapsed_us: AtomicU64,
   phase: AtomicU8,
+  epoch: Instant,
   notify: Notify,
 }
 
 const _: () = assert!(size_of::<CancellationToken>() == size_of::<usize>());
 const _: () = assert!(align_of::<CancellationToken>() == align_of::<usize>());
-const _: () = assert!(size_of::<CancellationState>() == 64);
-const _: () = assert!(align_of::<CancellationState>() == 64);
+const _: () = assert!(size_of::<CancellationState>().is_multiple_of(crate::BENCHMARK_CACHE_LINE_BYTES));
+const _: () = assert!(size_of::<CancellationState>() <= 2 * crate::BENCHMARK_CACHE_LINE_BYTES);
+const _: () = assert!(align_of::<CancellationState>() == crate::BENCHMARK_CACHE_LINE_BYTES);
 
 impl CancellationToken {
   /// Creates one unset token with the fixed child-shutdown deadline contract.
   pub fn new() -> Self {
     Self {
       state: Arc::new(CancellationState {
-        epoch: Instant::now(),
         requested_elapsed_us: AtomicU64::new(NO_REQUEST),
         phase: AtomicU8::new(RUNNING),
+        epoch: Instant::now(),
         notify: Notify::new(),
       }),
     }

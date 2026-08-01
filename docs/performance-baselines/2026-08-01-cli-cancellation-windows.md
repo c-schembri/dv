@@ -29,15 +29,15 @@ allocation, handler registration, SDK discovery and selection, and output.
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| Microsoft .NET 10 | 69.974 ms | 78.380 ms | 65.777 ms | 85.042 ms |
-| `dv` | 5.554 ms | 6.411 ms | 4.952 ms | 6.554 ms |
+| Microsoft .NET 10 | 68.262 ms | 71.868 ms | 65.596 ms | 72.110 ms |
+| `dv` | 6.309 ms | 7.356 ms | 5.308 ms | 7.863 ms |
 
-`dv` was 12.6x faster at the median. The complete stable batch is reported; no
+`dv` was 10.8x faster at the median. The complete stable batch is reported; no
 retained sample was removed.
 
 The non-work `dv --version` control, which deliberately skips cancellation
-installation and SDK discovery, measured 5.062 ms median, 5.544 ms p95,
-4.263 ms minimum, and 5.601 ms maximum. Its 0.492 ms median difference from
+installation and SDK discovery, measured 5.364 ms median, 5.764 ms p95,
+4.636 ms minimum, and 7.104 ms maximum. Its 0.945 ms median difference from
 `dv sdk current` is only an upper bound on handler cost because the latter also
 performs SDK discovery and selection.
 
@@ -60,12 +60,14 @@ which fails immediately if handler installation is unavailable.
 
 ## Cost And Layout
 
-`CancellationToken` is one pointer. Its one necessary shared allocation is a
-compile-time asserted 64-byte, 64-byte-aligned state containing a monotonic
-epoch, atomic first-signal timestamp, one-byte phase, and Tokio notification.
-Clones share that allocation; waits do not allocate a timer task or use dynamic
-dispatch. Help, self-version, global-option failure, and unknown-command paths
-do not allocate this state or start the handler thread.
+`CancellationToken` is one pointer. Its one necessary shared allocation is
+64-byte aligned and keeps the atomic first-signal timestamp and one-byte phase
+first. The monotonic epoch and platform-sized Tokio notification follow; the
+full state is 64 bytes on this Windows host and compile-time capped at two
+assumed cache lines on supported platforms. Clones share that allocation;
+waits do not allocate a timer task or use dynamic dispatch. Help, self-version,
+global-option failure, and unknown-command paths do not allocate this state or
+start the handler thread.
 
 Raw samples are retained as
 `benchmarks/results/2026-08-01-cli-cancellation-windows.json` and

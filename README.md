@@ -438,7 +438,7 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
-| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 69.974 ms | 5.554 ms | 12.6x | 78.380 ms | 6.411 ms |
+| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 68.262 ms | 6.309 ms | 10.8x | 71.868 ms | 7.356 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 146.054 ms | 4.827 ms | 30.3x | 152.690 ms | 6.424 ms |

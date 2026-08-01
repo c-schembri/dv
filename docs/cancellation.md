@@ -31,10 +31,13 @@ termination latency and will be validated when those child workflows land.`
 
 `CancellationToken` is one pointer and clones by incrementing one reference
 count. Its single shared state allocation is explicitly 64-byte aligned and
-compile-time asserted to occupy one cache line. The hot fields are an atomic
-microsecond timestamp and one-byte phase; the monotonic epoch and Tokio notify
-primitive share the same isolated line. No per-wait allocation, deadline task,
-timer thread, hash lookup, or dynamic dispatch is introduced.
+keeps its atomic microsecond timestamp and one-byte phase first under `repr(C)`.
+The following monotonic epoch and platform-sized Tokio notification keep the
+complete record at 64 bytes on Windows/Linux and 128 bytes on macOS. Compile
+assertions cap it at two assumed cache lines; the command working set is one
+pointer plus at most 128 allocation bytes.
+No per-wait allocation, deadline task, timer thread, hash lookup, or dynamic
+dispatch is introduced.
 
 One allocation is necessary because the process signal callback and spawned
 Tokio tasks require shared `'static` ownership. Commands that cannot perform
@@ -92,10 +95,10 @@ only as metadata.
 The like-for-like Windows case compares `dotnet --version` with `dv sdk
 current`; both select and print the active SDK, while `dv` additionally installs
 the new handler before discovery. Thirty retained samples after five warm-ups
-measured Microsoft at `69.974 ms` median and `78.380 ms` p95, versus `5.554 ms`
-and `6.411 ms` for `dv`, a `12.6x` median advantage. The non-work `dv
---version` control measured `5.062 ms` median and `5.544 ms` p95. Because SDK
-discovery is also included, the `0.492 ms` difference is only an upper bound on
+measured Microsoft at `68.262 ms` median and `71.868 ms` p95, versus `6.309 ms`
+and `7.356 ms` for `dv`, a `10.8x` median advantage. The non-work `dv
+--version` control measured `5.364 ms` median and `5.764 ms` p95. Because SDK
+discovery is also included, the `0.945 ms` difference is only an upper bound on
 the end-to-end handler cost. Raw samples
 are retained in
 `benchmarks/results/2026-08-01-cli-cancellation-windows.json` and

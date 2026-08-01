@@ -340,8 +340,10 @@ contracts.
   global-option failures retain their allocation-free fast path; every
   work-bearing command installs one
   handler before SDK, project, filesystem, process, or network work. One
-  64-byte cache-line-aligned state allocation records the first signal against
-  a monotonic epoch, wakes Tokio work, and exposes an absolute two-second child
+  cache-line-aligned state allocation keeps its hot atomics first and is bounded
+  to one or two assumed cache lines across supported hosts. It records the first
+  signal against a monotonic epoch, wakes Tokio work, and exposes an absolute
+  two-second child
   deadline; a second signal forces immediate termination. Package source,
   retry, response-stream, restore, and credential-provider waits observe the
   same token. The run/test boundary receives the typed policy while child

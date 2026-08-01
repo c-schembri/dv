@@ -65,7 +65,7 @@ fn sigint_cancels_in_flight_package_io_with_a_cancelled_event() {
   temp.write(
     "App.csproj",
     r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
   <ItemGroup><PackageReference Include="Cancellation.Package" Version="1.0.0" /></ItemGroup>
 </Project>"#,
   );
