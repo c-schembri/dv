@@ -71,7 +71,7 @@ there is no speculative metadata extension surface.
   as stable downgrade diagnostic `DV0413` instead of silently upgrading or
   downgrading it.
 - Central-transitive packages remain distinct from project-direct packages in
-  results, JSON events, human output, and lock schema 6.
+  results, JSON events, human output, and lock schema 7.
 
 The central policy and sorted version batch are SHA-256 fingerprinted into the
 lock. A changed props file that has the same effective selected data retains

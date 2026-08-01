@@ -939,7 +939,7 @@ boundary, not final drop-in parity.
   (`35.6x`). `P1`
 - [x] `RES-008` Package failures retain typed, ordered diagnostic fields behind
   one optional cold-path allocation. Successful direct-wins downgrades compact
-  into 32-byte rows and persist in lock schema 6, so cold and warm restores emit
+  into 32-byte rows and persist in lock schema 7, so cold and warm restores emit
   the same `DV0413` warning without reopening manifests. Constraint conflicts,
   cycles, missing identities, missing versions, and incompatible frameworks emit
   `DV0414`, `DV0415`, `DV0416`, `DV0417`, and `DV0402` respectively. Microsoft
@@ -957,13 +957,22 @@ boundary, not final drop-in parity.
   selections, three ordered `dv` project events, 16 resolved rows, eight total
   publications, and zero HTTP work. Thirty Windows samples measure
   `700.911 ms` for Microsoft versus `51.502 ms` for `dv` (`13.6x`). `P2`
-- [~] `RES-010` Parse `.nuspec` dependency groups without confusing later
-  `frameworkReferences` groups with dependency groups. Framework assemblies
-  remain incomplete. `P1`
+- [x] `RES-010` One bounded XML pass tracks `dependencies`,
+  `frameworkReferences`, and `frameworkAssemblies` as distinct containers, so
+  later framework groups cannot become dependency edges. Modern shared
+  frameworks and legacy .NET Framework assemblies use independent nearest-TFM
+  selection; unscoped assemblies are fallback-only, modern targets ignore
+  legacy assemblies, and runtime asset exclusion removes only legacy
+  assemblies. Selected names occupy sparse 20-byte package rows plus one
+  contiguous text-span batch, persist in lock schema 7, and publish through
+  event schema 16 and human output. Microsoft-oracled `net10.0` and `net48`
+  preflight verifies dependency, shared-framework, legacy-assembly, cold, and
+  warm-lock parity. Thirty cold local-source Windows samples measure
+  `558.832 ms` for Microsoft versus `15.989 ms` for `dv` (`35.0x`). `P1`
 - [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by compatible TFM and NuGet include/exclude
-  propagation. Lock schema 6 and event schema 15 preserve every selected family
+  propagation. Lock schema 7 and event schema 16 preserve every selected family
   in compact per-package ranges. The 203-package massive acceptance graph now
   matches `project.assets.json` across portable asset paths and runtime-target
   RID/type metadata and is benchmarked end to end. Selecting one concrete RID

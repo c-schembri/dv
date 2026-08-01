@@ -573,19 +573,29 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
 }
 
 fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolution) -> EventPayload {
+  let mut framework_rows = resolution.package_frameworks().peekable();
   let packages = resolution
     .packages()
     .iter()
     .copied()
     .enumerate()
-    .map(|(index, package)| ResolvedPackageEvent {
-      id: resolution.package_id(package).into(),
-      version: resolution.package_version(package).into(),
-      sha512: resolution.package_hash(index).into(),
-      direct: resolution.package_is_direct(package),
-      central_transitive: resolution.package_is_central_transitive(package),
-      dependency_count: resolution.package_dependencies(package).len() as u32,
-      cache_outcome: resolution.package_cache_outcome(package),
+    .map(|(index, package)| {
+      let framework = framework_rows.next_if(|framework| resolution.package_framework_package(*framework) as usize == index);
+      ResolvedPackageEvent {
+        id: resolution.package_id(package).into(),
+        version: resolution.package_version(package).into(),
+        sha512: resolution.package_hash(index).into(),
+        direct: resolution.package_is_direct(package),
+        central_transitive: resolution.package_is_central_transitive(package),
+        dependency_count: resolution.package_dependencies(package).len() as u32,
+        framework_references: framework
+          .map(|framework| resolution.package_framework_references(framework).map(str::to_owned).collect())
+          .unwrap_or_default(),
+        framework_assemblies: framework
+          .map(|framework| resolution.package_framework_assemblies(framework).map(str::to_owned).collect())
+          .unwrap_or_default(),
+        cache_outcome: resolution.package_cache_outcome(package),
+      }
     })
     .collect();
   let direct_policies = resolution
@@ -656,6 +666,12 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
 fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   let mut output = String::with_capacity(1024);
   use std::fmt::Write as _;
+  let (framework_references, framework_assemblies) = resolution.package_frameworks().fold((0usize, 0usize), |counts, framework| {
+    (
+      counts.0 + resolution.package_framework_references(framework).len(),
+      counts.1 + resolution.package_framework_assemblies(framework).len(),
+    )
+  });
   writeln!(output, "Package resolution").expect("writing a String succeeds");
   writeln!(output, "  Packages       {}", resolution.packages().len()).expect("writing a String succeeds");
   writeln!(output, "  Cache hits     {}", resolution.cache_hits()).expect("writing a String succeeds");
@@ -673,6 +689,8 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   )
   .expect("writing a String succeeds");
   writeln!(output, "  Runtime targets {}", resolution.runtime_targets().len()).expect("writing a String succeeds");
+  writeln!(output, "  Framework refs  {framework_references}").expect("writing a String succeeds");
+  writeln!(output, "  Framework asm   {framework_assemblies}").expect("writing a String succeeds");
   writeln!(output, "  Target         {}", resolution.target_framework()).expect("writing a String succeeds");
   writeln!(output, "  Source         {} ({})", resolution.source(), resolution.source_protocol()).expect("writing a String succeeds");
   for source in resolution.source_work() {

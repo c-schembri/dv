@@ -1585,13 +1585,6 @@ fn materialize_project(
   let target_framework = required_property(&project_path, "TargetFramework", raw.target_framework)?;
   let parsed_target =
     TargetFramework::parse(&target_framework).map_err(|error| ProjectError::new(ProjectErrorKind::InvalidProperty, &project_path, error.to_string()))?;
-  if !parsed_target.is_modern_net() {
-    return Err(ProjectError::new(
-      ProjectErrorKind::Unsupported,
-      &project_path,
-      format!("target framework {target_framework:?} is recognized but its SDK/pack family is not implemented yet"),
-    ));
-  }
 
   let output_type = match raw.output_type.as_deref().unwrap_or("Library") {
     "Exe" => ProjectOutputType::Exe,
@@ -2841,6 +2834,20 @@ mod tests {
     let package = result.package_references()[0];
     assert_eq!(result.package_id(package), "Example.Package");
     assert_eq!(result.package_version(package), "1.2.3");
+  }
+
+  #[test]
+  fn retains_a_recognized_legacy_target_for_package_restore() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "Legacy.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net48</TargetFramework></PropertyGroup></Project>"#,
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.target_framework(), "net48");
+    assert!(!result.target().is_modern_net());
   }
 
   #[test]

@@ -65,8 +65,10 @@ attempts, source bytes, and cumulative source-work microseconds; package
 rows report `hit` or `miss`. The selected source is now its configuration key
 or a redacted CLI identity, not its transport URL. Userinfo, query strings,
 fragments, proxy values, authorization headers, and credentials are forbidden
-from these fields. Schema 12 added per-source insecure-HTTP and
-disabled-TLS-validation flags plus their aggregate security consequence; URL
+from these fields. Schema 16 adds the selected package `framework_references`
+and `framework_assemblies` batches to `package_resolution_created`. Schema 12
+added per-source insecure-HTTP and disabled-TLS-validation flags plus their
+aggregate security consequence; URL
 credentials and unredacted transport configuration remain forbidden. Schema
 11 added the redacted effective HTTP retry, timeout, concurrency, proxy, TLS,
 redirect, and offline policy to `package_sources_inspected`; proxy

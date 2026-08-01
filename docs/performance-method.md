@@ -69,6 +69,7 @@ Invalid input behavior:
 | `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload with package and portable-asset oracle comparison |
 | `package_asset_plan` | unchanged `massive-package-graph`, populated isolated packages, matching tool-native lock | process launch, 203-package locked validation, family-partitioned asset-plan materialization, and output |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
+| `nuspec_framework_metadata` | two deterministic local archives, empty isolated package cache, outputs, and locks | process launch, one-pass manifest parsing, independent nearest dependency/shared-framework/legacy-assembly selection, two-package publication, lock write, and output |
 | `package_conflict_resolution` | fifteen deterministic local archives and a populated package cache; restore outputs and locks removed per sample | process launch, nested direct-wins, cousin and diamond convergence, stale-edge retraction, eleven-package materialization, and output |
 | `package_diagnostics` | eight deterministic local archives; isolated packages, outputs, and locks removed per sample | process launch, project/config parsing, local discovery and publication, cousin constraint convergence, expected-failure classification, and output |
 | `package_batch_resolution` | one root plus two package-bearing references, fifteen deterministic local archives, empty isolated package cache, outputs, and locks | process launch, root-first closure evaluation, two eight-package graphs, one shared metadata session, eight archive publications, three events, and output |
@@ -119,6 +120,7 @@ directional decisions.`
 | `package-conflict-resolution` | 1 project, 15 local archives, 11 selected identities, one nested downgrade, different-depth and alternate-root cousin convergence, and one retracted stale edge | advanced NuGet graph conflict selection without network variance | executable for both tools with exact version-batch preflight |
 | `package-conflict-resolution` diagnostic projects | 5 projects, 8 local archives, exact cousin conflict, cycle, absent identity, absent version, and incompatible TFM | stable structured failure categories and cold diagnostic latency without network variance | executable for both tools with six Microsoft/`dv` diagnostic-category pairs and cold/warm warning preflight |
 | `package-conflict-resolution` batch projects | 1 root, 2 project-reference children, 15 available local archives, 8 selected identities per child | project-closure ordering plus command-local metadata/download deduplication | executable for both tools with exact child graph parity, 16-row/eight-publication evidence, and zero-request preflight |
+| `nuspec-framework-metadata` | 1 `net10.0` timed project, 1 `net48` legacy oracle project, 2 local archives, conflicting dependency/framework groups, 4 legacy assembly rows | isolated nuspec-container parsing, nearest target selection, legacy `Any` fallback, and warm-lock preservation | executable for both tools with Microsoft `project.assets.json`, cold/warm `dv` event, schema-7 lock, two-publication, and zero-request preflight |
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-source-mapping` | 1 `net10.0` project, 1 exact package request, empty cache, 1 unreachable v3 source, and 1 nonmatching mapping pattern | mapping-before-discovery behavior and typed unmapped failure | executable for both tools with expected-failure, diagnostic, and zero-request preflight |
@@ -300,6 +302,14 @@ publication per unique package before timing:
 
 ```text
 cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
+```
+
+Measure isolated nuspec dependency, shared-framework, and legacy-assembly
+group selection. Timed samples use the latest stable target; preflight also
+compares `net48` behavior and a warm native lock with Microsoft:
+
+```text
+cargo bench-all --case nuspec_framework_metadata --samples 30 --warmups 3
 ```
 
 Measure one live, uncached v3 service-index request and exact capability

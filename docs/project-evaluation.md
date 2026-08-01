@@ -23,7 +23,10 @@ Observed fixture data:
 
 The supported property and item subset is:
 
-- one literal modern unified .NET `TargetFramework` (`net5.0` or later);
+- one literal recognized `TargetFramework`; package restore accepts modern,
+  .NET Core, .NET Standard, and .NET Framework families, while SDK, pack, and
+  compiler planners reject families they do not implement at their own typed
+  boundaries;
 - one optional literal `RuntimeIdentifier`;
 - an optional literal semicolon-delimited `RuntimeIdentifiers` batch;
 - `OutputType` equal to `Exe` or `Library`;

@@ -57,7 +57,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 6;
+const LOCK_SCHEMA_VERSION: u16 = 7;
 const SERVICE_CAPABILITY_COUNT: usize = 5;
 const PACKAGE_BASE_TYPES: &[&str] = &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"];
 const REGISTRATION_TYPES: &[&str] = &[
@@ -485,6 +485,20 @@ struct PackageExtendedAssets {
 const _: () = assert!(size_of::<PackageExtendedAssets>() == 56);
 const _: () = assert!(align_of::<PackageExtendedAssets>() == 4);
 
+/// Rare package-provided framework metadata, keyed into the package batch.
+///
+/// Three fields occupy 20 bytes at four-byte alignment. The common package has
+/// no row; names live in the resolution text table and each range is linear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageFrameworkAssets {
+  references: ItemRange,
+  assemblies: ItemRange,
+  package_index: u32,
+}
+
+const _: () = assert!(size_of::<PackageFrameworkAssets>() == 20);
+const _: () = assert!(align_of::<PackageFrameworkAssets>() == 4);
+
 /// Cold direct-reference policy kept separate from graph and asset hot rows.
 ///
 /// Six fields occupy 32 bytes at four-byte alignment. Two rows fit in one
@@ -802,6 +816,8 @@ pub struct PackageResolution {
   fallback_roots: Box<[TextSpan]>,
   package_assets: Box<[PackageAssets]>,
   package_extended_assets: Box<[PackageExtendedAssets]>,
+  package_framework_assets: Box<[PackageFrameworkAssets]>,
+  framework_items: Box<[TextSpan]>,
   direct_policies: Box<[DirectPackagePolicy]>,
   downgrades: Box<[PackageDowngrade]>,
   dependencies: Box<[u32]>,
@@ -816,7 +832,7 @@ pub struct PackageResolution {
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 368);
+const _: () = assert!(size_of::<PackageResolution>() == 400);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
@@ -961,6 +977,28 @@ impl PackageResolution {
   pub fn package_dependencies(&self, package: ResolvedPackage) -> impl ExactSizeIterator<Item = u32> + '_ {
     let range = range(package.dependencies);
     self.dependencies[range].iter().copied()
+  }
+
+  /// Iterates sparse package-framework rows in package identity order.
+  pub fn package_frameworks(&self) -> std::ops::Range<usize> {
+    0..self.package_framework_assets.len()
+  }
+
+  /// Returns the resolved package index which owns one framework row.
+  pub fn package_framework_package(&self, framework: usize) -> u32 {
+    self.package_framework_assets[framework].package_index
+  }
+
+  /// Iterates shared-framework references selected from one package manifest.
+  pub fn package_framework_references(&self, framework: usize) -> impl ExactSizeIterator<Item = &str> {
+    let selected = self.package_framework_assets[framework];
+    self.framework_items[range(selected.references)].iter().map(|span| self.get(*span))
+  }
+
+  /// Iterates legacy framework assembly names selected from one package manifest.
+  pub fn package_framework_assemblies(&self, framework: usize) -> impl ExactSizeIterator<Item = &str> {
+    let selected = self.package_framework_assets[framework];
+    self.framework_items[range(selected.assemblies)].iter().map(|span| self.get(*span))
   }
 
   /// Iterates direct-reference policy rows in package identity order.
@@ -1885,6 +1923,8 @@ struct WorkPackage {
   build_transitive_assets: Vec<PathBuf>,
   native_assets: Vec<PathBuf>,
   runtime_targets: Vec<WorkRuntimeTarget>,
+  framework_references: Vec<String>,
+  framework_assemblies: Vec<String>,
   cache_hit: bool,
   origin: Option<PackageSource>,
 }
@@ -1939,6 +1979,24 @@ struct ParsedPrunedPackage {
   upper: PackageVersion,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PackageFrameworkMetadata {
+  references: Vec<String>,
+  assemblies: Vec<String>,
+}
+
+impl PackageFrameworkMetadata {
+  fn is_empty(&self) -> bool {
+    self.references.is_empty() && self.assemblies.is_empty()
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedPackageMetadata {
+  dependencies: Vec<PackageRequirement>,
+  frameworks: PackageFrameworkMetadata,
+}
+
 impl PackagePruning {
   fn contains(&self, lower_id: &str, version: &PackageVersion) -> bool {
     self
@@ -1964,7 +2022,7 @@ impl PackagePruning {
 struct CachedPackage {
   root: PathBuf,
   hash: String,
-  dependencies: Option<Vec<PackageRequirement>>,
+  metadata: Option<ParsedPackageMetadata>,
   cache_hit: bool,
   source_work: Option<SourceWork>,
   failed_source_work: Box<[SourceWork]>,
@@ -2019,6 +2077,8 @@ struct BatchMetadataScope {
   fallback_roots: Arc<[PathBuf]>,
   text: TextTable,
   entries: Vec<BatchMetadataEntry>,
+  framework_indices: Vec<u32>,
+  frameworks: Vec<PackageFrameworkMetadata>,
   packages: Vec<Option<BatchCachedPackage>>,
 }
 
@@ -2042,15 +2102,58 @@ impl BatchCachedPackage {
     }
   }
 
+  fn from_task(package: &TaskCachedPackage) -> Self {
+    Self {
+      root: package.root.clone(),
+      hash: package.hash.clone(),
+      origin: package.origin.clone(),
+    }
+  }
+
   fn materialize(&self) -> CachedPackage {
     CachedPackage {
       root: self.root.clone(),
       hash: self.hash.clone(),
-      dependencies: None,
+      metadata: None,
       cache_hit: true,
       source_work: None,
       failed_source_work: Box::new([]),
       origin: self.origin.clone(),
+    }
+  }
+}
+
+struct TaskCachedPackage {
+  root: PathBuf,
+  hash: String,
+  origin: Option<PackageSource>,
+  cache_hit: bool,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<TaskCachedPackage>() == 96);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<TaskCachedPackage>() == align_of::<usize>());
+
+impl TaskCachedPackage {
+  fn from_cached(package: CachedPackage) -> Self {
+    Self {
+      root: package.root,
+      hash: package.hash,
+      origin: package.origin,
+      cache_hit: package.cache_hit,
+    }
+  }
+
+  fn materialize(self) -> CachedPackage {
+    CachedPackage {
+      root: self.root,
+      hash: self.hash,
+      metadata: None,
+      cache_hit: self.cache_hit,
+      source_work: None,
+      failed_source_work: Box::new([]),
+      origin: self.origin,
     }
   }
 }
@@ -2072,6 +2175,8 @@ impl BatchMetadataCache {
           fallback_roots: Arc::clone(&config.fallback_roots),
           text: TextTable::with_capacity(0),
           entries: Vec::new(),
+          framework_indices: Vec::new(),
+          frameworks: Vec::new(),
           packages: Vec::new(),
         });
         self.scopes.len() - 1
@@ -2079,7 +2184,7 @@ impl BatchMetadataCache {
     &mut self.scopes[index]
   }
 
-  fn get(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str) -> Option<Vec<PackageRequirement>> {
+  fn get(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str) -> Option<ParsedPackageMetadata> {
     let scope = self.scope_mut(config);
     let index = scope
       .entries
@@ -2091,7 +2196,16 @@ impl BatchMetadataCache {
           .then_with(|| scope.text.get(entry.version).cmp(version))
       })
       .ok()?;
-    Some(scope.entries[index].dependencies.to_vec())
+    let framework_index = scope.framework_indices[index];
+    let frameworks = if framework_index == u32::MAX {
+      PackageFrameworkMetadata::default()
+    } else {
+      scope.frameworks[framework_index as usize].clone()
+    };
+    Some(ParsedPackageMetadata {
+      dependencies: scope.entries[index].dependencies.to_vec(),
+      frameworks,
+    })
   }
 
   fn package(&mut self, config: &NugetConfiguration, target: TargetFramework, lower_id: &str, version: &str) -> Option<CachedPackage> {
@@ -2115,8 +2229,8 @@ impl BatchMetadataCache {
     target: TargetFramework,
     lower_id: &str,
     version: &str,
-    dependencies: &[PackageRequirement],
-    package: Option<&CachedPackage>,
+    metadata: &ParsedPackageMetadata,
+    package: Option<&TaskCachedPackage>,
   ) -> Result<(), PackageError> {
     let scope = self.scope_mut(config);
     let index = scope.entries.binary_search_by(|entry| {
@@ -2128,7 +2242,7 @@ impl BatchMetadataCache {
     });
     if let Ok(index) = index {
       if scope.packages[index].is_none() {
-        scope.packages[index] = package.map(BatchCachedPackage::from_cached);
+        scope.packages[index] = package.map(BatchCachedPackage::from_task);
       }
       return Ok(());
     }
@@ -2141,10 +2255,24 @@ impl BatchMetadataCache {
         target,
         lower_id,
         version,
-        dependencies: dependencies.into(),
+        dependencies: metadata.dependencies.as_slice().into(),
       },
     );
-    scope.packages.insert(index, package.map(BatchCachedPackage::from_cached));
+    let framework_index = if metadata.frameworks.is_empty() {
+      u32::MAX
+    } else {
+      let index = u32::try_from(scope.frameworks.len()).map_err(|_| {
+        PackageError::new(
+          PackageErrorKind::TextOverflow,
+          "package framework metadata",
+          "framework metadata count exceeds u32",
+        )
+      })?;
+      scope.frameworks.push(metadata.frameworks.clone());
+      index
+    };
+    scope.framework_indices.insert(index, framework_index);
+    scope.packages.insert(index, package.map(BatchCachedPackage::from_task));
     Ok(())
   }
 
@@ -2276,10 +2404,10 @@ impl<'a> ConstraintView<'a> {
 
 enum MetadataTaskResult {
   Requirements {
-    dependencies: Vec<PackageRequirement>,
+    metadata: ParsedPackageMetadata,
     source_work: Option<SourceWork>,
     failed_source_work: Box<[SourceWork]>,
-    package: Option<CachedPackage>,
+    package: Option<TaskCachedPackage>,
   },
   Versions {
     versions: Vec<PackageVersion>,
@@ -2834,6 +2962,10 @@ struct LockPackage {
   native_assets: Vec<String>,
   #[serde(default)]
   runtime_targets: Vec<LockRuntimeTarget>,
+  #[serde(default)]
+  framework_references: Vec<String>,
+  #[serde(default)]
+  framework_assemblies: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -5561,7 +5693,8 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
   stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
   let mut endpoints: Option<LazyServiceEndpoints> = None;
   let mut source_work = source_work_table(config.sources.len())?;
-  let mut metadata_packages = BTreeMap::<(String, String), CachedPackage>::new();
+  let mut metadata_packages = BTreeMap::<(String, String), TaskCachedPackage>::new();
+  let mut package_frameworks = BTreeMap::<(String, String), PackageFrameworkMetadata>::new();
   let mut shared_metadata_hits = 0u32;
   let mut tasks = JoinSet::new();
   let mut in_flight = BTreeSet::new();
@@ -5587,11 +5720,15 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       });
       let generation = node.generation;
       if let Some(request) = &request
-        && let Some(dependencies) = batch_metadata.get(config, target, &lower_id, &request.version)
+        && let Some(metadata) = batch_metadata.get(config, target, &lower_id, &request.version)
       {
         shared_metadata_hits = shared_metadata_hits
           .checked_add(1)
           .ok_or_else(|| resolution_error(&lower_id, "shared package metadata hit count overflow"))?;
+        let ParsedPackageMetadata { dependencies, frameworks } = metadata;
+        if !frameworks.is_empty() {
+          package_frameworks.insert((lower_id.clone(), request.version.clone()), frameworks);
+        }
         install_node_dependencies(&lower_id, generation, dependencies, roots.central_pins, &mut nodes, &mut dirty)?;
         stabilize_constraint_nodes(&mut nodes, &mut dirty, &mut ready, pruning)?;
         continue;
@@ -5699,7 +5836,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
         }
       },
       MetadataTaskResult::Requirements {
-        dependencies,
+        metadata,
         source_work: task_work,
         failed_source_work,
         package,
@@ -5711,12 +5848,18 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
           merge_source_work(&mut source_work, work, &lower_id)?;
         }
         if let Some(version) = task_version.as_deref() {
-          batch_metadata.insert(config, target, &lower_id, version, &dependencies, package.as_ref())?;
+          batch_metadata.insert(config, target, &lower_id, version, &metadata, package.as_ref())?;
+        }
+        let ParsedPackageMetadata { dependencies, frameworks } = metadata;
+        if !frameworks.is_empty()
+          && let Some(version) = task_version.as_deref()
+        {
+          package_frameworks.insert((lower_id.clone(), version.to_owned()), frameworks);
         }
         if let Some(package) = package
-          && let Some(version) = task_version
+          && let Some(version) = task_version.as_ref()
         {
-          metadata_packages.insert((lower_id.clone(), version), package);
+          metadata_packages.insert((lower_id.clone(), version.clone()), package);
         }
         if stale {
           if nodes.get(&lower_id).is_some_and(|node| !node.pruned) {
@@ -5757,7 +5900,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
   for (lower_id, request) in exact {
     match metadata_packages.remove(&(lower_id.clone(), request.version.clone())) {
       Some(cached) => {
-        acquired.insert(lower_id, (request, cached));
+        acquired.insert(lower_id, (request, cached.materialize()));
       },
       _ => {
         acquisition.insert(lower_id, request);
@@ -5823,7 +5966,8 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
   for (lower_id, (request, cached)) in acquired {
     let dependencies = concrete_dependencies(&nodes, &request.lower_id)?;
     let flags = asset_flags.get(&lower_id).copied().unwrap_or(AssetFlags::NONE);
-    let parsed = parse_cached_package(request.clone(), cached, target, target_text, dependencies, flags)?;
+    let frameworks = package_frameworks.remove(&(lower_id.clone(), request.version.clone())).unwrap_or_default();
+    let parsed = parse_cached_package(request.clone(), cached, target, target_text, dependencies, frameworks, flags)?;
     resolved.insert(lower_id, parsed);
   }
 
@@ -6311,11 +6455,11 @@ async fn load_node_metadata(
     && let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request)
   {
     let request = request.clone();
-    let dependencies = tokio::task::spawn_blocking(move || read_cached_requirements(&root, &request, target))
+    let metadata = tokio::task::spawn_blocking(move || read_cached_metadata(&root, &request, target))
       .await
       .map_err(package_blocking_task_error)??;
     return Ok(MetadataTaskResult::Requirements {
-      dependencies,
+      metadata,
       source_work: None,
       failed_source_work: Box::new([]),
       package: None,
@@ -6358,16 +6502,18 @@ async fn load_node_metadata(
   let mut exact_source_work = Vec::new();
   if let Some(request) = request {
     match ensure_package(client, request, storage, endpoints, source_mapping, target, false).await {
-      Ok(cached) => {
-        let dependencies = match &cached.dependencies {
-          Some(dependencies) => dependencies.clone(),
-          None => read_cached_requirements(&cached.root, request, target)?,
+      Ok(mut cached) => {
+        let metadata = match cached.metadata.take() {
+          Some(metadata) => metadata,
+          None => read_cached_metadata(&cached.root, request, target)?,
         };
+        let source_work = cached.source_work.take();
+        let failed_source_work = std::mem::take(&mut cached.failed_source_work);
         return Ok(MetadataTaskResult::Requirements {
-          dependencies,
-          source_work: cached.source_work,
-          failed_source_work: cached.failed_source_work.clone(),
-          package: Some(cached),
+          metadata,
+          source_work,
+          failed_source_work,
+          package: Some(TaskCachedPackage::from_cached(cached)),
         });
       },
       Err(mut error) if error.kind() == PackageErrorKind::Network => exact_source_work = error.take_source_work(),
@@ -6558,10 +6704,10 @@ fn network_attribute(reader: &Reader<&[u8]>, element: &quick_xml::events::BytesS
   Ok(None)
 }
 
-fn read_cached_requirements(root: &Path, request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequirement>, PackageError> {
+fn read_cached_metadata(root: &Path, request: &PackageRequest, target: TargetFramework) -> Result<ParsedPackageMetadata, PackageError> {
   let nuspec_path = find_nuspec(root)?;
   let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-  parse_nuspec_requirements(&nuspec_path, &nuspec, request, target)
+  parse_nuspec_metadata(&nuspec_path, &nuspec, request, target)
 }
 
 fn enumerate_cached_versions(cache_root: &Path, fallback_roots: &[PathBuf], lower_id: &str) -> Result<Vec<PackageVersion>, PackageError> {
@@ -7107,7 +7253,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
   normalize_nuspec_name(&downloaded.temp_root, &downloaded.request)?;
   let nuspec_path = downloaded.temp_root.join(format!("{}.nuspec", downloaded.request.lower_id));
   let nuspec = fs::read(&nuspec_path).map_err(|error| package_io("read package manifest", &nuspec_path, error))?;
-  let dependencies = parse_nuspec_requirements(&nuspec_path, &nuspec, &downloaded.request, downloaded.target)?;
+  let metadata = parse_nuspec_metadata(&nuspec_path, &nuspec, &downloaded.request, downloaded.target)?;
   fs::write(
     downloaded.temp_root.join(format!("{}.sha512", downloaded.nupkg_name)),
     downloaded.hash.as_bytes(),
@@ -7136,7 +7282,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
     CachedPackage {
       root: final_root,
       hash: downloaded.hash,
-      dependencies: Some(dependencies),
+      metadata: Some(metadata),
       cache_hit: false,
       source_work: Some(SourceWork {
         downloaded_bytes: downloaded.work.downloaded_bytes,
@@ -7829,7 +7975,7 @@ fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: boo
   Ok(CachedPackage {
     root: root.to_owned(),
     hash,
-    dependencies: None,
+    metadata: None,
     cache_hit,
     source_work: None,
     failed_source_work: Box::new([]),
@@ -7913,6 +8059,7 @@ fn parse_cached_package(
   target: TargetFramework,
   target_text: &str,
   dependencies: Vec<PackageRequest>,
+  mut frameworks: PackageFrameworkMetadata,
   flags: AssetFlags,
 ) -> Result<WorkPackage, PackageError> {
   let compile_assets = select_if(flags.contains(AssetFlags::COMPILE), || select_compile_assets(&cached.root, target))?;
@@ -7947,6 +8094,9 @@ fn parse_cached_package(
   let content_files = select_content_files(&cached.root, target, flags.contains(AssetFlags::CONTENT_FILES))?;
   let native_assets = select_if(flags.contains(AssetFlags::NATIVE), || select_legacy_native_assets(&cached.root))?;
   let runtime_targets = select_runtime_targets(&cached.root, target, flags)?;
+  if !flags.contains(AssetFlags::RUNTIME) {
+    frameworks.assemblies.clear();
+  }
   let selected_build = select_build_assets(&cached.root, "build", &request.id, target, true)?;
   let selected_build_transitive = select_build_assets(&cached.root, "buildTransitive", &request.id, target, true)?;
   let build_transitive_assets = if flags.contains(AssetFlags::BUILD_TRANSITIVE) {
@@ -7989,6 +8139,8 @@ fn parse_cached_package(
     build_transitive_assets,
     native_assets,
     runtime_targets,
+    framework_references: frameworks.references,
+    framework_assemblies: frameworks.assemblies,
     cache_hit: cached.cache_hit,
     origin: cached.origin,
   })
@@ -8054,6 +8206,29 @@ struct RawDependency {
   suppress_parent: AssetFlags,
 }
 
+struct FrameworkReferenceGroup {
+  framework: String,
+  references: Vec<String>,
+}
+
+struct RawFrameworkAssembly {
+  name: String,
+  frameworks: Option<String>,
+}
+
+struct FrameworkAssemblyGroup {
+  framework: Option<TargetFramework>,
+  assemblies: Vec<String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NuspecSection {
+  None,
+  Dependencies,
+  FrameworkReferences,
+  FrameworkAssemblies,
+}
+
 #[cfg(test)]
 fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequest>, PackageError> {
   parse_nuspec_requirements(path, bytes, request, target)?
@@ -8070,7 +8245,12 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
     .collect()
 }
 
+#[cfg(test)]
 fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest, target: TargetFramework) -> Result<Vec<PackageRequirement>, PackageError> {
+  Ok(parse_nuspec_metadata(path, bytes, request, target)?.dependencies)
+}
+
+fn parse_nuspec_metadata(path: &Path, bytes: &[u8], request: &PackageRequest, target: TargetFramework) -> Result<ParsedPackageMetadata, PackageError> {
   let mut reader = Reader::from_reader(bytes);
   reader.config_mut().trim_text(true);
   let mut current_text = NuspecText::None;
@@ -8078,44 +8258,88 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
   let mut version = None;
   let mut groups = Vec::<DependencyGroup>::new();
   let mut ungrouped = Vec::new();
-  let mut in_dependencies = false;
+  let mut reference_groups = Vec::<FrameworkReferenceGroup>::new();
+  let mut framework_assemblies = Vec::<RawFrameworkAssembly>::new();
+  let mut section = NuspecSection::None;
+  let mut open_group = NuspecSection::None;
   loop {
     match reader.read_event() {
       Ok(Event::Start(element)) => match local_name(element.name().as_ref()) {
         b"id" if id.is_none() => current_text = NuspecText::Id,
         b"version" if version.is_none() => current_text = NuspecText::Version,
-        b"dependencies" => in_dependencies = true,
-        b"group" if in_dependencies => {
+        b"dependencies" => section = NuspecSection::Dependencies,
+        b"frameworkReferences" => section = NuspecSection::FrameworkReferences,
+        b"frameworkAssemblies" => section = NuspecSection::FrameworkAssemblies,
+        b"group" if section == NuspecSection::Dependencies => {
+          if open_group != NuspecSection::None || !ungrouped.is_empty() {
+            return Err(package_manifest_error(
+              path,
+              "dependency groups cannot be nested or mixed with ungrouped dependencies",
+            ));
+          }
+          open_group = NuspecSection::Dependencies;
           groups.push(DependencyGroup {
             framework: nuspec_attribute(&reader, &element, b"targetFramework", path)?,
             dependencies: Vec::new(),
           });
         },
+        b"group" if section == NuspecSection::FrameworkReferences => {
+          if open_group != NuspecSection::None {
+            return Err(package_manifest_error(path, "framework reference groups cannot be nested"));
+          }
+          open_group = NuspecSection::FrameworkReferences;
+          let framework = required_nuspec_attribute(&reader, &element, b"targetFramework", "framework reference group", path)?;
+          validate_nuspec_frameworks(&framework, path)?;
+          reference_groups.push(FrameworkReferenceGroup {
+            framework,
+            references: Vec::new(),
+          });
+        },
+        b"dependency" if section == NuspecSection::Dependencies => {
+          push_raw_dependency(&reader, &element, path, open_group == NuspecSection::Dependencies, &mut groups, &mut ungrouped)?;
+        },
+        b"frameworkReference" if section == NuspecSection::FrameworkReferences => {
+          push_framework_reference(&reader, &element, path, open_group == NuspecSection::FrameworkReferences, &mut reference_groups)?;
+        },
+        b"frameworkAssembly" if section == NuspecSection::FrameworkAssemblies => {
+          framework_assemblies.push(parse_framework_assembly(&reader, &element, path)?);
+        },
         _ => {},
       },
-      Ok(Event::Empty(element)) if in_dependencies && local_name(element.name().as_ref()) == b"group" => {
-        groups.push(DependencyGroup {
-          framework: nuspec_attribute(&reader, &element, b"targetFramework", path)?,
-          dependencies: Vec::new(),
-        });
-      },
-      Ok(Event::Empty(element)) if in_dependencies && local_name(element.name().as_ref()) == b"dependency" => {
-        let dependency_id = nuspec_attribute(&reader, &element, b"id", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires id"))?;
-        let dependency_version =
-          nuspec_attribute(&reader, &element, b"version", path)?.ok_or_else(|| package_manifest_error(path, "dependency requires version"))?;
-        let include_assets = parse_asset_flags(nuspec_attribute(&reader, &element, b"include", path)?.as_deref(), AssetFlags::NO_CONTENT, path)?;
-        let exclude_assets = parse_asset_flags(nuspec_attribute(&reader, &element, b"exclude", path)?.as_deref(), AssetFlags::NONE, path)?;
-        let dependency = RawDependency {
-          id: dependency_id,
-          version: dependency_version,
-          include_assets: include_assets.without(exclude_assets),
-          suppress_parent: AssetFlags::NONE,
-        };
-        if let Some(group) = groups.last_mut() {
-          group.dependencies.push(dependency);
-        } else {
-          ungrouped.push(dependency);
-        }
+      Ok(Event::Empty(element)) => match local_name(element.name().as_ref()) {
+        b"group" if section == NuspecSection::Dependencies => {
+          if open_group != NuspecSection::None || !ungrouped.is_empty() {
+            return Err(package_manifest_error(
+              path,
+              "dependency groups cannot be nested or mixed with ungrouped dependencies",
+            ));
+          }
+          groups.push(DependencyGroup {
+            framework: nuspec_attribute(&reader, &element, b"targetFramework", path)?,
+            dependencies: Vec::new(),
+          });
+        },
+        b"group" if section == NuspecSection::FrameworkReferences => {
+          if open_group != NuspecSection::None {
+            return Err(package_manifest_error(path, "framework reference groups cannot be nested"));
+          }
+          let framework = required_nuspec_attribute(&reader, &element, b"targetFramework", "framework reference group", path)?;
+          validate_nuspec_frameworks(&framework, path)?;
+          reference_groups.push(FrameworkReferenceGroup {
+            framework,
+            references: Vec::new(),
+          });
+        },
+        b"dependency" if section == NuspecSection::Dependencies => {
+          push_raw_dependency(&reader, &element, path, open_group == NuspecSection::Dependencies, &mut groups, &mut ungrouped)?;
+        },
+        b"frameworkReference" if section == NuspecSection::FrameworkReferences => {
+          push_framework_reference(&reader, &element, path, open_group == NuspecSection::FrameworkReferences, &mut reference_groups)?;
+        },
+        b"frameworkAssembly" if section == NuspecSection::FrameworkAssemblies => {
+          framework_assemblies.push(parse_framework_assembly(&reader, &element, path)?);
+        },
+        _ => {},
       },
       Ok(Event::Text(text)) => {
         let value = text
@@ -8130,7 +8354,8 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
       },
       Ok(Event::End(element)) => match local_name(element.name().as_ref()) {
         b"id" | b"version" => current_text = NuspecText::None,
-        b"dependencies" => in_dependencies = false,
+        b"group" => open_group = NuspecSection::None,
+        b"dependencies" | b"frameworkReferences" | b"frameworkAssemblies" => section = NuspecSection::None,
         _ => {},
       },
       Ok(Event::Eof) => break,
@@ -8180,7 +8405,7 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
       .with_context("supported_frameworks", supported_frameworks)
     })?
   };
-  selected
+  let dependencies = selected
     .iter()
     .map(|dependency| {
       Ok(PackageRequirement {
@@ -8192,7 +8417,183 @@ fn parse_nuspec_requirements(path: &Path, bytes: &[u8], request: &PackageRequest
         suppress_parent: dependency.suppress_parent,
       })
     })
-    .collect()
+    .collect::<Result<Vec<_>, PackageError>>()?;
+  let mut references = reference_groups
+    .iter()
+    .filter_map(|group| framework_score(Some(&group.framework), target).map(|score| (score, group)))
+    .max_by_key(|(score, _)| *score)
+    .map_or_else(Vec::new, |(_, group)| group.references.clone());
+  sort_dedup_case_insensitive(&mut references);
+  let assemblies = select_framework_assemblies(framework_assemblies, target);
+  Ok(ParsedPackageMetadata {
+    dependencies,
+    frameworks: PackageFrameworkMetadata { references, assemblies },
+  })
+}
+
+fn select_framework_assemblies(rows: Vec<RawFrameworkAssembly>, target: TargetFramework) -> Vec<String> {
+  if target.family() != FrameworkFamily::NetFramework {
+    return Vec::new();
+  }
+  let mut groups = Vec::<FrameworkAssemblyGroup>::new();
+  for row in rows {
+    let frameworks = row.frameworks.as_deref().map(|frameworks| {
+      frameworks
+        .split(',')
+        .filter_map(|framework| parse_nuspec_target_framework(framework.trim().trim_start_matches('.')))
+        .collect::<Vec<_>>()
+    });
+    if frameworks.as_ref().is_some_and(Vec::is_empty) {
+      continue;
+    }
+    if let Some(frameworks) = frameworks {
+      for framework in frameworks {
+        if let Some(group) = groups.iter_mut().find(|group| group.framework == Some(framework)) {
+          group.assemblies.push(row.name.clone());
+        } else {
+          groups.push(FrameworkAssemblyGroup {
+            framework: Some(framework),
+            assemblies: vec![row.name.clone()],
+          });
+        }
+      }
+    } else if let Some(group) = groups.iter_mut().find(|group| group.framework.is_none()) {
+      group.assemblies.push(row.name);
+    } else {
+      groups.push(FrameworkAssemblyGroup {
+        framework: None,
+        assemblies: vec![row.name],
+      });
+    }
+  }
+  let mut selected = groups
+    .into_iter()
+    .filter_map(|group| {
+      group
+        .framework
+        .map_or(Some(0), |framework| framework_score_value(framework, target))
+        .map(|score| (score, group.assemblies))
+    })
+    .max_by_key(|(score, _)| *score)
+    .map_or_else(Vec::new, |(_, assemblies)| assemblies);
+  sort_dedup_case_insensitive(&mut selected);
+  selected
+}
+
+fn sort_dedup_case_insensitive(values: &mut Vec<String>) {
+  values.sort_unstable_by(|left, right| {
+    left
+      .bytes()
+      .map(|byte| byte.to_ascii_lowercase())
+      .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+      .then_with(|| left.cmp(right))
+  });
+  values.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+}
+
+fn push_raw_dependency(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  grouped: bool,
+  groups: &mut [DependencyGroup],
+  ungrouped: &mut Vec<RawDependency>,
+) -> Result<(), PackageError> {
+  let dependency_id = required_nuspec_attribute(reader, element, b"id", "dependency", path)?;
+  let dependency_version = required_nuspec_attribute(reader, element, b"version", "dependency", path)?;
+  let include_assets = parse_asset_flags(nuspec_attribute(reader, element, b"include", path)?.as_deref(), AssetFlags::NO_CONTENT, path)?;
+  let exclude_assets = parse_asset_flags(nuspec_attribute(reader, element, b"exclude", path)?.as_deref(), AssetFlags::NONE, path)?;
+  let dependency = RawDependency {
+    id: dependency_id,
+    version: dependency_version,
+    include_assets: include_assets.without(exclude_assets),
+    suppress_parent: AssetFlags::NONE,
+  };
+  if grouped {
+    let group = groups
+      .last_mut()
+      .ok_or_else(|| package_manifest_error(path, "dependency must be inside a declared dependency group"))?;
+    group.dependencies.push(dependency);
+  } else if groups.is_empty() {
+    ungrouped.push(dependency);
+  } else {
+    return Err(package_manifest_error(path, "grouped and ungrouped dependencies cannot be mixed"));
+  }
+  Ok(())
+}
+
+fn push_framework_reference(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  grouped: bool,
+  groups: &mut [FrameworkReferenceGroup],
+) -> Result<(), PackageError> {
+  if !grouped {
+    return Err(package_manifest_error(path, "frameworkReference must be inside a frameworkReferences group"));
+  }
+  let reference = required_nuspec_attribute(reader, element, b"name", "framework reference", path)?;
+  validate_framework_name(&reference, "framework reference", path)?;
+  groups
+    .last_mut()
+    .ok_or_else(|| package_manifest_error(path, "frameworkReference must be inside a frameworkReferences group"))?
+    .references
+    .push(reference);
+  Ok(())
+}
+
+fn parse_framework_assembly(reader: &Reader<&[u8]>, element: &quick_xml::events::BytesStart<'_>, path: &Path) -> Result<RawFrameworkAssembly, PackageError> {
+  let name = required_nuspec_attribute(reader, element, b"assemblyName", "framework assembly", path)?;
+  validate_framework_assembly_name(&name, path)?;
+  let frameworks = nuspec_attribute(reader, element, b"targetFramework", path)?;
+  if let Some(frameworks) = frameworks.as_deref() {
+    validate_nuspec_frameworks(frameworks, path)?;
+  }
+  Ok(RawFrameworkAssembly { name, frameworks })
+}
+
+fn required_nuspec_attribute(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  name: &[u8],
+  meaning: &str,
+  path: &Path,
+) -> Result<String, PackageError> {
+  nuspec_attribute(reader, element, name, path)?
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| package_manifest_error(path, format!("{meaning} requires {}", String::from_utf8_lossy(name))))
+}
+
+fn validate_framework_name(value: &str, meaning: &str, path: &Path) -> Result<(), PackageError> {
+  if value.len() > 1024
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'|'))
+  {
+    return Err(package_manifest_error(
+      path,
+      format!("{meaning} name {value:?} is outside the supported identifier form"),
+    ));
+  }
+  Ok(())
+}
+
+fn validate_framework_assembly_name(value: &str, path: &Path) -> Result<(), PackageError> {
+  if value.trim().is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+    return Err(package_manifest_error(
+      path,
+      "framework assembly name is empty, too long, or contains control characters",
+    ));
+  }
+  Ok(())
+}
+
+fn validate_nuspec_frameworks(value: &str, path: &Path) -> Result<(), PackageError> {
+  if value.len() > 1024 || value.split(',').any(|framework| framework.trim().is_empty()) {
+    return Err(package_manifest_error(path, "targetFramework is empty or exceeds 1024 bytes"));
+  }
+  Ok(())
 }
 
 fn parse_asset_flags(value: Option<&str>, default: AssetFlags, path: &Path) -> Result<AssetFlags, PackageError> {
@@ -8456,17 +8857,49 @@ fn select_framework_directory(category: &Path, target: TargetFramework) -> Resul
 
 fn framework_score(framework: Option<&str>, target: TargetFramework) -> Option<u32> {
   let canonical = framework?.trim().trim_start_matches('.');
-  let candidate = TargetFramework::parse(canonical).ok()?;
-  let version = u32::from(candidate.major()) * 100 + u32::from(candidate.minor());
+  let candidate = parse_nuspec_target_framework(canonical)?;
+  framework_score_value(candidate, target)
+}
+
+fn framework_score_value(candidate: TargetFramework, target: TargetFramework) -> Option<u32> {
+  let version = framework_version_key(candidate);
+  if candidate.family() == target.family() && version <= framework_version_key(target) {
+    return Some(30_000 + version);
+  }
   match candidate.family() {
-    FrameworkFamily::Net
-      if target.family() == FrameworkFamily::Net && candidate.major() >= 5 && (candidate.major(), candidate.minor()) <= (target.major(), target.minor()) =>
-    {
-      Some(30_000 + version)
-    },
     FrameworkFamily::NetCoreApp if target.family() == FrameworkFamily::Net && (candidate.major(), candidate.minor()) <= (3, 1) => Some(20_000 + version),
     FrameworkFamily::NetStandard if target.family() == FrameworkFamily::Net && (candidate.major(), candidate.minor()) <= (2, 1) => Some(10_000 + version),
     _ => None,
+  }
+}
+
+fn parse_nuspec_target_framework(value: &str) -> Option<TargetFramework> {
+  let lower = value.to_ascii_lowercase();
+  let Some(version) = lower.strip_prefix("netframework") else {
+    return TargetFramework::parse(value).ok();
+  };
+  let mut parts = version.split('.');
+  let major = parts.next()?.parse::<u16>().ok()?;
+  let minor = parts.next()?.parse::<u16>().ok()?;
+  let patch = parts.next().map(str::parse::<u16>).transpose().ok()?.unwrap_or(0);
+  if parts.next().is_some() || major > 9 || minor > 9 || patch > 9 {
+    return None;
+  }
+  let compact = if patch == 0 {
+    format!("net{major}{minor}")
+  } else {
+    format!("net{major}{minor}{patch}")
+  };
+  TargetFramework::parse(&compact).ok()
+}
+
+fn framework_version_key(framework: TargetFramework) -> u32 {
+  if framework.family() == FrameworkFamily::NetFramework {
+    let encoded = framework.minor();
+    let (minor, patch) = if encoded < 10 { (encoded, 0) } else { (encoded / 10, encoded % 10) };
+    u32::from(framework.major()) * 10_000 + u32::from(minor) * 100 + u32::from(patch)
+  } else {
+    u32::from(framework.major()) * 100 + u32::from(framework.minor())
   }
 }
 
@@ -8629,6 +9062,8 @@ fn materialize_resolution(
           .iter()
           .map(|asset| asset.path.as_os_str().len() + asset.runtime_identifier.len())
           .sum::<usize>()
+        + package.framework_references.iter().map(String::len).sum::<usize>()
+        + package.framework_assemblies.iter().map(String::len).sum::<usize>()
     })
     .sum::<usize>()
     + context.cache_root.as_os_str().len()
@@ -8703,6 +9138,16 @@ fn materialize_resolution(
   let mut package_roots = Vec::with_capacity(work.len());
   let mut package_assets = Vec::with_capacity(work.len());
   let mut package_extended_assets = Vec::with_capacity(work.len());
+  let framework_row_count = work
+    .values()
+    .filter(|package| !package.framework_references.is_empty() || !package.framework_assemblies.is_empty())
+    .count();
+  let framework_item_count = work
+    .values()
+    .map(|package| package.framework_references.len() + package.framework_assemblies.len())
+    .sum();
+  let mut package_framework_assets = Vec::with_capacity(framework_row_count);
+  let mut framework_items = Vec::with_capacity(framework_item_count);
   let mut dependencies = Vec::new();
   let (asset_ranges, asset_count) = plan_asset_ranges(work)?;
   let mut assets = vec![TextSpan { start: 0, len: 0 }; asset_count];
@@ -8721,6 +9166,7 @@ fn materialize_resolution(
   let mut cache_hits = 0u32;
 
   for package in work.values() {
+    let package_index = u32_len(packages.len(), "package framework owner")?;
     let dependency_start = u32_len(dependencies.len(), "package dependency range")?;
     for dependency in &package.dependencies {
       dependencies.push(*indices.get(dependency.lower_id.as_str()).ok_or_else(|| {
@@ -8753,6 +9199,27 @@ fn materialize_resolution(
       start: runtime_target_start,
       len: u32_len(package.runtime_targets.len(), "package runtime target range")?,
     };
+    if !package.framework_references.is_empty() || !package.framework_assemblies.is_empty() {
+      let reference_start = u32_len(framework_items.len(), "package framework reference range")?;
+      for reference in &package.framework_references {
+        framework_items.push(table.push(reference)?);
+      }
+      let assembly_start = u32_len(framework_items.len(), "package framework assembly range")?;
+      for assembly in &package.framework_assemblies {
+        framework_items.push(table.push(assembly)?);
+      }
+      package_framework_assets.push(PackageFrameworkAssets {
+        references: ItemRange {
+          start: reference_start,
+          len: u32_len(package.framework_references.len(), "package framework reference range")?,
+        },
+        assemblies: ItemRange {
+          start: assembly_start,
+          len: u32_len(package.framework_assemblies.len(), "package framework assembly range")?,
+        },
+        package_index,
+      });
+    }
     packages.push(ResolvedPackage {
       id: table.push(&package.request.id)?,
       version: table.push(&package.request.version)?,
@@ -8874,6 +9341,8 @@ fn materialize_resolution(
     fallback_roots,
     package_assets: package_assets.into_boxed_slice(),
     package_extended_assets: package_extended_assets.into_boxed_slice(),
+    package_framework_assets: package_framework_assets.into_boxed_slice(),
+    framework_items: framework_items.into_boxed_slice(),
     direct_policies: direct_policies.into_boxed_slice(),
     downgrades: materialized_downgrades,
     dependencies: dependencies.into_boxed_slice(),
@@ -8990,6 +9459,8 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     fallback_roots: Box::new([]),
     package_assets: Box::new([]),
     package_extended_assets: Box::new([]),
+    package_framework_assets: Box::new([]),
+    framework_items: Box::new([]),
     direct_policies: Box::new([]),
     downgrades: Box::new([]),
     dependencies: Box::new([]),
@@ -9130,6 +9601,12 @@ fn read_warm_lock(
         })
       })
       .collect::<Result<Vec<_>, PackageError>>()?;
+    for reference in &package.framework_references {
+      validate_framework_name(reference, "locked framework reference", path)?;
+    }
+    for assembly in &package.framework_assemblies {
+      validate_framework_assembly_name(assembly, path)?;
+    }
     if work
       .insert(
         request.lower_id.clone(),
@@ -9148,6 +9625,8 @@ fn read_warm_lock(
           build_transitive_assets,
           native_assets,
           runtime_targets,
+          framework_references: package.framework_references,
+          framework_assemblies: package.framework_assemblies,
           cache_hit: true,
           origin: None,
         },
@@ -9267,6 +9746,7 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
   }
   let mut direct = Vec::new();
   let mut packages = Vec::with_capacity(resolution.packages.len());
+  let mut framework_cursor = 0usize;
   for (index, package) in resolution.packages.iter().copied().enumerate() {
     let id = resolution.package_id(package).to_owned();
     let version = resolution.package_version(package).to_owned();
@@ -9290,6 +9770,15 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
       })
       .collect();
     let root = resolution.package_root_at(index);
+    let framework_row = resolution
+      .package_framework_assets
+      .get(framework_cursor)
+      .filter(|framework| framework.package_index as usize == index)
+      .map(|_| {
+        let row = framework_cursor;
+        framework_cursor += 1;
+        row
+      });
     packages.push(LockPackage {
       id,
       version,
@@ -9316,8 +9805,15 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
           })
         })
         .collect::<Result<Vec<_>, PackageError>>()?,
+      framework_references: framework_row
+        .map(|row| resolution.package_framework_references(row).map(str::to_owned).collect())
+        .unwrap_or_default(),
+      framework_assemblies: framework_row
+        .map(|row| resolution.package_framework_assemblies(row).map(str::to_owned).collect())
+        .unwrap_or_default(),
     });
   }
+  debug_assert_eq!(framework_cursor, resolution.package_framework_assets.len());
   let lock = LockFile {
     schema_version: LOCK_SCHEMA_VERSION,
     target_framework: resolution.target_framework().into(),
@@ -9581,12 +10077,19 @@ mod tests {
       build_transitive_assets: Vec::new(),
       native_assets: Vec::new(),
       runtime_targets: Vec::new(),
+      framework_references: Vec::new(),
+      framework_assemblies: Vec::new(),
       cache_hit: true,
       origin: None,
     }
   }
 
   fn write_test_package(temp: &TempDirectory, relative: &str, id: &str, version: &str) -> PathBuf {
+    let manifest = format!(r#"<package><metadata><id>{id}</id><version>{version}</version></metadata></package>"#);
+    write_test_package_manifest(temp, relative, id, &manifest)
+  }
+
+  fn write_test_package_manifest(temp: &TempDirectory, relative: &str, id: &str, manifest: &str) -> PathBuf {
     let path = temp.0.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = fs::File::create(&path).unwrap();
@@ -9597,9 +10100,7 @@ mod tests {
         SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
       )
       .unwrap();
-    archive
-      .write_all(format!(r#"<package><metadata><id>{id}</id><version>{version}</version></metadata></package>"#).as_bytes())
-      .unwrap();
+    archive.write_all(manifest.as_bytes()).unwrap();
     archive
       .start_file(
         format!("lib/net10.0/{id}.dll"),
@@ -11040,10 +11541,10 @@ mod tests {
       ))
       .unwrap();
 
-    let MetadataTaskResult::Requirements { dependencies, source_work, .. } = result else {
+    let MetadataTaskResult::Requirements { metadata, source_work, .. } = result else {
       panic!("exact cached identity should return its dependency batch");
     };
-    assert!(dependencies.is_empty());
+    assert!(metadata.dependencies.is_empty());
     assert_eq!(source_work, None);
   }
 
@@ -11939,6 +12440,188 @@ mod tests {
   }
 
   #[test]
+  fn nuspec_framework_reference_groups_are_isolated_from_dependency_groups() {
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version>
+<dependencies>
+  <group targetFramework="netstandard2.0"><dependency id="Base.Dependency" version="1.0" /></group>
+  <group targetFramework="net10.0"><dependency id="Current.Dependency" version="[2.0]" /></group>
+</dependencies>
+<frameworkReferences>
+  <group targetFramework="net8.0"><frameworkReference name="Ignored.Framework" /></group>
+  <group targetFramework="net10.0"><frameworkReference name="Microsoft.AspNetCore.App" /><frameworkReference name="microsoft.aspnetcore.app" /></group>
+</frameworkReferences>
+<frameworkAssemblies><frameworkAssembly assemblyName="System.Xml" targetFramework="net10.0" /></frameworkAssemblies>
+</metadata></package>"#;
+
+    let metadata = parse_nuspec_metadata(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request(),
+      TargetFramework::parse("net10.0").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(metadata.dependencies.len(), 1);
+    assert_eq!(metadata.dependencies[0].id, "Current.Dependency");
+    assert_eq!(metadata.frameworks.references, ["Microsoft.AspNetCore.App"]);
+    assert!(metadata.frameworks.assemblies.is_empty());
+  }
+
+  #[test]
+  fn nuspec_framework_assemblies_use_the_nearest_net_framework_group() {
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version>
+<frameworkAssemblies>
+  <frameworkAssembly assemblyName="System.Net" />
+  <frameworkAssembly assemblyName="System.Xml" targetFramework="net45, .NETFramework4.8" />
+  <frameworkAssembly assemblyName="System.Data" targetFramework="net48" />
+  <frameworkAssembly assemblyName="System.Old" targetFramework="net472" />
+</frameworkAssemblies>
+</metadata></package>"#;
+
+    let net48 = parse_nuspec_metadata(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request(),
+      TargetFramework::parse("net48").unwrap(),
+    )
+    .unwrap();
+    let net472 = parse_nuspec_metadata(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request(),
+      TargetFramework::parse("net472").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(net48.frameworks.assemblies, ["System.Data", "System.Xml"]);
+    assert_eq!(net472.frameworks.assemblies, ["System.Old"]);
+    assert!(net48.frameworks.references.is_empty());
+  }
+
+  #[test]
+  fn excluding_runtime_keeps_shared_frameworks_but_removes_legacy_assemblies() {
+    let temp = TempDirectory::new();
+    let cached = CachedPackage {
+      root: temp.0.clone(),
+      hash: BASE64.encode([0u8; 64]),
+      metadata: None,
+      cache_hit: true,
+      source_work: None,
+      failed_source_work: Box::new([]),
+      origin: None,
+    };
+
+    let package = parse_cached_package(
+      request(),
+      cached,
+      TargetFramework::parse("net10.0").unwrap(),
+      "net10.0",
+      Vec::new(),
+      PackageFrameworkMetadata {
+        references: vec!["Microsoft.AspNetCore.App".into()],
+        assemblies: vec!["System.Xml".into()],
+      },
+      AssetFlags::COMPILE,
+    )
+    .unwrap();
+
+    assert_eq!(package.framework_references, ["Microsoft.AspNetCore.App"]);
+    assert!(package.framework_assemblies.is_empty());
+  }
+
+  #[test]
+  fn nuspec_sections_select_framework_metadata_without_crossing_group_boundaries() {
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version>
+<dependencies>
+  <group targetFramework=".NETFramework4.7.2"><dependency id="Legacy.Dependency" version="[1.0]" /></group>
+  <group targetFramework="net10.0"><dependency id="Current.Dependency" version="[2.0]" /></group>
+</dependencies>
+<frameworkReferences>
+  <group targetFramework="net8.0"><frameworkReference name="Microsoft.WindowsDesktop.App" /></group>
+  <group targetFramework="net10.0"><frameworkReference name="Microsoft.AspNetCore.App" /></group>
+</frameworkReferences>
+<frameworkAssemblies>
+  <frameworkAssembly assemblyName="System.Net.Http" targetFramework=".NETFramework4.7.2" />
+  <frameworkAssembly assemblyName="System.Runtime" />
+</frameworkAssemblies>
+</metadata></package>"#;
+    let path = Path::new("sample.package.nuspec");
+
+    let modern = parse_nuspec_metadata(path, manifest, &request(), TargetFramework::parse("net10.0").unwrap()).unwrap();
+    let legacy = parse_nuspec_metadata(path, manifest, &request(), TargetFramework::parse("net472").unwrap()).unwrap();
+
+    assert_eq!(
+      modern.dependencies.iter().map(|dependency| dependency.id.as_str()).collect::<Vec<_>>(),
+      ["Current.Dependency"]
+    );
+    assert_eq!(modern.frameworks.references, ["Microsoft.AspNetCore.App"]);
+    assert!(modern.frameworks.assemblies.is_empty());
+    assert_eq!(
+      legacy.dependencies.iter().map(|dependency| dependency.id.as_str()).collect::<Vec<_>>(),
+      ["Legacy.Dependency"]
+    );
+    assert!(legacy.frameworks.references.is_empty());
+    assert_eq!(legacy.frameworks.assemblies, ["System.Net.Http"]);
+  }
+
+  #[test]
+  fn nuspec_framework_reference_requires_a_group() {
+    let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version>
+<frameworkReferences><frameworkReference name="Microsoft.AspNetCore.App" /></frameworkReferences>
+</metadata></package>"#;
+
+    let error = parse_nuspec_metadata(
+      Path::new("sample.package.nuspec"),
+      manifest,
+      &request(),
+      TargetFramework::parse("net10.0").unwrap(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), PackageErrorKind::Integrity);
+    assert!(error.to_string().contains("must be inside"));
+  }
+
+  #[test]
+  fn package_framework_metadata_survives_the_warm_lock() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Framework.Metadata" Version="1.0.0" /></ItemGroup></Project>"#,
+    );
+    let manifest = r#"<package><metadata><id>Framework.Metadata</id><version>1.0.0</version>
+<frameworkReferences><group targetFramework="net10.0"><frameworkReference name="Microsoft.AspNetCore.App" /></group></frameworkReferences>
+<frameworkAssemblies><frameworkAssembly assemblyName="System.Runtime" /></frameworkAssemblies>
+</metadata></package>"#;
+    write_test_package_manifest(&temp, "feed/Framework.Metadata.1.0.0.nupkg", "Framework.Metadata", manifest);
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      sources: vec![temp.0.join("feed").to_string_lossy().into_owned()],
+      offline: true,
+      write_lock: true,
+      ..PackageResolveOptions::default()
+    };
+
+    let cold = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+    let warm = resolve_package_inputs(&[&project], &options).unwrap().remove(0);
+
+    for resolution in [&cold, &warm] {
+      let framework = resolution.package_frameworks().next().unwrap();
+      assert_eq!(resolution.package_framework_package(framework), 0);
+      assert_eq!(
+        resolution.package_framework_references(framework).collect::<Vec<_>>(),
+        ["Microsoft.AspNetCore.App"]
+      );
+      assert!(resolution.package_framework_assemblies(framework).next().is_none());
+    }
+    assert_eq!(cold.downloaded_packages(), 1);
+    assert_eq!(warm.cache_hits(), 1);
+  }
+
+  #[test]
   fn nuspec_dependency_asset_filters_subtract_excludes_from_no_content_default() {
     let manifest = br#"<package><metadata><id>Sample.Package</id><version>1.2.3</version><dependencies>
 <group targetFramework="net10.0"><dependency id="Child.Package" version="1.0" exclude="Build,Analyzers" /></group>
@@ -11981,7 +12664,7 @@ mod tests {
     let cached = CachedPackage {
       root: temp.0.clone(),
       hash: BASE64.encode([0u8; 64]),
-      dependencies: None,
+      metadata: None,
       cache_hit: true,
       source_work: None,
       failed_source_work: Box::new([]),
@@ -11994,6 +12677,7 @@ mod tests {
       TargetFramework::parse("net10.0").unwrap(),
       "net10.0",
       Vec::new(),
+      PackageFrameworkMetadata::default(),
       AssetFlags::ALL,
     )
     .unwrap();
@@ -12152,7 +12836,7 @@ mod tests {
     let cached = CachedPackage {
       root: temp.0.clone(),
       hash: BASE64.encode([0u8; 64]),
-      dependencies: None,
+      metadata: None,
       cache_hit: true,
       source_work: None,
       failed_source_work: Box::new([]),
@@ -12171,6 +12855,7 @@ mod tests {
         direct: false,
         central_transitive: false,
       }],
+      PackageFrameworkMetadata::default(),
       AssetFlags::ALL,
     )
     .unwrap();

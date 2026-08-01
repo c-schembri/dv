@@ -38,6 +38,7 @@ enum CaseKind {
   PackageGraphMassive,
   PackageAssetPlan,
   PackageReferenceMetadata,
+  NuspecFrameworkMetadata,
   CentralPackageManagement,
   PackageConflictResolution,
   PackageBatchResolution,
@@ -80,6 +81,7 @@ struct Fixtures<'a> {
   unavailable_pack: &'a Path,
   package: &'a Path,
   package_reference_metadata: &'a Path,
+  nuspec_framework_metadata: &'a Path,
   central_package_management: &'a Path,
   package_conflict_resolution: &'a Path,
   package_reference_conditions: &'a Path,
@@ -269,6 +271,20 @@ const DOTNET_CASES: &[Case] = &[
       "restore",
       "MetadataProject.csproj",
       "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "nuspec_framework_metadata",
+    kind: CaseKind::NuspecFrameworkMetadata,
+    args: &[
+      "restore",
+      "FrameworkMetadata.csproj",
       "--packages",
       ".packages",
       "--nologo",
@@ -680,6 +696,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "nuspec_framework_metadata",
+    kind: CaseKind::NuspecFrameworkMetadata,
+    args: &["restore", "FrameworkMetadata.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "central_package_management",
     kind: CaseKind::CentralPackageManagement,
     args: &["restore", "CentralPackages.csproj", "--packages", ".packages", "--offline", "--json"],
@@ -946,6 +968,7 @@ fn run() -> Result<()> {
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
+  let nuspec_framework_metadata_fixture = repository.join("benchmarks/fixtures/nuspec-framework-metadata");
   let central_package_management_fixture = repository.join("benchmarks/fixtures/central-package-management");
   let package_conflict_resolution_fixture = repository.join("benchmarks/fixtures/package-conflict-resolution");
   let package_reference_conditions_fixture = repository.join("benchmarks/fixtures/package-reference-conditions");
@@ -975,6 +998,7 @@ fn run() -> Result<()> {
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
+    nuspec_framework_metadata: &nuspec_framework_metadata_fixture,
     central_package_management: &central_package_management_fixture,
     package_conflict_resolution: &package_conflict_resolution_fixture,
     package_reference_conditions: &package_reference_conditions_fixture,
@@ -1039,6 +1063,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "package_reference_metadata") {
     verify_package_reference_metadata(&repository, &dv_executable, &package_reference_metadata_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "nuspec_framework_metadata") {
+    verify_nuspec_framework_metadata(&repository, &dv_executable, &nuspec_framework_metadata_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "central_package_management") {
     verify_central_package_management(&repository, &dv_executable, &central_package_management_fixture)?;
@@ -2337,6 +2364,178 @@ fn verify_package_reference_metadata(repository: &Path, dv_executable: &Path, fi
   }
   assert_relative_policy_path(plan_property, "value", &dv_workspace, ".packages/newtonsoft.json/13.0.3")?;
   Ok(())
+}
+
+fn verify_nuspec_framework_metadata(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-nuspec-framework-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  reset_fixture(fixture, &root)?;
+  write_nuspec_framework_packages(&root.join("feed"))?;
+
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "FrameworkMetadata.csproj",
+      "--packages",
+      "dotnet-packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &root,
+    "Microsoft nuspec framework metadata oracle",
+  )?;
+  let assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join("obj/project.assets.json"))?)?;
+  let microsoft = assets
+    .pointer("/targets/net10.0/Framework.Metadata~11.0.0")
+    .ok_or("Microsoft assets omitted Framework.Metadata")?;
+  let dependencies = microsoft
+    .get("dependencies")
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft framework package omitted dependencies")?;
+  if dependencies.len() != 1 || dependencies.get("Framework.Child").and_then(serde_json::Value::as_str) != Some("[1.0.0]") {
+    return Err(format!("Microsoft selected the wrong nuspec dependency group: {dependencies:?}").into());
+  }
+  let microsoft_references = json_string_array(microsoft.get("frameworkReferences"), "Microsoft frameworkReferences")?;
+  let microsoft_assemblies = microsoft
+    .get("frameworkAssemblies")
+    .map(|value| json_string_array(Some(value), "Microsoft frameworkAssemblies"))
+    .transpose()?
+    .unwrap_or_default();
+  if microsoft_references != ["Microsoft.AspNetCore.App"] || !microsoft_assemblies.is_empty() {
+    return Err(format!("Microsoft selected unexpected framework metadata: references={microsoft_references:?} assemblies={microsoft_assemblies:?}").into());
+  }
+
+  remove_generated_path(&root.join("obj"))?;
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "LegacyFrameworkMetadata.csproj",
+      "--packages",
+      "dotnet-legacy-packages",
+      "-p:AutomaticallyUseReferenceAssemblyPackages=false",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &root,
+    "Microsoft legacy nuspec framework assembly oracle",
+  )?;
+  let legacy_assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join("obj/project.assets.json"))?)?;
+  let microsoft_legacy = legacy_assets
+    .pointer("/targets/.NETFramework,Version=v4.8/Framework.Metadata~11.0.0")
+    .ok_or("Microsoft legacy assets omitted Framework.Metadata")?;
+  let microsoft_legacy_assemblies = json_string_array(microsoft_legacy.get("frameworkAssemblies"), "Microsoft legacy frameworkAssemblies")?;
+  if microsoft_legacy_assemblies != ["System.Data", "System.Xml"] || microsoft_legacy.get("frameworkReferences").is_some() {
+    return Err(format!("Microsoft selected unexpected legacy framework metadata: {microsoft_legacy}").into());
+  }
+
+  remove_generated_path(&root.join("obj"))?;
+  let cold = command_text(
+    dv_executable,
+    &["restore", "FrameworkMetadata.csproj", "--packages", "dv-packages", "--offline", "--json"],
+    &root,
+  )?;
+  let warm = command_text(
+    dv_executable,
+    &["restore", "FrameworkMetadata.csproj", "--packages", "dv-packages", "--offline", "--json"],
+    &root,
+  )?;
+  for (state, output) in [("cold", &cold), ("warm", &warm)] {
+    let resolution = json_event(output, "package_resolution_created").ok_or("dv framework restore omitted package_resolution_created")?;
+    let packages = resolution
+      .get("packages")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("dv framework restore omitted packages")?;
+    if packages.len() != 2 {
+      return Err(format!("dv {state} framework restore selected {} packages instead of two", packages.len()).into());
+    }
+    let package = packages
+      .iter()
+      .find(|package| package.get("id").and_then(serde_json::Value::as_str) == Some("Framework.Metadata"))
+      .ok_or("dv framework restore omitted Framework.Metadata")?;
+    let references = json_string_array(package.get("framework_references"), "dv framework_references")?;
+    let assemblies = json_string_array(package.get("framework_assemblies"), "dv framework_assemblies")?;
+    if references != microsoft_references || assemblies != microsoft_assemblies {
+      return Err(format!("dv {state} framework metadata differs: references={references:?} assemblies={assemblies:?}").into());
+    }
+    if output.contains("Unselected.Dependency") || output.contains("Microsoft.WindowsDesktop.App") || output.contains("System.Net.Http") {
+      return Err(format!("dv {state} framework restore leaked an incompatible nuspec group").into());
+    }
+  }
+  let cold_event = json_event(&cold, "package_resolution_created").expect("cold resolution was checked");
+  let warm_event = json_event(&warm, "package_resolution_created").expect("warm resolution was checked");
+  if cold_event.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(2)
+    || warm_event.get("cache_hits").and_then(serde_json::Value::as_u64) != Some(2)
+  {
+    return Err("dv framework metadata preflight did not exercise cold publication and warm-lock reuse".into());
+  }
+  let lock: serde_json::Value = serde_json::from_slice(&fs::read(root.join("dv.lock.json"))?)?;
+  if lock.get("schema_version").and_then(serde_json::Value::as_u64) != Some(7) {
+    return Err("dv framework metadata lock did not use schema 7".into());
+  }
+  remove_generated_path(&root.join("obj"))?;
+  remove_generated_path(&root.join("dv.lock.json"))?;
+  let legacy_cold = command_text(
+    dv_executable,
+    &[
+      "restore",
+      "LegacyFrameworkMetadata.csproj",
+      "--packages",
+      "dv-legacy-packages",
+      "--offline",
+      "--json",
+    ],
+    &root,
+  )?;
+  let legacy_warm = command_text(
+    dv_executable,
+    &[
+      "restore",
+      "LegacyFrameworkMetadata.csproj",
+      "--packages",
+      "dv-legacy-packages",
+      "--offline",
+      "--json",
+    ],
+    &root,
+  )?;
+  for (state, output) in [("cold", &legacy_cold), ("warm", &legacy_warm)] {
+    let legacy_resolution = json_event(output, "package_resolution_created").ok_or("dv legacy framework restore omitted its resolution")?;
+    let legacy_package = legacy_resolution
+      .get("packages")
+      .and_then(serde_json::Value::as_array)
+      .and_then(|packages| {
+        packages
+          .iter()
+          .find(|package| package.get("id").and_then(serde_json::Value::as_str) == Some("Framework.Metadata"))
+      })
+      .ok_or("dv legacy framework restore omitted Framework.Metadata")?;
+    let legacy_references = json_string_array(legacy_package.get("framework_references"), "dv legacy framework_references")?;
+    let legacy_assemblies = json_string_array(legacy_package.get("framework_assemblies"), "dv legacy framework_assemblies")?;
+    if !legacy_references.is_empty() || legacy_assemblies != microsoft_legacy_assemblies {
+      return Err(format!("dv legacy {state} framework metadata differs: references={legacy_references:?} assemblies={legacy_assemblies:?}").into());
+    }
+  }
+  let legacy_cold_event = json_event(&legacy_cold, "package_resolution_created").expect("legacy cold resolution was checked");
+  let legacy_warm_event = json_event(&legacy_warm, "package_resolution_created").expect("legacy warm resolution was checked");
+  if legacy_cold_event.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(1)
+    || legacy_warm_event.get("cache_hits").and_then(serde_json::Value::as_u64) != Some(1)
+  {
+    return Err("dv legacy framework metadata preflight did not exercise cold publication and warm-lock reuse".into());
+  }
+  Ok(())
+}
+
+fn json_string_array<'a>(value: Option<&'a serde_json::Value>, meaning: &str) -> Result<Vec<&'a str>> {
+  value
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| -> Box<dyn Error> { format!("{meaning} is absent or is not an array").into() })?
+    .iter()
+    .map(|value| value.as_str().ok_or_else(|| format!("{meaning} contains a non-string value").into()))
+    .collect()
 }
 
 fn verify_central_package_management(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -4473,6 +4672,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
+      | CaseKind::NuspecFrameworkMetadata
       | CaseKind::CentralPackageManagement
       | CaseKind::PackageConflictResolution
       | CaseKind::PackageBatchResolution
@@ -4807,6 +5007,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
         "PackageReference metadata setup",
       )?;
     }
+  }
+  if matches!(case.kind, CaseKind::NuspecFrameworkMetadata) {
+    prepare_nuspec_framework_metadata(workspace)?;
   }
   if matches!(case.kind, CaseKind::CentralPackageManagement) {
     if is_dotnet(executable) {
@@ -5205,6 +5408,56 @@ fn write_conflict_package(feed: &Path, package: &ConflictPackage) -> Result<()> 
   archive.write_all(b"deterministic managed assembly placeholder")?;
   archive.finish()?;
   Ok(())
+}
+
+fn write_nuspec_framework_packages(feed: &Path) -> Result<()> {
+  use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+  fs::create_dir_all(feed)?;
+  let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+  for (id, manifest) in [
+    (
+      "Framework.Child",
+      r#"<?xml version="1.0"?><package><metadata><id>Framework.Child</id><version>1.0.0</version><authors>dv</authors><description>Framework metadata child.</description></metadata></package>"#,
+    ),
+    (
+      "Framework.Metadata",
+      r#"<?xml version="1.0"?><package><metadata><id>Framework.Metadata</id><version>1.0.0</version><authors>dv</authors><description>Framework metadata oracle.</description>
+<dependencies>
+  <group targetFramework="net8.0"><dependency id="Unselected.Dependency" version="[9.0.0]" /></group>
+  <group targetFramework="net10.0"><dependency id="Framework.Child" version="[1.0.0]" /></group>
+  <group targetFramework="net48" />
+</dependencies>
+<frameworkReferences>
+  <group targetFramework="net8.0"><frameworkReference name="Microsoft.WindowsDesktop.App" /></group>
+  <group targetFramework="net10.0"><frameworkReference name="Microsoft.AspNetCore.App" /></group>
+</frameworkReferences>
+<frameworkAssemblies>
+  <frameworkAssembly assemblyName="System.Net.Http" targetFramework=".NETFramework4.7.2" />
+  <frameworkAssembly assemblyName="System.Runtime" />
+  <frameworkAssembly assemblyName="System.Xml" targetFramework="net48" />
+  <frameworkAssembly assemblyName="System.Data" targetFramework=".NETFramework4.8, net472" />
+</frameworkAssemblies>
+</metadata></package>"#,
+    ),
+  ] {
+    let mut archive = ZipWriter::new(fs::File::create(feed.join(format!("{id}.1.0.0.nupkg")))?);
+    archive.start_file(format!("{id}.nuspec"), options)?;
+    archive.write_all(manifest.as_bytes())?;
+    archive.start_file(format!("lib/net10.0/{id}.dll"), options)?;
+    archive.write_all(b"deterministic managed assembly placeholder")?;
+    archive.start_file(format!("lib/net48/{id}.dll"), options)?;
+    archive.write_all(b"deterministic legacy assembly placeholder")?;
+    archive.finish()?;
+  }
+  Ok(())
+}
+
+fn prepare_nuspec_framework_metadata(workspace: &Path) -> Result<()> {
+  let feed = workspace.join("feed");
+  remove_generated_path(&feed)?;
+  write_nuspec_framework_packages(&feed)?;
+  reset_nuspec_framework_metadata_iteration(workspace)
 }
 
 fn write_incompatible_package(feed: &Path) -> Result<()> {
@@ -5700,6 +5953,13 @@ fn reset_package_batch_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_nuspec_framework_metadata_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", "obj", "dv.lock.json", "packages.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn remove_generated_path(path: &Path) -> Result<()> {
   const RETRIES: [Duration; 4] = [
     Duration::from_millis(10),
@@ -5736,6 +5996,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
+    CaseKind::NuspecFrameworkMetadata => reset_nuspec_framework_metadata_iteration(workspace),
     CaseKind::NugetCredentials
     | CaseKind::NugetCredentialProvider
     | CaseKind::NugetClientCertificates
@@ -5811,6 +6072,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
+    CaseKind::NuspecFrameworkMetadata => fixtures.nuspec_framework_metadata,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
     CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => fixtures.package_conflict_resolution,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
@@ -5845,6 +6107,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
+    CaseKind::NuspecFrameworkMetadata => Some("nuspec-framework-metadata"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
     CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => Some("package-conflict-resolution"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
@@ -5932,6 +6195,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageGraphMassive
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
+        | CaseKind::NuspecFrameworkMetadata
         | CaseKind::CentralPackageManagement
         | CaseKind::PackageConflictResolution
         | CaseKind::PackageSyncWarm
@@ -5955,6 +6219,11 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(0) || evidence.resolved_packages != Some(11))
     {
       return Err(format!("conflict-resolution sample did not resolve eleven cached packages with zero network work: {evidence:?}").into());
+    }
+    if matches!(case.kind, CaseKind::NuspecFrameworkMetadata)
+      && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(2) || evidence.resolved_packages != Some(2))
+    {
+      return Err(format!("nuspec-framework sample did not acquire two local packages with zero network work: {evidence:?}").into());
     }
     Some(evidence)
   } else if !is_dotnet(executable)
@@ -6752,6 +7021,7 @@ fn case_label(case: &str) -> &str {
     "package_graph_massive" => "Cold massive solution graph",
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
+    "nuspec_framework_metadata" => "NuGet framework metadata",
     "central_package_management" => "Central package management",
     "package_conflict_resolution" => "Package conflict resolution",
     "package_batch_resolution" => "Two-project package batch",

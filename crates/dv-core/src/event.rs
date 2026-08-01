@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 15;
+pub const EVENT_SCHEMA_VERSION: u16 = 16;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,6 +283,10 @@ pub struct ResolvedPackageEvent {
   pub central_transitive: bool,
   /// Number of outgoing dependency edges.
   pub dependency_count: u32,
+  /// Shared-framework references selected from this package's nearest nuspec group.
+  pub framework_references: Vec<String>,
+  /// Legacy .NET Framework assemblies selected from this package's nearest nuspec group.
+  pub framework_assemblies: Vec<String>,
   /// Whether the package was reused or acquired for this command.
   pub cache_outcome: CacheOutcome,
 }

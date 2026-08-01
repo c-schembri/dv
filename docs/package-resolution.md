@@ -15,9 +15,11 @@ Floating lower bounds may also carry an inclusive or exclusive interval upper
 bound; floating upper bounds are rejected like NuGet.Client. The target
 framework comes from each `ProjectSpec`; package code does not contain a fixed
 current .NET version.
-Modern `net5.0` through the latest captured stable generation are evaluated
-from the same parsed target descriptor. Recognized legacy families remain
-explicitly unsupported until their pack and compiler policies are captured.
+Modern `net5.0` through the latest captured stable generation and recognized
+legacy .NET Framework targets are evaluated from the same parsed target
+descriptor. Package restore uses legacy targets for NuGet dependency and
+framework-assembly selection; SDK pack and compiler planning continue to fail
+explicitly until their legacy policies are captured.
 
 NuGet sources are typed records containing URL and protocol generation:
 
@@ -108,8 +110,8 @@ identity-ordered central version batch. Direct references use their selected
 central value unless `VersionOverride` wins. Matching transitive identities are
 promoted to the exact central version before package metadata is scheduled;
 an incompatible lower pin fails rather than drifting upward. Central-transitive
-packages remain distinct from project-direct packages in lock schema 6 and
-event schema 15. See the
+packages remain distinct from project-direct packages in lock schema 7 and
+event schema 16. See the
 [central package management contract](central-package-management.md).
 
 Version constraints are owned by one identity-ordered graph node and keyed by
@@ -133,6 +135,13 @@ root is retained as a valid graph node and resolves to 50 packages totaling
 runtime, or analyzer asset of their own; packages with neither a compatible
 asset nor a dependency remain incompatible.
 
+A representative local cache inspection found 393 nuspecs: 16 packages with
+modern `frameworkReferences` and 53 with legacy `frameworkAssemblies`. The
+largest manifests had four framework-reference groups, three references in one
+group, and eleven legacy assemblies. This sparse distribution keeps framework
+metadata out of the hot dependency row and justifies a parallel optional index
+rather than two vectors on every package.
+
 ## Transform
 
 ```text
@@ -146,6 +155,8 @@ ProjectSpec batch + resolve options
   -> seed a bounded queue with direct package constraints
   -> fetch and stage up to twenty-four independent requests with async I/O
   -> parse each completed manifest and immediately enqueue unseen dependencies
+  -> independently select nearest dependency, shared-framework, and legacy
+     framework-assembly groups from the same bounded XML pass
   -> retain exact target/id/version dependency metadata for later projects
   -> merge dependency identities and conflicts through one deterministic owner
   -> reject empty constraint intersections before source enumeration
@@ -189,6 +200,24 @@ hit clones the parsed requirements into the next project's independently
 mutable graph without reopening or reparsing the nuspec. Storage scope includes
 the writable cache and ordered fallback roots, while the target key prevents
 dependency-group reuse across TFMs.
+
+Package-provided framework metadata is cold and sparse. Dependency,
+`frameworkReferences`, and `frameworkAssemblies` containers have distinct parser
+state, and each group is selected independently for the evaluated target.
+Shared-framework references apply only from their required nearest target
+group. Legacy framework assemblies apply only to .NET Framework: a compatible
+target-scoped group wins as a batch, while unscoped rows form the `Any`
+fallback rather than being merged into that winner. Excluding runtime assets
+removes legacy assemblies but does not remove modern shared-framework
+references, matching NuGet.Client.
+
+The final resolution owns one sparse 20-byte, four-byte-aligned row only for a
+package with selected framework metadata. Each row holds two contiguous name
+ranges plus its package index; names share the resolution text table through
+eight-byte spans. The batch metadata cache retains its 40-byte hot dependency
+row and carries framework ownership in a parallel `u32` index, so the common
+package does not pay for two vectors in the hot record. Lock schema 7 and event
+schema 16 preserve the selected names across cold and warm restores.
 
 Project graphs converge sequentially. This deliberately avoids duplicate
 downloads, publication races, graph locks, and completion-order instability;
@@ -241,9 +270,9 @@ span allocation. Actual per-package roots and ordered fallback roots are cold
 parallel path-span batches, so fallback support does not enlarge the hot
 package scan. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
 path is an 8-byte offset/length span into one owned UTF-8 buffer. The
-pointer-aligned `PackageResolution` header is 368 bytes after adding the two
-cold root batches, typed policy fields, source-work batch, and downgrade batch.
-Assuming the benchmark machine's
+pointer-aligned `PackageResolution` header is 400 bytes. Schema 7 adds two
+framework-metadata slice owners to the previous 368-byte header; the common
+package still adds no row or name allocation. Assuming the benchmark machine's
 observed 64-byte cache line, eight spans fit per line. Reporters and compiler
 planning scan only the ranges they consume.
 
@@ -306,7 +335,7 @@ Two rows fit the benchmark host's assumed 64-byte cache line. Text shares the
 resolution buffer and the common no-warning path owns an empty boxed slice,
 so it performs no row allocation. A single post-convergence scan reads package
 constraints linearly and enters the graph ancestry path only for relevant
-transitive multi-parent constraints. Lock schema 6 persists this batch, which
+transitive multi-parent constraints. Lock schema 7 persists this batch, which
 lets a warm locked restore reproduce `DV0413` without reopening manifests or
 rescanning the graph.
 
@@ -458,6 +487,19 @@ cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
 
 The curated distribution is retained in the
 [package batch-resolution baseline](performance-baselines/2026-08-01-package-batch-resolution-windows.md).
+
+The nuspec-framework case generates a two-package local feed whose dependency,
+shared-framework, and legacy-assembly groups deliberately disagree. Preflight
+compares Microsoft and `dv` on the latest stable `net10.0` target, separately
+queries `net48` to prove nearest legacy assembly and `Any` fallback behavior,
+then verifies `dv` cold and schema-7 warm-lock output before timing:
+
+```powershell
+cargo bench-all --case nuspec_framework_metadata --samples 30 --warmups 3
+```
+
+The curated distribution is retained in the
+[nuspec framework-metadata baseline](performance-baselines/2026-08-01-nuspec-framework-metadata-windows.md).
 
 The storage-policy case builds an adapter against the selected SDK's official
 `NuGet.Common` and `NuGet.Configuration` assemblies, queries audit properties
