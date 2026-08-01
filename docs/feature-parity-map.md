@@ -347,7 +347,7 @@ contracts.
   deadline; a second signal forces immediate termination. Package source,
   retry, response-stream, restore, and credential-provider waits observe the
   same token. The run/test boundary receives the typed policy while child
-  launch remains ordered under `RUN-006`, `RUN-009`, and `CLI-015`. Unix
+  launch remains ordered under `RUN-006` and `RUN-009`. Unix
   process tests deliver real SIGINT during stalled HTTP work; all-platform
   tests cover transitions, deadline stability, diagnostics, and the child
   boundary. Thirty warm Windows samples measure cancellation-ready SDK
@@ -364,7 +364,10 @@ contracts.
   preserved and test-host failures mapped into the aggregated test result.
   Real cross-platform process tests retain `0`, `37`, and `211`, distinguish a
   nonexistent executable from a nonzero child, and keep Unix `SIGTERM`
-  separate from numeric exits. Application launch,
+  separate from numeric exits. The structural Windows child-boundary case is
+  explicitly excluded from like-for-like claims while `run` is TBI; successful
+  SDK selection remains `12.6x` faster and like-for-like unknown-option failure
+  remains `28.4x` faster after the outer exit change. Application launch,
   process-group ownership, and signal policy remain ordered under `RUN-006`
   and `RUN-009`. `P1`
 - [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,

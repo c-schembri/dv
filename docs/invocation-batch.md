@@ -295,8 +295,9 @@ pay that allocation or handler-thread cost. The run/test boundary receives the
 same typed token and its fixed two-second child grace. The absolute deadline is
 anchored to the first signal rather than restarted by each child, and a second
 signal changes the policy to immediate termination. Actual child creation and
-reference-specific exit propagation remain in `RUN-006`, `RUN-009`, and
-`CLI-015`.
+process-group ownership remain in `RUN-006` and `RUN-009`. `CLI-015` now owns
+typed numeric termination and the declared run/test mapping; signal and
+cancellation exit profiles remain with their workflow-specific slices.
 
 The common no-environment SDK control measured `dotnet --version` at
 `68.493 ms` median and `70.539 ms` p95, and `dv sdk current` at `5.596 ms`

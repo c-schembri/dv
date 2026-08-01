@@ -58,6 +58,7 @@ Invalid input behavior:
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_environment` | immutable `small-console` fixture; identical `NO_COLOR`, `DV_COLOR`, and `DV_VERBOSITY` values | process launch, typed environment precedence, pre-I/O unknown-option rejection, ANSI suppression, and secret-free failure output |
+| `cli_child_exit` | prebuilt `argument-forwarding` fixture; child-exit parity and typed TBI-boundary preflight outside timing | Microsoft launches the managed child; `dv` captures the declared exit policy and emits its TBI boundary |
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
@@ -204,6 +205,13 @@ reference/dv process inputs:
 
 ```text
 cargo bench-all --case cli_environment --samples 30 --warmups 3
+```
+
+Measure the structural child-exit boundary. This is not like-for-like until
+`dv run` launches the managed application:
+
+```text
+cargo bench-all --case cli_child_exit --samples 30 --warmups 5
 ```
 
 Measure SDK-owned portable RID expansion:

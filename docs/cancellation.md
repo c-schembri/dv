@@ -19,9 +19,10 @@ The first Ctrl+C/SIGINT request:
 The deadline is absolute. A child that observes cancellation late receives
 only the time remaining from the original signal. A second request changes the
 state to forced and makes the remaining grace zero. Further requests are
-idempotent. Child creation, platform process-group ownership, and final exit
-code propagation are implemented in the ordered `RUN-006`, `RUN-009`, and
-`CLI-015` slices; the run/test boundary already receives this policy.
+idempotent. `CLI-015` now owns typed child termination and numeric exit-code
+propagation. Child creation, platform process-group ownership, and signal-exit
+policy remain in the ordered `RUN-006` and `RUN-009` slices; the run/test
+boundary already receives both cancellation and exit policies.
 
 `ASSUMPTION: a two-second grace is long enough for well-behaved compiler,
 application, test, and provider children to flush and exit - affects forced
@@ -73,9 +74,10 @@ notification. Credential-provider cancellation sends the NuGet protocol
 reaps the provider on timeout or a second signal.
 
 Cancellation emits `DV0005` and the JSON `cancelled` outcome. Failure to own
-the process signal handler emits `DV0004` before work starts. Native process
-exit remains the existing operation-failure value until `CLI-015` captures and
-implements each reference tool's exit policy.
+the process signal handler emits `DV0004` before work starts. `CLI-015`
+preserves normal numeric child exits where the command owns that contract;
+cancellation and signal exits retain the existing operation-failure value
+until their workflow-specific reference policies are proven.
 
 ## Evidence
 

@@ -78,8 +78,8 @@ return `23`; `dv` must instead expose its typed preserve policy and explicit
 TBI diagnostic. Its timings are not compared as application execution. The
 like-for-like failure guard uses the existing unknown-option contract because
 `CLI-015` changes the outer process-exit boundary for every command. A separate
-SDK-selection control covers successful termination. Full results are recorded in the
-[Windows baseline](performance-baselines/2026-08-01-cli-child-exit-windows.md).
+SDK-selection control covers successful termination. Full results are recorded
+in the [Windows baseline](performance-baselines/2026-08-01-cli-child-exit-windows.md).
 
 Reproduce:
 

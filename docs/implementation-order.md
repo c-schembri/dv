@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 63 rows are implemented;
+- 64 rows are implemented;
 - 32 rows have partial foundations;
-- 373 rows are missing;
+- 372 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
