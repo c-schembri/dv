@@ -20,17 +20,18 @@ use invocation::{COMMAND_SYNTAX_VERSION, ColorChoice, CommandArguments, CommandK
 use output::redact_argument_text;
 
 use dv_core::{
-  CancellationToken, CentralPackageVersionEvent, ChildExitPolicy, ChildTermination, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind,
-  CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, DotnetArchitecture, Event, EventPayload,
-  FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind,
-  PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
-  PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
-  ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
-  RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
-  WorkspaceCandidateKind, discover_installed_sdks, discover_installed_sdks_for_architecture, discover_repository_root, discover_runtimes,
-  discover_runtimes_for_architecture, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
-  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
-  resolve_package_inputs_with_runtime_graph, write_json_lines,
+  AncestorInputError, AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, CancellationToken, CentralPackageVersionEvent, ChildExitPolicy,
+  ChildTermination, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
+  DiagnosticCode, DirectPackagePolicyEvent, DotnetArchitecture, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind,
+  FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent,
+  PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent,
+  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
+  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory, RuntimePackError, RuntimePackErrorKind,
+  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity, WorkspaceCandidateKind, discover_ancestor_inputs,
+  discover_installed_sdks, discover_installed_sdks_for_architecture, discover_repository_root, discover_runtimes, discover_runtimes_for_architecture,
+  discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph,
+  write_json_lines,
 };
 
 const HELP: &str = "\
@@ -140,6 +141,8 @@ Usage:
 const PROJECT_HELP: &str = "\
 Usage:
   dv project root [PATH]  Print the nearest repository root
+  dv project inputs [PATH]
+                          List ancestor-scoped build inputs
   dv project inspect [PROJECT|SOLUTION] [--project PATH]
                      [--configuration Debug|Release]
   dv project frameworks [PROJECT|SOLUTION] [--project PATH] [--packages PATH]
@@ -527,7 +530,7 @@ fn run() -> ExitCode {
 
 fn command_requires_cancellation(globals: InvocationOptions, command: CommandKind, command_args: CommandArguments<'_>) -> bool {
   let bounded_inventory = command == CommandKind::Sdk && command_args.first().and_then(OsStr::to_str) == Some("runtimes");
-  let bounded_repository_root = command == CommandKind::Project && command_args.first().and_then(OsStr::to_str) == Some("root");
+  let bounded_project_discovery = command == CommandKind::Project && matches!(command_args.first().and_then(OsStr::to_str), Some("root" | "inputs"));
   let work_command = matches!(
     command,
     CommandKind::Sdk
@@ -539,7 +542,7 @@ fn command_requires_cancellation(globals: InvocationOptions, command: CommandKin
       | CommandKind::Run
       | CommandKind::Test
   ) || (command == CommandKind::Compat && command_args.first().is_some_and(|argument| argument == "check"));
-  work_command && !bounded_inventory && !bounded_repository_root && !command_help_only(globals, command, command_args)
+  work_command && !bounded_inventory && !bounded_project_discovery && !command_help_only(globals, command, command_args)
 }
 
 fn run_compat(
@@ -672,7 +675,7 @@ fn command_help_only(globals: InvocationOptions, command: CommandKind, command_a
   matches!(command, CommandKind::Project)
     && matches!(
       command_args.first().and_then(OsStr::to_str),
-      Some("inspect" | "frameworks" | "runtime-packs" | "package-sources")
+      Some("root" | "inputs" | "inspect" | "frameworks" | "runtime-packs" | "package-sources")
     )
     && command_args.get(1).is_some_and(|argument| globals.argument_is_help(argument))
     && command_args.len() == 2
@@ -2066,7 +2069,7 @@ fn run_project(
     return ExitCode::SUCCESS;
   }
   let mut semantic_operands = operands.iter();
-  if matches!(subcommand, "root" | "inspect" | "frameworks" | "runtime-packs" | "package-sources")
+  if matches!(subcommand, "root" | "inputs" | "inspect" | "frameworks" | "runtime-packs" | "package-sources")
     && semantic_operands.next().is_some_and(|argument| globals.argument_is_help(argument))
     && semantic_operands.next().is_none()
   {
@@ -2075,6 +2078,9 @@ fn run_project(
   }
   if subcommand == "root" {
     return project_root(started, globals, args, operands);
+  }
+  if subcommand == "inputs" {
+    return project_inputs(started, globals, args, operands);
   }
   let cancellation = cancellation.expect("non-help project commands install cancellation");
   if subcommand == "runtime-packs" {
@@ -2273,6 +2279,135 @@ fn project_root(started: Instant, globals: InvocationOptions, args: Vec<String>,
     return ExitCode::SUCCESS;
   }
   succeed(started, "project root", args, payload)
+}
+
+fn project_inputs(started: Instant, globals: InvocationOptions, args: Vec<String>, operands: CommandArguments<'_>) -> ExitCode {
+  if operands.len() > 1 {
+    return reject(
+      started,
+      globals,
+      "project inputs",
+      args,
+      diagnostic(
+        "DV0002",
+        "project inputs accepts at most one path",
+        None,
+        Some("Use `dv project inputs [PATH]`."),
+      ),
+    );
+  }
+  if let Some(operand) = operands.first()
+    && globals.argument_is_option(operand)
+  {
+    let option = redact_argument_text(operand);
+    return reject(
+      started,
+      globals,
+      "project inputs",
+      args,
+      diagnostic(
+        "DV0002",
+        format!("unknown project inputs option {option:?}"),
+        None,
+        Some("Use `dv project inputs --help` to inspect the accepted arguments."),
+      ),
+    );
+  }
+
+  let current_directory;
+  let start = if let Some(path) = operands.first() {
+    Path::new(path)
+  } else {
+    current_directory = match env::current_dir() {
+      Ok(directory) => directory,
+      Err(error) => {
+        return fail(
+          started,
+          globals,
+          "project inputs",
+          args,
+          diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+        );
+      },
+    };
+    &current_directory
+  };
+  let inputs = match discover_ancestor_inputs(start, AncestorInputRequest::ALL) {
+    Ok(inputs) => inputs,
+    Err(error) => return fail(started, globals, "project inputs", args, workspace_inputs_diagnostic(error)),
+  };
+  let singleton_path = |kind, meaning| {
+    inputs
+      .inputs(kind)
+      .first()
+      .copied()
+      .map(|input| path_text(&inputs.path(input), meaning))
+      .transpose()
+  };
+  let global_json = match singleton_path(AncestorInputKind::GlobalJson, "global.json") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, globals, "project inputs", args, *diagnostic),
+  };
+  let nuget_configs = match inputs
+    .inputs(AncestorInputKind::NugetConfig)
+    .iter()
+    .copied()
+    .map(|input| path_text(&inputs.path(input), "NuGet.Config"))
+    .collect::<Result<Vec<_>, _>>()
+  {
+    Ok(paths) => paths,
+    Err(diagnostic) => return fail(started, globals, "project inputs", args, *diagnostic),
+  };
+  let directory_build_props = match singleton_path(AncestorInputKind::DirectoryBuildProps, "Directory.Build.props") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, globals, "project inputs", args, *diagnostic),
+  };
+  let directory_build_targets = match singleton_path(AncestorInputKind::DirectoryBuildTargets, "Directory.Build.targets") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, globals, "project inputs", args, *diagnostic),
+  };
+  let directory_packages_props = match singleton_path(AncestorInputKind::DirectoryPackagesProps, "Directory.Packages.props") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, globals, "project inputs", args, *diagnostic),
+  };
+  let payload = EventPayload::WorkspaceInputsDiscovered {
+    global_json,
+    nuget_configs,
+    directory_build_props,
+    directory_build_targets,
+    directory_packages_props,
+    ancestor_count: inputs.ancestor_count(),
+    metadata_probes: inputs.metadata_probes(),
+    directory_enumerations: inputs.directory_enumerations(),
+  };
+  if !globals.json() {
+    let EventPayload::WorkspaceInputsDiscovered {
+      global_json,
+      nuget_configs,
+      directory_build_props,
+      directory_build_targets,
+      directory_packages_props,
+      ancestor_count,
+      metadata_probes,
+      directory_enumerations,
+    } = &payload
+    else {
+      unreachable!("workspace input discovery created its typed payload")
+    };
+    println!("global.json: {}", global_json.as_deref().unwrap_or("not found"));
+    println!("NuGet.Config:");
+    for path in nuget_configs {
+      println!("  {path}");
+    }
+    println!("Directory.Build.props: {}", directory_build_props.as_deref().unwrap_or("not found"));
+    println!("Directory.Build.targets: {}", directory_build_targets.as_deref().unwrap_or("not found"));
+    println!("Directory.Packages.props: {}", directory_packages_props.as_deref().unwrap_or("not found"));
+    println!("Ancestors: {ancestor_count}");
+    println!("Metadata probes: {metadata_probes}");
+    println!("Directory enumerations: {directory_enumerations}");
+    return ExitCode::SUCCESS;
+  }
+  succeed(started, "project inputs", args, payload)
 }
 
 fn project_package_sources(
@@ -3015,6 +3150,27 @@ fn repository_root_diagnostic(error: ProjectError) -> Diagnostic {
       value: error.path().display().to_string(),
     }),
     help,
+  )
+}
+
+fn workspace_inputs_diagnostic(error: AncestorInputError) -> Diagnostic {
+  let code = match error.kind() {
+    AncestorInputErrorKind::NotFound => "DV0200",
+    AncestorInputErrorKind::Io => "DV0202",
+    AncestorInputErrorKind::UnsupportedFileType | AncestorInputErrorKind::LimitExceeded => "DV0204",
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    match error.kind() {
+      AncestorInputErrorKind::NotFound => Some("Pass an existing project file or directory."),
+      AncestorInputErrorKind::UnsupportedFileType => Some("Use regular ancestor input files and a regular file or directory search start."),
+      _ => None,
+    },
   )
 }
 
@@ -3881,6 +4037,8 @@ mod argument_tests {
       &["--compat", "dotnet", "--list-sdks"],
       &["--compat", "dotnet", "--list-runtimes"],
       &["project"],
+      &["project", "root"],
+      &["project", "inputs"],
       &["project", "inspect", "--help"],
       &["--compat", "dotnet", "build", "-?"],
       &["--compat", "dotnet", "run", "-h"],

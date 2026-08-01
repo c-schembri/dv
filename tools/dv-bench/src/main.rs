@@ -106,6 +106,7 @@ enum CaseKind {
   CliChildExit,
   RidGraph,
   RepositoryRoot,
+  WorkspaceInputs,
   ProjectEvaluate,
   PackageReferenceConditions,
   RuntimeEvaluate,
@@ -162,6 +163,7 @@ struct Case {
 struct Fixtures<'a> {
   small: &'a Path,
   repository_root: &'a Path,
+  workspace_inputs: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
@@ -347,6 +349,17 @@ const DOTNET_CASES: &[Case] = &[
     name: "repository_root",
     kind: CaseKind::RepositoryRoot,
     args: &["msbuild", "nested/src/RepositoryRoot.proj", "--nologo", "-getProperty:RepositoryRoot"],
+    implemented: true,
+  },
+  Case {
+    name: "workspace_inputs",
+    kind: CaseKind::WorkspaceInputs,
+    args: &[
+      "msbuild",
+      "nested/src/WorkspaceInputs.proj",
+      "--nologo",
+      "-getProperty:GlobalJson,NuGetConfigs,DirectoryBuildProps,DirectoryBuildTargets,DirectoryPackagesProps",
+    ],
     implemented: true,
   },
   Case {
@@ -1071,6 +1084,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "workspace_inputs",
+    kind: CaseKind::WorkspaceInputs,
+    args: &["project", "inputs", "nested/src", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
@@ -1475,6 +1494,7 @@ fn run() -> Result<()> {
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
   let repository_root_fixture = repository.join("benchmarks/fixtures/repository-root");
+  let workspace_inputs_fixture = repository.join("benchmarks/fixtures/workspace-inputs");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
@@ -1509,6 +1529,7 @@ fn run() -> Result<()> {
   let fixtures = Fixtures {
     small: &fixture,
     repository_root: &repository_root_fixture,
+    workspace_inputs: &workspace_inputs_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
@@ -1621,6 +1642,14 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "repository_root") {
     verify_repository_root(&repository, &dv_executable, &repository_root_fixture, &workspace.join("verify-repository-root"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "workspace_inputs") {
+    verify_workspace_inputs(
+      &repository,
+      &dv_executable,
+      &workspace_inputs_fixture,
+      &workspace.join("verify-workspace-inputs"),
+    )?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
@@ -2829,8 +2858,8 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
   Ok(())
 }
 
-const EVENT_SCHEMA_VERSION: u64 = 22;
-const COMMAND_SYNTAX_VERSION: u64 = 4;
+const EVENT_SCHEMA_VERSION: u64 = 23;
+const COMMAND_SYNTAX_VERSION: u64 = 5;
 const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
 
 fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -3059,6 +3088,32 @@ fn verify_repository_root(repository: &Path, dv_executable: &Path, fixture: &Pat
   let after = snapshot_tree(workspace)?;
   if before != after {
     return Err("repository-root queries mutated the fixture".into());
+  }
+  Ok(())
+}
+
+fn verify_workspace_inputs(repository: &Path, dv_executable: &Path, fixture: &Path, workspace: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, workspace)?;
+  reset_fixture(fixture, workspace)?;
+  let before = snapshot_tree(workspace)?;
+  let reference = Command::new("dotnet")
+    .args([
+      "msbuild",
+      "nested/src/WorkspaceInputs.proj",
+      "--nologo",
+      "-getProperty:GlobalJson,NuGetConfigs,DirectoryBuildProps,DirectoryBuildTargets,DirectoryPackagesProps",
+    ])
+    .current_dir(workspace)
+    .output()?;
+  validate_workspace_inputs_output(&reference, workspace, true)?;
+  let candidate = Command::new(dv_executable)
+    .args(["project", "inputs", "nested/src", "--json"])
+    .current_dir(workspace)
+    .output()?;
+  validate_workspace_inputs_output(&candidate, workspace, false)?;
+  let after = snapshot_tree(workspace)?;
+  if before != after {
+    return Err("workspace-input queries mutated the fixture".into());
   }
   Ok(())
 }
@@ -6877,6 +6932,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
     case.kind,
     CaseKind::RidGraph
       | CaseKind::RepositoryRoot
+      | CaseKind::WorkspaceInputs
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
@@ -8387,6 +8443,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::CliChildExit
     | CaseKind::RidGraph
     | CaseKind::RepositoryRoot
+    | CaseKind::WorkspaceInputs
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -8478,6 +8535,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::CliForwarding | CaseKind::CliChildExit => fixtures.argument_forwarding,
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RepositoryRoot => fixtures.repository_root,
+    CaseKind::WorkspaceInputs => fixtures.workspace_inputs,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
@@ -8517,6 +8575,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::CliForwarding | CaseKind::CliChildExit => Some("argument-forwarding"),
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RepositoryRoot => Some("repository-root"),
+    CaseKind::WorkspaceInputs => Some("workspace-inputs"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
@@ -8620,6 +8679,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_child_exit_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::RepositoryRoot) {
     validate_repository_root_output(&output, cwd)?;
+  } else if matches!(case.kind, CaseKind::WorkspaceInputs) {
+    validate_workspace_inputs_output(&output, cwd, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -8735,6 +8796,99 @@ fn validate_repository_root_output(output: &Output, cwd: &Path) -> Result<()> {
   let root = std::str::from_utf8(&output.stdout)?.trim();
   if Path::new(root) != cwd {
     return Err(format!("repository-root sample returned {root:?}; expected {}", cwd.display()).into());
+  }
+  Ok(())
+}
+
+fn validate_workspace_inputs_output(output: &Output, workspace: &Path, dotnet: bool) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "workspace-input sample failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let expected_global = workspace.join("global.json");
+  let expected_configs = [workspace.join("NuGet.Config"), workspace.join("nested/NuGet.Config")];
+  let expected_props = workspace.join("Directory.Build.props");
+  let expected_targets = workspace.join("nested/Directory.Build.targets");
+  let expected_packages = workspace.join("nested/Directory.Packages.props");
+
+  let (global, configs, props, targets, packages) = if dotnet {
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let properties = document
+      .get("Properties")
+      .and_then(serde_json::Value::as_object)
+      .ok_or("MSBuild workspace-input query omitted Properties")?;
+    let path = |name| {
+      properties
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("MSBuild workspace-input query omitted {name}"))
+    };
+    let configs = properties
+      .get("NuGetConfigs")
+      .and_then(serde_json::Value::as_str)
+      .ok_or("MSBuild workspace-input query omitted NuGetConfigs")?
+      .split(';')
+      .map(PathBuf::from)
+      .collect::<Vec<_>>();
+    (
+      path("GlobalJson")?,
+      configs,
+      path("DirectoryBuildProps")?,
+      path("DirectoryBuildTargets")?,
+      path("DirectoryPackagesProps")?,
+    )
+  } else {
+    let event = output
+      .stdout
+      .split(|byte| *byte == b'\n')
+      .filter(|line| !line.is_empty())
+      .map(serde_json::from_slice::<serde_json::Value>)
+      .collect::<std::result::Result<Vec<_>, _>>()?
+      .into_iter()
+      .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("workspace_inputs_discovered"))
+      .ok_or("dv workspace-input event was not emitted")?;
+    if event.get("schema_version").and_then(serde_json::Value::as_u64) != Some(EVENT_SCHEMA_VERSION)
+      || event.get("ancestor_count").and_then(serde_json::Value::as_u64).is_none_or(|count| count < 3)
+      || event.get("metadata_probes").and_then(serde_json::Value::as_u64).is_none_or(|count| count < 13)
+    {
+      return Err("dv workspace-input event omitted bounded traversal evidence".into());
+    }
+    let path = |name| {
+      event
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("dv workspace-input event omitted {name}"))
+    };
+    let configs = event
+      .get("nuget_configs")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("dv workspace-input event omitted nuget_configs")?
+      .iter()
+      .map(|path| {
+        path
+          .as_str()
+          .map(PathBuf::from)
+          .ok_or_else(|| Box::<dyn Error>::from("dv emitted a non-path NuGet configuration"))
+      })
+      .collect::<Result<Vec<_>>>()?;
+    (
+      path("global_json")?,
+      configs,
+      path("directory_build_props")?,
+      path("directory_build_targets")?,
+      path("directory_packages_props")?,
+    )
+  };
+  if global != expected_global || configs != expected_configs || props != expected_props || targets != expected_targets || packages != expected_packages {
+    return Err(format!("workspace-input mismatch: global={global:?} configs={configs:?} props={props:?} targets={targets:?} packages={packages:?}").into());
   }
   Ok(())
 }
@@ -9552,6 +9706,7 @@ fn case_label(case: &str) -> &str {
     "cli_compat_manifest" => "Compatibility manifest query",
     "cli_compat_check" => "Static compatibility check",
     "repository_root" => "Repository root discovery",
+    "workspace_inputs" => "Ancestor build input discovery",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "workspace_discovery" => "Implicit workspace discovery",

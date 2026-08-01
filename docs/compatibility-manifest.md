@@ -67,7 +67,7 @@ allocation, filesystem read, process launch, or network request. It linearly
 writes the embedded artifact once. Other commands never access those pages.
 The embedded data increases the Windows release executable by 271,872 bytes;
 interleaved before/after startup samples did not show a directional regression.
-The retained query writes 270,222 output bytes after the repository-root
+The retained query writes 270,226 output bytes after the workspace-input
 support and protocol-version update.
 
 The manifest is an inventory and claim boundary, not evidence that missing or

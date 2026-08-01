@@ -31,7 +31,7 @@ Human compatibility output is byte-for-byte equal after CRLF normalization:
 ```
 
 JSON reports one ordered `sdk_inventory` or `runtime_inventory` payload under
-event schema 21. Unsupported operands and malformed, combined, missing-value,
+event schema 23. Unsupported operands and malformed, combined, missing-value,
 or repeated architecture selectors fail before host discovery. This avoids
 copying Microsoft spellings such as `--arch=x86` that are silently ignored and
 therefore do not select x86.
@@ -64,7 +64,7 @@ the stated records-per-line count, not the 16-byte record contract.`
 Tests cover all ten architecture names, case-insensitive typed parsing,
 incomplete SDK directories, deterministic runtime ordering, current-host root
 selection, malformed-argument rejection before unrelated SDK input, exact
-Microsoft row shapes, and the schema-22 runtime event batch. Benchmark
+Microsoft row shapes, and the schema-23 runtime event batch. Benchmark
 preflight compares current and x86 SDK/runtime output with Microsoft and
 verifies the fixture is unchanged.
 

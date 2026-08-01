@@ -17,6 +17,7 @@ mod reporter;
 mod runtime_graph;
 mod runtime_pack;
 mod sdk;
+mod workspace;
 
 /// ASSUMPTION: current benchmark hosts expose 64-byte cache lines. This value
 /// documents packing evidence only; it does not define a wire or ABI layout.
@@ -61,4 +62,7 @@ pub use sdk::{
   DotnetArchitecture, InstalledSdkInventory, RuntimeInstallation, RuntimeInventory, SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion,
   discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture, discover_runtimes_in_roots,
   discover_sdks, discover_sdks_in_roots,
+};
+pub use workspace::{
+  AncestorInput, AncestorInputBatch, AncestorInputError, AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, discover_ancestor_inputs,
 };

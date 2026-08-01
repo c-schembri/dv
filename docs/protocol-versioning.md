@@ -1,8 +1,8 @@
 # Command And Event Protocol Versioning
 
 `CLI-017` gives command grammar and JSON compatibility separate version
-identities. The current command syntax is `4`; the current event schema is
-`22`. A command alias can therefore be added or retired under the syntax
+identities. The current command syntax is `5`; the current event schema is
+`23`. A command alias can therefore be added or retired under the syntax
 contract without pretending that the JSON object layout changed.
 
 ## Data Contract
@@ -34,6 +34,10 @@ Schema 22 adds the typed `repository_root_discovered` payload. Command syntax
 4 adds `dv project root [PATH]`; the syntax and schema advance together because
 the slice introduces both a command surface and a JSON payload.
 
+Schema 23 adds the typed `workspace_inputs_discovered` payload. Command syntax
+5 adds `dv project inputs [PATH]`; the command reports the same shared ancestor
+batch consumed internally by SDK, NuGet, and central-package discovery.
+
 `dv --json --version` emits exactly `command_started`, `tool_version`, and
 `command_finished`. The normal `dv --version` text remains unchanged.
 
@@ -58,8 +62,8 @@ is added to the common path.
 ## Verification
 
 Cross-platform CLI tests execute native `version`, `--version`, and `-V`.
-Every native alias must produce the same three-event schema-22 shape, canonical
-`version` command, syntax version `4`, and successful terminal event. Under the
+Every native alias must produce the same three-event schema-23 shape, canonical
+`version` command, syntax version `5`, and successful terminal event. Under the
 explicit dotnet profile, `--version` instead selects the same SDK as Microsoft
 `dotnet --version`; this compatibility correction is why syntax versions are
 not interchangeable. The benchmark preflight validates both

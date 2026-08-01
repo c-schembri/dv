@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <StartDirectory>$(MSBuildThisFileDirectory)</StartDirectory>
+    <GlobalJsonDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(StartDirectory)', 'global.json'))</GlobalJsonDirectory>
+    <GlobalJson>$([System.IO.Path]::Combine('$(GlobalJsonDirectory)', 'global.json'))</GlobalJson>
+    <DirectoryBuildPropsDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(StartDirectory)', 'Directory.Build.props'))</DirectoryBuildPropsDirectory>
+    <DirectoryBuildProps>$([System.IO.Path]::Combine('$(DirectoryBuildPropsDirectory)', 'Directory.Build.props'))</DirectoryBuildProps>
+    <DirectoryBuildTargetsDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(StartDirectory)', 'Directory.Build.targets'))</DirectoryBuildTargetsDirectory>
+    <DirectoryBuildTargets>$([System.IO.Path]::Combine('$(DirectoryBuildTargetsDirectory)', 'Directory.Build.targets'))</DirectoryBuildTargets>
+    <DirectoryPackagesPropsDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(StartDirectory)', 'Directory.Packages.props'))</DirectoryPackagesPropsDirectory>
+    <DirectoryPackagesProps>$([System.IO.Path]::Combine('$(DirectoryPackagesPropsDirectory)', 'Directory.Packages.props'))</DirectoryPackagesProps>
+    <NearestNuGetDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(StartDirectory)', 'NuGet.Config'))</NearestNuGetDirectory>
+    <ParentNuGetSearchDirectory>$([System.IO.Directory]::GetParent('$(NearestNuGetDirectory)').FullName)</ParentNuGetSearchDirectory>
+    <ParentNuGetDirectory>$([MSBuild]::GetDirectoryNameOfFileAbove('$(ParentNuGetSearchDirectory)', 'NuGet.Config'))</ParentNuGetDirectory>
+    <NuGetConfigs>$([System.IO.Path]::Combine('$(ParentNuGetDirectory)', 'NuGet.Config'));$([System.IO.Path]::Combine('$(NearestNuGetDirectory)', 'NuGet.Config'))</NuGetConfigs>
+  </PropertyGroup>
+</Project>

@@ -33,10 +33,10 @@ use zip::ZipArchive;
 use package_signature::{FingerprintAlgorithm, SignaturePolicy, TrustedCertificate, TrustedSigner, TrustedSignerKind};
 
 use crate::{
-  BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CancellationToken, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
-  ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
+  AncestorInputKind, AncestorInputRequest, BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CancellationToken, CredentialProviderLogSink, FrameworkFamily,
+  NugetAuditLevel, NugetAuditMode, PackageAssetFlags, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
   credential_provider::{self, CredentialProviderError, CredentialProviderErrorKind, CredentialProviderOptions},
-  discover_sdks,
+  discover_ancestor_inputs, discover_sdks,
   framework_reference::package_pruning_runtime_names,
   legacy_pruning::{LegacyPrunePackage, PruningFramework, exact_legacy_pruning, nearest_legacy_pruning},
   load_portable_runtime_graph, redact_url_for_output,
@@ -4817,8 +4817,10 @@ fn discover_config_paths(project_directory: &Path, explicit_config: Option<&Path
     return Ok(vec![path.to_owned()]);
   }
 
-  let ancestor_count = project_directory.ancestors().count();
-  let mut paths = Vec::with_capacity(ancestor_count + 4);
+  let ancestor_inputs =
+    discover_ancestor_inputs(project_directory, AncestorInputRequest::NUGET_CONFIG).map_err(|error| config_error(error.path(), error.to_string()))?;
+  let nuget_configs = ancestor_inputs.inputs(AncestorInputKind::NugetConfig);
+  let mut paths = Vec::with_capacity(nuget_configs.len() + 4);
   if let Some(directory) = roots.machine_config_directory.as_deref() {
     append_config_fragments(directory, &mut paths, false)?;
   }
@@ -4830,12 +4832,8 @@ fn discover_config_paths(project_directory: &Path, explicit_config: Option<&Path
     }
   }
 
-  let mut ancestors: Vec<&Path> = project_directory.ancestors().collect();
-  ancestors.reverse();
-  for directory in ancestors {
-    if let Some(path) = config_path_in(directory) {
-      paths.push(path);
-    }
+  for input in nuget_configs.iter().copied() {
+    paths.push(ancestor_inputs.path(input));
   }
   Ok(paths)
 }
@@ -4879,41 +4877,6 @@ fn is_config_fragment(path: &Path) -> bool {
     extension.eq_ignore_ascii_case("config")
   } else {
     matches!(extension, "Config" | "config")
-  }
-}
-
-fn config_path_in(directory: &Path) -> Option<PathBuf> {
-  const CASE_SENSITIVE_NAMES: [&str; 3] = ["nuget.config", "NuGet.config", "NuGet.Config"];
-  let names = if cfg!(windows) {
-    &CASE_SENSITIVE_NAMES[2..]
-  } else {
-    &CASE_SENSITIVE_NAMES[..]
-  };
-  let path = names.iter().map(|name| directory.join(name)).find(|path| path.is_file())?;
-  #[cfg(target_os = "macos")]
-  {
-    // The default macOS filesystem is case-insensitive but case-preserving.
-    // Preserve the real directory entry rather than the spelling of our probe.
-    let mut selected = None::<(usize, PathBuf)>;
-    if let Ok(entries) = fs::read_dir(directory) {
-      for entry in entries.flatten() {
-        let Some(name) = entry
-          .file_name()
-          .to_str()
-          .and_then(|name| names.iter().position(|candidate| *candidate == name))
-        else {
-          continue;
-        };
-        if selected.as_ref().is_none_or(|(rank, _)| name < *rank) {
-          selected = Some((name, entry.path()));
-        }
-      }
-    }
-    selected.map_or(Some(path), |(_, actual)| Some(actual))
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    Some(path)
   }
 }
 
@@ -13739,7 +13702,17 @@ mod tests {
     let temp = TempDirectory::new();
     temp.write("NuGet.Config", "<configuration />");
 
-    let path = config_path_in(&temp.0).unwrap();
+    let path = discover_config_paths(
+      &temp.0,
+      None,
+      &NugetConfigRoots {
+        machine_config_directory: None,
+        user_settings_directory: None,
+      },
+    )
+    .unwrap()
+    .pop()
+    .unwrap();
 
     assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("NuGet.Config")));
   }

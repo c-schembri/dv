@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 22;
+pub const EVENT_SCHEMA_VERSION: u16 = 23;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -471,6 +471,25 @@ pub enum EventPayload {
     kind: String,
     /// Number of marker metadata probes performed.
     marker_probes: u16,
+  },
+  /// Ancestor-scoped build inputs were discovered without parsing projects.
+  WorkspaceInputsDiscovered {
+    /// Nearest ancestor `global.json`, when present.
+    global_json: Option<String>,
+    /// Ancestor NuGet configurations from lowest to highest precedence.
+    nuget_configs: Vec<String>,
+    /// Nearest ancestor `Directory.Build.props`, when present.
+    directory_build_props: Option<String>,
+    /// Nearest ancestor `Directory.Build.targets`, when present.
+    directory_build_targets: Option<String>,
+    /// Nearest ancestor `Directory.Packages.props`, when present.
+    directory_packages_props: Option<String>,
+    /// Number of ancestor directories visited.
+    ancestor_count: u16,
+    /// Number of marker metadata probes performed.
+    metadata_probes: u32,
+    /// Number of directory enumerations used to preserve actual filename casing.
+    directory_enumerations: u16,
   },
   /// Runtime, host, native, and apphost inputs were selected for one RID.
   RuntimePackPlanCreated {

@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 79 rows are implemented;
+- 80 rows are implemented;
 - 31 rows have partial foundations;
-- 358 rows are missing;
+- 357 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -149,7 +149,7 @@ unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result
 pairs are explicit. Executed child, test, and signal/cancellation semantics
 remain partial with their owning workflows.
-Command syntax version 4 and JSON event schema version 22 are independent.
+Command syntax version 5 and JSON event schema version 23 are independent.
 Native tool-version aliases normalize to one typed request and event shape;
 the dotnet `--version` compatibility form selects the SDK exactly like its
 Microsoft reference command. Profile-aware help uses static text before SDK or
@@ -216,14 +216,16 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` through `WS-004` are complete: one bounded immediate directory pass
+`WS-001` through `WS-005` are complete: one bounded immediate directory pass
 packs all five project/solution candidate kinds into a stable offset-indexed
 batch, explicit candidate files take a single-metadata-query validation path,
 and exact-one directory selection produces a typed owning result before any
 evaluator is chosen. Repository-root discovery is an independent one-buffer
 ancestor walk with one `.git` metadata probe per level and no project reads.
-The next workspace work remains `WS-005` through `WS-012`; recursive traversal
-is not silently folded into immediate selection.
+One shared request-masked parent walk now discovers the five SDK, NuGet, and
+build inputs with their distinct singleton or root-to-leaf precedence. The next
+workspace work remains `WS-006` through `WS-012`; recursive traversal is not
+silently folded into immediate selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,
 resources, analyzers, options, and output paths match Microsoft oracle data for

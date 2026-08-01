@@ -9,6 +9,8 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::{AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, discover_ancestor_inputs};
+
 #[cfg(not(windows))]
 use std::io::BufRead;
 
@@ -594,7 +596,15 @@ fn text_range(text: &str, start: u32, len: u16) -> &str {
 
 /// Discovers and selects SDKs using an explicit host-root batch.
 pub fn discover_sdks_in_roots(start_directory: &Path, host_roots: &[PathBuf]) -> Result<SdkInventory, SdkError> {
-  let global_json = find_global_json(start_directory);
+  let global_json = discover_ancestor_inputs(start_directory, AncestorInputRequest::GLOBAL_JSON)
+    .map_err(|error| {
+      let kind = match error.kind() {
+        AncestorInputErrorKind::UnsupportedFileType | AncestorInputErrorKind::LimitExceeded => SdkErrorKind::GlobalJson,
+        AncestorInputErrorKind::NotFound | AncestorInputErrorKind::Io => SdkErrorKind::Io,
+      };
+      SdkError::new(kind, error.to_string())
+    })?
+    .into_nearest_path(AncestorInputKind::GlobalJson);
   let config = global_json.as_deref().map(read_global_json).transpose()?.unwrap_or_default();
   let roots = resolve_search_roots(global_json.as_deref(), &config.sdk, host_roots)?;
   let installations = discover_installations(&roots)?;
@@ -796,18 +806,6 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
   } else {
     left == right
   }
-}
-
-fn find_global_json(start_directory: &Path) -> Option<PathBuf> {
-  let mut directory = Some(start_directory);
-  while let Some(current) = directory {
-    let candidate = current.join("global.json");
-    if candidate.is_file() {
-      return Some(candidate);
-    }
-    directory = current.parent();
-  }
-  None
 }
 
 fn read_global_json(path: &Path) -> Result<GlobalJson, SdkError> {

@@ -43,7 +43,9 @@ use quick_xml::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{BENCHMARK_CACHE_LINE_BYTES, FrameworkFamily, TargetFramework};
+use crate::{
+  AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, BENCHMARK_CACHE_LINE_BYTES, FrameworkFamily, TargetFramework, discover_ancestor_inputs,
+};
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
 const MAX_XML_DEPTH: usize = 8;
@@ -1377,36 +1379,29 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
 }
 
 fn discover_central_packages(project_directory: &Path) -> Result<RawCentralPackages, ProjectError> {
-  let mut directory = Some(project_directory);
-  while let Some(current) = directory {
-    let path = current.join("Directory.Packages.props");
-    match fs::metadata(&path) {
-      Ok(metadata) => {
-        if !metadata.is_file() {
-          return Err(ProjectError::new(
-            ProjectErrorKind::Unsupported,
-            &path,
-            "Directory.Packages.props must be a regular file",
-          ));
-        }
-        if metadata.len() > MAX_CENTRAL_PACKAGE_FILE_BYTES {
-          return Err(ProjectError::new(
-            ProjectErrorKind::Unsupported,
-            &path,
-            format!("Directory.Packages.props exceeds the {MAX_CENTRAL_PACKAGE_FILE_BYTES}-byte input limit"),
-          ));
-        }
-        let bytes = fs::read(&path).map_err(|error| io_error("read", &path, error))?;
-        let mut central = parse_central_packages(&path, &bytes)?;
-        central.path = Some(path);
-        return Ok(central);
-      },
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-      Err(error) => return Err(io_error("read", &path, error)),
-    }
-    directory = current.parent();
+  let inputs = discover_ancestor_inputs(project_directory, AncestorInputRequest::DIRECTORY_PACKAGES_PROPS).map_err(|error| {
+    let kind = match error.kind() {
+      AncestorInputErrorKind::NotFound => ProjectErrorKind::NotFound,
+      AncestorInputErrorKind::Io => ProjectErrorKind::Io,
+      AncestorInputErrorKind::UnsupportedFileType | AncestorInputErrorKind::LimitExceeded => ProjectErrorKind::Unsupported,
+    };
+    ProjectError::new(kind, error.path(), error.to_string())
+  })?;
+  let Some(input) = inputs.inputs(AncestorInputKind::DirectoryPackagesProps).first().copied() else {
+    return Ok(RawCentralPackages::default());
+  };
+  let path = inputs.path(input);
+  if u64::from(input.file_len()) > MAX_CENTRAL_PACKAGE_FILE_BYTES {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      &path,
+      format!("Directory.Packages.props exceeds the {MAX_CENTRAL_PACKAGE_FILE_BYTES}-byte input limit"),
+    ));
   }
-  Ok(RawCentralPackages::default())
+  let bytes = fs::read(&path).map_err(|error| io_error("read", &path, error))?;
+  let mut central = parse_central_packages(&path, &bytes)?;
+  central.path = Some(path);
+  Ok(central)
 }
 
 fn parse_central_packages(path: &Path, bytes: &[u8]) -> Result<RawCentralPackages, ProjectError> {

@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `22`;
+- schema version `23`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -47,6 +47,8 @@ items.
 - `sdk_inventory`
 - `runtime_inventory`
 - `runtime_compatibility`
+- `repository_root_discovered`
+- `workspace_inputs_discovered`
 - `runtime_pack_plan_created`
 - `framework_reference_plan_created`
 - `project_evaluated`
@@ -57,6 +59,10 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
+Schema 23 adds `workspace_inputs_discovered`, containing the five independently
+ordered ancestor input families and bounded traversal counters. Schema 22 adds
+`repository_root_discovered`, containing the nearest typed repository boundary
+and marker-probe count.
 Schema 21 adds `runtime_inventory`, a single ordered batch of installed shared
 framework family, version, and path rows used by the native and compatible
 runtime inventory queries.

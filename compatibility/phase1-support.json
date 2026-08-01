@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "manifest_version": 1,
-  "dv_command_syntax_version": 4,
-  "dv_event_schema_version": 22,
+  "dv_command_syntax_version": 5,
+  "dv_event_schema_version": 23,
   "commands": [
     {
       "tool": "dotnet",

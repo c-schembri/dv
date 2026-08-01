@@ -21,7 +21,7 @@ impl CommandSyntaxVersion {
 const _: () = assert!(size_of::<CommandSyntaxVersion>() == 2);
 const _: () = assert!(align_of::<CommandSyntaxVersion>() == 2);
 
-pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(4);
+pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

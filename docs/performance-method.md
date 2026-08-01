@@ -31,7 +31,7 @@ Transform:
 
 Output:
 
-- schema-22 JSON containing every raw sample, statistic, and explicit
+- schema-22 benchmark-report JSON containing every raw sample, statistic, and explicit
   `measured` or `tbi` status;
 - a console table for immediate comparison;
 - no benchmark files written into an immutable fixture.
@@ -58,9 +58,9 @@ Invalid input behavior:
 | `cli_golden_trace` | fresh `small-console` fixture, empty local source, and isolated package directory; schema-1 SDK/restore trace preflight and fixture reset outside timing | process launch, controlled trace environment, valid zero-package offline restore, output capture, and sample validation |
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
-| `cli_protocol_version` | immutable `small-console` directory; three-native-alias schema preflight outside timing | `dv` process launch and one validated schema-22 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
-| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,222-byte static manifest write; Microsoft has no equivalent query and reports TBI |
-| `cli_compat_check` | immutable 195-byte workflow and 278-byte SDK project; event/version/count/exit/no-write preflight outside timing | `dv` process launch, bounded reads, literal script/XML scan, static manifest-index classification, and one validated schema-22 event batch; Microsoft has no equivalent non-executing scanner and reports TBI |
+| `cli_protocol_version` | immutable `small-console` directory; three-native-alias schema preflight outside timing | `dv` process launch and one validated schema-23 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
+| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,226-byte static manifest write; Microsoft has no equivalent query and reports TBI |
+| `cli_compat_check` | immutable 195-byte workflow and 278-byte SDK project; event/version/count/exit/no-write preflight outside timing | `dv` process launch, bounded reads, literal script/XML scan, static manifest-index classification, and one validated schema-23 event batch; Microsoft has no equivalent non-executing scanner and reports TBI |
 | `dotnet_runtime_inventory` | installed host inventory; exact SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, current-architecture shared-framework enumeration, semantic ordering, and compatible text output |
 | `dotnet_runtime_inventory_arch` | registered x86 host inventory; exact current/x86 SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, 32-bit registry-root selection, x86 shared-framework enumeration, semantic ordering, and compatible text output |
 | `cli_compat_help` | immutable `small-console` fixture; successful output-shape and zero-mutation preflight outside timing | process launch, profile-aware static help dispatch, output validation, and no SDK/project/filesystem/network discovery |
@@ -78,6 +78,8 @@ Invalid input behavior:
 | `project_select_named` | immutable `small-console` fixture; explicit selection and property/item equivalence preflight outside timing | process launch, borrowed option parsing, one project-file metadata query, project parsing, source discovery, evaluation, and JSON output |
 | `workspace_discovery` | immutable `small-console` fixture; exact-one property/item equivalence plus empty/ambiguous typed zero-write preflight outside timing | process launch, one immediate directory scan, typed owning project selection, project parsing, source discovery, evaluation, and JSON output |
 | `repository_root` | immutable three-level nested fixture; MSBuild ancestor-query equality, typed kind/probe count, and zero-mutation preflight outside timing | process launch, start metadata, one reusable path buffer, three `.git` metadata probes, and path output |
+| `workspace_inputs` | immutable three-level fixture; five-family MSBuild query equality, NuGet precedence order, typed probe evidence, and zero-mutation preflight outside timing | process launch, one ancestor walk, requested marker metadata probes, compact row materialization, and JSON output |
+| `workspace_inputs` | immutable four-level ancestor fixture; exact five-family MSBuild property-query equality, typed traversal counters, and zero-mutation preflight outside timing | process launch, one start metadata query, request-masked parent probes, compact row writes, path formatting, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
 | `runtime_pack_plan` | restored isolated runtime pack and one validated immutable inventory built during warm-up | process launch, SDK/graph/manifest selection, inventory fingerprint/decode, compact path materialization, and JSON output |
 | `runtime_pack_inventory_cold` | restored isolated runtime pack; only the `dv` inventory removed before every iteration | process launch, SDK/graph/manifest selection, validation of 187 runtime assets, apphost selection, binary inventory publication, and JSON output |
