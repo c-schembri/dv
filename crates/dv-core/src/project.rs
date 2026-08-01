@@ -52,6 +52,10 @@ const MAX_REFERENCE_CONDITION_OPERATORS: u8 = 32;
 const MAX_REFERENCE_CONDITION_DEPTH: u8 = 8;
 const MAX_CENTRAL_PACKAGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CENTRAL_PACKAGE_ROWS: usize = 100_000;
+const MAX_WORKSPACE_CANDIDATES: usize = u16::MAX as usize;
+const MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES: usize = 16;
+const WORKSPACE_CANDIDATE_CAPACITY: usize = 8;
+const WORKSPACE_PATH_CAPACITY: usize = 256;
 const NO_REFERENCE_CONDITION: u32 = u32::MAX;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
@@ -113,6 +117,98 @@ struct TextSpan {
 
 const _: () = assert!(size_of::<TextSpan>() == 8);
 const _: () = assert!(align_of::<TextSpan>() == 4);
+
+/// A project or solution kind recognized during workspace discovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum WorkspaceCandidateKind {
+  /// An MSBuild C# project.
+  CSharpProject,
+  /// An MSBuild F# project.
+  FSharpProject,
+  /// An MSBuild Visual Basic project.
+  VisualBasicProject,
+  /// A text `.sln` solution.
+  Solution,
+  /// An XML `.slnx` solution.
+  XmlSolution,
+}
+
+impl WorkspaceCandidateKind {
+  fn description(self) -> &'static str {
+    match self {
+      Self::CSharpProject => "C# project",
+      Self::FSharpProject => "F# project",
+      Self::VisualBasicProject => "Visual Basic project",
+      Self::Solution => "solution",
+      Self::XmlSolution => "XML solution",
+    }
+  }
+}
+
+const _: () = assert!(size_of::<WorkspaceCandidateKind>() == 1);
+const _: () = assert!(align_of::<WorkspaceCandidateKind>() == 1);
+
+/// One immutable candidate row indexing `WorkspaceInventory` path text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct WorkspaceCandidate {
+  path_start: u32,
+  path_len: u16,
+  kind: WorkspaceCandidateKind,
+}
+
+const _: () = assert!(size_of::<WorkspaceCandidate>() == 8);
+const _: () = assert!(align_of::<WorkspaceCandidate>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<WorkspaceCandidate>() == 8);
+
+/// A stable candidate batch for one directory.
+#[derive(Debug)]
+pub struct WorkspaceInventory {
+  root: PathBuf,
+  paths: String,
+  candidates: Vec<WorkspaceCandidate>,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<WorkspaceInventory>() == 80);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<WorkspaceInventory>() == 72);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<WorkspaceInventory>() == align_of::<usize>());
+
+impl WorkspaceInventory {
+  /// Returns the absolute directory that owns the candidate batch.
+  pub fn root(&self) -> &Path {
+    &self.root
+  }
+
+  /// Returns candidates sorted by their preserved relative path.
+  pub fn candidates(&self) -> &[WorkspaceCandidate] {
+    &self.candidates
+  }
+
+  /// Returns a candidate's recognized file kind.
+  pub fn kind(&self, candidate: WorkspaceCandidate) -> WorkspaceCandidateKind {
+    candidate.kind
+  }
+
+  /// Returns a candidate's preserved relative path.
+  pub fn path(&self, candidate: WorkspaceCandidate) -> &str {
+    let start = candidate.path_start as usize;
+    &self.paths[start..start + usize::from(candidate.path_len)]
+  }
+
+  /// Constructs a candidate's full path only at the consumer boundary.
+  pub fn full_path(&self, candidate: WorkspaceCandidate) -> PathBuf {
+    self.root.join(self.path(candidate))
+  }
+
+  /// Returns bytes retained by compact candidate rows and their path arena.
+  pub fn working_set_bytes(&self) -> usize {
+    self.candidates.len() * size_of::<WorkspaceCandidate>() + self.paths.len()
+  }
+}
 
 /// NuGet asset families selected by PackageReference metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -853,6 +949,86 @@ pub fn evaluate_project(start_directory: &Path, configuration: ProjectConfigurat
   evaluate_project_path(&project_path, configuration)
 }
 
+/// Enumerates one directory into a stable batch of recognized project and solution candidates.
+pub fn discover_workspace(directory: &Path) -> Result<WorkspaceInventory, ProjectError> {
+  let metadata = match fs::metadata(directory) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Err(ProjectError::new(
+        ProjectErrorKind::NotFound,
+        directory,
+        format!("workspace root {} does not exist", directory.display()),
+      ));
+    },
+    Err(error) => return Err(io_error("inspect", directory, error)),
+  };
+  if !metadata.is_dir() {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      directory,
+      format!("workspace root {} is not a directory", directory.display()),
+    ));
+  }
+  let root = absolute_path(directory)?;
+  let entries = fs::read_dir(&root).map_err(|error| io_error("enumerate", &root, error))?;
+  let mut paths = String::new();
+  let mut candidates = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|error| io_error("enumerate", &root, error))?;
+    if !entry.file_type().map_err(|error| io_error("inspect", &entry.path(), error))?.is_file() {
+      continue;
+    }
+    let file_name = entry.file_name();
+    let Some(kind) = workspace_candidate_kind(Path::new(&file_name)) else {
+      continue;
+    };
+    if candidates.is_empty() {
+      candidates.reserve_exact(WORKSPACE_CANDIDATE_CAPACITY);
+      paths.reserve_exact(WORKSPACE_PATH_CAPACITY);
+    }
+    if candidates.len() == MAX_WORKSPACE_CANDIDATES {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        &root,
+        format!("workspace candidate count exceeds {MAX_WORKSPACE_CANDIDATES}"),
+      ));
+    }
+    let file_name = file_name.to_str().ok_or_else(|| {
+      let path = root.join(&file_name);
+      ProjectError::new(
+        ProjectErrorKind::NonUnicodePath,
+        &path,
+        format!("workspace candidate {} is not valid Unicode", path.display()),
+      )
+    })?;
+    let path_len = u16::try_from(file_name.len()).map_err(|_| {
+      let path = root.join(file_name);
+      ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        &path,
+        format!("workspace candidate name exceeds {} UTF-8 bytes", u16::MAX),
+      )
+    })?;
+    let next_path_len = paths
+      .len()
+      .checked_add(file_name.len())
+      .filter(|length| *length <= u32::MAX as usize)
+      .ok_or_else(|| ProjectError::new(ProjectErrorKind::Unsupported, &root, "workspace candidate path arena exceeds 4 GiB"))?;
+    let path_start = paths.len() as u32;
+    paths.push_str(file_name);
+    debug_assert_eq!(paths.len(), next_path_len);
+    candidates.push(WorkspaceCandidate { path_start, path_len, kind });
+  }
+  candidates.sort_unstable_by(|left, right| {
+    let left_start = left.path_start as usize;
+    let right_start = right.path_start as usize;
+    paths[left_start..left_start + usize::from(left.path_len)]
+      .cmp(&paths[right_start..right_start + usize::from(right.path_len)])
+      .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
+  });
+  Ok(WorkspaceInventory { root, paths, candidates })
+}
+
 /// Evaluates one explicit SDK-style `.csproj`.
 pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
   if !is_csproj(project_path) {
@@ -1043,29 +1219,45 @@ fn parse_central_packages(path: &Path, bytes: &[u8]) -> Result<RawCentralPackage
 }
 
 fn discover_project(directory: &Path) -> Result<PathBuf, ProjectError> {
-  let mut projects = Vec::new();
-  let entries = fs::read_dir(directory).map_err(|error| io_error("enumerate", directory, error))?;
-  for entry in entries {
-    let entry = entry.map_err(|error| io_error("enumerate", directory, error))?;
-    let path = entry.path();
-    if entry.file_type().map_err(|error| io_error("inspect", &path, error))?.is_file() && is_csproj(&path) {
-      projects.push(path);
-    }
-  }
-  projects.sort_unstable();
+  use std::fmt::Write as _;
 
-  match projects.len() {
+  let inventory = discover_workspace(directory)?;
+  match inventory.candidates().len() {
     0 => Err(ProjectError::new(
       ProjectErrorKind::NotFound,
       directory,
-      format!("no C# project was found in {}", directory.display()),
+      format!("no project or solution was found in {}", directory.display()),
     )),
-    1 => Ok(projects.pop().expect("one project exists")),
-    count => Err(ProjectError::new(
-      ProjectErrorKind::Ambiguous,
-      directory,
-      format!("{count} C# projects were found in {}; pass one project path explicitly", directory.display()),
-    )),
+    1 => {
+      let candidate = inventory.candidates()[0];
+      if inventory.kind(candidate) == WorkspaceCandidateKind::CSharpProject {
+        Ok(inventory.full_path(candidate))
+      } else {
+        Err(ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          inventory.full_path(candidate),
+          format!(
+            "the initial evaluator cannot load the discovered {} {}",
+            inventory.kind(candidate).description(),
+            inventory.path(candidate)
+          ),
+        ))
+      }
+    },
+    count => Err(ProjectError::new(ProjectErrorKind::Ambiguous, directory, {
+      let mut message = format!("{count} project or solution candidates were found in {}: ", directory.display());
+      for (index, candidate) in inventory.candidates().iter().copied().take(MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES).enumerate() {
+        if index != 0 {
+          message.push_str(", ");
+        }
+        write!(message, "{} ({})", inventory.path(candidate), inventory.kind(candidate).description()).expect("writing a String succeeds");
+      }
+      if count > MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES {
+        write!(message, ", and {} more", count - MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES).expect("writing a String succeeds");
+      }
+      message.push_str("; pass one project or solution path explicitly");
+      message
+    })),
   }
 }
 
@@ -2736,6 +2928,23 @@ fn is_csproj(path: &Path) -> bool {
   path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("csproj"))
 }
 
+fn workspace_candidate_kind(path: &Path) -> Option<WorkspaceCandidateKind> {
+  let extension = path.extension()?;
+  if extension.eq_ignore_ascii_case("csproj") {
+    Some(WorkspaceCandidateKind::CSharpProject)
+  } else if extension.eq_ignore_ascii_case("fsproj") {
+    Some(WorkspaceCandidateKind::FSharpProject)
+  } else if extension.eq_ignore_ascii_case("vbproj") {
+    Some(WorkspaceCandidateKind::VisualBasicProject)
+  } else if extension.eq_ignore_ascii_case("sln") {
+    Some(WorkspaceCandidateKind::Solution)
+  } else if extension.eq_ignore_ascii_case("slnx") {
+    Some(WorkspaceCandidateKind::XmlSolution)
+  } else {
+    None
+  }
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf, ProjectError> {
   let absolute = if path.is_absolute() {
     path.to_owned()
@@ -2836,6 +3045,96 @@ mod tests {
   {items}
 </Project>"#
     )
+  }
+
+  #[test]
+  fn workspace_inventory_packs_every_candidate_kind_in_stable_path_order() {
+    let temp = TempDirectory::new();
+    temp.write("E.slnx", "<Solution />");
+    temp.write("A.csproj", "<Project />");
+    temp.write("D.sln", "");
+    temp.write("C.VBPROJ", "<Project />");
+    temp.write("B.FsPrOj", "<Project />");
+    temp.write("notes.txt", "ignored");
+    temp.write("nested/Ignored.csproj", "<Project />");
+
+    let inventory = discover_workspace(&temp.0).unwrap();
+    let rows = inventory
+      .candidates()
+      .iter()
+      .copied()
+      .map(|candidate| (inventory.path(candidate), inventory.kind(candidate)))
+      .collect::<Vec<_>>();
+
+    assert_eq!(inventory.root(), temp.0);
+    assert_eq!(
+      rows,
+      [
+        ("A.csproj", WorkspaceCandidateKind::CSharpProject),
+        ("B.FsPrOj", WorkspaceCandidateKind::FSharpProject),
+        ("C.VBPROJ", WorkspaceCandidateKind::VisualBasicProject),
+        ("D.sln", WorkspaceCandidateKind::Solution),
+        ("E.slnx", WorkspaceCandidateKind::XmlSolution),
+      ]
+    );
+    assert_eq!(inventory.working_set_bytes(), 5 * size_of::<WorkspaceCandidate>() + 35);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn workspace_inventory_rejects_a_recognized_non_unicode_candidate() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDirectory::new();
+    let name = std::ffi::OsString::from_vec(vec![b'A', 0xff, b'.', b'c', b's', b'p', b'r', b'o', b'j']);
+    fs::write(temp.0.join(name), b"<Project />").unwrap();
+
+    let error = discover_workspace(&temp.0).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::NonUnicodePath);
+  }
+
+  #[test]
+  fn empty_missing_and_non_directory_workspace_roots_have_explicit_boundaries() {
+    let temp = TempDirectory::new();
+    let empty = temp.0.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let inventory = discover_workspace(&empty).unwrap();
+    assert!(inventory.candidates().is_empty());
+    assert_eq!(inventory.paths.capacity(), 0);
+    assert_eq!(inventory.candidates.capacity(), 0);
+    assert_eq!(inventory.working_set_bytes(), 0);
+
+    let missing = temp.0.join("missing");
+    assert_eq!(discover_workspace(&missing).unwrap_err().kind(), ProjectErrorKind::NotFound);
+    let file = temp.write("not-a-directory.csproj", "<Project />");
+    assert_eq!(discover_workspace(&file).unwrap_err().kind(), ProjectErrorKind::Unsupported);
+  }
+
+  #[test]
+  fn implicit_selection_reports_every_candidate_in_stable_order() {
+    let temp = TempDirectory::new();
+    temp.write("B.sln", "");
+    temp.write("A.csproj", "<Project />");
+
+    let error = evaluate_project(&temp.0, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::Ambiguous);
+    let message = error.to_string();
+    assert!(message.contains("A.csproj (C# project), B.sln (solution)"), "{message}");
+    assert!(message.contains("pass one project or solution path explicitly"), "{message}");
+  }
+
+  #[test]
+  fn implicit_selection_rejects_one_unsupported_candidate_kind() {
+    let temp = TempDirectory::new();
+    let solution = temp.write("App.slnx", "<Solution />");
+
+    let error = evaluate_project(&temp.0, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::Unsupported);
+    assert_eq!(error.path(), solution);
+    assert!(error.to_string().contains("XML solution App.slnx"));
   }
 
   #[test]

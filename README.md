@@ -35,6 +35,9 @@ dv project inspect              3.846 ms median
 dotnet named project query    328.778 ms median
 dv project --project            6.204 ms median
 
+dotnet implicit project query 290.493 ms median
+dv implicit project query       5.287 ms median
+
 dotnet reject unknown option  146.054 ms median
 dv reject unknown option         4.827 ms median
 
@@ -170,6 +173,7 @@ The project is in the first implementation phase.
 | Current and architecture-selected SDK/runtime inventory through `dotnet` spellings | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
+| Bounded immediate workspace candidate discovery | Implemented |
 | TFM/RID/configuration conditional references | Implemented |
 | Target-aware framework and compiler input planning | Implemented |
 | Framework references and shared-runtime roll-forward | Implemented |
@@ -340,6 +344,13 @@ one compact target-dimension batch rather than copies of the project. Target
 family and version are parsed once and shared by pack, compiler,
 dependency-group, and package-asset selection. Unsupported MSBuild behavior
 fails explicitly.
+
+Implicit selection now batch-enumerates immediate `.csproj`, `.fsproj`,
+`.vbproj`, `.sln`, and `.slnx` candidates in one directory pass. Paths occupy
+one UTF-8 arena and stable 8-byte records, with eight records per assumed
+64-byte cache line. One C# project proceeds; empty, unsupported, and ambiguous
+directories fail with typed ordered context. Recursive repository traversal and
+solution parsing remain explicit later features.
 
 Direct package references normalize `IncludeAssets`, `ExcludeAssets`, and
 `PrivateAssets` into eight-bit family masks during evaluation. The effective
@@ -524,6 +535,8 @@ Current-architecture SDK and runtime inventory has byte-equivalent, zero-write
 evidence in the [dotnet inventory baseline](docs/performance-baselines/2026-08-02-dotnet-driver-inventory-windows.md).
 Architecture-selected inventory has equivalent registered-root and empty-root
 evidence in the [architecture inventory baseline](docs/performance-baselines/2026-08-02-dotnet-driver-inventory-arch-windows.md).
+Immediate workspace discovery and implicit project selection have like-for-like
+evidence in the [workspace discovery baseline](docs/performance-baselines/2026-08-02-workspace-discovery-windows.md).
 Reference-compatible help has like-for-like, zero-mutation evidence in the
 [compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
 The first versioned real-CI substitution corpus covers SDK selection and a
@@ -553,7 +566,7 @@ Initial machine:
 - AMD Ryzen 9 9900X, 12 cores and 24 hardware threads
 - .NET SDK `10.0.100`
 - 30 retained samples after 3 warm-ups for SDK selection, RID expansion,
-  project evaluation, named project selection, unknown-option rejection,
+  project evaluation, named and implicit project selection, unknown-option rejection,
   conditional references, runtime evaluation, warm and cold runtime-pack inventory
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
@@ -596,6 +609,7 @@ Initial machine:
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate a named project selection | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect --project SmallConsole.csproj --json` | 328.778 ms | 6.204 ms | 53.0x | 502.383 ms | 8.214 ms |
+| Discover and evaluate the only project in a workspace | `dotnet msbuild` property/item query | `dv project inspect --json` | 290.493 ms | 5.287 ms | 55.0x | 305.210 ms | 6.048 ms |
 | Evaluate TFM/RID/configuration conditional references | `dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release` property/item query | `dv project inspect ConditionalReferences.csproj --configuration Release --json` | 288.983 ms | 4.765 ms | 60.6x | 321.422 ms | 6.209 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan runtime and host packs from a warm inventory | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --packages .packages --json` | 360.550 ms | 6.403 ms | 56.3x | 370.695 ms | 8.218 ms |
@@ -887,6 +901,7 @@ cargo bench-all --case cli_protocol_version --samples 30 --warmups 5
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case project_select_named --samples 30 --warmups 3
+cargo bench-all --case workspace_discovery --samples 30 --warmups 3
 cargo bench-all --case package_reference_conditions --samples 30 --warmups 3
 cargo bench-all --case runtime_evaluate --samples 30 --warmups 3
 cargo bench-all --case runtime_pack_plan --samples 30 --warmups 3

@@ -698,12 +698,22 @@ contracts.
 
 ## 2. Workspace And Input Discovery
 
-- [ ] `WS-001` Batch-enumerate `.csproj`, `.fsproj`, `.vbproj`, `.sln`, and
-  `.slnx` candidates with stable normalized path indices. `P1`
+- [x] `WS-001` Batch-enumerate `.csproj`, `.fsproj`, `.vbproj`, `.sln`, and
+  `.slnx` candidates with stable normalized path indices. One immediate
+  directory pass packs preserved UTF-8 names into one arena and sorted 8-byte
+  records, bounded to 65,535 candidates. Missing roots, non-directories,
+  recognized non-Unicode names, and size limits fail explicitly. Thirty warm
+  Windows samples measured Microsoft implicit discovery/evaluation at
+  `290.493 ms` median and `305.210 ms` p95 versus `5.287 ms` and `6.048 ms` for
+  `dv`, a `55.0x` median improvement. `P1`
 - [~] `WS-002` Select an explicit file directly and reject a missing,
   wrong-kind, or unreadable path before evaluation. `P1`
 - [~] `WS-003` From a directory, select one project or solution and diagnose
-  zero or ambiguous candidates with ordered context. `P1`
+  zero or ambiguous candidates with ordered context. Immediate selection now
+  consumes the shared stable candidate batch, selects one C# project, rejects
+  one unsupported kind, and reports at most 16 ordered ambiguity rows plus a
+  remainder count. Solution loading and recursive repository selection remain
+  open. `P1`
 - [ ] `WS-004` Define repository root discovery independently from project
   selection. `P1`
 - [ ] `WS-005` Discover nearest ancestor `global.json`, `NuGet.Config`,

@@ -1230,7 +1230,7 @@ fn project_inspect_rejects_ambiguous_selection() {
   assert_eq!(output.status.code(), Some(2));
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert!(stderr.contains("error[DV0201]"));
-  assert!(stderr.contains("pass one project path explicitly"));
+  assert!(stderr.contains("pass one project or solution path explicitly"));
 }
 
 #[test]

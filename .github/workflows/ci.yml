@@ -56,6 +56,8 @@ jobs:
         run: cargo run -p dv-bench -- --case dotnet_runtime_inventory --samples 1 --warmups 0 --output target/benchmark-runtime-inventory-smoke.json
       - name: Run architecture-selected runtime inventory benchmark smoke test
         run: cargo run -p dv-bench -- --case dotnet_runtime_inventory_arch --samples 1 --warmups 0 --output target/benchmark-runtime-inventory-arch-smoke.json
+      - name: Run workspace discovery benchmark smoke test
+        run: cargo run -p dv-bench -- --case workspace_discovery --samples 1 --warmups 0 --output target/benchmark-workspace-discovery-smoke.json
       - name: Run typed transform benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_transform_equivalence --samples 1 --warmups 0 --output target/benchmark-transform-equivalence-smoke.json
       - name: Run invocation mode benchmark smoke test

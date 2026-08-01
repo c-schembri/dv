@@ -366,6 +366,17 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "workspace_discovery",
+    kind: CaseKind::ProjectEvaluate,
+    args: &[
+      "msbuild",
+      "--nologo",
+      "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
+      "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_reference_conditions",
     kind: CaseKind::PackageReferenceConditions,
     args: &[
@@ -1058,6 +1069,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "workspace_discovery",
+    kind: CaseKind::ProjectEvaluate,
+    args: &["project", "inspect", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_reference_conditions",
     kind: CaseKind::PackageReferenceConditions,
     args: &["project", "inspect", "ConditionalReferences.csproj", "--configuration", "Release", "--json"],
@@ -1587,10 +1604,13 @@ fn run() -> Result<()> {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
-    verify_project_evaluation(&dv_executable, &fixture, false)?;
+    verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_select_named") {
-    verify_project_evaluation(&dv_executable, &fixture, true)?;
+    verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Named)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "workspace_discovery") {
+    verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Implicit)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_reference_conditions") {
     verify_package_reference_conditions(&dv_executable, &package_reference_conditions_fixture)?;
@@ -2969,23 +2989,34 @@ fn verify_rid_graph(repository: &Path, dv_executable: &Path, fixture: &Path) -> 
   Ok(())
 }
 
-fn verify_project_evaluation(dv_executable: &Path, fixture: &Path, named_selection: bool) -> Result<()> {
-  let dotnet_text = command_text(
-    Path::new("dotnet"),
+#[derive(Clone, Copy)]
+enum ProjectSelectionBenchmark {
+  Positional,
+  Named,
+  Implicit,
+}
+
+fn verify_project_evaluation(dv_executable: &Path, fixture: &Path, selection: ProjectSelectionBenchmark) -> Result<()> {
+  let dotnet_project = match selection {
+    ProjectSelectionBenchmark::Positional | ProjectSelectionBenchmark::Named => &["SmallConsole.csproj"][..],
+    ProjectSelectionBenchmark::Implicit => &[],
+  };
+  let dotnet_arguments = [
+    &["msbuild"][..],
+    dotnet_project,
     &[
-      "msbuild",
-      "SmallConsole.csproj",
       "--nologo",
       "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
       "-getItem:Compile,ProjectReference,PackageReference",
     ],
-    fixture,
-  )?;
+  ]
+  .concat();
+  let dotnet_text = command_text(Path::new("dotnet"), &dotnet_arguments, fixture)?;
   let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
-  let dv_arguments = if named_selection {
-    &["project", "inspect", "--project", "SmallConsole.csproj", "--json"][..]
-  } else {
-    &["project", "inspect", "SmallConsole.csproj", "--json"][..]
+  let dv_arguments = match selection {
+    ProjectSelectionBenchmark::Positional => &["project", "inspect", "SmallConsole.csproj", "--json"][..],
+    ProjectSelectionBenchmark::Named => &["project", "inspect", "--project", "SmallConsole.csproj", "--json"][..],
+    ProjectSelectionBenchmark::Implicit => &["project", "inspect", "--json"][..],
   };
   let dv_text = command_text(dv_executable, dv_arguments, fixture)?;
   let dv = dv_text
@@ -9387,6 +9418,7 @@ fn case_label(case: &str) -> &str {
     "cli_compat_check" => "Static compatibility check",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
+    "workspace_discovery" => "Implicit workspace discovery",
     "package_reference_conditions" => "Conditional references",
     "runtime_pack_plan" => "Runtime pack plan",
     "runtime_pack_inventory_cold" => "Cold runtime pack inventory",
