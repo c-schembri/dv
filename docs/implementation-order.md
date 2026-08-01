@@ -37,8 +37,8 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 77 rows are implemented;
-- 32 rows have partial foundations;
+- 78 rows are implemented;
+- 31 rows have partial foundations;
 - 359 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
@@ -216,11 +216,12 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` and `WS-002` are complete: one bounded immediate directory pass packs
-all five project/solution candidate kinds into a stable offset-indexed batch,
-and explicit candidate files take a single-metadata-query validation path. The
-next workspace work remains `WS-003` through `WS-012`; recursive traversal is
-not silently folded into either selection transform.
+`WS-001` through `WS-003` are complete: one bounded immediate directory pass
+packs all five project/solution candidate kinds into a stable offset-indexed
+batch, explicit candidate files take a single-metadata-query validation path,
+and exact-one directory selection produces a typed owning result before any
+evaluator is chosen. The next workspace work remains `WS-004` through
+`WS-012`; recursive traversal is not silently folded into immediate selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,
 resources, analyzers, options, and output paths match Microsoft oracle data for

@@ -1230,7 +1230,18 @@ fn project_inspect_rejects_ambiguous_selection() {
   assert_eq!(output.status.code(), Some(2));
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert!(stderr.contains("error[DV0201]"));
-  assert!(stderr.contains("pass one project or solution path explicitly"));
+  let first = stderr.find("candidate: A.csproj (C# project)").unwrap();
+  let second = stderr.find("candidate: B.csproj (C# project)").unwrap();
+  assert!(first < second, "{stderr}");
+  assert!(stderr.contains("help: Pass one project or solution path explicitly."));
+
+  let json = dv().args(["--json", "project", "inspect"]).current_dir(&temp.0).output().unwrap();
+  assert_eq!(json.status.code(), Some(2));
+  assert!(json.stderr.is_empty());
+  let stdout = String::from_utf8(json.stdout).unwrap();
+  let first = stdout.find(r#""name":"candidate","value":"A.csproj (C# project)""#).unwrap();
+  let second = stdout.find(r#""name":"candidate","value":"B.csproj (C# project)""#).unwrap();
+  assert!(first < second, "{stdout}");
 }
 
 #[test]

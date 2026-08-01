@@ -35,10 +35,11 @@ recognized-extension branches are predictable in ordinary source roots, while
 kind selection is cold. Sorting is over compact records and candidate counts
 observed here are tiny.
 
-Implicit C# evaluation consumes the same batch. One C# project proceeds; zero
-candidates fails; one unsupported project/solution kind fails explicitly; and
-ambiguity reports up to the first 16 sorted candidates plus the remaining
-count. Full paths are constructed only for the selected or diagnostic row.
+The `WS-003` selector consumes the same batch. One candidate of any recognized
+kind becomes a typed owning selection; zero candidates fail, and ambiguity
+reports up to the first 16 sorted typed candidates plus the remaining count.
+Only the selected row becomes a full path. C# evaluation is a separate
+consumer; unsupported evaluators do not change discovery or selection.
 
 `ASSUMPTION: the benchmark machine has 64-byte cache lines - affects the
 records-per-line statement, not record correctness or layout assertions.`

@@ -49,8 +49,8 @@ pub use package::{
 };
 pub use project::{
   CentralPackageVersion, FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError,
-  ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, WorkspaceCandidate, WorkspaceCandidateKind, WorkspaceInventory, discover_workspace,
-  evaluate_project, evaluate_project_closure, evaluate_project_path,
+  ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, WorkspaceCandidate, WorkspaceCandidateKind, WorkspaceInventory, WorkspaceSelection,
+  discover_workspace, evaluate_project, evaluate_project_closure, evaluate_project_path, select_workspace,
 };
 pub use redaction::redact_url_for_output;
 pub use reporter::write_json_lines;

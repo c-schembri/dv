@@ -2900,12 +2900,12 @@ fn project_diagnostic(error: ProjectError) -> Diagnostic {
   };
   let help = match error.kind() {
     ProjectErrorKind::NotFound => Some("Pass a path to one SDK-style C# project."),
-    ProjectErrorKind::Ambiguous => Some("Pass one .csproj path explicitly."),
+    ProjectErrorKind::Ambiguous => Some("Pass one project or solution path explicitly."),
     ProjectErrorKind::Unsupported | ProjectErrorKind::InvalidProperty => Some("Use the supported single-target Microsoft.NET.Sdk project subset."),
     ProjectErrorKind::InvalidXml => Some("Correct the project XML and try again."),
     ProjectErrorKind::Io | ProjectErrorKind::NonUnicodePath => None,
   };
-  diagnostic(
+  let mut result = diagnostic(
     code,
     error.to_string(),
     Some(ContextField {
@@ -2913,7 +2913,11 @@ fn project_diagnostic(error: ProjectError) -> Diagnostic {
       value: error.path().display().to_string(),
     }),
     help,
-  )
+  );
+  result
+    .context
+    .extend(error.into_diagnostic_context().map(|(name, value)| ContextField { name: name.into(), value }));
+  result
 }
 
 fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {

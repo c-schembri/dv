@@ -226,6 +226,42 @@ impl WorkspaceInventory {
   pub fn working_set_bytes(&self) -> usize {
     self.candidates.len() * size_of::<WorkspaceCandidate>() + self.paths.len()
   }
+
+  fn into_selection(self, candidate: WorkspaceCandidate) -> WorkspaceSelection {
+    let Self { mut root, paths, .. } = self;
+    let start = candidate.path_start as usize;
+    root.push(&paths[start..start + usize::from(candidate.path_len)]);
+    WorkspaceSelection {
+      path: root,
+      kind: candidate.kind,
+    }
+  }
+}
+
+/// One project or solution selected from a directory candidate batch.
+#[derive(Debug)]
+pub struct WorkspaceSelection {
+  path: PathBuf,
+  kind: WorkspaceCandidateKind,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<WorkspaceSelection>() == 40);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<WorkspaceSelection>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<WorkspaceSelection>() == align_of::<usize>());
+
+impl WorkspaceSelection {
+  /// Returns the selected absolute project or solution path.
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Returns the selected project or solution kind.
+  pub fn kind(&self) -> WorkspaceCandidateKind {
+    self.kind
+  }
 }
 
 /// NuGet asset families selected by PackageReference metadata.
@@ -741,8 +777,19 @@ pub enum ProjectErrorKind {
 pub struct ProjectError {
   kind: ProjectErrorKind,
   path: PathBuf,
-  message: String,
+  message: Box<str>,
+  diagnostic: Option<Box<ProjectDiagnosticData>>,
 }
+
+#[derive(Debug, Default)]
+struct ProjectDiagnosticData {
+  context: Vec<(&'static str, String)>,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<ProjectError>() == BENCHMARK_CACHE_LINE_BYTES);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<ProjectError>() == 56);
 
 impl ProjectError {
   /// Returns the stable error category.
@@ -759,8 +806,40 @@ impl ProjectError {
     Self {
       kind,
       path: path.into(),
-      message: message.into(),
+      message: message.into().into_boxed_str(),
+      diagnostic: None,
     }
+  }
+
+  fn with_context(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    self
+      .diagnostic
+      .get_or_insert_with(|| Box::new(ProjectDiagnosticData::default()))
+      .context
+      .push((name, value.into()));
+    self
+  }
+
+  fn with_context_capacity(mut self, capacity: usize) -> Self {
+    self.diagnostic = Some(Box::new(ProjectDiagnosticData {
+      context: Vec::with_capacity(capacity),
+    }));
+    self
+  }
+
+  /// Iterates ordered machine-readable context retained on the cold error path.
+  pub fn diagnostic_context(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+    self
+      .diagnostic
+      .as_ref()
+      .map_or(&[][..], |diagnostic| diagnostic.context.as_slice())
+      .iter()
+      .map(|(name, value)| (*name, value.as_str()))
+  }
+
+  /// Moves ordered machine-readable context into a reporter without copying values.
+  pub fn into_diagnostic_context(self) -> std::vec::IntoIter<(&'static str, String)> {
+    self.diagnostic.map_or_else(Vec::new, |diagnostic| diagnostic.context).into_iter()
   }
 }
 
@@ -961,10 +1040,21 @@ impl TextTable {
   }
 }
 
-/// Finds exactly one `.csproj` in a directory and evaluates it.
+/// Selects exactly one project or solution in a directory and evaluates a C# project.
 pub fn evaluate_project(start_directory: &Path, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
-  let project_path = discover_project(start_directory)?;
-  evaluate_project_path(&project_path, configuration)
+  let selection = select_workspace(start_directory)?;
+  if selection.kind() != WorkspaceCandidateKind::CSharpProject {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      selection.path(),
+      format!(
+        "the initial evaluator cannot load the selected {} {}",
+        selection.kind().description(),
+        selection.path().file_name().unwrap_or(selection.path().as_os_str()).to_string_lossy()
+      ),
+    ));
+  }
+  evaluate_project_path(selection.path(), configuration)
 }
 
 /// Enumerates one directory into a stable batch of recognized project and solution candidates.
@@ -1045,6 +1135,41 @@ pub fn discover_workspace(directory: &Path) -> Result<WorkspaceInventory, Projec
       .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
   });
   Ok(WorkspaceInventory { root, paths, candidates })
+}
+
+/// Selects exactly one immediate project or solution candidate from a directory.
+pub fn select_workspace(directory: &Path) -> Result<WorkspaceSelection, ProjectError> {
+  let inventory = discover_workspace(directory)?;
+  match inventory.candidates().len() {
+    0 => Err(ProjectError::new(
+      ProjectErrorKind::NotFound,
+      inventory.root(),
+      format!("no project or solution was found in {}", inventory.root().display()),
+    )),
+    1 => {
+      let candidate = inventory.candidates()[0];
+      Ok(inventory.into_selection(candidate))
+    },
+    count => {
+      let context_count = count.min(MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES) + usize::from(count > MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES);
+      let mut error = ProjectError::new(
+        ProjectErrorKind::Ambiguous,
+        inventory.root(),
+        format!("{count} project or solution candidates were found in {}", inventory.root().display()),
+      )
+      .with_context_capacity(context_count);
+      for candidate in inventory.candidates().iter().copied().take(MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES) {
+        error = error.with_context(
+          "candidate",
+          format!("{} ({})", inventory.path(candidate), inventory.kind(candidate).description()),
+        );
+      }
+      if count > MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES {
+        error = error.with_context("remaining_candidates", (count - MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES).to_string());
+      }
+      Err(error)
+    },
+  }
 }
 
 /// Evaluates one explicit SDK-style `.csproj`.
@@ -1245,49 +1370,6 @@ fn parse_central_packages(path: &Path, bytes: &[u8]) -> Result<RawCentralPackage
     ));
   }
   Ok(raw)
-}
-
-fn discover_project(directory: &Path) -> Result<PathBuf, ProjectError> {
-  use std::fmt::Write as _;
-
-  let inventory = discover_workspace(directory)?;
-  match inventory.candidates().len() {
-    0 => Err(ProjectError::new(
-      ProjectErrorKind::NotFound,
-      directory,
-      format!("no project or solution was found in {}", directory.display()),
-    )),
-    1 => {
-      let candidate = inventory.candidates()[0];
-      if inventory.kind(candidate) == WorkspaceCandidateKind::CSharpProject {
-        Ok(inventory.full_path(candidate))
-      } else {
-        Err(ProjectError::new(
-          ProjectErrorKind::Unsupported,
-          inventory.full_path(candidate),
-          format!(
-            "the initial evaluator cannot load the discovered {} {}",
-            inventory.kind(candidate).description(),
-            inventory.path(candidate)
-          ),
-        ))
-      }
-    },
-    count => Err(ProjectError::new(ProjectErrorKind::Ambiguous, directory, {
-      let mut message = format!("{count} project or solution candidates were found in {}: ", directory.display());
-      for (index, candidate) in inventory.candidates().iter().copied().take(MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES).enumerate() {
-        if index != 0 {
-          message.push_str(", ");
-        }
-        write!(message, "{} ({})", inventory.path(candidate), inventory.kind(candidate).description()).expect("writing a String succeeds");
-      }
-      if count > MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES {
-        write!(message, ", and {} more", count - MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES).expect("writing a String succeeds");
-      }
-      message.push_str("; pass one project or solution path explicitly");
-      message
-    })),
-  }
 }
 
 fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> {
@@ -3116,11 +3198,59 @@ mod tests {
     assert_eq!(inventory.paths.capacity(), 0);
     assert_eq!(inventory.candidates.capacity(), 0);
     assert_eq!(inventory.working_set_bytes(), 0);
+    let empty_error = select_workspace(&empty).unwrap_err();
+    assert_eq!(empty_error.kind(), ProjectErrorKind::NotFound);
+    assert_eq!(empty_error.path(), empty);
 
     let missing = temp.0.join("missing");
     assert_eq!(discover_workspace(&missing).unwrap_err().kind(), ProjectErrorKind::NotFound);
     let file = temp.write("not-a-directory.csproj", "<Project />");
     assert_eq!(discover_workspace(&file).unwrap_err().kind(), ProjectErrorKind::Unsupported);
+  }
+
+  #[test]
+  fn workspace_selection_accepts_each_candidate_kind_without_evaluating_it() {
+    let temp = TempDirectory::new();
+    for (index, (name, kind)) in [
+      ("App.csproj", WorkspaceCandidateKind::CSharpProject),
+      ("App.fsproj", WorkspaceCandidateKind::FSharpProject),
+      ("App.vbproj", WorkspaceCandidateKind::VisualBasicProject),
+      ("App.sln", WorkspaceCandidateKind::Solution),
+      ("App.slnx", WorkspaceCandidateKind::XmlSolution),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      let directory = temp.0.join(index.to_string());
+      fs::create_dir(&directory).unwrap();
+      let path = directory.join(name);
+      fs::write(&path, b"selection does not parse content").unwrap();
+
+      let selection = select_workspace(&directory).unwrap();
+
+      assert_eq!(selection.path(), path);
+      assert_eq!(selection.kind(), kind);
+    }
+  }
+
+  #[test]
+  fn workspace_selection_bounds_ordered_ambiguity_context() {
+    let temp = TempDirectory::new();
+    for index in 0..18 {
+      temp.write(&format!("P{index:02}.csproj"), "<Project />");
+    }
+
+    let error = select_workspace(&temp.0).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::Ambiguous);
+    assert_eq!(error.path(), temp.0);
+    let context = error.diagnostic_context().collect::<Vec<_>>();
+    assert_eq!(context.len(), 17);
+    for (index, field) in context[..16].iter().enumerate() {
+      assert_eq!(field.0, "candidate");
+      assert_eq!(field.1, format!("P{index:02}.csproj (C# project)"));
+    }
+    assert_eq!(context[16], ("remaining_candidates", "2"));
   }
 
   #[test]
@@ -3175,9 +3305,10 @@ mod tests {
     let error = evaluate_project(&temp.0, ProjectConfiguration::Debug).unwrap_err();
 
     assert_eq!(error.kind(), ProjectErrorKind::Ambiguous);
-    let message = error.to_string();
-    assert!(message.contains("A.csproj (C# project), B.sln (solution)"), "{message}");
-    assert!(message.contains("pass one project or solution path explicitly"), "{message}");
+    assert_eq!(
+      error.diagnostic_context().collect::<Vec<_>>(),
+      [("candidate", "A.csproj (C# project)"), ("candidate", "B.sln (solution)")]
+    );
   }
 
   #[test]

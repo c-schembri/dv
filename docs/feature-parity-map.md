@@ -714,12 +714,16 @@ contracts.
   typed failures. Thirty warm Windows samples measured Microsoft at
   `289.046 ms` median and `302.358 ms` p95 versus `5.326 ms` and `6.219 ms` for
   `dv`, a `54.3x` median improvement. `P1`
-- [~] `WS-003` From a directory, select one project or solution and diagnose
-  zero or ambiguous candidates with ordered context. Immediate selection now
-  consumes the shared stable candidate batch, selects one C# project, rejects
-  one unsupported kind, and reports at most 16 ordered ambiguity rows plus a
-  remainder count. Solution loading and recursive repository selection remain
-  open. `P1`
+- [x] `WS-003` From a directory, select one project or solution and diagnose
+  zero or ambiguous candidates with ordered context. Exact-one selection
+  consumes the shared stable candidate batch and accepts every recognized kind
+  into a typed owning result without parsing it. Zero and ambiguity remain
+  distinct; ambiguity reports at most 16 ordered typed candidate fields plus a
+  remainder count. Solution loading remains owned by `SLN-001`/`SLN-002`, and
+  recursive repository selection remains outside this immediate-directory
+  transform. Thirty warm Windows samples measured Microsoft at `303.399 ms`
+  median and `320.158 ms` p95 versus `6.051 ms` and `7.540 ms` for `dv`, a
+  `50.1x` median improvement. `P1`
 - [ ] `WS-004` Define repository root discovery independently from project
   selection. `P1`
 - [ ] `WS-005` Discover nearest ancestor `global.json`, `NuGet.Config`,

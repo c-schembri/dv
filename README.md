@@ -35,8 +35,8 @@ dv project inspect              3.846 ms median
 dotnet named project query    289.046 ms median
 dv project --project            5.326 ms median
 
-dotnet implicit project query 290.493 ms median
-dv implicit project query       5.287 ms median
+dotnet implicit project query 303.399 ms median
+dv implicit project query       6.051 ms median
 
 dotnet reject unknown option  146.054 ms median
 dv reject unknown option         4.827 ms median
@@ -175,6 +175,7 @@ The project is in the first implementation phase.
 | Initial SDK-style project evaluation | Implemented |
 | Direct typed explicit project-file selection | Implemented |
 | Bounded immediate workspace candidate discovery | Implemented |
+| Exact-one project/solution directory selection with ordered diagnostics | Implemented |
 | TFM/RID/configuration conditional references | Implemented |
 | Target-aware framework and compiler input planning | Implemented |
 | Framework references and shared-runtime roll-forward | Implemented |
@@ -355,9 +356,12 @@ failures. The borrowed singleton selector does not allocate path storage.
 Implicit selection now batch-enumerates immediate `.csproj`, `.fsproj`,
 `.vbproj`, `.sln`, and `.slnx` candidates in one directory pass. Paths occupy
 one UTF-8 arena and stable 8-byte records, with eight records per assumed
-64-byte cache line. One C# project proceeds; empty, unsupported, and ambiguous
-directories fail with typed ordered context. Recursive repository traversal and
-solution parsing remain explicit later features.
+64-byte cache line. Exact-one selection accepts every recognized kind into an
+owned 40-byte Windows or 32-byte Unix result; the C# evaluator is a separate
+consumer. Empty directories fail distinctly, while ambiguous directories
+report at most 16 ordered typed candidate fields plus a remainder count.
+Recursive repository traversal and solution parsing remain explicit later
+features.
 
 Direct package references normalize `IncludeAssets`, `ExcludeAssets`, and
 `PrivateAssets` into eight-bit family masks during evaluation. The effective
@@ -546,6 +550,8 @@ Direct explicit project selection has like-for-like evidence in the
 [explicit project selection baseline](docs/performance-baselines/2026-08-02-explicit-project-selection-windows.md).
 Immediate workspace discovery and implicit project selection have like-for-like
 evidence in the [workspace discovery baseline](docs/performance-baselines/2026-08-02-workspace-discovery-windows.md).
+The completed exact-one directory selector has fresh like-for-like evidence in
+the [workspace selection baseline](docs/performance-baselines/2026-08-02-workspace-selection-windows.md).
 Reference-compatible help has like-for-like, zero-mutation evidence in the
 [compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
 The first versioned real-CI substitution corpus covers SDK selection and a
@@ -618,7 +624,7 @@ Initial machine:
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate a named project selection | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect --project SmallConsole.csproj --json` | 289.046 ms | 5.326 ms | 54.3x | 302.358 ms | 6.219 ms |
-| Discover and evaluate the only project in a workspace | `dotnet msbuild` property/item query | `dv project inspect --json` | 290.493 ms | 5.287 ms | 55.0x | 305.210 ms | 6.048 ms |
+| Discover, select, and evaluate the only project in a workspace | `dotnet msbuild` property/item query | `dv project inspect --json` | 303.399 ms | 6.051 ms | 50.1x | 320.158 ms | 7.540 ms |
 | Evaluate TFM/RID/configuration conditional references | `dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release` property/item query | `dv project inspect ConditionalReferences.csproj --configuration Release --json` | 288.983 ms | 4.765 ms | 60.6x | 321.422 ms | 6.209 ms |
 | Evaluate runtime target dimensions | `dotnet msbuild RuntimeProject.csproj` runtime-property query | `dv project inspect RuntimeProject.csproj --json` | 321.215 ms | 5.687 ms | 56.5x | 330.112 ms | 6.897 ms |
 | Plan runtime and host packs from a warm inventory | `dotnet msbuild RuntimePackProject.csproj` runtime-pack/apphost item query | `dv project runtime-packs RuntimePackProject.csproj --packages .packages --json` | 360.550 ms | 6.403 ms | 56.3x | 370.695 ms | 8.218 ms |

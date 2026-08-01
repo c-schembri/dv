@@ -1611,6 +1611,7 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "workspace_discovery") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Implicit)?;
+    verify_workspace_selection_boundary(&repository, &dv_executable, &workspace.join("verify-workspace-selection"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_reference_conditions") {
     verify_package_reference_conditions(&dv_executable, &package_reference_conditions_fixture)?;
@@ -3061,6 +3062,47 @@ fn verify_project_evaluation(dv_executable: &Path, fixture: &Path, selection: Pr
   }
   if !dv.get("package_references").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
     return Err("dv small-console evaluation unexpectedly contains package references".into());
+  }
+  Ok(())
+}
+
+fn verify_workspace_selection_boundary(repository: &Path, dv_executable: &Path, workspace: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, workspace)?;
+  remove_generated_path(workspace)?;
+  fs::create_dir_all(workspace)?;
+
+  let empty = Command::new(dv_executable)
+    .args(["--json", "project", "inspect"])
+    .current_dir(workspace)
+    .output()?;
+  if empty.status.success() || !empty.stderr.is_empty() {
+    return Err("empty workspace selection did not produce one structured failure".into());
+  }
+  let empty_stdout = String::from_utf8(empty.stdout)?;
+  if !empty_stdout.contains(r#""code":"DV0200""#) {
+    return Err("empty workspace selection did not retain its not-found identity".into());
+  }
+
+  fs::write(workspace.join("B.sln"), b"selection boundary only")?;
+  fs::write(workspace.join("A.csproj"), b"selection boundary only")?;
+  let before = snapshot_tree(workspace)?;
+  let ambiguous = Command::new(dv_executable)
+    .args(["--json", "project", "inspect"])
+    .current_dir(workspace)
+    .output()?;
+  let after = snapshot_tree(workspace)?;
+  if ambiguous.status.success() || !ambiguous.stderr.is_empty() || before != after {
+    return Err("ambiguous workspace selection did not remain a structured zero-write failure".into());
+  }
+  let ambiguous_stdout = String::from_utf8(ambiguous.stdout)?;
+  let first = ambiguous_stdout
+    .find(r#""name":"candidate","value":"A.csproj (C# project)""#)
+    .ok_or("ambiguous workspace selection omitted its first ordered candidate")?;
+  let second = ambiguous_stdout
+    .find(r#""name":"candidate","value":"B.sln (solution)""#)
+    .ok_or("ambiguous workspace selection omitted its second ordered candidate")?;
+  if !ambiguous_stdout.contains(r#""code":"DV0201""#) || first >= second {
+    return Err("ambiguous workspace selection lost its typed identity or stable order".into());
   }
   Ok(())
 }
