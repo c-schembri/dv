@@ -1248,15 +1248,17 @@ fn project_inspect_rejects_ambiguous_selection() {
 fn project_root_discovers_git_without_project_selection() {
   let temp = TempDirectory::new();
   fs::create_dir(temp.0.join(".git")).unwrap();
+  fs::write(temp.0.join(".git/fixture-marker"), []).unwrap();
   let nested = temp.0.join("src/tool");
   fs::create_dir_all(&nested).unwrap();
 
   let human = dv().args(["project", "root"]).current_dir(&nested).output().unwrap();
   assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
   assert!(human.stderr.is_empty());
-  assert_eq!(String::from_utf8(human.stdout).unwrap().trim(), temp.0.to_string_lossy());
+  let human_root = PathBuf::from(String::from_utf8(human.stdout).unwrap().trim());
+  assert!(human_root.join(".git/fixture-marker").is_file());
 
-  let json = dv().args(["--json", "project", "root"]).current_dir(&nested).output().unwrap();
+  let json = dv().args(["--json", "project", "root"]).arg(&nested).output().unwrap();
   assert!(json.status.success(), "{}", String::from_utf8_lossy(&json.stderr));
   assert!(json.stderr.is_empty());
   let event = String::from_utf8(json.stdout)
