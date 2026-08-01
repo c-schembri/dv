@@ -135,6 +135,24 @@ pub enum WorkspaceCandidateKind {
 }
 
 impl WorkspaceCandidateKind {
+  /// Classifies a project or solution path by its final extension.
+  pub fn classify(path: &Path) -> Option<Self> {
+    let extension = path.extension()?;
+    if extension.eq_ignore_ascii_case("csproj") {
+      Some(Self::CSharpProject)
+    } else if extension.eq_ignore_ascii_case("fsproj") {
+      Some(Self::FSharpProject)
+    } else if extension.eq_ignore_ascii_case("vbproj") {
+      Some(Self::VisualBasicProject)
+    } else if extension.eq_ignore_ascii_case("sln") {
+      Some(Self::Solution)
+    } else if extension.eq_ignore_ascii_case("slnx") {
+      Some(Self::XmlSolution)
+    } else {
+      None
+    }
+  }
+
   fn description(self) -> &'static str {
     match self {
       Self::CSharpProject => "C# project",
@@ -979,7 +997,7 @@ pub fn discover_workspace(directory: &Path) -> Result<WorkspaceInventory, Projec
       continue;
     }
     let file_name = entry.file_name();
-    let Some(kind) = workspace_candidate_kind(Path::new(&file_name)) else {
+    let Some(kind) = WorkspaceCandidateKind::classify(Path::new(&file_name)) else {
       continue;
     };
     if candidates.is_empty() {
@@ -1038,11 +1056,22 @@ pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfigur
       "the initial evaluator accepts only C# .csproj files",
     ));
   }
-  if !project_path.is_file() {
+  let metadata = match fs::metadata(project_path) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Err(ProjectError::new(
+        ProjectErrorKind::NotFound,
+        project_path,
+        format!("project {} does not exist", project_path.display()),
+      ));
+    },
+    Err(error) => return Err(io_error("inspect", project_path, error)),
+  };
+  if !metadata.is_file() {
     return Err(ProjectError::new(
-      ProjectErrorKind::NotFound,
+      ProjectErrorKind::Unsupported,
       project_path,
-      format!("project {} does not exist", project_path.display()),
+      format!("project {} is not a regular file", project_path.display()),
     ));
   }
 
@@ -2925,24 +2954,7 @@ fn is_literal_package_version(value: &str) -> bool {
 }
 
 fn is_csproj(path: &Path) -> bool {
-  path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("csproj"))
-}
-
-fn workspace_candidate_kind(path: &Path) -> Option<WorkspaceCandidateKind> {
-  let extension = path.extension()?;
-  if extension.eq_ignore_ascii_case("csproj") {
-    Some(WorkspaceCandidateKind::CSharpProject)
-  } else if extension.eq_ignore_ascii_case("fsproj") {
-    Some(WorkspaceCandidateKind::FSharpProject)
-  } else if extension.eq_ignore_ascii_case("vbproj") {
-    Some(WorkspaceCandidateKind::VisualBasicProject)
-  } else if extension.eq_ignore_ascii_case("sln") {
-    Some(WorkspaceCandidateKind::Solution)
-  } else if extension.eq_ignore_ascii_case("slnx") {
-    Some(WorkspaceCandidateKind::XmlSolution)
-  } else {
-    None
-  }
+  WorkspaceCandidateKind::classify(path) == Some(WorkspaceCandidateKind::CSharpProject)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, ProjectError> {
@@ -3109,6 +3121,49 @@ mod tests {
     assert_eq!(discover_workspace(&missing).unwrap_err().kind(), ProjectErrorKind::NotFound);
     let file = temp.write("not-a-directory.csproj", "<Project />");
     assert_eq!(discover_workspace(&file).unwrap_err().kind(), ProjectErrorKind::Unsupported);
+  }
+
+  #[test]
+  fn explicit_project_selection_validates_kind_and_file_type_before_xml() {
+    let temp = TempDirectory::new();
+
+    let missing = temp.0.join("Missing.csproj");
+    let missing_error = evaluate_project_path(&missing, ProjectConfiguration::Debug).unwrap_err();
+    assert_eq!(missing_error.kind(), ProjectErrorKind::NotFound);
+    assert_eq!(missing_error.path(), missing);
+
+    let wrong_kind = temp.0.join("Missing.fsproj");
+    let wrong_kind_error = evaluate_project_path(&wrong_kind, ProjectConfiguration::Debug).unwrap_err();
+    assert_eq!(wrong_kind_error.kind(), ProjectErrorKind::Unsupported);
+    assert_eq!(wrong_kind_error.path(), wrong_kind);
+
+    let directory = temp.0.join("Directory.csproj");
+    fs::create_dir(&directory).unwrap();
+    let directory_error = evaluate_project_path(&directory, ProjectConfiguration::Debug).unwrap_err();
+    assert_eq!(directory_error.kind(), ProjectErrorKind::Unsupported);
+    assert_eq!(directory_error.path(), directory);
+    assert!(directory_error.to_string().contains("not a regular file"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn explicit_project_selection_reports_an_unreadable_file_before_xml() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDirectory::new();
+    let project = temp.write("Unreadable.csproj", "<Project />");
+    let original_permissions = fs::metadata(&project).unwrap().permissions();
+    let mut unreadable_permissions = original_permissions.clone();
+    unreadable_permissions.set_mode(0);
+    fs::set_permissions(&project, unreadable_permissions).unwrap();
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug);
+    fs::set_permissions(&project, original_permissions).unwrap();
+
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), ProjectErrorKind::Io);
+    assert_eq!(error.path(), project);
+    assert!(error.to_string().contains("failed to read"));
   }
 
   #[test]

@@ -59,7 +59,7 @@ Invalid input behavior:
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_protocol_version` | immutable `small-console` directory; three-native-alias schema preflight outside timing | `dv` process launch and one validated schema-21 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
-| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,210-byte static manifest write; Microsoft has no equivalent query and reports TBI |
+| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,214-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_compat_check` | immutable 195-byte workflow and 278-byte SDK project; event/version/count/exit/no-write preflight outside timing | `dv` process launch, bounded reads, literal script/XML scan, static manifest-index classification, and one validated schema-21 event batch; Microsoft has no equivalent non-executing scanner and reports TBI |
 | `dotnet_runtime_inventory` | installed host inventory; exact SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, current-architecture shared-framework enumeration, semantic ordering, and compatible text output |
 | `dotnet_runtime_inventory_arch` | registered x86 host inventory; exact current/x86 SDK/runtime text equality and zero-fixture-mutation preflight outside timing | process launch, 32-bit registry-root selection, x86 shared-framework enumeration, semantic ordering, and compatible text output |
@@ -75,6 +75,7 @@ Invalid input behavior:
 | `cli_child_exit` | prebuilt `argument-forwarding` fixture; child-exit parity and typed TBI-boundary preflight outside timing | Microsoft launches the managed child; `dv` captures the declared exit policy and emits its TBI boundary |
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |
 | `project_evaluate` | immutable `small-console` fixture | process launch, project parsing, source discovery, evaluation, and JSON output |
+| `project_select_named` | immutable `small-console` fixture; explicit selection and property/item equivalence preflight outside timing | process launch, borrowed option parsing, one project-file metadata query, project parsing, source discovery, evaluation, and JSON output |
 | `workspace_discovery` | immutable `small-console` fixture; implicit selection and property/item equivalence preflight outside timing | process launch, one immediate directory scan, implicit project selection, project parsing, source discovery, evaluation, and JSON output |
 | `runtime_evaluate` | immutable `runtime-project` fixture | process launch, project parsing, compact RID target-dimension materialization, and JSON output |
 | `runtime_pack_plan` | restored isolated runtime pack and one validated immutable inventory built during warm-up | process launch, SDK/graph/manifest selection, inventory fingerprint/decode, compact path materialization, and JSON output |
@@ -262,6 +263,7 @@ Measure only like-for-like project evaluation:
 
 ```text
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
+cargo bench-all --case project_select_named --samples 30 --warmups 3
 cargo bench-all --case workspace_discovery --samples 30 --warmups 3
 ```
 

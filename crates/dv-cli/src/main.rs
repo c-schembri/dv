@@ -27,9 +27,10 @@ use dv_core::{
   PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
   ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
   RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
-  discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture, discover_sdks, evaluate_project,
-  evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
-  plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
+  WorkspaceCandidateKind, discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture,
+  discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph,
+  write_json_lines,
 };
 
 const HELP: &str = "\
@@ -2776,7 +2777,9 @@ fn load_project(directory: &Path, requested: Option<&Path>, configuration: Proje
   } else {
     directory.join(requested)
   };
-  if requested.is_dir() {
+  if WorkspaceCandidateKind::classify(&requested).is_some() {
+    evaluate_project_path(&requested, configuration)
+  } else if requested.is_dir() {
     evaluate_project(&requested, configuration)
   } else {
     evaluate_project_path(&requested, configuration)

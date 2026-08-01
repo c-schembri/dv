@@ -706,8 +706,14 @@ contracts.
   Windows samples measured Microsoft implicit discovery/evaluation at
   `290.493 ms` median and `305.210 ms` p95 versus `5.287 ms` and `6.048 ms` for
   `dv`, a `55.0x` median improvement. `P1`
-- [~] `WS-002` Select an explicit file directly and reject a missing,
-  wrong-kind, or unreadable path before evaluation. `P1`
+- [x] `WS-002` Select an explicit file directly and reject a missing,
+  wrong-kind, or unreadable path before evaluation. Recognized candidate kinds
+  are classified before I/O, wrong kinds require no metadata query, and the C#
+  success path performs one metadata query before its one file read. Missing,
+  metadata-failed, non-regular, unreadable, and malformed inputs retain distinct
+  typed failures. Thirty warm Windows samples measured Microsoft at
+  `289.046 ms` median and `302.358 ms` p95 versus `5.326 ms` and `6.219 ms` for
+  `dv`, a `54.3x` median improvement. `P1`
 - [~] `WS-003` From a directory, select one project or solution and diagnose
   zero or ambiguous candidates with ordered context. Immediate selection now
   consumes the shared stable candidate batch, selects one C# project, rejects

@@ -1254,6 +1254,25 @@ fn project_inspect_accepts_named_file_and_directory_selection() {
 }
 
 #[test]
+fn project_inspect_validates_explicit_candidate_files_before_evaluation() {
+  let temp = TempDirectory::new();
+  fs::create_dir(temp.0.join("Directory.csproj")).unwrap();
+
+  for (project, code, message) in [
+    ("Missing.csproj", "DV0200", "does not exist"),
+    ("Missing.fsproj", "DV0204", "accepts only C# .csproj files"),
+    ("Directory.csproj", "DV0204", "not a regular file"),
+  ] {
+    let output = dv().args(["project", "inspect", "--project", project]).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(&format!("error[{code}]")), "{project}: {stderr}");
+    assert!(stderr.contains(message), "{project}: {stderr}");
+    assert!(!stderr.contains("invalid XML"), "{project}: {stderr}");
+  }
+}
+
+#[test]
 fn malformed_project_selection_fails_before_project_io() {
   let temp = TempDirectory::new();
   for arguments in [
