@@ -216,8 +216,8 @@ fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery
   let manifest: serde_json::Value = serde_json::from_slice(expected).unwrap();
   assert_eq!(manifest["schema_version"], 1);
   assert_eq!(manifest["manifest_version"], 1);
-  assert_eq!(manifest["command_syntax_version"], 3);
-  assert_eq!(manifest["event_schema_version"], 21);
+  assert_eq!(manifest["command_syntax_version"], 4);
+  assert_eq!(manifest["event_schema_version"], 22);
   assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
   assert!(manifest["commands"].as_array().unwrap().len() >= 100);
   assert_eq!(manifest["parity_rows"].as_array().unwrap().len(), 468);
@@ -269,7 +269,7 @@ fn compatibility_check_scans_literal_scripts_and_projects_without_execution() {
     .lines()
     .map(|line| serde_json::from_str(line).unwrap())
     .collect();
-  assert!(events.iter().all(|event| event["schema_version"] == 21));
+  assert!(events.iter().all(|event| event["schema_version"] == 22));
   let report = events.iter().find(|event| event["type"] == "compatibility_checked").unwrap();
   assert_eq!(report["manifest_version"], 1);
   assert_eq!(report["inputs"].as_array().unwrap().len(), 2);
@@ -860,8 +860,8 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":21"));
-  assert!(lines[0].contains("\"command_syntax_version\":3"));
+  assert!(lines[0].contains("\"schema_version\":22"));
+  assert!(lines[0].contains("\"command_syntax_version\":4"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -884,15 +884,15 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
     assert!(
       events
         .iter()
-        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(21))
+        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(22))
     );
     assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
     assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
-    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(3));
+    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(4));
     assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
     assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
-    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(3));
-    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(21));
+    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(4));
+    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(22));
     assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
   }
 }
@@ -1078,7 +1078,7 @@ fn runtime_inventory_json_uses_the_shared_event_batch() {
 
   assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
   let stdout = String::from_utf8(output.stdout).unwrap();
-  assert!(stdout.contains("\"schema_version\":21"), "{stdout}");
+  assert!(stdout.contains("\"schema_version\":22"), "{stdout}");
   assert!(stdout.contains("\"type\":\"runtime_inventory\""), "{stdout}");
   assert!(stdout.contains("\"family\":\"Microsoft.NETCore.App\""), "{stdout}");
   assert!(stdout.contains("\"outcome\":\"succeeded\""), "{stdout}");
@@ -1245,6 +1245,46 @@ fn project_inspect_rejects_ambiguous_selection() {
 }
 
 #[test]
+fn project_root_discovers_git_without_project_selection() {
+  let temp = TempDirectory::new();
+  fs::create_dir(temp.0.join(".git")).unwrap();
+  let nested = temp.0.join("src/tool");
+  fs::create_dir_all(&nested).unwrap();
+
+  let human = dv().args(["project", "root"]).current_dir(&nested).output().unwrap();
+  assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
+  assert!(human.stderr.is_empty());
+  assert_eq!(String::from_utf8(human.stdout).unwrap().trim(), temp.0.to_string_lossy());
+
+  let json = dv().args(["--json", "project", "root"]).current_dir(&nested).output().unwrap();
+  assert!(json.status.success(), "{}", String::from_utf8_lossy(&json.stderr));
+  assert!(json.stderr.is_empty());
+  let event = String::from_utf8(json.stdout)
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+    .find(|event| event["type"] == "repository_root_discovered")
+    .unwrap();
+  assert_eq!(event["schema_version"], 22);
+  assert_eq!(event["root"], temp.0.to_string_lossy().as_ref());
+  assert_eq!(event["kind"], "git");
+  assert_eq!(event["marker_probes"], 3);
+}
+
+#[test]
+fn project_root_validates_operands_before_marker_io() {
+  let temp = TempDirectory::new();
+
+  let output = dv().args(["project", "root", "first", "second"]).current_dir(&temp.0).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("error[DV0002]"), "{stderr}");
+  assert!(stderr.contains("at most one path"), "{stderr}");
+  assert!(!stderr.contains("repository marker"), "{stderr}");
+}
+
+#[test]
 fn project_inspect_accepts_named_file_and_directory_selection() {
   let temp = TempDirectory::new();
   temp.write("Program.cs", "");
@@ -1390,7 +1430,7 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 
   assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
   let stdout = String::from_utf8(alias.stdout).unwrap();
-  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":3,\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":4,\"command\":\"restore\""));
   assert!(stdout.contains("\"type\":\"package_resolution_created\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));

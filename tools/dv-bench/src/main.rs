@@ -105,6 +105,7 @@ enum CaseKind {
   CliForwarding,
   CliChildExit,
   RidGraph,
+  RepositoryRoot,
   ProjectEvaluate,
   PackageReferenceConditions,
   RuntimeEvaluate,
@@ -160,6 +161,7 @@ struct Case {
 
 struct Fixtures<'a> {
   small: &'a Path,
+  repository_root: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
@@ -339,6 +341,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
+    implemented: true,
+  },
+  Case {
+    name: "repository_root",
+    kind: CaseKind::RepositoryRoot,
+    args: &["msbuild", "nested/src/RepositoryRoot.proj", "--nologo", "-getProperty:RepositoryRoot"],
     implemented: true,
   },
   Case {
@@ -1057,6 +1065,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "repository_root",
+    kind: CaseKind::RepositoryRoot,
+    args: &["project", "root", "nested/src"],
+    implemented: true,
+  },
+  Case {
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
@@ -1460,6 +1474,7 @@ fn run() -> Result<()> {
   let options = parse_options(env::args_os().skip(1))?;
   let repository = repository_root();
   let fixture = repository.join("benchmarks/fixtures/small-console");
+  let repository_root_fixture = repository.join("benchmarks/fixtures/repository-root");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
@@ -1493,6 +1508,7 @@ fn run() -> Result<()> {
   let massive_package_graph_fixture = repository.join("benchmarks/fixtures/massive-package-graph");
   let fixtures = Fixtures {
     small: &fixture,
+    repository_root: &repository_root_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
@@ -1602,6 +1618,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "repository_root") {
+    verify_repository_root(&repository, &dv_executable, &repository_root_fixture, &workspace.join("verify-repository-root"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
@@ -2810,8 +2829,8 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
   Ok(())
 }
 
-const EVENT_SCHEMA_VERSION: u64 = 21;
-const COMMAND_SYNTAX_VERSION: u64 = 3;
+const EVENT_SCHEMA_VERSION: u64 = 22;
+const COMMAND_SYNTAX_VERSION: u64 = 4;
 const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
 
 fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -2995,6 +3014,53 @@ enum ProjectSelectionBenchmark {
   Positional,
   Named,
   Implicit,
+}
+
+fn verify_repository_root(repository: &Path, dv_executable: &Path, fixture: &Path, workspace: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, workspace)?;
+  reset_fixture(fixture, workspace)?;
+  fs::write(workspace.join(".git"), b"gitdir: benchmark-marker")?;
+  let nested = workspace.join("nested/src");
+  let before = snapshot_tree(workspace)?;
+
+  let reference = command_text(
+    Path::new("dotnet"),
+    &["msbuild", "RepositoryRoot.proj", "--nologo", "-getProperty:RepositoryRoot"],
+    &nested,
+  )?;
+  let candidate = Command::new(dv_executable).args(["project", "root", "--json"]).current_dir(&nested).output()?;
+  if !candidate.status.success() || !candidate.stderr.is_empty() {
+    return Err("repository-root query did not produce one structured success".into());
+  }
+  let event = candidate
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("repository_root_discovered"))
+    .ok_or("repository-root event was not emitted")?;
+  let candidate_root = event
+    .get("root")
+    .and_then(serde_json::Value::as_str)
+    .ok_or("repository-root event omitted root")?;
+  let kind = event.get("kind").and_then(serde_json::Value::as_str);
+  let probes = event.get("marker_probes").and_then(serde_json::Value::as_u64);
+  let expected = workspace.to_string_lossy();
+  if Path::new(reference.trim()) != workspace || Path::new(candidate_root) != workspace || kind != Some("git") || probes != Some(3) {
+    return Err(
+      format!(
+        "repository-root mismatch: expected {expected:?}, Microsoft returned {reference:?}, dv returned root={candidate_root:?} kind={kind:?} probes={probes:?}"
+      )
+      .into(),
+    );
+  }
+  let after = snapshot_tree(workspace)?;
+  if before != after {
+    return Err("repository-root queries mutated the fixture".into());
+  }
+  Ok(())
 }
 
 fn verify_project_evaluation(dv_executable: &Path, fixture: &Path, selection: ProjectSelectionBenchmark) -> Result<()> {
@@ -6810,6 +6876,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(
     case.kind,
     CaseKind::RidGraph
+      | CaseKind::RepositoryRoot
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
@@ -6864,6 +6931,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::RunWarm
   ) {
     reset_fixture(fixture, workspace)?;
+  }
+  if matches!(case.kind, CaseKind::RepositoryRoot) {
+    fs::write(workspace.join(".git"), b"gitdir: benchmark-marker")?;
   }
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
@@ -8316,6 +8386,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::CliForwarding
     | CaseKind::CliChildExit
     | CaseKind::RidGraph
+    | CaseKind::RepositoryRoot
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -8406,6 +8477,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
     CaseKind::CliForwarding | CaseKind::CliChildExit => fixtures.argument_forwarding,
     CaseKind::RidGraph => fixtures.rid_graph,
+    CaseKind::RepositoryRoot => fixtures.repository_root,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
@@ -8444,6 +8516,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::Startup => None,
     CaseKind::CliForwarding | CaseKind::CliChildExit => Some("argument-forwarding"),
     CaseKind::RidGraph => Some("rid-graph-oracle"),
+    CaseKind::RepositoryRoot => Some("repository-root"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
@@ -8545,6 +8618,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_forwarding_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliChildExit) {
     validate_child_exit_output(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::RepositoryRoot) {
+    validate_repository_root_output(&output, cwd)?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -8644,6 +8719,24 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     None
   };
   Ok(Measurement { elapsed_ns: elapsed, work })
+}
+
+fn validate_repository_root_output(output: &Output, cwd: &Path) -> Result<()> {
+  if !output.status.success() {
+    return Err(
+      format!(
+        "repository-root sample failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let root = std::str::from_utf8(&output.stdout)?.trim();
+  if Path::new(root) != cwd {
+    return Err(format!("repository-root sample returned {root:?}; expected {}", cwd.display()).into());
+  }
+  Ok(())
 }
 
 fn validate_pack_inventory_cache(workspace: &Path) -> Result<()> {
@@ -9458,6 +9551,7 @@ fn case_label(case: &str) -> &str {
     "cli_protocol_version" => "Syntax + JSON protocol versions",
     "cli_compat_manifest" => "Compatibility manifest query",
     "cli_compat_check" => "Static compatibility check",
+    "repository_root" => "Repository root discovery",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "workspace_discovery" => "Implicit workspace discovery",

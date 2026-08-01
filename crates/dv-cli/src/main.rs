@@ -27,10 +27,10 @@ use dv_core::{
   PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
   ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
   RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
-  WorkspaceCandidateKind, discover_installed_sdks, discover_installed_sdks_for_architecture, discover_runtimes, discover_runtimes_for_architecture,
-  discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph,
-  write_json_lines,
+  WorkspaceCandidateKind, discover_installed_sdks, discover_installed_sdks_for_architecture, discover_repository_root, discover_runtimes,
+  discover_runtimes_for_architecture, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
+  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
+  resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -139,6 +139,7 @@ Usage:
 
 const PROJECT_HELP: &str = "\
 Usage:
+  dv project root [PATH]  Print the nearest repository root
   dv project inspect [PROJECT|SOLUTION] [--project PATH]
                      [--configuration Debug|Release]
   dv project frameworks [PROJECT|SOLUTION] [--project PATH] [--packages PATH]
@@ -526,6 +527,7 @@ fn run() -> ExitCode {
 
 fn command_requires_cancellation(globals: InvocationOptions, command: CommandKind, command_args: CommandArguments<'_>) -> bool {
   let bounded_inventory = command == CommandKind::Sdk && command_args.first().and_then(OsStr::to_str) == Some("runtimes");
+  let bounded_repository_root = command == CommandKind::Project && command_args.first().and_then(OsStr::to_str) == Some("root");
   let work_command = matches!(
     command,
     CommandKind::Sdk
@@ -537,7 +539,7 @@ fn command_requires_cancellation(globals: InvocationOptions, command: CommandKin
       | CommandKind::Run
       | CommandKind::Test
   ) || (command == CommandKind::Compat && command_args.first().is_some_and(|argument| argument == "check"));
-  work_command && !bounded_inventory && !command_help_only(globals, command, command_args)
+  work_command && !bounded_inventory && !bounded_repository_root && !command_help_only(globals, command, command_args)
 }
 
 fn run_compat(
@@ -2064,12 +2066,15 @@ fn run_project(
     return ExitCode::SUCCESS;
   }
   let mut semantic_operands = operands.iter();
-  if matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
+  if matches!(subcommand, "root" | "inspect" | "frameworks" | "runtime-packs" | "package-sources")
     && semantic_operands.next().is_some_and(|argument| globals.argument_is_help(argument))
     && semantic_operands.next().is_none()
   {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
+  }
+  if subcommand == "root" {
+    return project_root(started, globals, args, operands);
   }
   let cancellation = cancellation.expect("non-help project commands install cancellation");
   if subcommand == "runtime-packs" {
@@ -2199,6 +2204,75 @@ fn run_project(
     self_contained: project.self_contained(),
   };
   succeed(started, "project inspect", args, payload)
+}
+
+fn project_root(started: Instant, globals: InvocationOptions, args: Vec<String>, operands: CommandArguments<'_>) -> ExitCode {
+  if operands.len() > 1 {
+    return reject(
+      started,
+      globals,
+      "project root",
+      args,
+      diagnostic("DV0002", "project root accepts at most one path", None, Some("Use `dv project root [PATH]`.")),
+    );
+  }
+  if let Some(operand) = operands.first()
+    && globals.argument_is_option(operand)
+  {
+    let option = redact_argument_text(operand);
+    return reject(
+      started,
+      globals,
+      "project root",
+      args,
+      diagnostic(
+        "DV0002",
+        format!("unknown project root option {option:?}"),
+        None,
+        Some("Use `dv project root --help` to inspect the accepted arguments."),
+      ),
+    );
+  }
+
+  let current_directory;
+  let start = if let Some(path) = operands.first() {
+    Path::new(path)
+  } else {
+    current_directory = match env::current_dir() {
+      Ok(directory) => directory,
+      Err(error) => {
+        return fail(
+          started,
+          globals,
+          "project root",
+          args,
+          diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
+        );
+      },
+    };
+    &current_directory
+  };
+  let root = match discover_repository_root(start) {
+    Ok(root) => root,
+    Err(error) => return fail(started, globals, "project root", args, repository_root_diagnostic(error)),
+  };
+  let root_path = match path_text(root.path(), "repository root") {
+    Ok(path) => path,
+    Err(diagnostic) => return fail(started, globals, "project root", args, *diagnostic),
+  };
+  let payload = EventPayload::RepositoryRootDiscovered {
+    root: root_path,
+    kind: root.kind().as_str().into(),
+    marker_probes: root.marker_probes(),
+  };
+  if !globals.json() {
+    let EventPayload::RepositoryRootDiscovered { root, .. } = &payload else {
+      unreachable!("repository root created its typed payload")
+    };
+    println!("{root}");
+    return ExitCode::SUCCESS;
+  }
+  succeed(started, "project root", args, payload)
 }
 
 fn project_package_sources(
@@ -2918,6 +2992,30 @@ fn project_diagnostic(error: ProjectError) -> Diagnostic {
     .context
     .extend(error.into_diagnostic_context().map(|(name, value)| ContextField { name: name.into(), value }));
   result
+}
+
+fn repository_root_diagnostic(error: ProjectError) -> Diagnostic {
+  let code = match error.kind() {
+    ProjectErrorKind::NotFound => "DV0200",
+    ProjectErrorKind::Io => "DV0202",
+    ProjectErrorKind::Unsupported => "DV0204",
+    ProjectErrorKind::NonUnicodePath => "DV0206",
+    ProjectErrorKind::Ambiguous | ProjectErrorKind::InvalidXml | ProjectErrorKind::InvalidProperty => "DV0204",
+  };
+  let help = match error.kind() {
+    ProjectErrorKind::NotFound => Some("Run from a Git worktree or pass a path beneath one."),
+    ProjectErrorKind::Unsupported => Some("Use a regular file or directory beneath a `.git` directory or gitfile."),
+    _ => None,
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    Some(ContextField {
+      name: "path".into(),
+      value: error.path().display().to_string(),
+    }),
+    help,
+  )
 }
 
 fn compiler_plan_diagnostic(error: CompilerPlanError) -> Diagnostic {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 21;
+pub const EVENT_SCHEMA_VERSION: u16 = 22;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -462,6 +462,15 @@ pub enum EventPayload {
     edge_count: u32,
     /// Number of precomputed compatibility indices.
     compatibility_count: u32,
+  },
+  /// The nearest explicit version-control repository boundary was discovered.
+  RepositoryRootDiscovered {
+    /// Absolute, lexically normalized repository root.
+    root: String,
+    /// Stable lowercase repository kind.
+    kind: String,
+    /// Number of marker metadata probes performed.
+    marker_probes: u16,
   },
   /// Runtime, host, native, and apphost inputs were selected for one RID.
   RuntimePackPlanCreated {

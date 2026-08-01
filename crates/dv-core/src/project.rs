@@ -264,6 +264,64 @@ impl WorkspaceSelection {
   }
 }
 
+/// The version-control marker which establishes a repository boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RepositoryKind {
+  /// A Git worktree (`.git` directory or gitfile).
+  Git,
+}
+
+const _: () = assert!(size_of::<RepositoryKind>() == 1);
+const _: () = assert!(align_of::<RepositoryKind>() == 1);
+
+impl RepositoryKind {
+  /// Returns the stable lowercase repository kind.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Git => "git",
+    }
+  }
+
+  const fn marker(self) -> &'static str {
+    match self {
+      Self::Git => ".git",
+    }
+  }
+}
+
+/// One nearest repository boundary discovered independently of project files.
+#[derive(Debug)]
+pub struct RepositoryRoot {
+  path: PathBuf,
+  marker_probes: u16,
+  kind: RepositoryKind,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<RepositoryRoot>() == 40);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<RepositoryRoot>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<RepositoryRoot>() == align_of::<usize>());
+
+impl RepositoryRoot {
+  /// Returns the absolute, lexically normalized repository root.
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Returns the marker kind which established the boundary.
+  pub fn kind(&self) -> RepositoryKind {
+    self.kind
+  }
+
+  /// Returns the number of version-control marker metadata probes performed.
+  pub fn marker_probes(&self) -> u16 {
+    self.marker_probes
+  }
+}
+
 /// NuGet asset families selected by PackageReference metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackageAssetFlags(u8);
@@ -1170,6 +1228,85 @@ pub fn select_workspace(directory: &Path) -> Result<WorkspaceSelection, ProjectE
       Err(error)
     },
   }
+}
+
+/// Finds the nearest explicit version-control boundary without inspecting projects.
+pub fn discover_repository_root(start: &Path) -> Result<RepositoryRoot, ProjectError> {
+  let mut cursor = absolute_path(start)?;
+  let metadata = match fs::metadata(&cursor) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Err(ProjectError::new(
+        ProjectErrorKind::NotFound,
+        &cursor,
+        format!("repository search start {} does not exist", cursor.display()),
+      ));
+    },
+    Err(error) => return Err(io_error("inspect", &cursor, error)),
+  };
+  if metadata.is_file() {
+    if !cursor.pop() {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        start,
+        format!("repository search start {} has no parent directory", start.display()),
+      ));
+    }
+  } else if !metadata.is_dir() {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      &cursor,
+      format!("repository search start {} is not a file or directory", cursor.display()),
+    ));
+  }
+
+  // Reuse one path buffer for every marker probe and ancestor. The successful
+  // path moves directly into the result, so the common path allocates once.
+  cursor.reserve(RepositoryKind::Git.marker().len());
+  let mut marker_probes = 0_u16;
+  loop {
+    marker_probes = marker_probes
+      .checked_add(1)
+      .ok_or_else(|| ProjectError::new(ProjectErrorKind::Unsupported, &cursor, "repository search exceeds 65,535 marker probes"))?;
+    if probe_repository_marker(&mut cursor)? {
+      return Ok(RepositoryRoot {
+        path: cursor,
+        marker_probes,
+        kind: RepositoryKind::Git,
+      });
+    }
+    if !cursor.pop() {
+      break;
+    }
+  }
+
+  Err(ProjectError::new(
+    ProjectErrorKind::NotFound,
+    start,
+    format!("no repository marker was found from {}", start.display()),
+  ))
+}
+
+fn probe_repository_marker(cursor: &mut PathBuf) -> Result<bool, ProjectError> {
+  cursor.push(RepositoryKind::Git.marker());
+  let marker_type = match fs::symlink_metadata(&*cursor) {
+    Ok(metadata) => metadata.file_type(),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      cursor.pop();
+      return Ok(false);
+    },
+    Err(error) => return Err(io_error("inspect repository marker", cursor, error)),
+  };
+  let valid = marker_type.is_file() || marker_type.is_dir();
+  if !valid {
+    return Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      &*cursor,
+      format!("repository marker {} has an unsupported file type", cursor.display()),
+    ));
+  }
+  cursor.pop();
+  Ok(true)
 }
 
 /// Evaluates one explicit SDK-style `.csproj`.
@@ -3251,6 +3388,63 @@ mod tests {
       assert_eq!(field.1, format!("P{index:02}.csproj (C# project)"));
     }
     assert_eq!(context[16], ("remaining_candidates", "2"));
+  }
+
+  #[test]
+  fn repository_root_uses_the_nearest_git_marker_without_project_discovery() {
+    let temp = TempDirectory::new();
+    fs::create_dir(temp.0.join(".git")).unwrap();
+    let nested = temp.0.join("src/tool/deep");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("Ignored.csproj"), b"not parsed").unwrap();
+
+    let root = discover_repository_root(&nested).unwrap();
+
+    assert_eq!(root.path(), temp.0);
+    assert_eq!(root.kind(), RepositoryKind::Git);
+    assert_eq!(root.marker_probes(), 4);
+  }
+
+  #[test]
+  fn repository_root_accepts_a_gitfile_and_a_file_start() {
+    let temp = TempDirectory::new();
+    fs::write(temp.0.join(".git"), b"gitdir: elsewhere").unwrap();
+    let project = temp.write("src/App.csproj", "not parsed");
+
+    let root = discover_repository_root(&project).unwrap();
+
+    assert_eq!(root.path(), temp.0);
+    assert_eq!(root.kind(), RepositoryKind::Git);
+    assert_eq!(root.marker_probes(), 2);
+  }
+
+  #[test]
+  fn repository_root_reports_missing_start_and_missing_marker_separately() {
+    let temp = TempDirectory::new();
+    let missing = temp.0.join("missing");
+
+    let missing_start = discover_repository_root(&missing).unwrap_err();
+    let missing_marker = discover_repository_root(&temp.0).unwrap_err();
+
+    assert_eq!(missing_start.kind(), ProjectErrorKind::NotFound);
+    assert!(missing_start.to_string().contains("does not exist"));
+    assert_eq!(missing_marker.kind(), ProjectErrorKind::NotFound);
+    assert!(missing_marker.to_string().contains("no repository marker"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn repository_root_rejects_a_symlink_marker_until_link_policy_exists() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDirectory::new();
+    fs::create_dir(temp.0.join("metadata")).unwrap();
+    symlink(temp.0.join("metadata"), temp.0.join(".git")).unwrap();
+
+    let error = discover_repository_root(&temp.0).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::Unsupported);
+    assert!(error.to_string().contains("unsupported file type"));
   }
 
   #[test]

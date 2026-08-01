@@ -312,7 +312,7 @@ environment, cancellation, and child-exit contracts.
 
 - Command names and text-only SDK operands must be valid Unicode.
 - Paths remain lossless OS strings until consumed by filesystem APIs.
-- The command syntax version is `3` and is independent of the JSON event schema.
+- The command syntax version is `4` and is independent of the JSON event schema.
 - Every currently accepted alias normalizes to one semantic command kind.
   Executable-token inference remains explicitly open under `DROP-012`; future
   compatibility aliases remain unsupported in their owning `DROP-*` rows.
@@ -325,8 +325,8 @@ regresses beyond benchmark noise relative to the prior release baseline.
 
 ## Independent Protocol Versions
 
-`CLI-017` stores command syntax version 3 as a two-byte transparent value in
-the 6-byte invocation request. Event schema version 21 remains a
+`CLI-017` stores command syntax version 4 as a two-byte transparent value in
+the 6-byte invocation request. Event schema version 22 remains a
 reporter constant. Native `version`, `--version`, and `-V` produce the same
 typed tool-version request. `--compat dotnet --version` produces the typed SDK
 selection request required by the Microsoft spelling. Original tokens remain

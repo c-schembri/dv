@@ -376,7 +376,7 @@ contracts.
 - [x] `CLI-017` Version command syntax and JSON compatibility independently so
   a CLI alias does not mutate the event protocol. The 6-byte typed invocation
   request now carries a two-byte syntax-version value while the reporter owns
-  schema version 21. Native `version`, `--version`, and `-V` normalize to one
+  schema version 22. Native `version`, `--version`, and `-V` normalize to one
   tool-version request; explicit dotnet `--version` instead normalizes to the
   selected-SDK request required by the reference command. Raw alias arguments
   remain reporter evidence rather than protocol selection. The
@@ -537,7 +537,7 @@ contracts.
   uncheckable records in deterministic source order. Dynamic, malformed,
   oversized, and non-UTF-8 input is rejected or retained as uncheckable rather
   than guessed. Human and
-  event-schema-21 JSON output consume the same typed report and name embedded
+  event-schema-22 JSON output consume the same typed report and name embedded
   compatibility manifest version 1. No discovered command, SDK tool, or
   network request is executed. The release benchmark measured `5.791 ms`
   median and `7.314 ms` p95 on Windows across 50 retained samples; Microsoft
@@ -569,7 +569,7 @@ contracts.
   matches the process and otherwise resolves the architecture-specific
   Windows registry or Unix registration before platform-supported defaults.
   Native `sdk runtimes` uses the same typed runtime inventory, while the
-  existing `sdk list` remains selection-aware; JSON emits one schema-21 batch.
+  existing `sdk list` remains selection-aware; JSON emits one schema-22 batch.
   Incomplete SDK directories are excluded using the same `dotnet.dll`
   completeness boundary. Complete `--info`, diagnostics, and the remaining
   root-driver grammar stay explicit unfinished work. Two hundred warm Windows
@@ -724,8 +724,14 @@ contracts.
   transform. Thirty warm Windows samples measured Microsoft at `303.399 ms`
   median and `320.158 ms` p95 versus `6.051 ms` and `7.540 ms` for `dv`, a
   `50.1x` median improvement. `P1`
-- [ ] `WS-004` Define repository root discovery independently from project
-  selection. `P1`
+- [x] `WS-004` Define repository root discovery independently from project
+  selection. One absolute path buffer walks parents linearly and performs one
+  `.git` metadata probe per ancestor without enumerating or parsing projects.
+  Existing file and directory starts, gitfiles, missing starts, absent roots,
+  invalid marker types, and the 65,535-probe bound have explicit behavior.
+  Thirty warm Windows samples measured Microsoft at `137.639 ms` median and
+  `161.395 ms` p95 versus `5.007 ms` and `5.696 ms` for `dv`, a `27.5x` median
+  improvement. `P1`
 - [ ] `WS-005` Discover nearest ancestor `global.json`, `NuGet.Config`,
   `Directory.Build.props`, `Directory.Build.targets`, and
   `Directory.Packages.props` with their distinct precedence rules. `P1`

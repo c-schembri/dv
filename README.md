@@ -25,6 +25,7 @@ test, pack, and publish workflows are not complete yet.
 - Discover and select installed .NET SDKs using `global.json` rules.
 - List installed SDKs and shared runtimes, including architecture selection.
 - Inspect SDK-style C# projects and select explicit or implicit project files.
+- Discover the nearest Git repository root without project evaluation.
 - Evaluate conditional project, package, and framework references.
 - Plan framework, runtime-pack, apphost, and Roslyn compiler inputs.
 - Resolve and cache NuGet dependencies from v2, v3, and local sources.
@@ -61,6 +62,9 @@ target\release\dv.exe sdk runtimes
 # Inspect a project
 target\release\dv.exe project inspect path\to\App.csproj
 
+# Find the nearest Git repository root
+target\release\dv.exe project root path\to\working-directory
+
 # Create a compiler input plan without compiling
 target\release\dv.exe build --plan path\to\App.csproj
 
@@ -92,6 +96,7 @@ Results from different machines are not directly comparable.
 | Print build help | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x |
 | Evaluate a project | `dotnet msbuild SmallConsole.csproj` query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x |
 | Select and evaluate the only project | `dotnet msbuild` query | `dv project inspect --json` | 303.399 ms | 6.051 ms | 50.1x |
+| Find the nearest repository root | `dotnet msbuild` ancestor query | `dv project root nested/src` | 137.639 ms | 5.007 ms | 27.5x |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x |
 | Cold one-package restore | `dotnet restore PackageConsole.csproj` | `dv restore PackageConsole.csproj` | 1028.951 ms | 417.981 ms | 2.5x |
 | Cold 50-package restore | `dotnet restore LargePackageGraph.csproj` | `dv restore LargePackageGraph.csproj` | 1425.299 ms | 632.458 ms | 2.3x |

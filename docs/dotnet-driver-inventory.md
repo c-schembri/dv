@@ -64,7 +64,7 @@ the stated records-per-line count, not the 16-byte record contract.`
 Tests cover all ten architecture names, case-insensitive typed parsing,
 incomplete SDK directories, deterministic runtime ordering, current-host root
 selection, malformed-argument rejection before unrelated SDK input, exact
-Microsoft row shapes, and the schema-21 runtime event batch. Benchmark
+Microsoft row shapes, and the schema-22 runtime event batch. Benchmark
 preflight compares current and x86 SDK/runtime output with Microsoft and
 verifies the fixture is unchanged.
 
