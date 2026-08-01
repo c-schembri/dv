@@ -53,8 +53,8 @@ dv RID/content (warm)            7.589 ms median
 dotnet PackageReference policy 456.722 ms median
 dv PackageReference policy       6.611 ms median
 
-dotnet legacy package pruning  636.670 ms median
-dv legacy package pruning        9.698 ms median
+dotnet legacy package pruning  492.588 ms median
+dv legacy package pruning        7.339 ms median
 
 dotnet central package restore 461.826 ms median
 dv central package restore      29.864 ms median
@@ -400,7 +400,7 @@ Initial machine:
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
-| Apply .NET 9 Core and ASP.NET package pruning on a warm locked graph | `dotnet restore LegacyPruningProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore LegacyPruningProject.csproj --packages .packages --offline --json` | 636.670 ms | 9.698 ms | 65.7x | 1254.781 ms | 12.624 ms |
+| Apply .NET 9 Core and ASP.NET package pruning on a warm locked graph | `dotnet restore LegacyPruningProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore LegacyPruningProject.csproj --packages .packages --offline --json` | 492.588 ms | 7.339 ms | 67.1x | 544.651 ms | 8.434 ms |
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
 | Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
@@ -496,7 +496,7 @@ package-pruning case opts a `net9.0` project into the SDK behavior and merges
 the implicit Core plus direct ASP.NET framework tables. Preflight restores the
 same locked `Newtonsoft.Json` graph, while focused SDK-oracle checks require
 the same 420 pruning identities and stable patch ceilings. Thirty samples
-measure `636.670 ms` for Microsoft and `9.698 ms` for `dv` (`65.7x`), with no
+measure `492.588 ms` for Microsoft and `7.339 ms` for `dv` (`67.1x`), with no
 timed network or download work. The
 central-package case resolves the same 54 identities through versionless
 direct references, an override, a global SourceLink reference, and a

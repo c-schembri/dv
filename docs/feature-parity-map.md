@@ -991,8 +991,8 @@ boundary, not final drop-in parity.
   the SDK's nearest compatible generated fallback. Stable package versions get
   the SDK's patch ceiling, pruned graph edges retract, and the compact semantic
   table fingerprints warm locks. The generated .NET 8/9 Core and ASP.NET
-  counts match MSBuild at 418/420. Thirty warm samples measure `636.670 ms`
-  for Microsoft restore versus `9.698 ms` for `dv` (`65.7x`). `P2`
+  counts match MSBuild at 418/420. Thirty warm samples measure `492.588 ms`
+  for Microsoft restore versus `7.339 ms` for `dv` (`67.1x`). `P2`
 - [x] `RES-013` Stream exact `.nupkg` content through SHA-512 into bounded
   temporary storage. `P1`
 - [x] `RES-014` Verify package identity, version, v2 source hash/size, ZIP

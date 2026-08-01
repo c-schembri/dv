@@ -30,10 +30,10 @@ dv restore LegacyPruningProject.csproj --packages .packages --offline --json
 
 | Tool | Median | P95 | Min | Max |
 |---|---:|---:|---:|---:|
-| Microsoft | 636.670 ms | 1254.781 ms | 468.276 ms | 1411.643 ms |
-| `dv` | 9.698 ms | 12.624 ms | 7.785 ms | 17.565 ms |
+| Microsoft | 492.588 ms | 544.651 ms | 476.067 ms | 723.315 ms |
+| `dv` | 7.339 ms | 8.434 ms | 6.643 ms | 8.804 ms |
 
-`dv` is 65.7x faster by median. The timed interval includes process startup,
+`dv` is 67.1x faster by median. The timed interval includes process startup,
 project evaluation, selected-SDK framework mapping, generated legacy-table
 selection and compaction, semantic fingerprinting, and warm lock validation.
 
