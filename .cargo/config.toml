@@ -1,5 +1,5 @@
 [build]
-jobs = -1
+jobs = "default"
 
 [alias]
 bench-all = "run -p dv-bench --release --"
