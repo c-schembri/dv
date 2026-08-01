@@ -354,6 +354,60 @@ fn project_inspect_rejects_ambiguous_selection() {
 }
 
 #[test]
+fn project_inspect_accepts_named_file_and_directory_selection() {
+  let temp = TempDirectory::new();
+  temp.write("Program.cs", "");
+  temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+  );
+
+  for arguments in [
+    vec!["project", "inspect", "--project", "App.csproj", "--json"],
+    vec!["project", "inspect", "--project=App.csproj", "--json"],
+    vec!["project", "inspect", "--project", ".", "--json"],
+  ] {
+    let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8(output.stdout).unwrap().contains("\"type\":\"project_evaluated\""));
+  }
+}
+
+#[test]
+fn malformed_project_selection_fails_before_project_io() {
+  let temp = TempDirectory::new();
+  for arguments in [
+    vec!["project", "inspect", "Missing.csproj", "--project", "Other.csproj"],
+    vec!["project", "inspect", "--project", "Missing.csproj", "--project", "Other.csproj"],
+    vec!["project", "inspect", "--project="],
+    vec!["project", "inspect", "--project", "--configuration", "Release"],
+  ] {
+    let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0002]"));
+    assert!(!stderr.contains("error[DV020"));
+  }
+}
+
+#[test]
+fn explicit_solution_selection_is_typed_before_solution_evaluation() {
+  let temp = TempDirectory::new();
+  temp.write("App.sln", "Microsoft Visual Studio Solution File, Format Version 12.00\n");
+  temp.write("App.slnx", "<Solution />\n");
+
+  for solution in ["App.sln", "App.slnx"] {
+    let output = dv().args(["project", "inspect", "--project", solution]).current_dir(&temp.0).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0204]"));
+    assert!(stderr.contains("accepts only C# .csproj files"));
+    assert!(!stderr.contains("ambiguous"));
+  }
+}
+
+#[test]
 fn restore_applies_the_selected_configuration_before_package_validation() {
   let temp = TempDirectory::new();
   temp.write(

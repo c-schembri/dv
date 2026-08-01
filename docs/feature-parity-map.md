@@ -276,8 +276,14 @@ contracts.
   classes internally. Explicit `dotnet`, MSBuild, NuGet, and VSTest profiles
   map typed usage, unsupported, and operation failures to the exit behavior
   observed from SDK `10.0.100`; native failures retain stable code 2. `P1`
-- [ ] `CLI-008` Support `--project`, explicit project/solution paths, and
-  unambiguous current-directory defaults. `P1`
+- [x] `CLI-008` Support `--project`, explicit project/solution paths, and
+  unambiguous current-directory defaults. One borrowed typed selector is shared
+  by the current inspect, plan, restore, sync, framework, runtime-pack, and
+  package-source commands; malformed mixed/repeated selection fails before
+  project I/O. Solution selection is typed here while solution evaluation
+  remains owned by `SLN-001` through `SLN-011`. The like-for-like named-project
+  query measured `328.778 ms` for Microsoft versus `6.204 ms` for `dv`
+  (`53.0x`). `P1`
 - [ ] `CLI-009` Support repeated CLI property overrides without reparsing
   strings in downstream stages. `P2`
 - [ ] `CLI-010` Support configuration, framework, runtime, architecture,

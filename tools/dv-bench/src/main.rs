@@ -149,6 +149,18 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "project_select_named",
+    kind: CaseKind::ProjectEvaluate,
+    args: &[
+      "msbuild",
+      "SmallConsole.csproj",
+      "--nologo",
+      "-getProperty:TargetFramework,OutputType,Nullable,ImplicitUsings,AssemblyName,RootNamespace,Configuration,Deterministic",
+      "-getItem:Compile,ProjectReference,PackageReference",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "package_reference_conditions",
     kind: CaseKind::PackageReferenceConditions,
     args: &[
@@ -730,6 +742,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "project_select_named",
+    kind: CaseKind::ProjectEvaluate,
+    args: &["project", "inspect", "--project", "SmallConsole.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "package_reference_conditions",
     kind: CaseKind::PackageReferenceConditions,
     args: &["project", "inspect", "ConditionalReferences.csproj", "--configuration", "Release", "--json"],
@@ -1170,7 +1188,10 @@ fn run() -> Result<()> {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
-    verify_project_evaluation(&dv_executable, &fixture)?;
+    verify_project_evaluation(&dv_executable, &fixture, false)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "project_select_named") {
+    verify_project_evaluation(&dv_executable, &fixture, true)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "package_reference_conditions") {
     verify_package_reference_conditions(&dv_executable, &package_reference_conditions_fixture)?;
@@ -1348,7 +1369,7 @@ fn verify_rid_graph(repository: &Path, dv_executable: &Path, fixture: &Path) -> 
   Ok(())
 }
 
-fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()> {
+fn verify_project_evaluation(dv_executable: &Path, fixture: &Path, named_selection: bool) -> Result<()> {
   let dotnet_text = command_text(
     Path::new("dotnet"),
     &[
@@ -1361,7 +1382,12 @@ fn verify_project_evaluation(dv_executable: &Path, fixture: &Path) -> Result<()>
     fixture,
   )?;
   let dotnet: serde_json::Value = serde_json::from_str(&dotnet_text)?;
-  let dv_text = command_text(dv_executable, &["project", "inspect", "SmallConsole.csproj", "--json"], fixture)?;
+  let dv_arguments = if named_selection {
+    &["project", "inspect", "--project", "SmallConsole.csproj", "--json"][..]
+  } else {
+    &["project", "inspect", "SmallConsole.csproj", "--json"][..]
+  };
+  let dv_text = command_text(dv_executable, dv_arguments, fixture)?;
   let dv = dv_text
     .lines()
     .map(serde_json::from_str::<serde_json::Value>)
@@ -7628,6 +7654,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current_compat" => "SDK selection + compatibility",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
+    "project_select_named" => "Named project selection",
     "package_reference_conditions" => "Conditional references",
     "runtime_pack_plan" => "Runtime pack plan",
     "runtime_pack_inventory_cold" => "Cold runtime pack inventory",

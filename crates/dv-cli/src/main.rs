@@ -64,12 +64,14 @@ Usage:
 
 const PROJECT_HELP: &str = "\
 Usage:
-  dv project inspect [PROJECT] [--configuration Debug|Release]
-  dv project frameworks [PROJECT] [--packages PATH]
+  dv project inspect [PROJECT|SOLUTION] [--project PATH]
+                     [--configuration Debug|Release]
+  dv project frameworks [PROJECT|SOLUTION] [--project PATH] [--packages PATH]
                         [--configuration Debug|Release]
-  dv project runtime-packs [PROJECT] [--packages PATH]
+  dv project runtime-packs [PROJECT|SOLUTION] [--project PATH] [--packages PATH]
                            [--configuration Debug|Release]
-  dv project package-sources [PROJECT] [-s|--source SOURCE]...
+  dv project package-sources [PROJECT|SOLUTION] [--project PATH]
+                             [-s|--source SOURCE]...
                              [--configfile PATH] [--offline] [--interactive]
                              [--configuration Debug|Release]
                              [--probe-credentials]
@@ -77,15 +79,18 @@ Usage:
 
 const BUILD_HELP: &str = "\
 Usage:
-  dv build --plan [PROJECT] [--configuration Debug|Release]
+  dv build --plan [PROJECT|SOLUTION] [--project PATH]
+                  [--configuration Debug|Release]
 ";
 
 const PACKAGE_HELP: &str = "\
 Usage:
-  dv restore [PROJECT]... [-s|--source SOURCE]... [--packages PATH]
+  dv restore [PROJECT|SOLUTION]... [--project PATH]
+             [-s|--source SOURCE]... [--packages PATH]
              [--configfile PATH] [--offline] [--interactive]
              [--configuration Debug|Release]
-  dv sync [PROJECT]... [-s|--source SOURCE]... [--packages PATH]
+  dv sync [PROJECT|SOLUTION]... [--project PATH]
+          [-s|--source SOURCE]... [--packages PATH]
           [--configfile PATH] [--offline] [--interactive]
           [--configuration Debug|Release]
 ";
@@ -213,19 +218,9 @@ fn run_package_command(started: Instant, globals: InvocationOptions, command: &s
     },
   };
   let configuration = options.configuration.unwrap_or(ProjectConfiguration::Debug);
-  let requested = options
-    .project
-    .iter()
-    .chain(&options.additional_projects)
-    .map(PathBuf::as_path)
-    .collect::<Vec<_>>();
-  let mut projects = Vec::with_capacity(requested.len().max(1));
+  let mut projects = Vec::with_capacity(options.additional_projects.len() + 1);
   let mut seen = Vec::<PathBuf>::new();
-  let roots = if requested.is_empty() {
-    vec![None]
-  } else {
-    requested.into_iter().map(Some).collect()
-  };
+  let roots = std::iter::once(options.project.path()).chain(options.additional_projects.iter().copied().map(Some));
   for requested in roots {
     let root = match load_project(&current_directory, requested, configuration) {
       Ok(project) => project,
@@ -276,7 +271,7 @@ fn run_package_command(started: Instant, globals: InvocationOptions, command: &s
   succeed_batch_with_diagnostics(started, globals, command, args, diagnostics, payloads)
 }
 
-fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
+fn normalize_package_options(options: PackageCommandOptions<'_>, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
   let cancellation = install_credential_provider_cancellation()?;
   Ok(PackageResolveOptions {
     packages_directory: options
@@ -312,9 +307,65 @@ fn install_credential_provider_cancellation() -> Result<Option<PackageCancellati
   Ok(Some(cancellation))
 }
 
-struct PackageCommandOptions {
-  project: Option<PathBuf>,
-  additional_projects: Vec<PathBuf>,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProjectSelection<'a> {
+  #[default]
+  CurrentDirectory,
+  Positional(&'a Path),
+  Named(&'a Path),
+}
+
+impl<'a> ProjectSelection<'a> {
+  fn path(self) -> Option<&'a Path> {
+    match self {
+      Self::CurrentDirectory => None,
+      Self::Positional(path) | Self::Named(path) => Some(path),
+    }
+  }
+
+  fn select_positional(&mut self, path: &'a OsStr) -> Result<(), String> {
+    if path.is_empty() {
+      return Err("project or solution path must not be empty".into());
+    }
+    match self {
+      Self::CurrentDirectory => {
+        *self = Self::Positional(Path::new(path));
+        Ok(())
+      },
+      Self::Named(_) => Err("--project cannot be combined with a positional project or solution path".into()),
+      Self::Positional(_) => Err("a project or solution path cannot be specified more than once".into()),
+    }
+  }
+
+  fn select_named(&mut self, path: &'a OsStr) -> Result<(), String> {
+    if path.is_empty() {
+      return Err("--project requires a project or solution path".into());
+    }
+    match self {
+      Self::CurrentDirectory => {
+        *self = Self::Named(Path::new(path));
+        Ok(())
+      },
+      Self::Named(_) => Err("--project cannot be specified more than once".into()),
+      Self::Positional(_) => Err("--project cannot be combined with a positional project or solution path".into()),
+    }
+  }
+
+  fn is_positional(self) -> bool {
+    matches!(self, Self::Positional(_))
+  }
+}
+
+// One borrowed fat path plus a compact source tag; this singleton lives only
+// for argument parsing and performs no path allocation in the common case.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ProjectSelection<'_>>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<ProjectSelection<'_>>() == std::mem::align_of::<usize>());
+
+struct PackageCommandOptions<'a> {
+  project: ProjectSelection<'a>,
+  additional_projects: Vec<&'a Path>,
   configuration: Option<ProjectConfiguration>,
   packages_directory: Option<PathBuf>,
   config_file: Option<PathBuf>,
@@ -324,9 +375,9 @@ struct PackageCommandOptions {
   probe_credentials: bool,
 }
 
-fn parse_package_args(command: &str, arguments: CommandArguments<'_>) -> Result<PackageCommandOptions, String> {
+fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Result<PackageCommandOptions<'a>, String> {
   let mut options = PackageCommandOptions {
-    project: None,
+    project: ProjectSelection::default(),
     additional_projects: Vec::new(),
     configuration: None,
     packages_directory: None,
@@ -338,7 +389,8 @@ fn parse_package_args(command: &str, arguments: CommandArguments<'_>) -> Result<
   };
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].to_str() {
+    let argument = arguments.get(index).expect("bounded project option index is valid");
+    match argument.to_str() {
       Some("--configuration") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration") => {
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
@@ -352,6 +404,13 @@ fn parse_package_args(command: &str, arguments: CommandArguments<'_>) -> Result<
         }
         let value = &value["--configuration=".len()..];
         options.configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
+      },
+      Some("--project") => {
+        let path = take_project_value(arguments, &mut index, false)?;
+        options.project.select_named(path)?;
+      },
+      Some(value) if value.starts_with("--project=") => {
+        options.project.select_named(OsStr::new(&value["--project=".len()..]))?;
       },
       Some("--packages") if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
       Some("--packages") => {
@@ -411,9 +470,17 @@ fn parse_package_args(command: &str, arguments: CommandArguments<'_>) -> Result<
       Some("--interactive") => options.interactive = true,
       Some("--probe-credentials") if command == "project package-sources" => options.probe_credentials = true,
       Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {value:?}")),
-      _ if options.project.is_none() => options.project = Some(PathBuf::from(&arguments[index])),
-      _ if matches!(command, "restore" | "sync") => options.additional_projects.push(PathBuf::from(&arguments[index])),
-      _ => return Err(format!("unexpected {command} argument {:?}", arguments[index].to_string_lossy())),
+      _ if matches!(options.project, ProjectSelection::CurrentDirectory) => options.project.select_positional(argument)?,
+      _ if matches!(command, "restore" | "sync") && options.project.is_positional() => {
+        if argument.is_empty() {
+          return Err("project or solution path must not be empty".into());
+        }
+        options.additional_projects.push(Path::new(argument));
+      },
+      _ if matches!(options.project, ProjectSelection::Named(_)) => {
+        return Err("--project cannot be combined with a positional project or solution path".into());
+      },
+      _ => return Err(format!("unexpected {command} argument {:?}", argument.to_string_lossy())),
     }
     index += 1;
   }
@@ -427,6 +494,16 @@ fn take_semantic_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, i
     if !ignore_plan || value != "--plan" {
       return Ok(value);
     }
+  }
+}
+
+fn take_project_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, ignore_plan: bool) -> Result<&'a OsStr, &'static str> {
+  const MISSING: &str = "--project requires a project or solution path";
+  let value = take_semantic_value(arguments, index, ignore_plan, MISSING)?;
+  if value.to_str().is_some_and(|value| value.starts_with('-')) {
+    Err(MISSING)
+  } else {
+    Ok(value)
   }
 }
 
@@ -502,7 +579,7 @@ fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, bu
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+  let project = match load_project(&current_directory, requested_path.path(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "build --plan", args, project_diagnostic(error)),
   };
@@ -1027,7 +1104,7 @@ fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, 
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+  let project = match load_project(&current_directory, requested_path.path(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project inspect", args, project_diagnostic(error)),
   };
@@ -1128,7 +1205,7 @@ fn project_package_sources(started: Instant, globals: InvocationOptions, args: V
     },
   };
   let configuration = parsed.configuration.unwrap_or(ProjectConfiguration::Debug);
-  let project = match load_project(&current_directory, parsed.project.as_deref(), configuration) {
+  let project = match load_project(&current_directory, parsed.project.path(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project package-sources", args, project_diagnostic(error)),
   };
@@ -1275,7 +1352,7 @@ fn project_frameworks(started: Instant, globals: InvocationOptions, args: Vec<St
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+  let project = match load_project(&current_directory, requested_path.path(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project frameworks", args, project_diagnostic(error)),
   };
@@ -1357,7 +1434,7 @@ fn project_runtime_packs(started: Instant, globals: InvocationOptions, args: Vec
       );
     },
   };
-  let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
+  let project = match load_project(&current_directory, requested_path.path(), configuration) {
     Ok(project) => project,
     Err(error) => return fail(started, globals, "project runtime-packs", args, project_diagnostic(error)),
   };
@@ -1401,15 +1478,23 @@ fn project_runtime_packs(started: Instant, globals: InvocationOptions, args: Vec
   )
 }
 
-fn parse_pack_plan_args(arguments: CommandArguments<'_>, command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
-  let mut project = None;
+fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> Result<(ProjectSelection<'a>, Option<PathBuf>, ProjectConfiguration), String> {
+  let mut project = ProjectSelection::default();
   let mut packages = None;
   let mut configuration = None;
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].to_str() {
+    let argument = arguments.get(index).expect("bounded project option index is valid");
+    match argument.to_str() {
       Some("--packages") => {
         packages = Some(PathBuf::from(take_semantic_value(arguments, &mut index, false, "--packages requires a path")?));
+      },
+      Some("--project") => {
+        let path = take_project_value(arguments, &mut index, false)?;
+        project.select_named(path)?;
+      },
+      Some(value) if value.starts_with("--project=") => {
+        project.select_named(OsStr::new(&value["--project=".len()..]))?;
       },
       Some("--configuration") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration") => {
@@ -1426,22 +1511,33 @@ fn parse_pack_plan_args(arguments: CommandArguments<'_>, command: &str) -> Resul
         configuration = Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?);
       },
       Some(value) if value.starts_with('-') => return Err(format!("unknown project {command} option {value:?}")),
-      _ if project.is_none() => project = Some(PathBuf::from(&arguments[index])),
-      _ => return Err(format!("unexpected project {command} argument {:?}", arguments[index].to_string_lossy())),
+      _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
+      _ if matches!(project, ProjectSelection::Named(_)) => {
+        return Err("--project cannot be combined with a positional project or solution path".into());
+      },
+      _ => return Err(format!("unexpected project {command} argument {:?}", argument.to_string_lossy())),
     }
     index += 1;
   }
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
-fn parse_project_args(arguments: CommandArguments<'_>, ignore_plan: bool) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
-  let mut project = None;
+fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
+  let mut project = ProjectSelection::default();
   let mut configuration = ProjectConfiguration::Debug;
   let mut index = 0;
   while index < arguments.len() {
-    match arguments[index].to_str() {
+    let argument = arguments.get(index).expect("bounded project option index is valid");
+    match argument.to_str() {
       Some("--plan") if ignore_plan => {},
       Some("-h" | "--help" | "help") => return Err("help must be requested as `dv project --help`".into()),
+      Some("--project") => {
+        let path = take_project_value(arguments, &mut index, ignore_plan)?;
+        project.select_named(path)?;
+      },
+      Some(value) if value.starts_with("--project=") => {
+        project.select_named(OsStr::new(&value["--project=".len()..]))?;
+      },
       Some("--configuration") => {
         let value = take_semantic_value(arguments, &mut index, ignore_plan, "--configuration requires Debug or Release")?
           .to_str()
@@ -1449,8 +1545,11 @@ fn parse_project_args(arguments: CommandArguments<'_>, ignore_plan: bool) -> Res
         configuration = ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {value:?} is unsupported"))?;
       },
       Some(value) if value.starts_with('-') => return Err(format!("unknown project option {value:?}")),
-      _ if project.is_none() => project = Some(PathBuf::from(&arguments[index])),
-      _ => return Err(format!("unexpected project argument {:?}", arguments[index].to_string_lossy())),
+      _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
+      _ if matches!(project, ProjectSelection::Named(_)) => {
+        return Err("--project cannot be combined with a positional project or solution path".into());
+      },
+      _ => return Err(format!("unexpected project argument {:?}", argument.to_string_lossy())),
     }
     index += 1;
   }
@@ -2206,8 +2305,51 @@ mod argument_tests {
     let batch = InvocationBatch::capture([OsString::from("project"), path.clone()]);
     let (parsed, configuration) = parse_project_args(batch.command_arguments(), false).unwrap();
 
-    assert_eq!(parsed, Some(PathBuf::from(path)));
+    assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
     assert_eq!(configuration, ProjectConfiguration::Debug);
+  }
+
+  #[test]
+  fn named_project_paths_retain_their_os_encoding() {
+    let path = non_unicode_path();
+    let batch = InvocationBatch::capture([OsString::from("project"), OsString::from("--project"), path.clone()]);
+    let (parsed, _) = parse_project_args(batch.command_arguments(), false).unwrap();
+
+    assert!(matches!(parsed, ProjectSelection::Named(_)));
+    assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
+
+    let batch = InvocationBatch::capture([OsString::from("frameworks"), OsString::from("--project"), path.clone()]);
+    let (parsed, _, _) = parse_pack_plan_args(batch.command_arguments(), "frameworks").unwrap();
+    assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
+
+    let batch = InvocationBatch::capture([OsString::from("restore"), OsString::from("--project"), path.clone()]);
+    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    assert_eq!(parsed.project.path().map(Path::as_os_str), Some(path.as_os_str()));
+  }
+
+  #[test]
+  fn project_selection_rejects_repeated_mixed_and_empty_paths() {
+    for arguments in [
+      vec!["project", "--project", "App.csproj", "--project", "Other.csproj"],
+      vec!["project", "App.csproj", "--project", "Other.csproj"],
+      vec!["project", "--project", "App.csproj", "Other.csproj"],
+      vec!["project", "--project="],
+      vec!["project", "--project", "--configuration", "Release"],
+    ] {
+      let batch = InvocationBatch::capture(arguments.into_iter().map(OsString::from));
+      assert!(parse_project_args(batch.command_arguments(), false).is_err());
+    }
+  }
+
+  #[test]
+  fn restore_keeps_positional_batches_but_named_selection_is_singular() {
+    let batch = InvocationBatch::capture(["restore", "App.csproj", "Library.csproj"].map(OsString::from));
+    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    assert_eq!(parsed.project.path(), Some(Path::new("App.csproj")));
+    assert_eq!(parsed.additional_projects, [Path::new("Library.csproj")]);
+
+    let batch = InvocationBatch::capture(["restore", "--project", "App.csproj", "Library.csproj"].map(OsString::from));
+    assert!(parse_package_args("restore", batch.command_arguments()).is_err());
   }
 
   #[test]

@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 58 rows are implemented;
+- 59 rows are implemented;
 - 32 rows have partial foundations;
-- 378 rows are missing;
+- 377 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -132,8 +132,9 @@ cache publication. Network work is outside the verification benchmark.
 
 ### Wave 1: Invocation And Manifest Spine
 
-Status: in progress; `CLI-005` through `CLI-007` are complete, explicit
-compatibility exit profiles are available, and the broader foundations of
+Status: in progress; `CLI-005` through `CLI-008` are complete, explicit
+compatibility exit profiles and allocation-free named project selection are
+available, and the broader foundations of
 `DROP-002`, `DROP-003`, `DROP-011`, and `DROP-016` are partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command
