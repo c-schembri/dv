@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `20`;
+- schema version `21`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -45,6 +45,7 @@ items.
 - `cache_decision`
 - `sdk_selected`
 - `sdk_inventory`
+- `runtime_inventory`
 - `runtime_compatibility`
 - `runtime_pack_plan_created`
 - `framework_reference_plan_created`
@@ -56,6 +57,9 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
+Schema 21 adds `runtime_inventory`, a single ordered batch of installed shared
+framework family, version, and path rows used by the native and compatible
+runtime inventory queries.
 Schema 19 adds the independently versioned command grammar to
 `command_started` and introduces `tool_version`, which reports the executable,
 command-syntax, and event-schema versions without coupling any of them. The

@@ -1,9 +1,24 @@
 {
   "schema_version": 1,
   "manifest_version": 1,
-  "dv_command_syntax_version": 2,
-  "dv_event_schema_version": 20,
+  "dv_command_syntax_version": 3,
+  "dv_event_schema_version": 21,
   "commands": [
+    {
+      "tool": "dotnet",
+      "path": [],
+      "canonical_path": ["sdk"],
+      "status": "partial",
+      "parity_rows": ["DNCLI-001", "SDK-005", "SDK-007"],
+      "dimensions": {
+        "options": "partial",
+        "arguments": "missing",
+        "defaults": "partial",
+        "environment": "partial",
+        "exits": "partial",
+        "outputs": "partial"
+      }
+    },
     {
       "tool": "dotnet",
       "path": ["build"],

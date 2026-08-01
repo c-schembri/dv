@@ -37,7 +37,7 @@ ordered paths
 
 The report owns contiguous input and invocation vectors until reporting ends.
 Each invocation stores its input index plus one-based line/column instead of a
-path copy. Human and JSON output render the same batch. JSON uses event schema 20;
+path copy. Human and JSON output render the same batch. JSON uses event schema 21;
 the report separately identifies compatibility manifest version 1. A check
 returns exit 0 only when every retained record is `implemented`; `partial`,
 `missing`, and `uncheckable` records return the native unsupported exit 2.
@@ -53,7 +53,7 @@ parse and each lookup scans only the chosen tool's bounded command batch.
 
 `CompatibilitySupport` and the internal tool key are one byte, each command
 range is four bytes, and each stack token is 12 bytes. The 64-token line batch
-therefore occupies 768 stack bytes. The 270,158-byte release manifest is
+therefore occupies 768 stack bytes. The 270,192-byte release manifest is
 projected at build time into immutable static command slices, ranges, and only
 unresolved row IDs. On 64-bit builds each three-field command record is 40 bytes:
 the 115-record table occupies 4,600 bytes before its borrowed path/row slices,

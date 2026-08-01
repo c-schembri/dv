@@ -34,7 +34,8 @@ pub use event::{
   CacheOutcome, CentralPackageVersionEvent, CompatibilityInputEvent, CompatibilityInvocationEvent, CompatibilitySupport, CompilerReferenceAliasEvent,
   ContentFileEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome, PackageHttpPolicyEvent,
   PackagePathPropertyEvent, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceWorkEvent, ProjectFrameworkReferenceEvent,
-  ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent, SdkInstallationEvent, validate_events,
+  ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeInstallationEvent, RuntimeTargetEvent, SdkInstallationEvent,
+  validate_events,
 };
 pub use framework::{FrameworkFamily, TargetFramework, TargetFrameworkError};
 pub use framework_reference::{
@@ -54,4 +55,7 @@ pub use redaction::redact_url_for_output;
 pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};
 pub use runtime_pack::{RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, plan_runtime_packs};
-pub use sdk::{SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion, discover_sdks, discover_sdks_in_roots};
+pub use sdk::{
+  InstalledSdkInventory, RuntimeInstallation, RuntimeInventory, SdkError, SdkErrorKind, SdkInstallation, SdkInventory, SdkVersion, discover_installed_sdks,
+  discover_runtimes, discover_runtimes_in_roots, discover_sdks, discover_sdks_in_roots,
+};

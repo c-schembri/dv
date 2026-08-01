@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-const COMMAND_SYNTAX_VERSION: u16 = 2;
+const COMMAND_SYNTAX_VERSION: u16 = 3;
 const MAX_COMMANDS: usize = 512;
 const MAX_COMMAND_DEPTH: usize = 4;
 const MAX_STREAM_BYTES: usize = 1024 * 1024;
@@ -475,8 +475,9 @@ fn validate_support_source(source: &SupportSource) -> Result<()> {
   }
   let mut keys = BTreeSet::new();
   for command in &source.commands {
-    if command.path.is_empty() || command.canonical_path.is_empty() || !keys.insert((command.tool.as_str(), command.path.as_slice())) {
-      return Err("support commands require unique nonempty tool/path and canonical paths".into());
+    let invalid_root = command.path.is_empty() && command.tool != "dotnet";
+    if invalid_root || command.canonical_path.is_empty() || !keys.insert((command.tool.as_str(), command.path.as_slice())) {
+      return Err("support commands require unique paths and nonempty canonical paths; only dotnet may declare the root path".into());
     }
   }
   Ok(())

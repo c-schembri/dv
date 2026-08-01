@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 20;
+pub const EVENT_SCHEMA_VERSION: u16 = 21;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -152,6 +152,17 @@ pub struct SdkInstallationEvent {
   pub path: String,
   /// Whether this record was selected.
   pub selected: bool,
+}
+
+/// One installed shared framework materialized at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeInstallationEvent {
+  /// Shared-framework family, such as `Microsoft.NETCore.App`.
+  pub family: String,
+  /// Installed runtime version.
+  pub version: String,
+  /// Full shared-framework directory.
+  pub path: String,
 }
 
 /// One RID-specific package runtime target.
@@ -429,6 +440,11 @@ pub enum EventPayload {
     installations: Vec<SdkInstallationEvent>,
     /// `global.json` used for selection, when present.
     global_json: Option<String>,
+  },
+  /// The installed shared-framework batch was discovered.
+  RuntimeInventory {
+    /// Runtime records in deterministic root, family, and version order.
+    installations: Vec<RuntimeInstallationEvent>,
   },
   /// One SDK-owned runtime identifier was expanded through the portable graph.
   RuntimeCompatibility {

@@ -216,8 +216,8 @@ fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery
   let manifest: serde_json::Value = serde_json::from_slice(expected).unwrap();
   assert_eq!(manifest["schema_version"], 1);
   assert_eq!(manifest["manifest_version"], 1);
-  assert_eq!(manifest["command_syntax_version"], 2);
-  assert_eq!(manifest["event_schema_version"], 20);
+  assert_eq!(manifest["command_syntax_version"], 3);
+  assert_eq!(manifest["event_schema_version"], 21);
   assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
   assert!(manifest["commands"].as_array().unwrap().len() >= 100);
   assert_eq!(manifest["parity_rows"].as_array().unwrap().len(), 468);
@@ -269,7 +269,7 @@ fn compatibility_check_scans_literal_scripts_and_projects_without_execution() {
     .lines()
     .map(|line| serde_json::from_str(line).unwrap())
     .collect();
-  assert!(events.iter().all(|event| event["schema_version"] == 20));
+  assert!(events.iter().all(|event| event["schema_version"] == 21));
   let report = events.iter().find(|event| event["type"] == "compatibility_checked").unwrap();
   assert_eq!(report["manifest_version"], 1);
   assert_eq!(report["inputs"].as_array().unwrap().len(), 2);
@@ -860,8 +860,8 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":20"));
-  assert!(lines[0].contains("\"command_syntax_version\":2"));
+  assert!(lines[0].contains("\"schema_version\":21"));
+  assert!(lines[0].contains("\"command_syntax_version\":3"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
@@ -884,15 +884,15 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
     assert!(
       events
         .iter()
-        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(20))
+        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(21))
     );
     assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
     assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
-    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(2));
+    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(3));
     assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
     assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
-    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(2));
-    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(20));
+    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(3));
+    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(21));
     assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
   }
 }
@@ -960,6 +960,7 @@ fn package_source_inspection_surfaces_explicit_transport_risks() {
 fn sdk_current_discovers_without_executing_dotnet() {
   let temp = TempDirectory::new();
   fs::create_dir_all(temp.0.join("sdk/9.0.308")).unwrap();
+  temp.write("sdk/9.0.308/dotnet.dll", "");
   fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
 
   let output = dv().args(["sdk", "current"]).current_dir(&temp.0).env("PATH", &temp.0).output().unwrap();
@@ -988,6 +989,45 @@ fn dotnet_sdk_queries_share_the_canonical_selected_sdk_result() {
 }
 
 #[test]
+fn dotnet_inventory_queries_match_the_reference_row_shapes() {
+  let temp = TempDirectory::new();
+  temp.write("sdk/9.0.308/dotnet.dll", "");
+  fs::create_dir_all(temp.0.join("sdk/10.0.100-stale")).unwrap();
+  fs::create_dir_all(temp.0.join("shared/Microsoft.NETCore.App/10.0.0")).unwrap();
+  fs::create_dir_all(temp.0.join("shared/Microsoft.NETCore.App/9.0.11")).unwrap();
+  fs::create_dir_all(temp.0.join("shared/Microsoft.AspNetCore.App/10.0.0")).unwrap();
+  fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
+
+  let sdks = dv().args(["--compat", "dotnet", "--list-sdks"]).env("PATH", &temp.0).output().unwrap();
+  assert!(sdks.status.success(), "{}", String::from_utf8_lossy(&sdks.stderr));
+  assert_eq!(String::from_utf8(sdks.stdout).unwrap(), format!("9.0.308 [{}]\n", temp.0.join("sdk").display()));
+
+  let runtimes = dv().args(["--compat", "dotnet", "--list-runtimes"]).env("PATH", &temp.0).output().unwrap();
+  assert!(runtimes.status.success(), "{}", String::from_utf8_lossy(&runtimes.stderr));
+  assert_eq!(
+    String::from_utf8(runtimes.stdout).unwrap(),
+    format!(
+      "Microsoft.AspNetCore.App 10.0.0 [{}]\nMicrosoft.NETCore.App 9.0.11 [{}]\nMicrosoft.NETCore.App 10.0.0 [{}]\n",
+      temp.0.join("shared").join("Microsoft.AspNetCore.App").display(),
+      temp.0.join("shared").join("Microsoft.NETCore.App").display(),
+      temp.0.join("shared").join("Microsoft.NETCore.App").display()
+    )
+  );
+}
+
+#[test]
+fn runtime_inventory_json_uses_the_shared_event_batch() {
+  let output = dv().args(["--compat", "dotnet", "--list-runtimes", "--json"]).output().unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("\"schema_version\":21"), "{stdout}");
+  assert!(stdout.contains("\"type\":\"runtime_inventory\""), "{stdout}");
+  assert!(stdout.contains("\"family\":\"Microsoft.NETCore.App\""), "{stdout}");
+  assert!(stdout.contains("\"outcome\":\"succeeded\""), "{stdout}");
+}
+
+#[test]
 fn malformed_dotnet_sdk_queries_fail_before_sdk_discovery() {
   let temp = TempDirectory::new();
   temp.write("global.json", "{ malformed");
@@ -995,6 +1035,8 @@ fn malformed_dotnet_sdk_queries_fail_before_sdk_discovery() {
   for (arguments, command) in [
     (&["--compat", "dotnet", "--version", "unexpected"][..], "--version"),
     (&["--compat", "dotnet", "--info", "unexpected"][..], "--info"),
+    (&["--compat", "dotnet", "--list-sdks", "unexpected"][..], "--list-sdks"),
+    (&["--compat", "dotnet", "--list-runtimes", "unexpected"][..], "--list-runtimes"),
   ] {
     let output = dv().args(arguments).current_dir(&temp.0).output().unwrap();
     assert_eq!(output.status.code(), Some(1), "arguments={arguments:?}");
@@ -1009,6 +1051,7 @@ fn malformed_dotnet_sdk_queries_fail_before_sdk_discovery() {
 fn sdk_current_json_reports_selected_path() {
   let temp = TempDirectory::new();
   fs::create_dir_all(temp.0.join("sdk/10.0.100")).unwrap();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
 
   let output = dv()
@@ -1029,6 +1072,7 @@ fn sdk_current_json_reports_selected_path() {
 fn sdk_compatible_rids_loads_the_selected_graph_without_inference() {
   let temp = TempDirectory::new();
   fs::create_dir_all(temp.0.join("sdk/10.0.100")).unwrap();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
   temp.write(
     "sdk/10.0.100/PortableRuntimeIdentifierGraph.json",
@@ -1259,7 +1303,7 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 
   assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
   let stdout = String::from_utf8(alias.stdout).unwrap();
-  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":2,\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":3,\"command\":\"restore\""));
   assert!(stdout.contains("\"type\":\"package_resolution_created\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));
@@ -1771,6 +1815,7 @@ fn package_source_credentials_report_only_the_authentication_kind() {
 #[test]
 fn build_plan_json_reports_framework_and_compiler_inputs() {
   let temp = TempDirectory::new();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   temp.write("Program.cs", "Console.WriteLine(\"hello\");");
   temp.write(
     "App.csproj",
@@ -1812,6 +1857,7 @@ fn build_plan_json_reports_framework_and_compiler_inputs() {
 #[test]
 fn runtime_pack_json_reports_manifest_selected_assets_and_apphost() {
   let temp = TempDirectory::new();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   temp.write("Program.cs", "");
   temp.write(
     "App.csproj",
@@ -1859,6 +1905,7 @@ fn runtime_pack_json_reports_manifest_selected_assets_and_apphost() {
 #[test]
 fn unavailable_runtime_pack_reports_identity_version_dimensions_and_action() {
   let temp = TempDirectory::new();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   temp.write("Program.cs", "");
   temp.write(
     "App.csproj",
@@ -1900,6 +1947,7 @@ fn unavailable_runtime_pack_reports_identity_version_dimensions_and_action() {
 #[test]
 fn framework_plan_json_resolves_explicit_reference_and_shared_runtime() {
   let temp = TempDirectory::new();
+  temp.write("sdk/10.0.100/dotnet.dll", "");
   temp.write("Program.cs", "");
   temp.write(
     "App.csproj",

@@ -3,12 +3,15 @@ use std::{
   env,
   error::Error,
   fmt, fs, io,
+  mem::{align_of, size_of},
   path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
 
 const NO_PRERELEASE: u16 = u16::MAX;
+const MAX_SDK_INSTALLATIONS: usize = 4_096;
+const MAX_RUNTIME_INSTALLATIONS: usize = 4_096;
 
 /// A parsed .NET SDK version with its original display text.
 #[derive(Clone, Debug)]
@@ -24,6 +27,15 @@ pub struct SdkVersion {
 impl SdkVersion {
   /// Parses a full three-part .NET SDK version.
   pub fn parse(value: &str) -> Result<Self, SdkError> {
+    Self::parse_boxed(value.into())
+  }
+
+  fn parse_owned(value: String) -> Result<Self, SdkError> {
+    Self::parse_boxed(value.into_boxed_str())
+  }
+
+  fn parse_boxed(text: Box<str>) -> Result<Self, SdkError> {
+    let value = text.as_ref();
     if value.is_empty() || value.len() >= usize::from(NO_PRERELEASE) {
       return Err(SdkError::new(SdkErrorKind::InvalidVersion, format!("invalid .NET SDK version {value:?}")));
     }
@@ -52,7 +64,7 @@ impl SdkVersion {
     });
 
     Ok(Self {
-      text: value.into(),
+      text,
       major,
       minor,
       patch,
@@ -149,6 +161,90 @@ pub struct SdkInventory {
   pub selected_index: usize,
   /// Nearest `global.json` that influenced selection.
   pub global_json: Option<PathBuf>,
+}
+
+/// A deterministic batch of installed SDKs without selection policy.
+#[derive(Debug)]
+pub struct InstalledSdkInventory {
+  /// Host roots in muxer search order.
+  pub roots: Vec<PathBuf>,
+  /// Complete installations sorted by root order and ascending version.
+  pub installations: Vec<SdkInstallation>,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<InstalledSdkInventory>() == 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<InstalledSdkInventory>() == align_of::<usize>());
+
+impl InstalledSdkInventory {
+  /// Returns the root containing an installation.
+  pub fn root(&self, installation: &SdkInstallation) -> &Path {
+    &self.roots[usize::from(installation.root_index)]
+  }
+
+  /// Constructs the full SDK directory for an installation.
+  pub fn installation_path(&self, installation: &SdkInstallation) -> PathBuf {
+    self.root(installation).join("sdk").join(installation.version.as_str())
+  }
+}
+
+/// One shared-framework row backed by the inventory's contiguous text arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct RuntimeInstallation {
+  family_start: u32,
+  version_start: u32,
+  family_len: u16,
+  version_len: u16,
+  root_index: u16,
+}
+
+const _: () = assert!(size_of::<RuntimeInstallation>() == 16);
+const _: () = assert!(align_of::<RuntimeInstallation>() == 4);
+
+/// Installed shared frameworks in deterministic family/version order.
+#[derive(Debug)]
+pub struct RuntimeInventory {
+  roots: Vec<PathBuf>,
+  text: String,
+  installations: Vec<RuntimeInstallation>,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<RuntimeInventory>() == 72);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<RuntimeInventory>() == align_of::<usize>());
+
+impl RuntimeInventory {
+  /// Returns the compact installation batch.
+  pub fn installations(&self) -> &[RuntimeInstallation] {
+    &self.installations
+  }
+
+  /// Returns an installation's framework family.
+  pub fn family(&self, installation: RuntimeInstallation) -> &str {
+    text_range(&self.text, installation.family_start, installation.family_len)
+  }
+
+  /// Returns an installation's runtime version.
+  pub fn version(&self, installation: RuntimeInstallation) -> &str {
+    text_range(&self.text, installation.version_start, installation.version_len)
+  }
+
+  /// Returns the host root containing an installation.
+  pub fn root(&self, installation: RuntimeInstallation) -> &Path {
+    &self.roots[usize::from(installation.root_index)]
+  }
+
+  /// Constructs the full shared-framework directory.
+  pub fn installation_path(&self, installation: RuntimeInstallation) -> PathBuf {
+    self
+      .root(installation)
+      .join("shared")
+      .join(self.family(installation))
+      .join(self.version(installation))
+  }
 }
 
 impl SdkInventory {
@@ -251,6 +347,157 @@ pub fn discover_sdks(start_directory: &Path) -> Result<SdkInventory, SdkError> {
   discover_sdks_in_roots(start_directory, &roots)
 }
 
+/// Lists complete SDK installations without applying `global.json` selection.
+pub fn discover_installed_sdks() -> Result<InstalledSdkInventory, SdkError> {
+  let roots = discover_host_roots();
+  if roots.is_empty() {
+    return Err(SdkError::new(
+      SdkErrorKind::RootNotFound,
+      "no .NET installation root was found in PATH, DOTNET_ROOT, or platform defaults".into(),
+    ));
+  }
+  let installations = discover_installations(&roots)?;
+  Ok(InstalledSdkInventory { roots, installations })
+}
+
+/// Lists installed shared frameworks from the active host-root batch.
+pub fn discover_runtimes() -> Result<RuntimeInventory, SdkError> {
+  let roots = discover_host_roots();
+  if roots.is_empty() {
+    return Err(SdkError::new(
+      SdkErrorKind::RootNotFound,
+      "no .NET installation root was found in PATH, DOTNET_ROOT, or platform defaults".into(),
+    ));
+  }
+  discover_runtimes_in_owned_roots(roots)
+}
+
+/// Lists installed shared frameworks from explicit host roots.
+pub fn discover_runtimes_in_roots(roots: &[PathBuf]) -> Result<RuntimeInventory, SdkError> {
+  discover_runtimes_in_owned_roots(roots.to_vec())
+}
+
+fn discover_runtimes_in_owned_roots(roots: Vec<PathBuf>) -> Result<RuntimeInventory, SdkError> {
+  if roots.len() > usize::from(u16::MAX) {
+    return Err(SdkError::new(SdkErrorKind::GlobalJson, "too many runtime search roots".into()));
+  }
+
+  struct WorkFamily {
+    family: String,
+    versions: Vec<SdkVersion>,
+    root_index: u16,
+  }
+
+  let mut work = Vec::with_capacity(4);
+  let mut discovered_installations = 0usize;
+  for (root_index, root) in roots.iter().enumerate() {
+    let shared_directory = root.join("shared");
+    let families = match fs::read_dir(&shared_directory) {
+      Ok(entries) => entries,
+      Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+      Err(error) => return Err(io_error("enumerate", &shared_directory, error)),
+    };
+    for family_entry in families {
+      let family_entry = family_entry.map_err(|error| io_error("enumerate", &shared_directory, error))?;
+      if !family_entry
+        .file_type()
+        .map_err(|error| io_error("inspect", &family_entry.path(), error))?
+        .is_dir()
+      {
+        continue;
+      }
+      let Ok(family) = family_entry.file_name().into_string() else {
+        continue;
+      };
+      let family_directory = family_entry.path();
+      let versions = fs::read_dir(&family_directory).map_err(|error| io_error("enumerate", &family_directory, error))?;
+      let mut family_versions = Vec::with_capacity(8);
+      for version_entry in versions {
+        let version_entry = version_entry.map_err(|error| io_error("enumerate", &family_directory, error))?;
+        if !version_entry
+          .file_type()
+          .map_err(|error| io_error("inspect", &version_entry.path(), error))?
+          .is_dir()
+        {
+          continue;
+        }
+        let Ok(version_text) = version_entry.file_name().into_string() else {
+          continue;
+        };
+        let Ok(version) = SdkVersion::parse_owned(version_text) else {
+          continue;
+        };
+        if discovered_installations == MAX_RUNTIME_INSTALLATIONS {
+          return Err(SdkError::new(
+            SdkErrorKind::Io,
+            format!("runtime inventory exceeds {MAX_RUNTIME_INSTALLATIONS} installations"),
+          ));
+        }
+        discovered_installations += 1;
+        family_versions.push(version);
+      }
+      if !family_versions.is_empty() {
+        family_versions.sort_unstable();
+        work.push(WorkFamily {
+          family,
+          versions: family_versions,
+          root_index: root_index as u16,
+        });
+      }
+    }
+  }
+  work.sort_unstable_by(|left, right| left.root_index.cmp(&right.root_index).then_with(|| left.family.cmp(&right.family)));
+
+  let installation_count = work
+    .iter()
+    .try_fold(0usize, |count, family| count.checked_add(family.versions.len()))
+    .ok_or_else(|| SdkError::new(SdkErrorKind::Io, "runtime inventory is too large".into()))?;
+  debug_assert_eq!(installation_count, discovered_installations);
+  let text_capacity = work
+    .iter()
+    .map(|family| {
+      family
+        .versions
+        .iter()
+        .fold(family.family.len(), |bytes, version| bytes.saturating_add(version.as_str().len()))
+    })
+    .try_fold(0usize, usize::checked_add)
+    .ok_or_else(|| SdkError::new(SdkErrorKind::Io, "runtime inventory text is too large".into()))?;
+  if text_capacity > u32::MAX as usize {
+    return Err(SdkError::new(SdkErrorKind::Io, "runtime inventory text is too large".into()));
+  }
+  let mut text = String::with_capacity(text_capacity);
+  let mut installations = Vec::with_capacity(installation_count);
+  for family in work {
+    let family_len = u16::try_from(family.family.len()).map_err(|_| SdkError::new(SdkErrorKind::Io, "runtime family name is too long".into()))?;
+    let family_start = text.len() as u32;
+    text.push_str(&family.family);
+    for version in family.versions {
+      let version_len = u16::try_from(version.as_str().len()).map_err(|_| SdkError::new(SdkErrorKind::Io, "runtime version is too long".into()))?;
+      let version_start = text.len() as u32;
+      text.push_str(version.as_str());
+      installations.push(RuntimeInstallation {
+        family_start,
+        version_start,
+        family_len,
+        version_len,
+        root_index: family.root_index,
+      });
+    }
+  }
+
+  Ok(RuntimeInventory {
+    roots,
+    text,
+    installations,
+  })
+}
+
+fn text_range(text: &str, start: u32, len: u16) -> &str {
+  let start = start as usize;
+  &text[start..start + usize::from(len)]
+}
+
 /// Discovers and selects SDKs using an explicit host-root batch.
 pub fn discover_sdks_in_roots(start_directory: &Path, host_roots: &[PathBuf]) -> Result<SdkInventory, SdkError> {
   let global_json = find_global_json(start_directory);
@@ -302,10 +549,14 @@ fn discover_host_roots() -> Vec<PathBuf> {
     for directory in env::split_paths(&path) {
       let executable = directory.join(&executable_name);
       if executable.is_file() {
-        let root = fs::canonicalize(&executable)
-          .ok()
-          .and_then(|path| path.parent().map(Path::to_owned))
-          .unwrap_or(directory);
+        let root = if cfg!(windows) {
+          directory
+        } else {
+          fs::canonicalize(&executable)
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_owned))
+            .unwrap_or(directory)
+        };
         push_unique_path(&mut roots, root);
         return roots;
       }
@@ -354,7 +605,8 @@ fn dotnet_architecture() -> Option<&'static str> {
 }
 
 fn push_existing_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
-  if root.join("sdk").is_dir() {
+  let host = root.join(format!("dotnet{}", env::consts::EXE_SUFFIX));
+  if host.is_file() || root.join("sdk").is_dir() || root.join("shared").is_dir() {
     push_unique_path(roots, root);
   }
 }
@@ -425,7 +677,7 @@ fn discover_installations(roots: &[PathBuf]) -> Result<Vec<SdkInstallation>, Sdk
     return Err(SdkError::new(SdkErrorKind::GlobalJson, "too many SDK search roots".into()));
   }
 
-  let mut installations = Vec::new();
+  let mut installations = Vec::with_capacity(8);
   for (root_index, root) in roots.iter().enumerate() {
     let sdk_directory = root.join("sdk");
     let entries = match fs::read_dir(&sdk_directory) {
@@ -444,6 +696,15 @@ fn discover_installations(roots: &[PathBuf]) -> Result<Vec<SdkInstallation>, Sdk
       let Ok(version) = SdkVersion::parse(&version_text) else {
         continue;
       };
+      if !entry.path().join("dotnet.dll").is_file() {
+        continue;
+      }
+      if installations.len() == MAX_SDK_INSTALLATIONS {
+        return Err(SdkError::new(
+          SdkErrorKind::Io,
+          format!("SDK inventory exceeds {MAX_SDK_INSTALLATIONS} installations"),
+        ));
+      }
       installations.push(SdkInstallation {
         version,
         root_index: root_index as u16,
@@ -683,7 +944,9 @@ mod tests {
 
     fn sdk(&self, root: &str, version: &str) -> PathBuf {
       let root = self.0.join(root);
-      fs::create_dir_all(root.join("sdk").join(version)).unwrap();
+      let installation = root.join("sdk").join(version);
+      fs::create_dir_all(&installation).unwrap();
+      fs::write(installation.join("dotnet.dll"), []).unwrap();
       root
     }
   }
@@ -715,6 +978,54 @@ mod tests {
     let inventory = discover_sdks_in_roots(&temp.0, &[root]).unwrap();
 
     assert_eq!(inventory.selected().version.as_str(), "10.0.100");
+  }
+
+  #[test]
+  fn incomplete_sdk_directories_are_not_installations() {
+    let temp = TempDirectory::new();
+    let root = temp.sdk("dotnet", "10.0.100");
+    fs::create_dir_all(root.join("sdk/11.0.100-preview.1")).unwrap();
+
+    let inventory = discover_sdks_in_roots(&temp.0, &[root]).unwrap();
+
+    assert_eq!(inventory.installations.len(), 1);
+    assert_eq!(inventory.selected().version.as_str(), "10.0.100");
+  }
+
+  #[test]
+  fn runtime_inventory_is_flat_and_sorted_by_root_family_and_version() {
+    let temp = TempDirectory::new();
+    let root = temp.0.join("dotnet");
+    for path in [
+      "shared/Microsoft.NETCore.App/10.0.0",
+      "shared/Microsoft.NETCore.App/9.0.11",
+      "shared/Microsoft.AspNetCore.App/10.0.0",
+      "shared/Microsoft.NETCore.App/not-a-version",
+    ] {
+      fs::create_dir_all(root.join(path)).unwrap();
+    }
+
+    let inventory = discover_runtimes_in_roots(std::slice::from_ref(&root)).unwrap();
+    let actual: Vec<_> = inventory
+      .installations()
+      .iter()
+      .map(|installation| {
+        (
+          inventory.family(*installation),
+          inventory.version(*installation),
+          inventory.installation_path(*installation),
+        )
+      })
+      .collect();
+
+    assert_eq!(
+      actual,
+      [
+        ("Microsoft.AspNetCore.App", "10.0.0", root.join("shared/Microsoft.AspNetCore.App/10.0.0")),
+        ("Microsoft.NETCore.App", "9.0.11", root.join("shared/Microsoft.NETCore.App/9.0.11")),
+        ("Microsoft.NETCore.App", "10.0.0", root.join("shared/Microsoft.NETCore.App/10.0.0")),
+      ]
+    );
   }
 
   #[test]

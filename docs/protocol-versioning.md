@@ -1,8 +1,8 @@
 # Command And Event Protocol Versioning
 
 `CLI-017` gives command grammar and JSON compatibility separate version
-identities. The current command syntax is `2`; the current event schema is
-`20`. A command alias can therefore be added or retired under the syntax
+identities. The current command syntax is `3`; the current event schema is
+`21`. A command alias can therefore be added or retired under the syntax
 contract without pretending that the JSON object layout changed.
 
 ## Data Contract
@@ -24,6 +24,11 @@ payload containing:
 Schema 20 adds the typed `compatibility_checked` payload for a bounded static
 scan. The syntax remains version 2 because no existing command spelling or
 precedence changed incompatibly.
+
+Schema 21 adds the ordered `runtime_inventory` payload. Command syntax 3 adds
+the executable `dotnet --list-sdks` and `dotnet --list-runtimes` compatibility
+queries; the two versions advance independently for these separate contract
+changes.
 
 `dv --json --version` emits exactly `command_started`, `tool_version`, and
 `command_finished`. The normal `dv --version` text remains unchanged.
@@ -49,11 +54,11 @@ is added to the common path.
 ## Verification
 
 Cross-platform CLI tests execute native `version`, `--version`, and `-V`.
-Every native alias must produce the same three-event schema-20 shape, canonical
-`version` command, syntax version `2`, and successful terminal event. Under the
+Every native alias must produce the same three-event schema-21 shape, canonical
+`version` command, syntax version `3`, and successful terminal event. Under the
 explicit dotnet profile, `--version` instead selects the same SDK as Microsoft
-`dotnet --version`; this compatibility correction is why syntax version 2 is
-not interchangeable with version 1. The benchmark preflight validates both
+`dotnet --version`; this compatibility correction is why syntax versions are
+not interchangeable. The benchmark preflight validates both
 contracts before retaining samples.
 
 Microsoft tooling has no equivalent query for `dv`'s two protocol versions, so

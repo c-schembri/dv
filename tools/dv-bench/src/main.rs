@@ -92,6 +92,7 @@ enum CaseKind {
   Startup,
   CliUnknownOption,
   CliOptionEffects,
+  CliDriverInventory,
   CliGoldenTrace,
   CliCompatCheck,
   CliCommandNormalization,
@@ -248,6 +249,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_option_effects",
     kind: CaseKind::CliOptionEffects,
     args: &["test", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "dotnet_runtime_inventory",
+    kind: CaseKind::CliDriverInventory,
+    args: &["--list-runtimes"],
     implemented: true,
   },
   Case {
@@ -961,6 +968,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "dotnet_runtime_inventory",
+    kind: CaseKind::CliDriverInventory,
+    args: &["--compat", "dotnet", "--list-runtimes"],
+    implemented: true,
+  },
+  Case {
     name: "cli_command_normalization",
     kind: CaseKind::CliCommandNormalization,
     args: &["sync", "--definitely-unknown"],
@@ -1522,6 +1535,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_option_effects") {
     verify_option_effect_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-option-effects"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "dotnet_runtime_inventory") {
+    verify_driver_inventory_boundary(&dv_executable, &fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_command_normalization") {
     verify_command_normalization_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-command-normalization"))?;
@@ -2106,6 +2122,52 @@ fn validate_option_effect_failure(output: &Output, reference: bool) -> Result<()
     }
   }
   Ok(())
+}
+
+fn verify_driver_inventory_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let before = snapshot_tree(fixture)?;
+  for (reference_arguments, candidate_arguments, label) in [
+    (&["--list-sdks"][..], &["--compat", "dotnet", "--list-sdks"][..], "SDK inventory"),
+    (&["--list-runtimes"][..], &["--compat", "dotnet", "--list-runtimes"][..], "runtime inventory"),
+  ] {
+    let reference = Command::new("dotnet").args(reference_arguments).current_dir(fixture).output()?;
+    let candidate = Command::new(dv_executable).args(candidate_arguments).current_dir(fixture).output()?;
+    validate_driver_inventory_output(&reference)?;
+    validate_driver_inventory_output(&candidate)?;
+    let reference_text = normalized_text(&reference.stdout)?;
+    let candidate_text = normalized_text(&candidate.stdout)?;
+    if reference_text != candidate_text {
+      return Err(format!("{label} differs between Microsoft and dv:\nreference={reference_text:?}\ncandidate={candidate_text:?}").into());
+    }
+  }
+  if before != snapshot_tree(fixture)? {
+    return Err("driver inventory preflight mutated the input workspace".into());
+  }
+  Ok(())
+}
+
+fn validate_driver_inventory_output(output: &Output) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "driver inventory failed with status {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let text = normalized_text(&output.stdout)?;
+  let lines = text.lines().collect::<Vec<_>>();
+  if lines.is_empty() || lines.iter().any(|line| !line.contains(" [") || !line.ends_with(']')) {
+    return Err(format!("driver inventory did not contain ordered version/path rows: {text:?}").into());
+  }
+  Ok(())
+}
+
+fn normalized_text(bytes: &[u8]) -> Result<String> {
+  Ok(std::str::from_utf8(bytes)?.replace("\r\n", "\n"))
 }
 
 fn verify_command_normalization_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
@@ -2693,8 +2755,8 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
   Ok(())
 }
 
-const EVENT_SCHEMA_VERSION: u64 = 20;
-const COMMAND_SYNTAX_VERSION: u64 = 2;
+const EVENT_SCHEMA_VERSION: u64 = 21;
+const COMMAND_SYNTAX_VERSION: u64 = 3;
 const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
 
 fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
@@ -6681,6 +6743,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliCompatCheck
       | CaseKind::CliUnknownOption
       | CaseKind::CliOptionEffects
+      | CaseKind::CliDriverInventory
       | CaseKind::CliCommandNormalization
       | CaseKind::CliTransformEquivalence
       | CaseKind::CliModeClassification
@@ -8135,6 +8198,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::CliCompatCheck
     | CaseKind::CliUnknownOption
     | CaseKind::CliOptionEffects
+    | CaseKind::CliDriverInventory
     | CaseKind::CliCommandNormalization
     | CaseKind::CliTransformEquivalence
     | CaseKind::CliModeClassification
@@ -8354,6 +8418,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliOptionEffects) {
     validate_option_effect_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliDriverInventory) {
+    validate_driver_inventory_output(&output)?;
   } else if matches!(case.kind, CaseKind::CliCommandNormalization) {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliTransformEquivalence) {
@@ -9269,6 +9335,7 @@ fn case_label(case: &str) -> &str {
     "cli_compat_help" => "Compatibility help",
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_option_effects" => "Child option effect boundary",
+    "dotnet_runtime_inventory" => "Installed runtime inventory",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_transform_equivalence" => "Typed transform equivalence",
     "cli_mode_classification" => "Invocation mode classification",

@@ -38,8 +38,8 @@ has not passed.
 The ordering input is one 468-row parity ledger:
 
 - 74 rows are implemented;
-- 31 rows have partial foundations;
-- 363 rows are missing;
+- 33 rows have partial foundations;
+- 361 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -149,17 +149,21 @@ unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result
 pairs are explicit. Executed child, test, and signal/cancellation semantics
 remain partial with their owning workflows.
-Command syntax version 2 and JSON event schema version 20 are independent.
+Command syntax version 3 and JSON event schema version 21 are independent.
 Native tool-version aliases normalize to one typed request and event shape;
 the dotnet `--version` compatibility form selects the SDK exactly like its
 Microsoft reference command. Profile-aware help uses static text before SDK or
 project discovery, and SDK info labels both compatibility and canonical syntax.
+The first `DNCLI-001` executable slice also maps current-architecture
+`--list-sdks` and `--list-runtimes` to bounded native inventories with exact
+.NET 10 text rows. Architecture selectors and the remaining root-driver
+surface remain open.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
 NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
 parity records with explicit per-dimension support state.
-All 20 currently accepted native command spellings normalize to 15 native
+All 21 currently accepted native command spellings normalize to 15 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
-26 command kinds in the same six-byte request; raw spelling and compatibility
+28 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
 The Phase 1 `build`, `restore`, `run`, and `test` spellings plus native `sync`
 now expose one allocation-free borrowed transform view. Exact equality covers

@@ -1,8 +1,10 @@
 # SDK Discovery And Selection
 
 `dv sdk current` selects a .NET SDK without launching `dotnet`, MSBuild, or any
-managed process. `dv sdk list` exposes the discovered batch and marks the
-selected record.
+managed process. `dv sdk list` exposes the complete installed SDK batch;
+`dv sdk runtimes` exposes installed shared frameworks. The compatible
+`--list-sdks` and `--list-runtimes` forms render the same current-architecture
+rows as the .NET 10 driver.
 
 `dv sdk compatible-rids RID` reuses that selection and loads the installation's
 portable runtime graph natively. Its compact graph and breadth-first semantics
@@ -21,7 +23,8 @@ Inputs:
 - the first `dotnet` host root found on `PATH`;
 - architecture-specific `DOTNET_ROOT_<ARCH>` and `DOTNET_ROOT` fallback roots;
 - existing platform default roots;
-- `<root>/sdk/<version>` directories.
+- complete `<root>/sdk/<version>/dotnet.dll` installations;
+- `<root>/shared/<family>/<version>` directories for runtime inventory.
 
 Transform:
 
@@ -42,9 +45,28 @@ Outputs:
 - one selected installation index;
 - the influencing `global.json` path.
 
-The inventory owns all paths and version text. It is immutable after selection
-and lives for one command. Full SDK paths are constructed only at the reporting
-edge.
+The inventory owns all paths and version text. It is immutable after discovery
+and lives for one command. Full SDK and runtime paths are constructed only at
+the reporting edge. The compatible installed-SDK and runtime transforms do not
+read `global.json` or apply selection policy; the selection-aware native
+`sdk list` continues to use the full policy above.
+
+## Runtime Inventory Layout
+
+Filesystem names are externally sized, so enumeration briefly owns cold
+`String` work rows. After sorting, family and version text are packed into one
+arena and each runtime becomes a 16-byte record containing two `u32` offsets,
+two `u16` lengths, and one `u16` root index. Four records fit in a 64-byte cache
+line; the 64-bit owner is 72 bytes. The batch is bounded to 4,096 installations
+and is sorted by root order, family, then semantic version.
+
+`ASSUMPTION: the Windows benchmark machine has 64-byte cache lines - affects
+the records-per-line count and is validated under issue 0003.`
+
+The query installs no cancellation handler because it is a bounded, read-only
+inventory operation. It launches no process, reads no project or `global.json`,
+and performs no network work. Architecture-specific roots and hostfxr,
+hostpolicy, RID, and provenance inventory remain explicit follow-on work.
 
 ## Supported Policy
 
@@ -64,10 +86,10 @@ with a compatible SDK wins.
 
 - malformed JSON, invalid versions, unsupported policy values, filesystem
   errors, missing roots, and no compatible SDK fail explicitly;
-- non-directory and non-version entries under `sdk/` are ignored;
+- non-directory, incomplete, and non-version entries under `sdk/` are ignored;
 - non-Unicode paths are valid for human output but rejected by JSON output,
   which requires lossless text;
-- more than 65,535 search roots is rejected;
+- more than 65,535 search roots or 4,096 SDK/runtime installations is rejected;
 - no fallback invokes `dotnet`.
 
 ## Cost And Access

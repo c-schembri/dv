@@ -811,7 +811,7 @@ fn classify_invocation(tool: Tool, arguments: &[&str], command: &ManifestCommand
       "dynamic command selection cannot be classified against a literal manifest row".into(),
     );
   }
-  if tool == Tool::Dotnet && matches!(arguments, ["--version"] | ["--info"]) {
+  if tool == Tool::Dotnet && matches!(arguments, ["--version"] | ["--info"] | ["--list-sdks"] | ["--list-runtimes"]) {
     return (
       CompatibilitySupport::Implemented,
       "literal SDK query is implemented by the selected compatibility profile".into(),
@@ -1034,10 +1034,12 @@ mod tests {
 
   #[test]
   fn sdk_queries_are_supported_but_redirected_output_is_uncheckable() {
-    let batch = scan_text("dotnet --version\ndotnet --info > sdk.txt\n");
-    assert_eq!(batch.invocations.len(), 2);
+    let batch = scan_text("dotnet --version\ndotnet --info > sdk.txt\ndotnet --list-sdks\ndotnet --list-runtimes\n");
+    assert_eq!(batch.invocations.len(), 4);
     assert_eq!(batch.invocations[0].support, CompatibilitySupport::Implemented);
     assert_eq!(batch.invocations[1].support, CompatibilitySupport::Uncheckable);
+    assert_eq!(batch.invocations[2].support, CompatibilitySupport::Implemented);
+    assert_eq!(batch.invocations[3].support, CompatibilitySupport::Implemented);
   }
 
   #[test]

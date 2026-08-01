@@ -12,7 +12,7 @@ required unless it is explicitly identified as a native `dv` addition.
 `REJECT` describes safe intermediate behavior for an unfinished compatibility
 row, not optional work.
 
-Snapshot: working tree on 2026-08-01.
+Snapshot: working tree on 2026-08-02.
 
 ## Scope Contract
 
@@ -376,7 +376,7 @@ contracts.
 - [x] `CLI-017` Version command syntax and JSON compatibility independently so
   a CLI alias does not mutate the event protocol. The 6-byte typed invocation
   request now carries a two-byte syntax-version value while the reporter owns
-  schema version 20. Native `version`, `--version`, and `-V` normalize to one
+  schema version 21. Native `version`, `--version`, and `-V` normalize to one
   tool-version request; explicit dotnet `--version` instead normalizes to the
   selected-SDK request required by the reference command. Raw alias arguments
   remain reporter evidence rather than protocol selection. The
@@ -537,7 +537,7 @@ contracts.
   uncheckable records in deterministic source order. Dynamic, malformed,
   oversized, and non-UTF-8 input is rejected or retained as uncheckable rather
   than guessed. Human and
-  event-schema-20 JSON output consume the same typed report and name embedded
+  event-schema-21 JSON output consume the same typed report and name embedded
   compatibility manifest version 1. No discovered command, SDK tool, or
   network request is executed. The release benchmark measured `5.791 ms`
   median and `7.314 ms` p95 on Windows across 50 retained samples; Microsoft
@@ -560,9 +560,20 @@ contracts.
 
 ## 1B. `dotnet` Driver Command-Line Surface
 
-- [ ] `DNCLI-001` Support global `--info`, `--version`, `--list-sdks`,
+- [~] `DNCLI-001` Support global `--info`, `--version`, `--list-sdks`,
   `--list-runtimes`, architecture selection, diagnostics, help, and verbosity
-  with compatible text layouts where scripts consume them. `P1/P4`
+  with compatible text layouts where scripts consume them. The executable
+  `--list-sdks` and `--list-runtimes` queries now produce the exact current-
+  architecture .NET 10 row order and text layout without launching a managed
+  process. Native `sdk runtimes` uses the same typed runtime inventory, while
+  the existing `sdk list` remains selection-aware; JSON emits one schema-21
+  batch. Incomplete SDK directories are
+  excluded using the same `dotnet.dll` completeness boundary. Architecture
+  selectors, complete `--info`, diagnostics, and the remaining root grammar
+  stay explicit unfinished work. Fifty warm Windows samples measured
+  Microsoft at `4.942 ms` median and `5.647 ms` p95 versus `4.901 ms` and
+  `5.525 ms` for `dv`, a `1.01x` median improvement at the native process-start
+  floor. `P1/P4`
 - [ ] `DNCLI-002` Support `build`, `clean`, `new`, `pack`, `publish`,
   `restore`, `run`, `test`, `vstest`, `msbuild`, `sdk check`, `sln`, and
   managed-application execution entry points. `P1-P5`
@@ -1641,8 +1652,13 @@ boundary, not final drop-in parity.
 - [x] `SDK-005` List and select installed SDKs without a managed process.
 - [ ] `SDK-006` Match `--list-sdks --arch` and architecture-specific roots.
   `P2`
-- [ ] `SDK-007` Inventory shared frameworks, hostfxr, hostpolicy, architecture,
-  RID, and install provenance. `P1`
+- [~] `SDK-007` Inventory shared frameworks, hostfxr, hostpolicy, architecture,
+  RID, and install provenance. Shared frameworks are now enumerated once into
+  16-byte records backed by one contiguous text arena, sorted by host-root,
+  family, and semantic version, and bounded to 4,096 installations. Four
+  records fit in an assumed 64-byte cache line; issue 0003 owns validation of
+  that platform value. Hostfxr, hostpolicy, explicit
+  architecture/RID classification, and provenance remain open. `P1`
 - [ ] `SDK-008` Select runtime framework versions using runtimeconfig and
   roll-forward rules independently from SDK selection. `P1`
 - [ ] `SDK-009` Query official release metadata by channel, version, quality,

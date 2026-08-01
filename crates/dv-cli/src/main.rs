@@ -24,10 +24,11 @@ use dv_core::{
   FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind,
   PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
   PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
-  ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind,
-  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity, discover_sdks, evaluate_project,
-  evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
-  plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
+  ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
+  RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
+  discover_installed_sdks, discover_runtimes, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
+  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
+  resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -85,11 +86,15 @@ Accepted compatibility syntax:
   dv --compat dotnet <command> [options]
   dv --compat dotnet --version
   dv --compat dotnet --info
+  dv --compat dotnet --list-sdks
+  dv --compat dotnet --list-runtimes
 Canonical dv syntax:
   dv --help
   dv <command> [options]
   dv sdk current
   dv sdk info
+  dv sdk list
+  dv sdk runtimes
 ";
 
 const MSBUILD_HELP: &str = "\
@@ -124,6 +129,7 @@ const SDK_HELP: &str = "\
 Usage:
   dv sdk current    Print the selected .NET SDK version
   dv sdk list       List discovered .NET SDKs
+  dv sdk runtimes   List installed shared runtimes
   dv sdk info       Print the selected SDK and installed SDK inventory
   dv sdk compatible-rids RID
                     Print RID fallbacks from the selected SDK graph
@@ -336,6 +342,35 @@ fn run() -> ExitCode {
         cancellation.as_ref().expect("SDK info installs cancellation"),
       )
     },
+    CommandKind::SdkList => {
+      if let Some(problem) = unexpected_leaf_argument(globals, "--list-sdks", command_args) {
+        return reject(
+          started,
+          globals,
+          "sdk list",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv --compat dotnet --list-sdks` without command operands.")),
+        );
+      }
+      sdk_installations(started, globals, invocation.event_arguments(json))
+    },
+    CommandKind::RuntimeList => {
+      if let Some(problem) = unexpected_leaf_argument(globals, "--list-runtimes", command_args) {
+        return reject(
+          started,
+          globals,
+          "sdk runtimes",
+          invocation.event_arguments(json),
+          diagnostic(
+            "DV0002",
+            problem,
+            None,
+            Some("Use `dv --compat dotnet --list-runtimes` without command operands."),
+          ),
+        );
+      }
+      runtime_installations(started, globals, invocation.event_arguments(json))
+    },
     CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
@@ -477,6 +512,7 @@ fn run() -> ExitCode {
 }
 
 fn command_requires_cancellation(globals: InvocationOptions, command: CommandKind, command_args: CommandArguments<'_>) -> bool {
+  let bounded_inventory = command == CommandKind::Sdk && command_args.first().and_then(OsStr::to_str) == Some("runtimes");
   let work_command = matches!(
     command,
     CommandKind::Sdk
@@ -488,7 +524,7 @@ fn command_requires_cancellation(globals: InvocationOptions, command: CommandKin
       | CommandKind::Run
       | CommandKind::Test
   ) || (command == CommandKind::Compat && command_args.first().is_some_and(|argument| argument == "check"));
-  work_command && !command_help_only(globals, command, command_args)
+  work_command && !bounded_inventory && !command_help_only(globals, command, command_args)
 }
 
 fn run_compat(
@@ -1510,6 +1546,7 @@ fn run_sdk(
     },
     SdkRequest::Current => sdk_current(started, globals, args, cancellation.expect("SDK current installs cancellation")),
     SdkRequest::List => sdk_list(started, globals, args, cancellation.expect("SDK list installs cancellation")),
+    SdkRequest::Runtimes => runtime_installations(started, globals, args),
     SdkRequest::Info => sdk_info(started, globals, args, cancellation.expect("SDK info installs cancellation")),
     SdkRequest::CompatibleRids(runtime_identifier) => sdk_compatible_rids(
       started,
@@ -1528,6 +1565,7 @@ enum SdkRequest<'a> {
   Help,
   Current,
   List,
+  Runtimes,
   Info,
   CompatibleRids(&'a str),
 }
@@ -1555,10 +1593,11 @@ fn parse_sdk_request(globals: InvocationOptions, arguments: CommandArguments<'_>
   }
 
   match command {
-    "current" | "list" | "info" => {
+    "current" | "list" | "runtimes" | "info" => {
       let request = match command {
         "current" => SdkRequest::Current,
         "list" => SdkRequest::List,
+        "runtimes" => SdkRequest::Runtimes,
         "info" => SdkRequest::Info,
         _ => unreachable!("the SDK command set is closed"),
       };
@@ -1721,7 +1760,6 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, can
   if cancellation.is_cancelled() {
     return cancelled(started, globals, "sdk list", args);
   }
-
   if !json {
     for (index, installation) in inventory.installations.iter().enumerate() {
       let marker = if index == inventory.selected_index { '*' } else { ' ' };
@@ -1735,6 +1773,115 @@ fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>, can
     Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
   };
   succeed(started, "sdk list", args, payload)
+}
+
+fn sdk_installations(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
+  let inventory = match discover_installed_sdks() {
+    Ok(inventory) => inventory,
+    Err(error) => return fail(started, globals, "sdk list", args, sdk_root_diagnostic(error)),
+  };
+  if !globals.json() {
+    let mut rendered = String::with_capacity(inventory.installations.len().saturating_mul(96));
+    for installation in &inventory.installations {
+      let root = match compatibility_path_text(inventory.root(installation), "SDK root") {
+        Ok(root) => root,
+        Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
+      };
+      let root = root.trim_end_matches(['\\', '/']);
+      writeln!(rendered, "{} [{root}{}sdk]", installation.version, std::path::MAIN_SEPARATOR).expect("writing a String succeeds");
+    }
+    io::stdout()
+      .lock()
+      .write_all(rendered.as_bytes())
+      .expect("writing SDK inventory to stdout succeeds");
+    return ExitCode::SUCCESS;
+  }
+
+  let installations: Result<Vec<_>, Box<Diagnostic>> = inventory
+    .installations
+    .iter()
+    .map(|installation| {
+      let path = inventory.installation_path(installation);
+      Ok(SdkInstallationEvent {
+        version: installation.version.as_str().into(),
+        path: compatibility_path_text(&path, "SDK installation")?,
+        selected: false,
+      })
+    })
+    .collect();
+  match installations {
+    Ok(installations) => succeed(
+      started,
+      "sdk list",
+      args,
+      EventPayload::SdkInventory {
+        installations,
+        global_json: None,
+      },
+    ),
+    Err(diagnostic) => fail(started, globals, "sdk list", args, *diagnostic),
+  }
+}
+
+fn runtime_installations(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
+  let inventory = match discover_runtimes() {
+    Ok(inventory) => inventory,
+    Err(error) => return fail(started, globals, "sdk runtimes", args, sdk_root_diagnostic(error)),
+  };
+  if !globals.json() {
+    return write_runtime_inventory(started, globals, args, &inventory);
+  }
+
+  let installations: Result<Vec<_>, Box<Diagnostic>> = inventory
+    .installations()
+    .iter()
+    .map(|installation| {
+      let path = inventory.installation_path(*installation);
+      Ok(RuntimeInstallationEvent {
+        family: inventory.family(*installation).into(),
+        version: inventory.version(*installation).into(),
+        path: compatibility_path_text(&path, "runtime installation")?,
+      })
+    })
+    .collect();
+  match installations {
+    Ok(installations) => succeed(started, "sdk runtimes", args, EventPayload::RuntimeInventory { installations }),
+    Err(diagnostic) => fail(started, globals, "sdk runtimes", args, *diagnostic),
+  }
+}
+
+fn write_runtime_inventory(started: Instant, globals: InvocationOptions, args: Vec<String>, inventory: &RuntimeInventory) -> ExitCode {
+  let mut rendered = String::with_capacity(inventory.installations().len().saturating_mul(128));
+  let mut prior_root = None;
+  let mut root_text = String::new();
+  for installation in inventory.installations() {
+    let family = inventory.family(*installation);
+    let root = inventory.root(*installation);
+    if prior_root != Some(root) {
+      root_text = match compatibility_path_text(root, "runtime root") {
+        Ok(root) => root,
+        Err(diagnostic) => return fail(started, globals, "sdk runtimes", args, *diagnostic),
+      };
+      root_text.truncate(root_text.trim_end_matches(['\\', '/']).len());
+      prior_root = Some(root);
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    rendered.push_str(family);
+    rendered.push(' ');
+    rendered.push_str(inventory.version(*installation));
+    rendered.push_str(" [");
+    rendered.push_str(&root_text);
+    rendered.push(separator);
+    rendered.push_str("shared");
+    rendered.push(separator);
+    rendered.push_str(family);
+    rendered.push_str("]\n");
+  }
+  io::stdout()
+    .lock()
+    .write_all(rendered.as_bytes())
+    .expect("writing runtime inventory to stdout succeeds");
+  ExitCode::SUCCESS
 }
 
 fn sdk_inventory_payload(inventory: &SdkInventory) -> Result<EventPayload, Box<Diagnostic>> {
@@ -2890,6 +3037,22 @@ fn sdk_diagnostic(current_directory: &Path, error: SdkError) -> Diagnostic {
   )
 }
 
+fn sdk_root_diagnostic(error: SdkError) -> Diagnostic {
+  let code = match error.kind() {
+    SdkErrorKind::RootNotFound => "DV0100",
+    SdkErrorKind::Io => "DV0101",
+    SdkErrorKind::GlobalJson => "DV0102",
+    SdkErrorKind::InvalidVersion => "DV0103",
+    SdkErrorKind::NoCompatibleSdk => "DV0104",
+  };
+  diagnostic(
+    code,
+    error.to_string(),
+    None,
+    (error.kind() == SdkErrorKind::RootNotFound).then_some("Install a .NET SDK or add its dotnet root to PATH."),
+  )
+}
+
 fn runtime_graph_diagnostic(error: RuntimeGraphError) -> Diagnostic {
   let (code, help) = match error.kind() {
     RuntimeGraphErrorKind::NotFound => ("DV0110", Some("Repair or reinstall the selected .NET SDK.")),
@@ -3031,6 +3194,20 @@ fn path_text(path: &Path, meaning: &str) -> Result<String, Box<Diagnostic>> {
       None,
     ))
   })
+}
+
+fn compatibility_path_text(path: &Path, meaning: &str) -> Result<String, Box<Diagnostic>> {
+  let text = path_text(path, meaning)?;
+  #[cfg(windows)]
+  {
+    if let Some(path) = text.strip_prefix(r"\\?\UNC\") {
+      return Ok(format!(r"\\{path}"));
+    }
+    if let Some(path) = text.strip_prefix(r"\\?\") {
+      return Ok(path.into());
+    }
+  }
+  Ok(text)
 }
 
 fn optional_path_text(path: Option<&Path>, meaning: &str) -> Result<Option<String>, Box<Diagnostic>> {
@@ -3514,6 +3691,7 @@ mod argument_tests {
 
     for arguments in [
       &["sdk", "current"][..],
+      &["sdk", "list"],
       &["--compat", "dotnet", "--version"],
       &["--compat", "dotnet", "--info"],
       &["project", "inspect", "App.csproj"],
@@ -3530,6 +3708,9 @@ mod argument_tests {
       &["--version"],
       &["sdk"],
       &["sdk", "--help"],
+      &["sdk", "runtimes"],
+      &["--compat", "dotnet", "--list-sdks"],
+      &["--compat", "dotnet", "--list-runtimes"],
       &["project"],
       &["project", "inspect", "--help"],
       &["--compat", "dotnet", "build", "-?"],
