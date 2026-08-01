@@ -61,6 +61,7 @@ Invalid input behavior:
 | `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,150-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_compat_help` | immutable `small-console` fixture; successful output-shape and zero-mutation preflight outside timing | process launch, profile-aware static help dispatch, output validation, and no SDK/project/filesystem/network discovery |
 | `cli_command_normalization` | immutable `small-console` fixture; tree snapshot and typed invalid-option parity preflight outside timing | process launch, lossless command capture, `dotnet restore`/`dv sync` normalization boundary, pre-I/O rejection, and output validation |
+| `cli_transform_equivalence` | immutable `small-console` fixture; tree snapshot, exact alias-equivalence unit corpus, and typed invalid-option parity preflight outside timing | process launch, lossless capture, dotnet-profile stripping, normalized borrowed transform construction, pre-I/O rejection, and output validation |
 | `cli_mode_classification` | immutable `small-console` fixture; tree snapshot and compatibility-profile rejection parity preflight outside timing | process launch, one-pass explicit mode classification, `dotnet`-profile exit selection, stable profile diagnostic context, pre-I/O rejection, and output validation |
 | `cli_exit_policy` | immutable `small-console` fixture; tree snapshot and missing-project restore parity preflight outside timing | process launch, project-path discovery failure, typed restore-result classification, one indexed profile-policy lookup, diagnostic output, and status propagation |
 | `cli_lexical_preservation` | immutable `small-console` fixture; tree snapshot and combined-value rejection parity preflight outside timing | process launch, exact `-c:Release` recognition, selected profile/platform lexical policy, stable profile diagnostic context, pre-I/O sentinel rejection, and output validation |
@@ -220,6 +221,7 @@ pre-I/O boundary:
 
 ```text
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
+cargo bench-all --case cli_transform_equivalence --samples 50 --warmups 10
 cargo bench-all --case cli_compat_help --samples 50 --warmups 10
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
 cargo bench-all --case cli_exit_policy --samples 50 --warmups 10

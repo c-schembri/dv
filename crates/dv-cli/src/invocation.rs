@@ -346,6 +346,50 @@ pub(crate) struct InvocationBatch {
 
 const _: () = assert!(size_of::<Option<NonZeroUsize>>() == size_of::<usize>());
 
+/// One-word borrowed semantic view over the process-owned argument batch.
+/// Compatibility provenance and command spelling remain cold metadata; every
+/// field that can change the selected transform is exposed through this view.
+#[derive(Clone, Copy)]
+pub(crate) struct TransformBatch<'a> {
+  invocation: &'a InvocationBatch,
+}
+
+const _: () = assert!(size_of::<TransformBatch<'static>>() == size_of::<usize>());
+const _: () = assert!(align_of::<TransformBatch<'static>>() == align_of::<usize>());
+
+impl<'a> TransformBatch<'a> {
+  pub(crate) fn request(self) -> InvocationRequest {
+    self.invocation.request
+  }
+
+  pub(crate) fn arguments(self) -> CommandArguments<'a> {
+    self.invocation.command_arguments()
+  }
+
+  pub(crate) fn forwarded(self) -> Option<ForwardedArguments<'a>> {
+    self.invocation.forwarded_arguments()
+  }
+
+  pub(crate) fn environment_directives(self) -> impl Iterator<Item = &'a str> {
+    self.invocation.environment_directives()
+  }
+}
+
+impl PartialEq for TransformBatch<'_> {
+  fn eq(&self, other: &Self) -> bool {
+    self.request() == other.request()
+      && self.arguments().iter().eq(other.arguments().iter())
+      && match (self.forwarded(), other.forwarded()) {
+        (Some(left), Some(right)) => left.as_slice() == right.as_slice(),
+        (None, None) => true,
+        _ => false,
+      }
+      && self.environment_directives().eq(other.environment_directives())
+  }
+}
+
+impl Eq for TransformBatch<'_> {}
+
 const INLINE_SEMANTIC_ARGUMENTS: usize = 16;
 
 enum SemanticIndices {
@@ -598,8 +642,13 @@ impl InvocationBatch {
     }
   }
 
+  #[cfg(test)]
   pub(crate) fn request(&self) -> InvocationRequest {
     self.request
+  }
+
+  pub(crate) fn transform_batch(&self) -> TransformBatch<'_> {
+    TransformBatch { invocation: self }
   }
 
   pub(crate) fn options(&self) -> InvocationOptions {
@@ -1369,6 +1418,73 @@ mod tests {
     assert_eq!(dotnet.command_text(), Some("restore"));
     assert_eq!(restore.options().mode, InvocationMode::Native);
     assert_eq!(dotnet.options().mode, InvocationMode::Dotnet);
+  }
+
+  #[test]
+  fn phase_one_aliases_create_identical_typed_transform_batches() {
+    let cases: &[(&[&str], &[&str])] = &[
+      (
+        &["build", "App.csproj", "--verbosity", "detailed"],
+        &["--verbosity=detailed", "--compat=dotnet", "build", "App.csproj"],
+      ),
+      (
+        &["--quiet", "restore", "App.csproj"],
+        &["--compat", "dotnet", "restore", "App.csproj", "--quiet"],
+      ),
+      (&["restore", "App.csproj"], &["sync", "App.csproj"]),
+      (
+        &["[env:PUBLIC=value]", "run", "App.csproj", "--", "", "--json"],
+        &["--compat=dotnet", "[env:PUBLIC=value]", "run", "App.csproj", "--", "", "--json"],
+      ),
+      (
+        &["--no-color", "test", "Tests.csproj", "--", "--filter", "Category=Fast"],
+        &["--compat", "dotnet", "test", "Tests.csproj", "--no-color", "--", "--filter", "Category=Fast"],
+      ),
+    ];
+
+    for (canonical_arguments, compatibility_arguments) in cases {
+      let canonical = InvocationBatch::capture(canonical_arguments.iter().map(OsString::from));
+      let compatibility = InvocationBatch::capture(compatibility_arguments.iter().map(OsString::from));
+      let canonical_transform = canonical.transform_batch();
+      let compatibility_transform = compatibility.transform_batch();
+
+      assert!(canonical_transform == compatibility_transform, "{canonical_arguments:?}");
+    }
+  }
+
+  #[test]
+  fn transform_equivalence_is_lossless_and_rejects_every_semantic_difference() {
+    let opaque = non_unicode_argument();
+    let canonical = InvocationBatch::capture([
+      OsString::from("[env:PUBLIC=value]"),
+      OsString::from("run"),
+      opaque.clone(),
+      OsString::from("--"),
+      OsString::from(""),
+      opaque.clone(),
+    ]);
+    let compatibility = InvocationBatch::capture([
+      OsString::from("--compat=dotnet"),
+      OsString::from("[env:PUBLIC=value]"),
+      OsString::from("run"),
+      opaque.clone(),
+      OsString::from("--"),
+      OsString::from(""),
+      opaque,
+    ]);
+    assert!(canonical.transform_batch() == compatibility.transform_batch());
+
+    for arguments in [
+      &["[env:PUBLIC=other]", "run", "App.csproj", "--", "child"][..],
+      &["[env:PUBLIC=value]", "test", "App.csproj", "--", "child"],
+      &["[env:PUBLIC=value]", "run", "Other.csproj", "--", "child"],
+      &["[env:PUBLIC=value]", "run", "App.csproj", "--", "other"],
+      &["--quiet", "[env:PUBLIC=value]", "run", "App.csproj", "--", "child"],
+    ] {
+      let baseline = InvocationBatch::capture(["[env:PUBLIC=value]", "run", "App.csproj", "--", "child"].map(OsString::from));
+      let different = InvocationBatch::capture(arguments.iter().map(OsString::from));
+      assert!(baseline.transform_batch() != different.transform_batch(), "{arguments:?}");
+    }
   }
 
   #[test]

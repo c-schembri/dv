@@ -502,8 +502,18 @@ contracts.
 - [ ] `DROP-018` Accept deprecated aliases for as long as the pinned reference
   tool does, emit equivalent deprecation diagnostics, and record removals in
   the compatibility manifest. `P5`
-- [ ] `DROP-019` Prove that each canonical `dv` command and its compatibility
-  aliases create identical typed transform batches after parsing. `P1-P4`
+- [~] `DROP-019` Prove that each canonical `dv` command and its compatibility
+  aliases create identical typed transform batches after parsing. The Phase 1
+  `build`, `restore`, `run`, and `test` spellings plus the native `sync` alias
+  now dispatch through one borrowed transform view. Equality covers the
+  six-byte normalized request, global policy, semantic operands, child tail,
+  and environment directives while excluding cold spelling/profile
+  provenance. Empty and non-Unicode tokens remain lossless. The view is one
+  machine word, allocates nothing, and is used directly by dispatch. Fifty
+  Windows pre-I/O samples measured `139.573 ms` for `dotnet` and `5.513 ms`
+  for `dv`, a `25.3x` median improvement. SDK query, MSBuild, NuGet, VSTest,
+  and later workflow transforms remain bounded by their owning rows rather
+  than being falsely claimed by the Phase 1 proof. `P1-P4`
 - [ ] `DROP-020` Maintain golden argv, environment, stdin, stdout, stderr, exit,
   filesystem, process, and network traces for real CI/build-script
   substitutions. `P1-P5`

@@ -5,7 +5,7 @@ inventory in [feature-parity-map.md](feature-parity-map.md). The parity map owns
 scope and completion state. This document owns sequencing. Moving a capability
 to a later wave never removes it from the drop-in contract.
 
-Snapshot: working tree on 2026-08-01.
+Snapshot: working tree on 2026-08-02.
 
 ## Scheduling Contract
 
@@ -38,8 +38,8 @@ has not passed.
 The ordering input is one 468-row parity ledger:
 
 - 72 rows are implemented;
-- 29 rows have partial foundations;
-- 367 rows are missing;
+- 30 rows have partial foundations;
+- 366 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -157,6 +157,10 @@ All 20 currently accepted native command spellings normalize to 15 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
 26 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
+The Phase 1 `build`, `restore`, `run`, and `test` spellings plus native `sync`
+now expose one allocation-free borrowed transform view. Exact equality covers
+the request and globals, semantic operands, child tail, and environment
+directives while ignoring only cold spelling/profile provenance.
 The broader workflow-dependent surface of `DROP-016` remains partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command

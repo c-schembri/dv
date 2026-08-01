@@ -25,6 +25,7 @@ enum CaseKind {
   Startup,
   CliUnknownOption,
   CliCommandNormalization,
+  CliTransformEquivalence,
   CliModeClassification,
   CliExitPolicy,
   CliLexicalPreservation,
@@ -161,6 +162,12 @@ const DOTNET_CASES: &[Case] = &[
   Case {
     name: "cli_command_normalization",
     kind: CaseKind::CliCommandNormalization,
+    args: &["restore", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_transform_equivalence",
+    kind: CaseKind::CliTransformEquivalence,
     args: &["restore", "--definitely-unknown"],
     implemented: true,
   },
@@ -842,6 +849,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_transform_equivalence",
+    kind: CaseKind::CliTransformEquivalence,
+    args: &["--compat", "dotnet", "restore", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_mode_classification",
     kind: CaseKind::CliModeClassification,
     args: &["--compat", "dotnet", "build", "--definitely-unknown"],
@@ -1380,6 +1393,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_command_normalization") {
     verify_command_normalization_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-command-normalization"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_transform_equivalence") {
+    verify_transform_equivalence_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-transform-equivalence"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_mode_classification") {
     verify_mode_classification_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-mode-classification"))?;
   }
@@ -1728,6 +1744,42 @@ fn validate_command_normalization_failure(output: &Output, reference: bool) -> R
     return Err(format!("dv sync did not retain its raw spelling at the typed restore rejection boundary: {text}").into());
   } else if text.contains("error[DV01") || text.contains("error[DV02") {
     return Err(format!("dv sync performed discovery before normalized rejection: {text}").into());
+  }
+  Ok(())
+}
+
+fn verify_transform_equivalence_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["restore", "--definitely-unknown"][..], true),
+    (dv_executable, "dv", &["--compat", "dotnet", "restore", "--definitely-unknown"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_transform_equivalence_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} transform-equivalence preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_transform_equivalence_failure(output: &Output, reference: bool) -> Result<()> {
+  if reference {
+    return validate_command_normalization_failure(output, true);
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if output.status.code() != Some(1)
+    || !output.stdout.is_empty()
+    || !text.contains("error[DV0002]")
+    || !text.contains("unknown restore option \"--definitely-unknown\"")
+    || !text.contains("compatibility_profile: dotnet")
+  {
+    return Err(format!("dv compatibility restore did not retain the typed canonical transform boundary: {text}").into());
+  }
+  if text.contains("error[DV01") || text.contains("error[DV02") {
+    return Err(format!("dv compatibility restore performed discovery before rejection: {text}").into());
   }
   Ok(())
 }
@@ -6175,6 +6227,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetSourceSecurity
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
+      | CaseKind::CliTransformEquivalence
       | CaseKind::CliModeClassification
       | CaseKind::CliExitPolicy
       | CaseKind::CliLexicalPreservation
@@ -7621,6 +7674,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
   match case.kind {
     CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
+    | CaseKind::CliTransformEquivalence
     | CaseKind::CliModeClassification
     | CaseKind::CliExitPolicy
     | CaseKind::CliLexicalPreservation
@@ -7831,6 +7885,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliCommandNormalization) {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliTransformEquivalence) {
+    validate_transform_equivalence_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliModeClassification) {
     validate_mode_classification_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliExitPolicy) {
@@ -8741,6 +8797,7 @@ fn case_label(case: &str) -> &str {
     "cli_compat_help" => "Compatibility help",
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
+    "cli_transform_equivalence" => "Typed transform equivalence",
     "cli_mode_classification" => "Invocation mode classification",
     "cli_exit_policy" => "Restore failure exit policy",
     "cli_lexical_preservation" => "Lexical argument preservation",

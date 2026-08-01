@@ -216,6 +216,29 @@ already removed interspersed globals may need its existing compact index list.
 
 ## Layout And Access
 
+`DROP-019` exposes the dispatch input as `TransformBatch<'_>`, one borrowed
+pointer to the process-owned `InvocationBatch`. It is 8 bytes at alignment 8
+on the measured x86-64 target, protected by target-width compile-time
+assertions, so eight views fit in the assumed 64-byte cache line. Copying the
+view never copies tokens or policy. Its lifetime cannot exceed the owner, and
+no allocation, scan, hash, filesystem access, process launch, or network
+request is added when dispatch creates it. A pointer is appropriate here
+because operands and child tails are variable-sized external OS data already
+owned contiguously for the process lifetime; copying that data into a second
+record would add work and split ownership.
+
+Transform equality reads the six-byte request and then linearly compares the
+borrowed semantic operand, forwarded-child, and environment-directive batches.
+The usual equal path has predictable presence branches; mismatches return at
+the first differing item. Compatibility mode and original command spelling
+remain cold provenance and are deliberately excluded. Unit coverage proves
+the Phase 1 `build`, `restore`, `run`, and `test` compatibility spellings plus
+native `sync`, global options on either side of the command, empty child
+arguments, and non-Unicode tokens. It also proves that a different global,
+command kind, operand, environment value, or child token is unequal. Invalid
+or unsupported syntax continues to produce the existing typed pre-discovery
+failure; later MSBuild, NuGet, and VSTest grammars are not claimed equivalent.
+
 `InvocationRequest` is 6 bytes and aligned to 2 on every supported target: a
 two-byte syntax version, one-byte semantic command, and three-byte output
 policy. Its layout is protected by compile-time assertions. Ten requests fit

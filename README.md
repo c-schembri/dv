@@ -488,6 +488,8 @@ Reference-compatible help has like-for-like, zero-mutation evidence in the
 [compatibility-help baseline](docs/performance-baselines/2026-08-02-cli-compat-help-windows.md).
 Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
+Canonical/compatibility typed-transform equality has like-for-like pre-I/O
+evidence in the [transform-equivalence baseline](docs/performance-baselines/2026-08-02-cli-transform-equivalence-windows.md).
 Explicit invocation-mode classification has a like-for-like pre-I/O baseline
 in the [invocation-mode evidence](docs/performance-baselines/2026-08-01-invocation-mode-windows.md).
 Structured explicit-profile diagnostics have updated like-for-like evidence in
@@ -533,6 +535,7 @@ Initial machine:
 | Print build help through the exact `dotnet` compatibility spelling | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x | 152.847 ms | 6.732 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
+| Create the same typed restore transform through compatibility syntax | `dotnet restore --definitely-unknown` | `dv --compat dotnet restore --definitely-unknown` | 139.573 ms | 5.513 ms | 25.3x | 155.743 ms | 6.449 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
 | Preserve missing-project restore failure status | `dotnet restore DefinitelyMissing.csproj` | `dv --compat dotnet restore DefinitelyMissing.csproj` | 122.756 ms | 5.158 ms | 23.8x | 134.338 ms | 6.073 ms |
 | Preserve a combined configuration token before sentinel rejection | `dotnet build -c:Release --definitely-unknown` | `dv --compat dotnet build -c:Release --definitely-unknown` | 141.461 ms | 4.912 ms | 28.8x | 176.976 ms | 6.003 ms |
@@ -814,6 +817,7 @@ cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_compat_help --samples 50 --warmups 10
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
+cargo bench-all --case cli_transform_equivalence --samples 50 --warmups 10
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
 cargo bench-all --case cli_exit_policy --samples 50 --warmups 10
 cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10

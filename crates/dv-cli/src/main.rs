@@ -223,10 +223,11 @@ fn main() {
 fn run() -> ExitCode {
   let started = Instant::now();
   let invocation = InvocationBatch::capture_process(env::args_os().skip(1));
-  let request = invocation.request();
+  let transform = invocation.transform_batch();
+  let request = transform.request();
   let globals = invocation.options();
   let json = globals.json();
-  let command_args = invocation.command_arguments();
+  let command_args = transform.arguments();
   let cancellation = if command_requires_cancellation(globals, request.command(), command_args) {
     match cancellation::install() {
       Ok(cancellation) => Some(cancellation),
@@ -349,8 +350,8 @@ fn run() -> ExitCode {
         globals,
         command,
         invocation.event_arguments(json),
-        invocation.forwarded_arguments(),
-        ChildEnvironmentPlan::capture(invocation.environment_directives(), command_args),
+        transform.forwarded(),
+        ChildEnvironmentPlan::capture(transform.environment_directives(), command_args),
         cancellation.as_ref().expect("run/test commands install cancellation"),
       )
     },
