@@ -360,8 +360,8 @@ fn verify_primary(path: &Path, file: &mut fs::File, archive: &SignedArchive, par
     }
     return Ok(());
   }
-  let primary_validation_time = verify_timestamp(path, signer, Some(policy))?;
   if let Some(allow_untrusted_root) = match_trusted(policy, kind, &parsed.certificate_der[certificate_index], &owners) {
+    let primary_validation_time = verify_timestamp(path, signer, Some(policy))?;
     let validation_time = primary_validation_time.unwrap_or_else(SystemTime::now);
     return verify_certificate_chain(
       path,
