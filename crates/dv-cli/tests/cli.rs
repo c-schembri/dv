@@ -997,10 +997,17 @@ fn dotnet_inventory_queries_match_the_reference_row_shapes() {
   fs::create_dir_all(temp.0.join("shared/Microsoft.NETCore.App/9.0.11")).unwrap();
   fs::create_dir_all(temp.0.join("shared/Microsoft.AspNetCore.App/10.0.0")).unwrap();
   fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
+  #[cfg(windows)]
+  let expected_root = temp.0.clone();
+  #[cfg(not(windows))]
+  let expected_root = fs::canonicalize(&temp.0).unwrap();
 
   let sdks = dv().args(["--compat", "dotnet", "--list-sdks"]).env("PATH", &temp.0).output().unwrap();
   assert!(sdks.status.success(), "{}", String::from_utf8_lossy(&sdks.stderr));
-  assert_eq!(String::from_utf8(sdks.stdout).unwrap(), format!("9.0.308 [{}]\n", temp.0.join("sdk").display()));
+  assert_eq!(
+    String::from_utf8(sdks.stdout).unwrap(),
+    format!("9.0.308 [{}]\n", expected_root.join("sdk").display())
+  );
 
   let runtimes = dv().args(["--compat", "dotnet", "--list-runtimes"]).env("PATH", &temp.0).output().unwrap();
   assert!(runtimes.status.success(), "{}", String::from_utf8_lossy(&runtimes.stderr));
@@ -1008,9 +1015,9 @@ fn dotnet_inventory_queries_match_the_reference_row_shapes() {
     String::from_utf8(runtimes.stdout).unwrap(),
     format!(
       "Microsoft.AspNetCore.App 10.0.0 [{}]\nMicrosoft.NETCore.App 9.0.11 [{}]\nMicrosoft.NETCore.App 10.0.0 [{}]\n",
-      temp.0.join("shared").join("Microsoft.AspNetCore.App").display(),
-      temp.0.join("shared").join("Microsoft.NETCore.App").display(),
-      temp.0.join("shared").join("Microsoft.NETCore.App").display()
+      expected_root.join("shared").join("Microsoft.AspNetCore.App").display(),
+      expected_root.join("shared").join("Microsoft.NETCore.App").display(),
+      expected_root.join("shared").join("Microsoft.NETCore.App").display()
     )
   );
 }
