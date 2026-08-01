@@ -58,9 +58,10 @@ Invalid input behavior:
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_protocol_version` | immutable `small-console` directory; four-alias schema preflight outside timing | `dv` process launch and one validated schema-19 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
-| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,098-byte static manifest write; Microsoft has no equivalent query and reports TBI |
+| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,102-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_command_normalization` | immutable `small-console` fixture; tree snapshot and typed invalid-option parity preflight outside timing | process launch, lossless command capture, `dotnet restore`/`dv sync` normalization boundary, pre-I/O rejection, and output validation |
 | `cli_mode_classification` | immutable `small-console` fixture; tree snapshot and compatibility-profile rejection parity preflight outside timing | process launch, one-pass explicit mode classification, `dotnet`-profile exit selection, stable profile diagnostic context, pre-I/O rejection, and output validation |
+| `cli_lexical_preservation` | immutable `small-console` fixture; tree snapshot and combined-value rejection parity preflight outside timing | process launch, exact `-c:Release` recognition, selected profile/platform lexical policy, stable profile diagnostic context, pre-I/O sentinel rejection, and output validation |
 | `cli_route_precedence` | immutable `small-console` fixture; tree snapshot and typed `pack` rejection parity preflight outside timing | process launch, profile-aware ambiguous-word routing, pre-I/O pack-option rejection, and output validation |
 | `cli_environment` | immutable `small-console` fixture; identical `NO_COLOR`, `DV_COLOR`, and `DV_VERBOSITY` values | process launch, typed environment precedence, pre-I/O unknown-option rejection, ANSI suppression, and secret-free failure output |
 | `cli_child_exit` | prebuilt `argument-forwarding` fixture; child-exit parity and typed TBI-boundary preflight outside timing | Microsoft launches the managed child; `dv` captures the declared exit policy and emits its TBI boundary |
@@ -218,6 +219,7 @@ pre-I/O boundary:
 ```text
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
+cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 ```
 

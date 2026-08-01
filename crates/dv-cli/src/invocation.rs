@@ -43,6 +43,15 @@ impl InvocationMode {
       Self::Vstest => Some("vstest"),
     }
   }
+
+  fn argument_is_option(self, argument: &OsStr) -> bool {
+    match argument.as_encoded_bytes().first().copied() {
+      Some(b'-') => true,
+      #[cfg(windows)]
+      Some(b'/') => matches!(self, Self::Dotnet | Self::Msbuild | Self::Vstest),
+      _ => false,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +198,8 @@ const _: () = assert!(align_of::<GlobalOptions>() == 1);
 const MODE_EXPLICIT: u8 = 1 << 0;
 const COLOR_EXPLICIT: u8 = 1 << 1;
 const VERBOSITY_EXPLICIT: u8 = 1 << 2;
+const OPTIONS_CLOSED: u8 = 1 << 3;
+const COMMAND_LITERAL: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InvocationScan {
@@ -247,6 +258,10 @@ impl InvocationOptions {
 
   pub(crate) fn compatibility_profile(self) -> Option<&'static str> {
     self.mode.profile()
+  }
+
+  pub(crate) fn argument_is_option(self, argument: &OsStr) -> bool {
+    self.mode.argument_is_option(argument)
   }
 
   pub(crate) fn failure_exit_code(self, class: FailureClass) -> u8 {
@@ -429,17 +444,31 @@ impl InvocationBatch {
     let mut option_error = None;
     let mut index = 0;
     while raw_arguments.get(index).is_some() {
-      if raw_arguments.get(index).is_some_and(|argument| argument == "--")
-        && command_index.is_some_and(|command| accepts_forwarded_arguments(scan.mode, raw_arguments.get(command).expect("command index is valid")))
-      {
-        forwarded_index = NonZeroUsize::new(index + 1);
-        break;
+      if raw_arguments.get(index).is_some_and(|argument| argument == "--") {
+        if let Some(command) = command_index {
+          if accepts_forwarded_arguments(scan.mode, raw_arguments.get(command).expect("command index is valid")) {
+            forwarded_index = NonZeroUsize::new(index + 1);
+          } else if let Some(indices) = &mut semantic_indices {
+            for semantic_index in index..raw_arguments.len() {
+              indices.push(semantic_index);
+            }
+          }
+          break;
+        }
+        scan.explicit |= OPTIONS_CLOSED | COMMAND_LITERAL;
+        index += 1;
+        continue;
       }
       let environment_directive = raw_arguments
         .get(index)
         .and_then(|argument| argument.to_str())
         .is_some_and(|value| value.starts_with("[env:"));
-      match parse_global_option(&raw_arguments, index, &mut scan) {
+      let parsed_global = if scan.is_explicit(OPTIONS_CLOSED) {
+        Ok(None)
+      } else {
+        parse_global_option(&raw_arguments, index, &mut scan)
+      };
+      match parsed_global {
         Ok(Some(width)) => {
           environment_directive_seen |= environment_directive;
           if let Some(command) = command_index
@@ -456,9 +485,9 @@ impl InvocationBatch {
         Ok(None) => {
           if command_index.is_none() {
             let argument = raw_arguments.get(index).expect("global option index is valid");
-            if argument
-              .to_str()
-              .is_some_and(|value| value.starts_with('-') && matches!(classify_command(scan.mode, argument), CommandKind::Unknown))
+            if !scan.is_explicit(OPTIONS_CLOSED)
+              && scan.mode.argument_is_option(argument)
+              && matches!(classify_command(scan.mode, argument), CommandKind::Unknown)
             {
               option_error = Some(format!("unknown global option {}", output::quoted_os_argument(argument)));
               break;
@@ -506,7 +535,16 @@ impl InvocationBatch {
       CommandKind::InvalidOptions
     } else {
       command_index.map_or(CommandKind::Help, |index| {
-        classify_command(scan.mode, raw_arguments.get(index).expect("classified argument index is valid"))
+        let command = raw_arguments.get(index).expect("classified argument index is valid");
+        if scan.is_explicit(COMMAND_LITERAL) {
+          if command.to_str().is_some() {
+            CommandKind::Unknown
+          } else {
+            CommandKind::InvalidText
+          }
+        } else {
+          classify_command(scan.mode, command)
+        }
       })
     };
     Self {
@@ -813,7 +851,7 @@ fn classify_command(mode: InvocationMode, command: &OsStr) -> CommandKind {
   let Some(command) = command.to_str() else {
     return CommandKind::InvalidText;
   };
-  if let Some(row) = ambiguous_command_row(command) {
+  if let Some(row) = ambiguous_command_row(command).or_else(|| nuget_ambiguous_command_row(mode, command)) {
     return AMBIGUOUS_COMMAND_PRECEDENCE[row][mode as usize];
   }
   match mode {
@@ -821,6 +859,29 @@ fn classify_command(mode: InvocationMode, command: &OsStr) -> CommandKind {
     InvocationMode::Nuget => CommandKind::Unknown,
     InvocationMode::Msbuild => CommandKind::MsbuildInput,
     InvocationMode::Vstest => CommandKind::VstestInput,
+  }
+}
+
+fn nuget_ambiguous_command_row(mode: InvocationMode, command: &str) -> Option<usize> {
+  if mode != InvocationMode::Nuget {
+    return None;
+  }
+  if command.eq_ignore_ascii_case("restore") {
+    Some(0)
+  } else if command.eq_ignore_ascii_case("pack") {
+    Some(1)
+  } else if command.eq_ignore_ascii_case("push") {
+    Some(2)
+  } else if command.eq_ignore_ascii_case("list") {
+    Some(3)
+  } else if command.eq_ignore_ascii_case("add") {
+    Some(4)
+  } else if command.eq_ignore_ascii_case("remove") {
+    Some(5)
+  } else if command.eq_ignore_ascii_case("update") {
+    Some(6)
+  } else {
+    None
   }
 }
 
@@ -1060,6 +1121,62 @@ mod tests {
   }
 
   #[test]
+  fn delimiter_stops_global_parsing_for_non_child_commands_without_losing_tokens() {
+    let batch = InvocationBatch::capture(["--compat", "dotnet", "build", "--quiet", "--", "--json", "", "--compat=nuget"].map(OsString::from));
+
+    assert_eq!(batch.request().command(), CommandKind::Build);
+    assert_eq!(batch.options().mode, InvocationMode::Dotnet);
+    assert_eq!(batch.options().verbosity(), DiagnosticVerbosity::Quiet);
+    assert_eq!(
+      batch.command_arguments().iter().collect::<Vec<_>>(),
+      [OsStr::new("--"), OsStr::new("--json"), OsStr::new(""), OsStr::new("--compat=nuget")]
+    );
+    assert!(batch.forwarded_arguments().is_none());
+  }
+
+  #[test]
+  fn leading_delimiter_keeps_the_following_command_literal() {
+    let option_command = InvocationBatch::capture(["--", "--version", "--json", ""].map(OsString::from));
+    let named_command = InvocationBatch::capture(["--compat=dotnet", "--", "build", "--json"].map(OsString::from));
+
+    assert_eq!(option_command.request().command(), CommandKind::Unknown);
+    assert_eq!(option_command.command_text(), Some("--version"));
+    assert!(!option_command.options().json());
+    assert_eq!(
+      option_command.command_arguments().iter().collect::<Vec<_>>(),
+      [OsStr::new("--json"), OsStr::new("")]
+    );
+    assert_eq!(named_command.request().command(), CommandKind::Unknown);
+    assert!(!named_command.options().json());
+    assert_eq!(named_command.command_arguments().first(), Some(OsStr::new("--json")));
+  }
+
+  #[test]
+  fn leading_delimiter_still_rejects_non_unicode_command_text() {
+    let batch = InvocationBatch::capture([OsString::from("--"), non_unicode_argument()]);
+
+    assert_eq!(batch.request().command(), CommandKind::InvalidText);
+  }
+
+  #[test]
+  fn delimiter_keeps_the_direct_non_child_argument_slice() {
+    let batch = InvocationBatch::capture(["restore", "App.csproj", "--", "--json", "two words", r#"a"b"#, ""].map(OsString::from));
+
+    assert!(batch.semantic_indices.is_none());
+    assert_eq!(
+      batch.command_arguments().iter().collect::<Vec<_>>(),
+      [
+        OsStr::new("App.csproj"),
+        OsStr::new("--"),
+        OsStr::new("--json"),
+        OsStr::new("two words"),
+        OsStr::new(r#"a"b"#),
+        OsStr::new("")
+      ]
+    );
+  }
+
+  #[test]
   fn large_forwarding_tail_remains_one_direct_slice() {
     let mut arguments = vec![OsString::from("run"), OsString::from("--")];
     arguments.extend((0..64).map(|index| OsString::from(format!("value-{index}"))));
@@ -1289,12 +1406,42 @@ mod tests {
   }
 
   #[test]
+  fn command_case_rules_follow_the_selected_reference_tool() {
+    let dotnet = InvocationBatch::capture(["--compat=dotnet", "BUILD"].map(OsString::from));
+    let native = InvocationBatch::capture([OsString::from("BUILD")]);
+    let nuget = InvocationBatch::capture(["--compat=nuget", "ReStOrE"].map(OsString::from));
+
+    assert_eq!(dotnet.request().command(), CommandKind::Unknown);
+    assert_eq!(native.request().command(), CommandKind::Unknown);
+    assert_eq!(nuget.request().command(), CommandKind::NugetRestore);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn slash_option_prefix_is_limited_to_windows_reference_tools_that_accept_it() {
+    let native = InvocationBatch::capture([OsString::from("build")]).options();
+    let dotnet = InvocationBatch::capture(["--compat=dotnet", "build"].map(OsString::from)).options();
+    let msbuild = InvocationBatch::capture(["--compat=msbuild", "project.csproj"].map(OsString::from)).options();
+    let nuget = InvocationBatch::capture(["--compat=nuget", "restore"].map(OsString::from)).options();
+    let vstest = InvocationBatch::capture(["--compat=vstest", "tests.dll"].map(OsString::from)).options();
+
+    assert!(!native.argument_is_option(OsStr::new("/target:Build")));
+    assert!(dotnet.argument_is_option(OsStr::new("/target:Build")));
+    assert!(msbuild.argument_is_option(OsStr::new("/target:Build")));
+    assert!(!nuget.argument_is_option(OsStr::new("/target:Build")));
+    assert!(vstest.argument_is_option(OsStr::new("/Tests:Example")));
+  }
+
+  #[test]
   fn wrong_profile_run_words_do_not_activate_the_child_delimiter() {
     let batch = InvocationBatch::capture(["--compat=nuget", "run", "--", "--json", "argument"].map(OsString::from));
 
     assert_eq!(batch.request().command(), CommandKind::Unknown);
     assert!(batch.forwarded_arguments().is_none());
-    assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("--"), OsStr::new("argument")]);
+    assert_eq!(
+      batch.command_arguments().iter().collect::<Vec<_>>(),
+      [OsStr::new("--"), OsStr::new("--json"), OsStr::new("argument")]
+    );
   }
 
   #[test]

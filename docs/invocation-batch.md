@@ -187,6 +187,33 @@ allocation, copy, filesystem operation, process launch, or network request.
 The rare error path allocates the two variable-sized strings required by the
 owned diagnostic wire record and grows its context vector by one element.
 
+## Profile Lexical Rules
+
+`DROP-013` keeps the platform-tokenized `OsString` batch as the source of
+truth. The scan never reconstructs shell quoting or normalizes case,
+separators, empty values, spaces, literal quote bytes, or non-Unicode data.
+Native and dotnet command/option matching is exact. Explicit NuGet command
+words use ASCII-insensitive comparison only after the seven exact ambiguous
+words miss. On Windows, a leading `/` is option-shaped only for the dotnet,
+MSBuild, and VSTest profiles; native and NuGet paths keep `/` as operand data.
+
+Implemented Phase 1 value options accept separated, `=`, and `:` forms.
+Singleton configuration, project, package-directory, and config-file values
+reject mixed repetitions, while repeatable sources append in input order.
+Combined values remain suffix slices into the owned token and allocate no
+text. Recognized common cases are straight-line matches; case-insensitive
+NuGet routing and prefix-shaped error handling remain rare branches.
+
+The first `--` closes global parsing. Native/dotnet run and test expose the
+following tokens as one borrowed forwarding slice. For every other command,
+the delimiter and complete remaining tail stay in the command-argument view,
+so a later `--json` or `--compat` cannot be stolen as a dv global. A leading
+delimiter is removed as syntax, then makes the following command token literal.
+This uses two previously spare bits in the existing scan bitset and does not
+change the five-byte scan record, four-byte options record, or six-byte
+semantic request. A direct tail remains one slice; only an invocation that
+already removed interspersed globals may need its existing compact index list.
+
 ## Layout And Access
 
 `InvocationRequest` is 6 bytes and aligned to 2 on every supported target: a
@@ -266,8 +293,8 @@ environment, cancellation, and child-exit contracts.
 - Every currently accepted alias normalizes to one semantic command kind.
   Executable-token inference remains explicitly open under `DROP-012`; future
   compatibility aliases remain unsupported in their owning `DROP-*` rows.
-- Automatic drop-in forwarding aliases remain open under `DROP-013`; no
-  unsupported syntax is silently accepted by this contract.
+- Command-specific options remain explicit in their owning driver rows and
+  never become silent no-ops at a lexical boundary.
 
 The design is disproved if a supported path cannot round-trip through
 `PathBuf`, classification performs external I/O, or process-level startup
@@ -420,6 +447,14 @@ profile context in human and JSON diagnostics. Fifty retained samples after
 ten warm-ups measured `133.281 ms` for Microsoft and `5.125 ms` for `dv`, a
 `26.0x` median improvement; p95 was `147.033 ms` and `6.256 ms`. Full evidence
 is retained in the [compatibility-diagnostics baseline](performance-baselines/2026-08-02-cli-compat-diagnostics-windows.md).
+
+`DROP-013` compares `dotnet build -c:Release --definitely-unknown` with the
+exact `dv --compat dotnet` replacement. Both accept the colon-joined
+configuration token, reject only the sentinel, and leave the fixture unchanged.
+Fifty retained samples after ten warm-ups measured `141.461 ms` versus
+`4.912 ms` median and `176.976 ms` versus `6.003 ms` p95, so `dv` is `28.8x`
+faster. Full evidence is retained in the
+[lexical-preservation baseline](performance-baselines/2026-08-02-cli-lexical-preservation-windows.md).
 
 `DROP-010` compares `dotnet pack --definitely-unknown` with `dv --compat
 dotnet pack --definitely-unknown`. Both reject the same invalid pack option;

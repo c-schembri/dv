@@ -461,9 +461,20 @@ contracts.
 - [ ] `DROP-012` Detect optional executable aliases or shims named `dotnet`,
   `msbuild`, `nuget`, and `vstest.console` through `argv[0]`, while keeping the
   same parser and execution transforms. `P5`
-- [ ] `DROP-013` Preserve case sensitivity, option-prefix rules, combined
+- [x] `DROP-013` Preserve case sensitivity, option-prefix rules, combined
   values, repeated options, separators, quoting, empty arguments, and end-of-
-  options behavior for the selected reference tool/platform. `P1-P3`
+  options behavior for the selected reference tool/platform. The process-owned
+  OS token batch is the lossless representation: quoting is resolved once by
+  the platform, while token boundaries, empty values, non-Unicode data, and
+  post-`--` text remain borrowed without copying. The one-pass scan applies
+  exact dotnet command/option case, case-insensitive NuGet command routing, and
+  Windows-only slash prefixes for dotnet/MSBuild/VSTest. Implemented Phase 1
+  values accept separate, `=`, and `:` forms; singleton repetitions reject
+  before project I/O while repeatable sources preserve order. Later command
+  rows own their option semantics, but the lexical batch already reaches those
+  TBI boundaries intact. Fifty Windows pre-I/O samples of `-c:Release` followed
+  by the same invalid sentinel measured `141.461 ms` for `dotnet` and
+  `4.912 ms` for `dv`, a `28.8x` median improvement. `P1-P3`
 - [ ] `DROP-014` Preserve precedence among command options, response files,
   environment variables, config files, project properties, and defaults. `P2`
 - [ ] `DROP-015` Preserve script-consumed stdout/stderr placement, encodings,

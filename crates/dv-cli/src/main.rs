@@ -183,7 +183,7 @@ fn run() -> ExitCode {
   }
   match request.command() {
     CommandKind::Help => {
-      if let Some(problem) = unexpected_leaf_argument("help", command_args) {
+      if let Some(problem) = unexpected_leaf_argument(globals, "help", command_args) {
         return reject(
           started,
           globals,
@@ -196,7 +196,7 @@ fn run() -> ExitCode {
       ExitCode::SUCCESS
     },
     CommandKind::Version => {
-      if let Some(problem) = unexpected_leaf_argument("version", command_args) {
+      if let Some(problem) = unexpected_leaf_argument(globals, "version", command_args) {
         return reject(
           started,
           globals,
@@ -257,7 +257,7 @@ fn run() -> ExitCode {
     | CommandKind::MsbuildInput
     | CommandKind::VstestInput => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      if let Some(problem) = first_unsupported_option(command, command_args) {
+      if let Some(problem) = first_unsupported_option(globals, command, command_args) {
         return reject(
           started,
           globals,
@@ -469,11 +469,11 @@ fn child_exit_policy(command: &str) -> ChildExitPolicy {
   }
 }
 
-fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> Option<String> {
+fn unexpected_leaf_argument(globals: InvocationOptions, command: &str, arguments: CommandArguments<'_>) -> Option<String> {
   let mut unexpected = None;
   for argument in arguments.iter() {
     match argument.to_str() {
-      Some(value) if value.starts_with('-') => return Some(format!("unknown {command} option {:?}", redact_argument_text(argument))),
+      _ if globals.argument_is_option(argument) => return Some(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       Some(value) => {
         unexpected.get_or_insert_with(|| format!("unexpected {command} argument {:?}", redact_argument_text(OsStr::new(value))));
       },
@@ -483,11 +483,10 @@ fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> O
   unexpected
 }
 
-fn first_unsupported_option(command: &str, arguments: CommandArguments<'_>) -> Option<String> {
+fn first_unsupported_option(globals: InvocationOptions, command: &str, arguments: CommandArguments<'_>) -> Option<String> {
   arguments.iter().find_map(|argument| {
-    argument
-      .to_str()
-      .is_some_and(|value| value.starts_with('-'))
+    globals
+      .argument_is_option(argument)
       .then(|| format!("unknown {command} option {:?}", redact_argument_text(argument)))
   })
 }
@@ -507,7 +506,7 @@ fn run_package_command(
     return ExitCode::SUCCESS;
   }
   let cancellation = cancellation.expect("non-help package commands install cancellation");
-  let options = match parse_package_args(command, command_args) {
+  let options = match parse_package_args(globals, command, command_args) {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -688,7 +687,7 @@ struct PackageCommandOptions<'a> {
   probe_credentials: bool,
 }
 
-fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Result<PackageCommandOptions<'a>, String> {
+fn parse_package_args<'a>(globals: InvocationOptions, command: &str, arguments: CommandArguments<'a>) -> Result<PackageCommandOptions<'a>, String> {
   let mut options = PackageCommandOptions {
     project: ProjectSelection::default(),
     additional_projects: Vec::new(),
@@ -704,28 +703,27 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
   while index < arguments.len() {
     let argument = arguments.get(index).expect("bounded project option index is valid");
     match argument.to_str() {
-      Some("--configuration") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
-      Some("--configuration") => {
+      Some("--configuration" | "-c") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration" | "-c") => {
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        options.configuration =
-          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
+        options.configuration = Some(parse_configuration(value)?);
       },
-      Some(value) if value.starts_with("--configuration=") => {
+      Some(value) if combined_option_value(value, "--configuration", Some("-c")).is_some() => {
         if options.configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
-        let value = &value["--configuration=".len()..];
-        options.configuration =
-          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
+        let value = combined_option_value(value, "--configuration", Some("-c")).expect("guard accepted a combined configuration");
+        options.configuration = Some(parse_configuration(value)?);
       },
       Some("--project") => {
-        let path = take_project_value(arguments, &mut index, false)?;
+        let path = take_project_value(globals, arguments, &mut index, false)?;
         options.project.select_named(path)?;
       },
-      Some(value) if value.starts_with("--project=") => {
-        options.project.select_named(OsStr::new(&value["--project=".len()..]))?;
+      Some(value) if combined_option_value(value, "--project", None).is_some() => {
+        let value = combined_option_value(value, "--project", None).expect("guard accepted a combined project");
+        options.project.select_named(OsStr::new(value))?;
       },
       Some("--packages") if options.packages_directory.is_some() => return Err("--packages cannot be specified more than once".into()),
       Some("--packages") => {
@@ -735,11 +733,11 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
         }
         options.packages_directory = Some(PathBuf::from(path));
       },
-      Some(value) if value.starts_with("--packages=") => {
+      Some(value) if combined_option_value(value, "--packages", None).is_some() => {
         if options.packages_directory.is_some() {
           return Err("--packages cannot be specified more than once".into());
         }
-        let value = &value["--packages=".len()..];
+        let value = combined_option_value(value, "--packages", None).expect("guard accepted a combined packages path");
         if value.is_empty() {
           return Err("--packages requires a path".into());
         }
@@ -753,11 +751,11 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
         }
         options.config_file = Some(PathBuf::from(path));
       },
-      Some(value) if value.starts_with("--configfile=") => {
+      Some(value) if combined_option_value(value, "--configfile", None).is_some() => {
         if options.config_file.is_some() {
           return Err("--configfile cannot be specified more than once".into());
         }
-        let value = &value["--configfile=".len()..];
+        let value = combined_option_value(value, "--configfile", None).expect("guard accepted a combined config path");
         if value.is_empty() {
           return Err("--configfile requires a path".into());
         }
@@ -773,8 +771,8 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
         validate_command_source(source)?;
         options.sources.push(source.to_owned());
       },
-      Some(value) if value.starts_with("--source=") || value.starts_with("-s=") => {
-        let source = value.strip_prefix("--source=").or_else(|| value.strip_prefix("-s=")).unwrap_or_default();
+      Some(value) if combined_option_value(value, "--source", Some("-s")).is_some() => {
+        let source = combined_option_value(value, "--source", Some("-s")).expect("guard accepted a combined package source");
         if source.is_empty() {
           return Err("--source requires a package source".into());
         }
@@ -784,7 +782,7 @@ fn parse_package_args<'a>(command: &str, arguments: CommandArguments<'a>) -> Res
       Some("--offline") => options.offline = true,
       Some("--interactive") => options.interactive = true,
       Some("--probe-credentials") if command == "project package-sources" => options.probe_credentials = true,
-      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
+      _ if globals.argument_is_option(argument) => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       _ if matches!(options.project, ProjectSelection::CurrentDirectory) => options.project.select_positional(argument)?,
       _ if matches!(command, "restore" | "sync") && options.project.is_positional() => {
         if argument.is_empty() {
@@ -812,14 +810,26 @@ fn take_semantic_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, i
   }
 }
 
-fn take_project_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, ignore_plan: bool) -> Result<&'a OsStr, &'static str> {
+fn combined_option_value<'a>(argument: &'a str, long: &str, short: Option<&str>) -> Option<&'a str> {
+  [Some(long), short].into_iter().flatten().find_map(|name| {
+    let suffix = argument.strip_prefix(name)?;
+    matches!(suffix.as_bytes().first(), Some(b'=' | b':')).then(|| &suffix[1..])
+  })
+}
+
+fn parse_configuration(value: &str) -> Result<ProjectConfiguration, String> {
+  ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))
+}
+
+fn take_project_value<'a>(
+  globals: InvocationOptions,
+  arguments: CommandArguments<'a>,
+  index: &mut usize,
+  ignore_plan: bool,
+) -> Result<&'a OsStr, &'static str> {
   const MISSING: &str = "--project requires a project or solution path";
   let value = take_semantic_value(arguments, index, ignore_plan, MISSING)?;
-  if value.to_str().is_some_and(|value| value.starts_with('-')) {
-    Err(MISSING)
-  } else {
-    Ok(value)
-  }
+  if globals.argument_is_option(value) { Err(MISSING) } else { Ok(value) }
 }
 
 fn validate_command_source(source: &str) -> Result<(), String> {
@@ -864,7 +874,7 @@ fn run_build(
   }
   let cancellation = cancellation.expect("non-help build commands install cancellation");
   let plan_requested = build_args.iter().any(|argument| argument == "--plan");
-  let (requested_path, configuration) = match parse_project_args(build_args, true, "build") {
+  let (requested_path, configuration) = match parse_project_args(globals, build_args, true, "build") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1167,7 +1177,7 @@ fn run_sdk(
   sdk_args: CommandArguments<'_>,
   cancellation: Option<&CancellationToken>,
 ) -> ExitCode {
-  let request = match parse_sdk_request(sdk_args) {
+  let request = match parse_sdk_request(globals, sdk_args) {
     Ok(request) => request,
     Err(diagnostic) => return reject(started, globals, "sdk", args, *diagnostic),
   };
@@ -1198,15 +1208,15 @@ enum SdkRequest<'a> {
   CompatibleRids(&'a str),
 }
 
-fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, Box<Diagnostic>> {
-  let Some(command) = arguments.first() else {
+fn parse_sdk_request(globals: InvocationOptions, arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, Box<Diagnostic>> {
+  let Some(command_argument) = arguments.first() else {
     return Ok(SdkRequest::Help);
   };
-  let command = command
+  let command = command_argument
     .to_str()
-    .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(command, "SDK command")))?;
+    .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(command_argument, "SDK command")))?;
   if matches!(command, "help" | "--help" | "-h") {
-    return match unexpected_leaf_argument("sdk help", arguments.slice_from(1)) {
+    return match unexpected_leaf_argument(globals, "sdk help", arguments.slice_from(1)) {
       None => Ok(SdkRequest::Help),
       Some(problem) => Err(Box::new(diagnostic(
         "DV0002",
@@ -1216,8 +1226,8 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
       ))),
     };
   }
-  if command.starts_with('-') {
-    return Err(unknown_sdk_option_diagnostic("sdk", OsStr::new(command)));
+  if globals.argument_is_option(command_argument) {
+    return Err(unknown_sdk_option_diagnostic("sdk", command_argument));
   }
 
   match command {
@@ -1225,12 +1235,12 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
       let request = if command == "current" { SdkRequest::Current } else { SdkRequest::List };
       let mut unexpected = None;
       for argument in arguments.slice_from(1).iter() {
+        if globals.argument_is_option(argument) {
+          return Err(unknown_sdk_option_diagnostic(&format!("sdk {command}"), argument));
+        }
         let value = argument
           .to_str()
           .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "SDK argument")))?;
-        if value.starts_with('-') {
-          return Err(unknown_sdk_option_diagnostic(&format!("sdk {command}"), argument));
-        }
         unexpected.get_or_insert(value);
       }
       match unexpected {
@@ -1245,12 +1255,12 @@ fn parse_sdk_request(arguments: CommandArguments<'_>) -> Result<SdkRequest<'_>, 
     },
     "compatible-rids" => {
       for argument in arguments.slice_from(1).iter() {
-        let value = argument
-          .to_str()
-          .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "runtime identifier")))?;
-        if value.starts_with('-') {
+        if globals.argument_is_option(argument) {
           return Err(unknown_sdk_option_diagnostic("sdk compatible-rids", argument));
         }
+        argument
+          .to_str()
+          .ok_or_else(|| Box::new(non_unicode_argument_diagnostic(argument, "runtime identifier")))?;
       }
       if arguments.len() != 2 {
         return Err(Box::new(diagnostic(
@@ -1441,7 +1451,8 @@ fn run_project(
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
   }
-  let subcommand = match project_args.first().and_then(OsStr::to_str) {
+  let subcommand_argument = &project_args[0];
+  let subcommand = match subcommand_argument.to_str() {
     Some(value) => value,
     None => {
       return reject(
@@ -1453,8 +1464,8 @@ fn run_project(
       );
     },
   };
-  if subcommand.starts_with('-') && !matches!(subcommand, "--help" | "-h") {
-    let subcommand = redact_argument_text(OsStr::new(subcommand));
+  if globals.argument_is_option(subcommand_argument) && !matches!(subcommand, "--help" | "-h") {
+    let subcommand = redact_argument_text(subcommand_argument);
     return reject(
       started,
       globals,
@@ -1470,7 +1481,7 @@ fn run_project(
   }
   let operands = project_args.slice_from(1);
   if matches!(subcommand, "help" | "--help" | "-h") {
-    if let Some(problem) = unexpected_leaf_argument("project help", operands) {
+    if let Some(problem) = unexpected_leaf_argument(globals, "project help", operands) {
       return reject(
         started,
         globals,
@@ -1519,7 +1530,7 @@ fn run_project(
     );
   }
 
-  let (requested_path, configuration) = match parse_project_args(operands, false, "project inspect") {
+  let (requested_path, configuration) = match parse_project_args(globals, operands, false, "project inspect") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1628,7 +1639,7 @@ fn project_package_sources(
   cancellation: &CancellationToken,
 ) -> ExitCode {
   let json = globals.json();
-  let parsed = match parse_package_args("project package-sources", project_args) {
+  let parsed = match parse_package_args(globals, "project package-sources", project_args) {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1785,7 +1796,7 @@ fn project_frameworks(
   cancellation: &CancellationToken,
 ) -> ExitCode {
   let json = globals.json();
-  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
+  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(globals, project_args, "frameworks") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1876,7 +1887,7 @@ fn project_runtime_packs(
   cancellation: &CancellationToken,
 ) -> ExitCode {
   let json = globals.json();
-  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
+  let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(globals, project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
       return reject(
@@ -1952,7 +1963,11 @@ fn project_runtime_packs(
   )
 }
 
-fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> Result<(ProjectSelection<'a>, Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_pack_plan_args<'a>(
+  globals: InvocationOptions,
+  arguments: CommandArguments<'a>,
+  command: &str,
+) -> Result<(ProjectSelection<'a>, Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = ProjectSelection::default();
   let mut packages = None;
   let mut configuration = None;
@@ -1960,33 +1975,47 @@ fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> R
   while index < arguments.len() {
     let argument = arguments.get(index).expect("bounded project option index is valid");
     match argument.to_str() {
+      Some("--packages") if packages.is_some() => return Err("--packages cannot be specified more than once".into()),
       Some("--packages") => {
-        packages = Some(PathBuf::from(take_semantic_value(arguments, &mut index, false, "--packages requires a path")?));
+        let path = take_semantic_value(arguments, &mut index, false, "--packages requires a path")?;
+        if path.is_empty() {
+          return Err("--packages requires a path".into());
+        }
+        packages = Some(PathBuf::from(path));
+      },
+      Some(value) if combined_option_value(value, "--packages", None).is_some() => {
+        if packages.is_some() {
+          return Err("--packages cannot be specified more than once".into());
+        }
+        let value = combined_option_value(value, "--packages", None).expect("guard accepted a combined packages path");
+        if value.is_empty() {
+          return Err("--packages requires a path".into());
+        }
+        packages = Some(PathBuf::from(value));
       },
       Some("--project") => {
-        let path = take_project_value(arguments, &mut index, false)?;
+        let path = take_project_value(globals, arguments, &mut index, false)?;
         project.select_named(path)?;
       },
-      Some(value) if value.starts_with("--project=") => {
-        project.select_named(OsStr::new(&value["--project=".len()..]))?;
+      Some(value) if combined_option_value(value, "--project", None).is_some() => {
+        let value = combined_option_value(value, "--project", None).expect("guard accepted a combined project");
+        project.select_named(OsStr::new(value))?;
       },
-      Some("--configuration") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
-      Some("--configuration") => {
+      Some("--configuration" | "-c") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration" | "-c") => {
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        configuration =
-          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
+        configuration = Some(parse_configuration(value)?);
       },
-      Some(value) if value.starts_with("--configuration=") => {
+      Some(value) if combined_option_value(value, "--configuration", Some("-c")).is_some() => {
         if configuration.is_some() {
           return Err("--configuration cannot be specified more than once".into());
         }
-        let value = &value["--configuration=".len()..];
-        configuration =
-          Some(ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?);
+        let value = combined_option_value(value, "--configuration", Some("-c")).expect("guard accepted a combined configuration");
+        configuration = Some(parse_configuration(value)?);
       },
-      Some(value) if value.starts_with('-') => {
+      _ if globals.argument_is_option(argument) => {
         return Err(format!("unknown project {command} option {:?}", redact_argument_text(argument)));
       },
       _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
@@ -2000,9 +2029,14 @@ fn parse_pack_plan_args<'a>(arguments: CommandArguments<'a>, command: &str) -> R
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
-fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool, command: &str) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
+fn parse_project_args<'a>(
+  globals: InvocationOptions,
+  arguments: CommandArguments<'a>,
+  ignore_plan: bool,
+  command: &str,
+) -> Result<(ProjectSelection<'a>, ProjectConfiguration), String> {
   let mut project = ProjectSelection::default();
-  let mut configuration = ProjectConfiguration::Debug;
+  let mut configuration = None;
   let mut index = 0;
   while index < arguments.len() {
     let argument = arguments.get(index).expect("bounded project option index is valid");
@@ -2010,20 +2044,28 @@ fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool, co
       Some("--plan") if ignore_plan => {},
       Some("-h" | "--help" | "help") => return Err(format!("help must be requested as `dv {command} --help`")),
       Some("--project") => {
-        let path = take_project_value(arguments, &mut index, ignore_plan)?;
+        let path = take_project_value(globals, arguments, &mut index, ignore_plan)?;
         project.select_named(path)?;
       },
-      Some(value) if value.starts_with("--project=") => {
-        project.select_named(OsStr::new(&value["--project=".len()..]))?;
+      Some(value) if combined_option_value(value, "--project", None).is_some() => {
+        let value = combined_option_value(value, "--project", None).expect("guard accepted a combined project");
+        project.select_named(OsStr::new(value))?;
       },
-      Some("--configuration") => {
+      Some("--configuration" | "-c") if configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
+      Some("--configuration" | "-c") => {
         let value = take_semantic_value(arguments, &mut index, ignore_plan, "--configuration requires Debug or Release")?
           .to_str()
           .ok_or("--configuration requires valid Unicode text")?;
-        configuration =
-          ProjectConfiguration::parse(value).ok_or_else(|| format!("configuration {:?} is unsupported", redact_argument_text(OsStr::new(value))))?;
+        configuration = Some(parse_configuration(value)?);
       },
-      Some(value) if value.starts_with('-') => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
+      Some(value) if combined_option_value(value, "--configuration", Some("-c")).is_some() => {
+        if configuration.is_some() {
+          return Err("--configuration cannot be specified more than once".into());
+        }
+        let value = combined_option_value(value, "--configuration", Some("-c")).expect("guard accepted a combined configuration");
+        configuration = Some(parse_configuration(value)?);
+      },
+      _ if globals.argument_is_option(argument) => return Err(format!("unknown {command} option {:?}", redact_argument_text(argument))),
       _ if matches!(project, ProjectSelection::CurrentDirectory) => project.select_positional(argument)?,
       _ if matches!(project, ProjectSelection::Named(_)) => {
         return Err("--project cannot be combined with a positional project or solution path".into());
@@ -2032,7 +2074,7 @@ fn parse_project_args<'a>(arguments: CommandArguments<'a>, ignore_plan: bool, co
     }
     index += 1;
   }
-  Ok((project, configuration))
+  Ok((project, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
 fn write_compiler_plan(plan: &CompilerPlan) -> ExitCode {
@@ -2834,7 +2876,7 @@ mod argument_tests {
   fn project_path_operands_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), path.clone()]);
-    let (parsed, configuration) = parse_project_args(batch.command_arguments(), false, "project inspect").unwrap();
+    let (parsed, configuration) = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
 
     assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
     assert_eq!(configuration, ProjectConfiguration::Debug);
@@ -2844,17 +2886,17 @@ mod argument_tests {
   fn named_project_paths_retain_their_os_encoding() {
     let path = non_unicode_path();
     let batch = InvocationBatch::capture([OsString::from("project"), OsString::from("--project"), path.clone()]);
-    let (parsed, _) = parse_project_args(batch.command_arguments(), false, "project inspect").unwrap();
+    let (parsed, _) = parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").unwrap();
 
     assert!(matches!(parsed, ProjectSelection::Named(_)));
     assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
 
     let batch = InvocationBatch::capture([OsString::from("frameworks"), OsString::from("--project"), path.clone()]);
-    let (parsed, _, _) = parse_pack_plan_args(batch.command_arguments(), "frameworks").unwrap();
+    let (parsed, _, _) = parse_pack_plan_args(batch.options(), batch.command_arguments(), "frameworks").unwrap();
     assert_eq!(parsed.path().map(Path::as_os_str), Some(path.as_os_str()));
 
     let batch = InvocationBatch::capture([OsString::from("restore"), OsString::from("--project"), path.clone()]);
-    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
     assert_eq!(parsed.project.path().map(Path::as_os_str), Some(path.as_os_str()));
   }
 
@@ -2868,19 +2910,19 @@ mod argument_tests {
       vec!["project", "--project", "--configuration", "Release"],
     ] {
       let batch = InvocationBatch::capture(arguments.into_iter().map(OsString::from));
-      assert!(parse_project_args(batch.command_arguments(), false, "project inspect").is_err());
+      assert!(parse_project_args(batch.options(), batch.command_arguments(), false, "project inspect").is_err());
     }
   }
 
   #[test]
   fn restore_keeps_positional_batches_but_named_selection_is_singular() {
     let batch = InvocationBatch::capture(["restore", "App.csproj", "Library.csproj"].map(OsString::from));
-    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
     assert_eq!(parsed.project.path(), Some(Path::new("App.csproj")));
     assert_eq!(parsed.additional_projects, [Path::new("Library.csproj")]);
 
     let batch = InvocationBatch::capture(["restore", "--project", "App.csproj", "Library.csproj"].map(OsString::from));
-    assert!(parse_package_args("restore", batch.command_arguments()).is_err());
+    assert!(parse_package_args(batch.options(), "restore", batch.command_arguments()).is_err());
   }
 
   #[test]
@@ -2892,7 +2934,7 @@ mod argument_tests {
       path.clone(),
       OsString::from("App.csproj"),
     ]);
-    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
 
     assert_eq!(parsed.packages_directory, Some(PathBuf::from(path)));
   }
@@ -2900,7 +2942,7 @@ mod argument_tests {
   #[test]
   fn global_json_does_not_become_an_option_value() {
     let batch = InvocationBatch::capture(["restore", "--packages", "--json", "packages"].map(OsString::from));
-    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
+    let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
 
     assert_eq!(parsed.packages_directory, Some(PathBuf::from("packages")));
   }
@@ -2908,9 +2950,51 @@ mod argument_tests {
   #[test]
   fn build_plan_marker_does_not_become_an_option_value() {
     let batch = InvocationBatch::capture(["build", "--configuration", "--plan", "Release"].map(OsString::from));
-    let (_, configuration) = parse_project_args(batch.command_arguments(), true, "build").unwrap();
+    let (_, configuration) = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
 
     assert_eq!(configuration, ProjectConfiguration::Release);
+  }
+
+  #[test]
+  fn configuration_forms_match_dotnet_case_and_separator_rules() {
+    for option in ["--configuration=Release", "--configuration:Release", "-c=Release", "-c:Release"] {
+      let batch = InvocationBatch::capture(["--compat", "dotnet", "build", option].map(OsString::from));
+      let (_, configuration) = parse_project_args(batch.options(), batch.command_arguments(), true, "build").unwrap();
+      assert_eq!(configuration, ProjectConfiguration::Release, "{option}");
+    }
+
+    for option in ["--Configuration=Release", "-C:Release", "--configurationRelease"] {
+      let batch = InvocationBatch::capture(["--compat", "dotnet", "build", option].map(OsString::from));
+      assert!(
+        parse_project_args(batch.options(), batch.command_arguments(), true, "build").is_err(),
+        "{option}"
+      );
+    }
+  }
+
+  #[test]
+  fn singleton_options_reject_mixed_repetitions_before_project_io() {
+    for arguments in [
+      ["build", "--configuration", "Debug", "-c:Release"],
+      ["build", "-c=Debug", "--configuration:Release", ""],
+    ] {
+      let batch = InvocationBatch::capture(arguments.map(OsString::from));
+      assert!(parse_project_args(batch.options(), batch.command_arguments(), true, "build").is_err());
+    }
+
+    let batch = InvocationBatch::capture(["restore", "--packages:first", "--packages=second"].map(OsString::from));
+    assert!(parse_package_args(batch.options(), "restore", batch.command_arguments()).is_err());
+
+    let batch = InvocationBatch::capture(["frameworks", "--packages", ""].map(OsString::from));
+    assert!(parse_pack_plan_args(batch.options(), batch.command_arguments(), "frameworks").is_err());
+  }
+
+  #[test]
+  fn repeatable_sources_preserve_combined_value_order() {
+    let batch = InvocationBatch::capture(["restore", "--source:first", "-s=second", "--source", "third", "App.csproj"].map(OsString::from));
+    let parsed = parse_package_args(batch.options(), "restore", batch.command_arguments()).unwrap();
+
+    assert_eq!(parsed.sources, ["first", "second", "third"]);
   }
 
   #[test]

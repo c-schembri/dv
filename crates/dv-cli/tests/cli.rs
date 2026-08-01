@@ -260,6 +260,43 @@ fn compatibility_unknown_options_use_reference_failure_exit_without_io() {
 }
 
 #[test]
+fn compatibility_lexical_rules_reject_before_project_io() {
+  let temp = TempDirectory::new();
+  temp.write("global.json", "{ definitely not JSON");
+  temp.write("Broken.csproj", "<Project><Broken>");
+
+  for arguments in [
+    vec!["--compat", "dotnet", "build", "--configuration=Debug", "-c:Release", "Broken.csproj"],
+    vec!["--compat", "dotnet", "build", "--Configuration=Release", "Broken.csproj"],
+  ] {
+    let output = dv().args(&arguments).current_dir(&temp.0).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("error[DV0002]"), "arguments={arguments:?}: {stderr}");
+    assert!(stderr.contains("compatibility_profile: dotnet"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV01"), "arguments={arguments:?}: {stderr}");
+    assert!(!stderr.contains("error[DV02"), "arguments={arguments:?}: {stderr}");
+  }
+
+  #[cfg(windows)]
+  {
+    let output = dv()
+      .args(["--compat", "dotnet", "build", "/definitely-invalid", "Broken.csproj"])
+      .current_dir(&temp.0)
+      .output()
+      .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unknown build option \"/definitely-invalid\""), "{stderr}");
+    assert!(!stderr.contains("error[DV01"), "{stderr}");
+    assert!(!stderr.contains("error[DV02"), "{stderr}");
+  }
+
+  assert!(!temp.0.join("obj").exists());
+}
+
+#[test]
 fn child_delimiter_keeps_trailing_global_spellings_opaque() {
   for command in ["run", "test"] {
     let exit_policy = if command == "run" { "preserve" } else { "map_to_command_failure" };

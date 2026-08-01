@@ -26,6 +26,7 @@ enum CaseKind {
   CliUnknownOption,
   CliCommandNormalization,
   CliModeClassification,
+  CliLexicalPreservation,
   CliRoutePrecedence,
   CliEnvironment,
   CliForwarding,
@@ -160,6 +161,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_mode_classification",
     kind: CaseKind::CliModeClassification,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_lexical_preservation",
+    kind: CaseKind::CliLexicalPreservation,
+    args: &["build", "-c:Release", "--definitely-unknown"],
     implemented: true,
   },
   Case {
@@ -822,6 +829,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_lexical_preservation",
+    kind: CaseKind::CliLexicalPreservation,
+    args: &["--compat", "dotnet", "build", "-c:Release", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_route_precedence",
     kind: CaseKind::CliRoutePrecedence,
     args: &["--compat", "dotnet", "pack", "--definitely-unknown"],
@@ -1342,6 +1355,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_mode_classification") {
     verify_mode_classification_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-mode-classification"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_lexical_preservation") {
+    verify_lexical_preservation_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-lexical-preservation"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_route_precedence") {
     verify_route_precedence_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-route-precedence"))?;
   }
@@ -1676,6 +1692,52 @@ fn validate_mode_classification_failure(output: &Output, reference: bool) -> Res
   }
   if text.contains("error[DV01") || text.contains("error[DV02") {
     return Err(format!("dv dotnet mode performed discovery before classified rejection: {text}").into());
+  }
+  Ok(())
+}
+
+fn verify_lexical_preservation_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["build", "-c:Release", "--definitely-unknown"][..], true),
+    (
+      dv_executable,
+      "dv",
+      &["--compat", "dotnet", "build", "-c:Release", "--definitely-unknown"][..],
+      false,
+    ),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_lexical_preservation_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} lexical-preservation preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_lexical_preservation_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("lexical-preservation boundary unexpectedly succeeded".into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    let lower = text.to_ascii_lowercase();
+    if output.status.code() != Some(1) || !text.contains("MSB1001") || !lower.contains("unknown switch") || !text.contains("--definitely-unknown") {
+      return Err(format!("dotnet lexical oracle did not accept -c:Release before rejecting the sentinel: {text}").into());
+    }
+  } else if output.status.code() != Some(1)
+    || !output.stdout.is_empty()
+    || !text.contains("error[DV0002]")
+    || !text.contains("unknown build option \"--definitely-unknown\"")
+    || !text.contains("compatibility_profile: dotnet")
+    || text.contains("unknown build option \"-c:Release\"")
+  {
+    return Err(format!("dv did not preserve the combined configuration token before sentinel rejection: {text}").into());
+  } else if text.contains("error[DV01") || text.contains("error[DV02") {
+    return Err(format!("dv lexical parser performed discovery before rejection: {text}").into());
   }
   Ok(())
 }
@@ -6008,6 +6070,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
       | CaseKind::CliModeClassification
+      | CaseKind::CliLexicalPreservation
       | CaseKind::CliRoutePrecedence
       | CaseKind::CliEnvironment
       | CaseKind::CliForwarding
@@ -7452,6 +7515,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
     | CaseKind::CliModeClassification
+    | CaseKind::CliLexicalPreservation
     | CaseKind::CliRoutePrecedence
     | CaseKind::CliEnvironment
     | CaseKind::CliForwarding
@@ -7659,6 +7723,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliModeClassification) {
     validate_mode_classification_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliLexicalPreservation) {
+    validate_lexical_preservation_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliRoutePrecedence) {
     validate_route_precedence_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliEnvironment) {
@@ -8563,6 +8629,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_mode_classification" => "Invocation mode classification",
+    "cli_lexical_preservation" => "Lexical argument preservation",
     "cli_route_precedence" => "Ambiguous command routing",
     "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",

@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, command-spelling normalization, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
+| Lossless typed CLI, profile/platform lexical rules, command-spelling normalization, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -240,6 +240,15 @@ and `update`) use a 35-byte read-only precedence matrix indexed by the selected
 profile. Routing performs one indexed byte read after the existing exact-token
 match, allocates nothing, and cannot probe a project or fall through into a
 different tool grammar.
+
+The same scan preserves the platform-tokenized argument batch exactly. It does
+not attempt to reconstruct quote characters that the OS has already resolved;
+instead it retains token boundaries, empty and non-Unicode arguments, option
+case, and everything after `--`. Dotnet option names are exact, NuGet command
+routing is case-insensitive, and Windows `/` prefixes are recognized only by
+the reference profiles that accept them. Implemented Phase 1 options accept
+separate, `=`, and `:` values. Singleton repeats fail before project I/O while
+repeatable package sources retain their input order.
 
 `dv compat manifest` emits compatibility manifest version `1` as a static JSON
 artifact. It records the selected .NET 10 SDK, MSBuild, NuGet, and VSTest
@@ -470,6 +479,9 @@ Explicit invocation-mode classification has a like-for-like pre-I/O baseline
 in the [invocation-mode evidence](docs/performance-baselines/2026-08-01-invocation-mode-windows.md).
 Structured explicit-profile diagnostics have updated like-for-like evidence in
 the [compatibility-diagnostics baseline](docs/performance-baselines/2026-08-02-cli-compat-diagnostics-windows.md).
+Profile-aware token case, prefixes, separators, repetition, and `--` behavior
+have like-for-like evidence in the
+[lexical-preservation baseline](docs/performance-baselines/2026-08-02-cli-lexical-preservation-windows.md).
 Ambiguous command precedence has a like-for-like pre-I/O baseline in the
 [route-precedence evidence](docs/performance-baselines/2026-08-01-cli-route-precedence-windows.md).
 
@@ -491,7 +503,9 @@ Initial machine:
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; command normalization, cancellation-ready SDK selection, compiler
-  planning, and cold/warm signed-package validation use 5 warm-ups; 10
+  planning, and cold/warm signed-package validation use 5 warm-ups; invocation
+  mode, lexical preservation, and route precedence use 50 retained samples
+  after 10 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -506,6 +520,7 @@ Initial machine:
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
+| Preserve a combined configuration token before sentinel rejection | `dotnet build -c:Release --definitely-unknown` | `dv --compat dotnet build -c:Release --definitely-unknown` | 141.461 ms | 4.912 ms | 28.8x | 176.976 ms | 6.003 ms |
 | Route ambiguous `pack` and reject before discovery | `dotnet pack --definitely-unknown` | `dv --compat dotnet pack --definitely-unknown` | 280.174 ms | 5.242 ms | 53.4x | 306.891 ms | 5.841 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
@@ -784,6 +799,7 @@ cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
+cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
