@@ -79,7 +79,7 @@ outward without weakening their quality.
 
 ## Compatibility Contract
 
-`dv` should eventually provide replacements for the everyday capabilities
+`dv` is intended to be a drop-in replacement for the everyday capabilities
 currently exposed through:
 
 - `dotnet restore`
@@ -98,8 +98,18 @@ Compatibility means accepting existing `.csproj`, `.fsproj` where feasible,
 `.sln`, `.slnx`, `global.json`, `NuGet.Config`, and related repository files.
 It does not require reproducing Microsoft's internal architecture or output.
 
+Drop-in compatibility is a process contract, not just equivalent final
+artifacts. For every supported workflow, a developer or CI script must be able
+to replace only the reference executable token (`dotnet`, MSBuild, NuGet, or
+VSTest) with `dv` and retain the remaining arguments and their order. Canonical
+`dv` commands may organize the same behavior more coherently, but both forms
+must normalize into the same typed command batch. Compatibility includes
+argument parsing and precedence, environment inputs, stdin/stdout/stderr roles,
+exit status, cancellation, and meaningful filesystem and network effects.
+
 Unsupported behavior must fail explicitly. `dv` must never silently produce a
-plausible but incompatible build.
+plausible but incompatible build or reinterpret an unknown reference-tool
+option after side effects have begun.
 
 ## Command Experience
 
@@ -216,25 +226,41 @@ integration, and richer terminal interfaces without parsing prose.
 - Discover SDK-style projects and select an installed SDK/runtime.
 - Evaluate the minimum project properties needed by simple C# projects.
 - Resolve and cache package dependencies with an initial lockfile.
+- Route the supported `dotnet` and direct MSBuild argument shapes into the same
+  typed commands as canonical `dv` syntax.
+- Construct the minimal deterministic project build graph.
+- Generate the SDK-owned C# inputs required by representative console and
+  library projects.
 - Compile directly with Roslyn.
-- Implement `dv build` and `dv run`.
+- Materialize compatible assemblies, symbols, dependency manifests, runtime
+  configuration, copy-local assets, and apphosts.
+- Implement `dv build` and `dv run`, including their supported executable-token
+  replacement forms.
 - Support accurate incremental and no-op builds.
 
 The phase succeeds when representative console and library projects can be
-restored, built, and run without invoking the .NET CLI or MSBuild.
+restored, built, and run without invoking the .NET CLI or MSBuild. Paired
+compatibility tests must preserve each supported reference command's complete
+argument vector while changing only its executable token to `dv`, then compare
+exit status and meaningful outputs.
 
 ### Phase 2: Real Repositories
 
 - Add solution and multi-target project support.
 - Expand project evaluation and build graph compatibility.
-- Add package source configuration, authentication, and conflict diagnostics.
+- Close remaining package source, signature, cache, and conflict-compatibility
+  gaps exposed by representative repositories.
 - Implement `dv add`, `dv remove`, and `dv sync`.
+- Expand direct MSBuild command and target compatibility for the supported
+  repository workflows.
 - Harden cross-platform behavior and cache concurrency.
 
 ### Phase 3: Testing
 
 - Discover test projects and adapters.
 - Build and execute tests without VSTest orchestration.
+- Support the corresponding `dotnet test` and direct VSTest executable-token
+  argument forms without invoking either reference tool.
 - Add filtering, parallel execution, cancellation, retries where appropriate,
   result files, coverage integration points, and clear failure summaries.
 
@@ -275,13 +301,35 @@ A workflow is complete only when:
 
 ## Immediate Next Steps
 
-Completed foundations now include the compatibility matrix, Roslyn trace,
-benchmark fixtures, Rust workspace, structured events, native SDK selection,
-and strict evaluation of the initial SDK-style project subset.
+As of 2026-08-01, the committed implementation has native SDK selection,
+bounded project evaluation, framework/runtime/apphost planning, structured
+events, exact package resolution, a verified NuGet-compatible cache, an initial
+lockfile, source configuration and authentication, deterministic package-asset
+planning, compatibility fixtures, and cold/warm benchmarks. `dv build --plan`
+produces compiler inputs but does not compile. Build outputs, execution,
+incremental state, and executable-token routing remain open.
 
-1. Resolve exact package references into a content-addressed cache and initial
-   lockfile.
-2. Materialize the three planned SDK-generated C# inputs.
-3. Invoke Roslyn through the selected native runtime host.
-4. Build the smallest end-to-end path: resolve, compile, cache, and run one
-   console application.
+Work the next steps in this order. Do not deepen unrelated compatibility areas
+until the end-to-end checkpoint passes unless new evidence shows they block it.
+The dependency-aware order beyond this checkpoint is maintained in
+`docs/implementation-order.md`; `docs/feature-parity-map.md` remains the scope
+and completion ledger.
+
+1. Create the Phase 1 compatibility manifest and normalize supported canonical,
+   `dotnet`, and direct MSBuild build forms into one typed command batch before
+   project or SDK I/O.
+2. Materialize target-framework attributes, assembly information, and implicit
+   global usings, then finalize the immutable compiler batch for one console
+   and one library fixture.
+3. Define the versioned, length-bounded compiler-host protocol and invoke the
+   selected Roslyn through native `hostfxr`, preserving typed diagnostics and
+   never invoking `dotnet exec`.
+4. Atomically materialize the minimal compatible output set: assemblies,
+   symbols, copy-local assets, `.deps.json`, `.runtimeconfig.json`, and apphost.
+5. Implement the smallest deterministic build graph and stage-local
+   fingerprints needed for cold, warm, incremental, and proven no-op builds.
+6. Run the console fixture through the selected Microsoft runtime with correct
+   arguments, environment, standard streams, cancellation, and exit status.
+7. Gate the vertical slice with paired executable-token tests, artifact
+   comparisons, human/JSON diagnostics, and cold/warm/incremental/no-op
+   benchmarks on representative console and library projects.

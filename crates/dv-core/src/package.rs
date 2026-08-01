@@ -30,6 +30,8 @@ use tokio::{
 use zeroize::Zeroizing;
 use zip::ZipArchive;
 
+use package_signature::{FingerprintAlgorithm, SignaturePolicy, TrustedCertificate, TrustedSigner, TrustedSignerKind};
+
 use crate::{
   BENCHMARK_CACHE_LINE_BYTES, CacheOutcome, CredentialProviderLogSink, FrameworkFamily, NugetAuditLevel, NugetAuditMode, PackageAssetFlags,
   PackageCancellation, ProjectSpec, RuntimeIdentifierGraph, SdkInventory, TargetFramework,
@@ -39,6 +41,9 @@ use crate::{
   legacy_pruning::{LegacyPrunePackage, PruningFramework, exact_legacy_pruning, nearest_legacy_pruning},
   load_portable_runtime_graph,
 };
+
+#[path = "package_signature.rs"]
+mod package_signature;
 
 const DEFAULT_SOURCE: &str = "https://api.nuget.org/v3/index.json";
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
@@ -2932,6 +2937,7 @@ struct NugetConfiguration {
   audit_sources: Vec<(String, PackageSource)>,
   source_mapping: Option<Arc<PackageSourceMapping>>,
   signature_validation: SignatureValidationMode,
+  signature_policy: Arc<SignaturePolicy>,
   proxy: Option<ProxySettings>,
   http_policy: PackageHttpPolicy,
 }
@@ -2948,6 +2954,7 @@ struct NugetConfigMerge {
   fallback_folders: Vec<FallbackFolder>,
   config_priority: u32,
   signature_validation: Option<SignatureValidationMode>,
+  trusted_signers: Vec<TrustedSigner>,
   proxy_url: Option<String>,
   proxy_user: Option<String>,
   proxy_password: Option<String>,
@@ -3322,14 +3329,18 @@ fn resolve_project(
   inventory: Option<&SdkInventory>,
   batch: &mut PackageBatchContext,
 ) -> Result<PackageResolution, PackageError> {
-  let config = discover_configuration(
+  let mut config = discover_configuration(
     project.project_directory(),
     options.packages_directory.as_deref(),
     options.config_file.as_deref(),
     &options.sources,
     options.credential_provider_options(),
   )?;
-  validate_signature_policy(config.signature_validation)?;
+  if let Some(inventory) = inventory {
+    Arc::get_mut(&mut config.signature_policy)
+      .expect("a newly discovered signature policy has one owner")
+      .set_sdk_root(inventory.installation_path(inventory.selected()));
+  }
   validate_audit_policy(project)?;
   let lock_path = project.project_directory().join("dv.lock.json");
   let direct = direct_requests(project)?;
@@ -3424,17 +3435,6 @@ fn resolve_project(
     write_lock(&resolution)?;
   }
   Ok(resolution)
-}
-
-fn validate_signature_policy(mode: SignatureValidationMode) -> Result<(), PackageError> {
-  if mode == SignatureValidationMode::Require {
-    return Err(PackageError::new(
-      PackageErrorKind::Configuration,
-      "signatureValidationMode",
-      "signatureValidationMode=require needs package signature verification, which remains tracked by RES-015",
-    ));
-  }
-  Ok(())
 }
 
 fn validate_audit_policy(project: &ProjectSpec) -> Result<(), PackageError> {
@@ -3964,6 +3964,8 @@ fn discover_configuration(
   let http_policy = effective_http_policy(&merged, proxy.as_ref());
   let request_budget = effective_request_budget();
   let signature_validation = merged.signature_validation.unwrap_or(SignatureValidationMode::Accept);
+  let signature_policy = Arc::new(SignaturePolicy::new(signature_validation, std::mem::take(&mut merged.trusted_signers)));
+  signature_policy.validate()?;
   for key in merged.disabled {
     merged.sources.retain(|(name, _)| !name.eq_ignore_ascii_case(&key));
   }
@@ -4014,6 +4016,7 @@ fn discover_configuration(
     audit_sources: merged.audit_sources,
     source_mapping,
     signature_validation,
+    signature_policy,
     proxy,
     http_policy,
   })
@@ -4899,8 +4902,196 @@ pub(crate) fn global_packages_directory(project_directory: &Path, explicit_cache
   discover_configuration(project_directory, None, None, &[], CredentialProviderOptions::default()).map(|configuration| configuration.cache_root)
 }
 
+struct PendingTrustedSigner {
+  name: String,
+  service_index: Option<String>,
+  owners: Vec<String>,
+  certificates: Vec<TrustedCertificate>,
+  kind: TrustedSignerKind,
+}
+
+fn merge_trusted_signers(bytes: &[u8], path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
+  let mut reader = Reader::from_reader(bytes);
+  reader.config_mut().trim_text(true);
+  let mut in_section = false;
+  let mut in_owners = false;
+  let mut owner_text = None::<String>;
+  let mut pending = None::<PendingTrustedSigner>;
+  loop {
+    match reader.read_event() {
+      Ok(Event::Start(element)) if local_name(element.name().as_ref()) == b"trustedSigners" => {
+        if in_section {
+          return Err(config_error(path, "NuGet trustedSigners sections cannot be nested"));
+        }
+        in_section = true;
+      },
+      Ok(Event::Start(element)) if in_section && matches!(local_name(element.name().as_ref()), b"author" | b"repository") => {
+        begin_trusted_signer(&reader, &element, path, &mut pending)?;
+      },
+      Ok(Event::Start(element)) if in_section && local_name(element.name().as_ref()) == b"certificate" => {
+        append_trusted_certificate(&reader, &element, path, pending.as_mut())?;
+      },
+      Ok(Event::Start(element)) if in_section && local_name(element.name().as_ref()) == b"owners" => {
+        let signer = pending
+          .as_ref()
+          .ok_or_else(|| config_error(path, "NuGet trusted repository owners must be inside a repository"))?;
+        if signer.kind != TrustedSignerKind::Repository || in_owners || owner_text.is_some() {
+          return Err(config_error(path, "NuGet trusted repository must contain at most one owners element"));
+        }
+        in_owners = true;
+      },
+      Ok(Event::Empty(element)) if in_section && local_name(element.name().as_ref()) == b"clear" && pending.is_none() => {
+        merged.trusted_signers.clear();
+      },
+      Ok(Event::Empty(element)) if in_section && local_name(element.name().as_ref()) == b"certificate" => {
+        append_trusted_certificate(&reader, &element, path, pending.as_mut())?;
+      },
+      Ok(Event::Empty(element)) if in_section && matches!(local_name(element.name().as_ref()), b"author" | b"repository") => {
+        return Err(config_error(path, "NuGet trusted signer requires at least one certificate"));
+      },
+      Ok(Event::Text(text)) if in_owners => {
+        let value = text
+          .xml_content(XmlVersion::Implicit1_0)
+          .map_err(|error| config_error(path, format!("invalid NuGet trusted repository owners text: {error}")))?
+          .into_owned();
+        if owner_text.replace(value).is_some() {
+          return Err(config_error(path, "NuGet trusted repository owners must contain one text value"));
+        }
+      },
+      Ok(Event::End(element)) if in_section && local_name(element.name().as_ref()) == b"owners" => {
+        let value = owner_text
+          .take()
+          .ok_or_else(|| config_error(path, "NuGet trusted repository owners cannot be empty"))?;
+        let owners = value.split(';').map(str::trim).collect::<Vec<_>>();
+        if owners.is_empty() || owners.iter().any(|owner| owner.is_empty()) {
+          return Err(config_error(
+            path,
+            "NuGet trusted repository owners must be semicolon-delimited non-empty names",
+          ));
+        }
+        pending.as_mut().expect("owners start required a signer").owners = owners.into_iter().map(str::to_owned).collect();
+        in_owners = false;
+      },
+      Ok(Event::End(element)) if in_section && matches!(local_name(element.name().as_ref()), b"author" | b"repository") => {
+        finish_trusted_signer(path, &mut merged.trusted_signers, &mut pending)?;
+      },
+      Ok(Event::End(element)) if local_name(element.name().as_ref()) == b"trustedSigners" => {
+        if pending.is_some() || in_owners {
+          return Err(config_error(path, "NuGet trusted signer did not close"));
+        }
+        in_section = false;
+      },
+      Ok(Event::Eof) => break,
+      Ok(_) => {},
+      Err(error) => return Err(config_error(path, format!("invalid NuGet configuration XML: {error}"))),
+    }
+  }
+  if in_section || pending.is_some() || in_owners {
+    return Err(config_error(path, "NuGet trustedSigners section did not close"));
+  }
+  Ok(())
+}
+
+fn begin_trusted_signer(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  pending: &mut Option<PendingTrustedSigner>,
+) -> Result<(), PackageError> {
+  if pending.is_some() {
+    return Err(config_error(path, "NuGet trusted signers cannot be nested"));
+  }
+  let name = config_attribute(reader, element, b"name", path)?.ok_or_else(|| config_error(path, "NuGet trusted signer requires a name"))?;
+  if name.is_empty() {
+    return Err(config_error(path, "NuGet trusted signer name cannot be empty"));
+  }
+  let kind = if local_name(element.name().as_ref()) == b"author" {
+    TrustedSignerKind::Author
+  } else {
+    TrustedSignerKind::Repository
+  };
+  let service_index = if kind == TrustedSignerKind::Repository {
+    let value =
+      config_attribute(reader, element, b"serviceIndex", path)?.ok_or_else(|| config_error(path, "NuGet trusted repository requires serviceIndex"))?;
+    let url = reqwest::Url::parse(&value).map_err(|error| config_error(path, format!("invalid trusted repository serviceIndex: {error}")))?;
+    if url.scheme() != "https" || !url.has_host() {
+      return Err(config_error(path, "NuGet trusted repository serviceIndex must use HTTPS"));
+    }
+    Some(value)
+  } else {
+    None
+  };
+  *pending = Some(PendingTrustedSigner {
+    name,
+    service_index,
+    owners: Vec::new(),
+    certificates: Vec::new(),
+    kind,
+  });
+  Ok(())
+}
+
+fn append_trusted_certificate(
+  reader: &Reader<&[u8]>,
+  element: &quick_xml::events::BytesStart<'_>,
+  path: &Path,
+  pending: Option<&mut PendingTrustedSigner>,
+) -> Result<(), PackageError> {
+  let signer = pending.ok_or_else(|| config_error(path, "NuGet trusted certificate must be inside an author or repository"))?;
+  let fingerprint =
+    config_attribute(reader, element, b"fingerprint", path)?.ok_or_else(|| config_error(path, "NuGet trusted certificate requires fingerprint"))?;
+  let algorithm = config_attribute(reader, element, b"hashAlgorithm", path)?
+    .and_then(|value| FingerprintAlgorithm::parse(&value))
+    .ok_or_else(|| config_error(path, "NuGet trusted certificate hashAlgorithm must be SHA256, SHA384, or SHA512"))?;
+  let allow_untrusted_root = config_attribute(reader, element, b"allowUntrustedRoot", path)?
+    .ok_or_else(|| config_error(path, "NuGet trusted certificate requires allowUntrustedRoot"))?
+    .parse::<bool>()
+    .map_err(|_| config_error(path, "NuGet trusted certificate allowUntrustedRoot must be true or false"))?;
+  let certificate = TrustedCertificate::parse(&fingerprint, algorithm, allow_untrusted_root)
+    .map_err(|error| config_error(path, format!("invalid NuGet trusted certificate: {error}")))?;
+  signer.certificates.push(certificate);
+  Ok(())
+}
+
+fn finish_trusted_signer(path: &Path, signers: &mut Vec<TrustedSigner>, pending: &mut Option<PendingTrustedSigner>) -> Result<(), PackageError> {
+  let pending = pending.take().ok_or_else(|| config_error(path, "NuGet trusted signer ended without a start"))?;
+  if pending.certificates.is_empty() {
+    return Err(config_error(path, "NuGet trusted signer requires at least one certificate"));
+  }
+  let signer = TrustedSigner {
+    name: pending.name,
+    service_index: pending.service_index,
+    owners: pending.owners.into_boxed_slice(),
+    certificates: pending.certificates.into_boxed_slice(),
+    kind: pending.kind,
+  };
+  let existing = signers.iter_mut().find(|existing| match signer.kind {
+    TrustedSignerKind::Author => existing.kind == TrustedSignerKind::Author && existing.name.eq_ignore_ascii_case(&signer.name),
+    TrustedSignerKind::Repository => {
+      existing.kind == TrustedSignerKind::Repository
+        && existing
+          .service_index
+          .as_deref()
+          .zip(signer.service_index.as_deref())
+          .is_some_and(|(existing, candidate)| {
+            reqwest::Url::parse(existing)
+              .ok()
+              .zip(reqwest::Url::parse(candidate).ok())
+              .is_some_and(|(existing, candidate)| existing == candidate)
+          })
+    },
+  });
+  if let Some(existing) = existing {
+    *existing = signer;
+  } else {
+    signers.push(signer);
+  }
+  Ok(())
+}
+
 fn merge_config(path: &Path, merged: &mut NugetConfigMerge) -> Result<(), PackageError> {
   let bytes = Zeroizing::new(fs::read(path).map_err(|error| package_io("read NuGet configuration", path, error))?);
+  merge_trusted_signers(bytes.as_slice(), path, merged)?;
   let config_priority = merged.config_priority;
   let mut reader = Reader::from_reader(bytes.as_slice());
   reader.config_mut().trim_text(true);
@@ -6225,6 +6416,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       let task_temp_root = config.temp_root.clone();
       let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
+      let task_signature_policy = Arc::clone(&config.signature_policy);
       let task_version = request.as_ref().map(|request| request.version.clone());
       let task_target = target;
       in_flight.insert(lower_id.clone());
@@ -6233,6 +6425,7 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
           cache_root: &task_cache_root,
           fallback_roots: &task_fallback_roots,
           temp_root: &task_temp_root,
+          signature_policy: &task_signature_policy,
         };
         let result = load_node_metadata(
           &task_client,
@@ -6371,12 +6564,14 @@ async fn resolve_streaming_graph(client: &reqwest::Client, roots: GraphRoots<'_>
       let task_temp_root = config.temp_root.clone();
       let task_endpoints = endpoints.as_ref().map(LazyServiceEndpoints::snapshot).unwrap_or_else(|| Arc::from([]));
       let task_source_mapping = config.source_mapping.clone();
+      let task_signature_policy = Arc::clone(&config.signature_policy);
       let parallel_extract = acquisition_tasks.is_empty() && acquisition.is_empty();
       acquisition_tasks.spawn(async move {
         let storage = PackageStorage {
           cache_root: &task_cache_root,
           fallback_roots: &task_fallback_roots,
           temp_root: &task_temp_root,
+          signature_policy: &task_signature_policy,
         };
         let result = ensure_package(
           &task_client,
@@ -6895,12 +7090,13 @@ struct PackageStorage<'a> {
   cache_root: &'a Path,
   fallback_roots: &'a [PathBuf],
   temp_root: &'a Path,
+  signature_policy: &'a Arc<SignaturePolicy>,
 }
 
-const _: () = assert!(size_of::<PackageStorage<'_>>() == 6 * size_of::<usize>());
+const _: () = assert!(size_of::<PackageStorage<'_>>() == 7 * size_of::<usize>());
 const _: () = assert!(align_of::<PackageStorage<'_>>() == align_of::<usize>());
 
-const _: () = assert!(size_of::<PackageStorage<'static>>() == 48);
+const _: () = assert!(size_of::<PackageStorage<'static>>() == 56);
 const _: () = assert!(align_of::<PackageStorage<'static>>() == align_of::<usize>());
 
 async fn load_node_metadata(
@@ -6916,9 +7112,15 @@ async fn load_node_metadata(
     && let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request)
   {
     let request = request.clone();
-    let metadata = tokio::task::spawn_blocking(move || read_cached_metadata(&root, &request, target))
-      .await
-      .map_err(package_blocking_task_error)??;
+    let signature_policy = Arc::clone(storage.signature_policy);
+    let metadata = tokio::task::spawn_blocking(move || {
+      if signature_policy.mode == SignatureValidationMode::Require {
+        validate_cached_package(&root, &request, true, &signature_policy)?;
+      }
+      read_cached_metadata(&root, &request, target)
+    })
+    .await
+    .map_err(package_blocking_task_error)??;
     return Ok(MetadataTaskResult::Requirements {
       metadata,
       source_work: None,
@@ -7436,7 +7638,8 @@ async fn ensure_package(
 ) -> Result<CachedPackage, PackageError> {
   if let Some(root) = find_package_root(storage.cache_root, storage.fallback_roots, request) {
     let request = request.clone();
-    return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true))
+    let signature_policy = Arc::clone(storage.signature_policy);
+    return tokio::task::spawn_blocking(move || validate_cached_package(&root, &request, true, &signature_policy))
       .await
       .map_err(package_blocking_task_error)?;
   }
@@ -7450,7 +7653,7 @@ async fn ensure_package(
     if !source_mapping_selects(source_mapping, selected_rank, &request.lower_id, endpoint.source_index()) {
       continue;
     }
-    match download_and_publish(client, request, storage.cache_root, storage.temp_root, endpoint, target, parallel_extract).await {
+    match download_and_publish(client, request, storage, endpoint, target, parallel_extract).await {
       Ok(mut package) => {
         package.failed_source_work = failed_source_work.into_boxed_slice();
         return Ok(package);
@@ -7520,6 +7723,7 @@ struct DownloadedPackage {
   nupkg_path: PathBuf,
   hash: String,
   work: HttpWork,
+  signature_policy: Arc<SignaturePolicy>,
   target: TargetFramework,
   parallel_extract: bool,
 }
@@ -7527,8 +7731,7 @@ struct DownloadedPackage {
 async fn download_and_publish(
   client: &reqwest::Client,
   request: &PackageRequest,
-  cache_root: &Path,
-  temp_root: &Path,
+  storage: PackageStorage<'_>,
   endpoint: &ServiceEndpoint,
   target: TargetFramework,
   parallel_extract: bool,
@@ -7542,9 +7745,10 @@ async fn download_and_publish(
       )
     })?;
     let request = request.clone();
-    let cache_root = cache_root.to_owned();
+    let cache_root = storage.cache_root.to_owned();
     let endpoint = endpoint.clone();
-    return tokio::task::spawn_blocking(move || install_local_package(&archive, request, cache_root, endpoint, target, parallel_extract))
+    let signature_policy = Arc::clone(storage.signature_policy);
+    return tokio::task::spawn_blocking(move || install_local_package(&archive, request, cache_root, endpoint, signature_policy, target, parallel_extract))
       .await
       .map_err(package_blocking_task_error)?;
   }
@@ -7566,7 +7770,7 @@ async fn download_and_publish(
     ));
   }
 
-  let scratch_root = unique_temp_root(temp_root, request);
+  let scratch_root = unique_temp_root(storage.temp_root, request);
   tokio::fs::create_dir_all(&scratch_root)
     .await
     .map_err(|error| package_io("create package scratch directory", &scratch_root, error))?;
@@ -7595,7 +7799,7 @@ async fn download_and_publish(
   }
   // Publication must remain an atomic rename on the global-cache volume.
   // Link from NuGet scratch when possible and copy only across volumes.
-  let staging_root = unique_temp_root(cache_root, request);
+  let staging_root = unique_temp_root(storage.cache_root, request);
   tokio::fs::create_dir_all(&staging_root)
     .await
     .map_err(|error| package_io("create package staging directory", &staging_root, error))?;
@@ -7610,13 +7814,14 @@ async fn download_and_publish(
   work.merge(package_work, &metadata.content_url)?;
   let downloaded = DownloadedPackage {
     request: request.clone(),
-    cache_root: cache_root.to_owned(),
+    cache_root: storage.cache_root.to_owned(),
     endpoint: endpoint.clone(),
     temp_root: staging_root,
     nupkg_name,
     nupkg_path,
     hash,
     work,
+    signature_policy: Arc::clone(storage.signature_policy),
     target,
     parallel_extract,
   };
@@ -7630,6 +7835,7 @@ fn install_local_package(
   request: PackageRequest,
   cache_root: PathBuf,
   endpoint: ServiceEndpoint,
+  signature_policy: Arc<SignaturePolicy>,
   target: TargetFramework,
   parallel_extract: bool,
 ) -> Result<CachedPackage, PackageError> {
@@ -7681,6 +7887,7 @@ fn install_local_package(
       duration_us: elapsed_us(source_started),
       requests: 0,
     },
+    signature_policy,
     target,
     parallel_extract,
   };
@@ -7710,6 +7917,7 @@ fn hash_local_package(path: &Path) -> Result<(String, u64), PackageError> {
 }
 
 fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard: TempGuard, _scratch_guard: TempGuard) -> Result<CachedPackage, PackageError> {
+  package_signature::verify_package(&downloaded.nupkg_path, &downloaded.signature_policy)?;
   validate_and_extract_archive(&downloaded.nupkg_path, &downloaded.temp_root, downloaded.parallel_extract)?;
   normalize_nuspec_name(&downloaded.temp_root, &downloaded.request)?;
   let nuspec_path = downloaded.temp_root.join(format!("{}.nuspec", downloaded.request.lower_id));
@@ -7755,7 +7963,7 @@ fn finish_download_and_publish(downloaded: DownloadedPackage, mut staging_guard:
       origin: None,
     }
   } else {
-    let mut cached = validate_cached_package(&final_root, &downloaded.request, false)?;
+    let mut cached = validate_cached_package(&final_root, &downloaded.request, false, &downloaded.signature_policy)?;
     cached.source_work = Some(SourceWork {
       downloaded_bytes: downloaded.work.downloaded_bytes,
       duration_us: downloaded.work.duration_us,
@@ -8396,7 +8604,7 @@ fn normalize_nuspec_name(root: &Path, request: &PackageRequest) -> Result<(), Pa
   fs::rename(&nuspecs[0], &expected).map_err(|error| package_io("normalize package nuspec", &expected, error))
 }
 
-fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: bool) -> Result<CachedPackage, PackageError> {
+fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: bool, signature_policy: &SignaturePolicy) -> Result<CachedPackage, PackageError> {
   if !root.is_dir() {
     return Err(PackageError::new(
       PackageErrorKind::Integrity,
@@ -8414,6 +8622,9 @@ fn validate_cached_package(root: &Path, request: &PackageRequest, cache_hit: boo
       root.display().to_string(),
       format!("package cache entry for {} {} is incomplete", request.id, request.version),
     ));
+  }
+  if signature_policy.mode == SignatureValidationMode::Require {
+    package_signature::verify_package(&nupkg, signature_policy)?;
   }
   let hash = fs::read_to_string(&hash_path)
     .map_err(|error| package_io("read package hash", &hash_path, error))?
@@ -10496,7 +10707,7 @@ fn read_warm_lock(
         ),
       )
     })?;
-    validate_locked_package(&root, &request, &package.sha512)?;
+    validate_locked_package(&root, &request, &package.sha512, &config.signature_policy)?;
     let compile_assets = lock_asset_paths(&root, &package.compile_assets)?;
     let runtime_assets = lock_asset_paths(&root, &package.runtime_assets)?;
     let analyzers = lock_asset_paths(&root, &package.analyzers)?;
@@ -10681,7 +10892,7 @@ fn lock_asset_path(root: &Path, value: &str) -> Result<PathBuf, PackageError> {
   Ok(root.join(relative))
 }
 
-fn validate_locked_package(root: &Path, request: &PackageRequest, expected_hash: &str) -> Result<(), PackageError> {
+fn validate_locked_package(root: &Path, request: &PackageRequest, expected_hash: &str, signature_policy: &SignaturePolicy) -> Result<(), PackageError> {
   // A completion marker is published only after the immutable package root is
   // fully extracted. Check the common dv-owned marker first so the warm path
   // performs one metadata request per package rather than two.
@@ -10706,6 +10917,10 @@ fn validate_locked_package(root: &Path, request: &PackageRequest, expected_hash:
       hash_path.display().to_string(),
       "locked package SHA-512 must decode to 64 bytes",
     ));
+  }
+  if signature_policy.mode == SignatureValidationMode::Require {
+    let nupkg = root.join(format!("{}.{}.nupkg", request.lower_id, request.version));
+    package_signature::verify_package(&nupkg, signature_policy)?;
   }
   Ok(())
 }
@@ -11442,6 +11657,7 @@ mod tests {
       audit_sources: Vec::new(),
       source_mapping: None,
       signature_validation: SignatureValidationMode::Accept,
+      signature_policy: Arc::new(SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new())),
       proxy: None,
       http_policy: DEFAULT_HTTP_POLICY,
     };
@@ -12515,6 +12731,7 @@ mod tests {
       source_index: 0,
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let signature_policy = Arc::new(SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new()));
 
     let result = runtime
       .block_on(load_node_metadata(
@@ -12525,6 +12742,7 @@ mod tests {
           cache_root: &cache_root,
           fallback_roots: &[],
           temp_root: &temp_root,
+          signature_policy: &signature_policy,
         },
         &[unrelated_endpoint],
         Some(&mapping),
@@ -12575,6 +12793,7 @@ mod tests {
       central_transitive: false,
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let signature_policy = Arc::new(SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new()));
 
     let result = runtime
       .block_on(load_node_metadata(
@@ -12585,6 +12804,7 @@ mod tests {
           cache_root: &cache_root,
           fallback_roots: &[],
           temp_root: &temp_root,
+          signature_policy: &signature_policy,
         },
         &[],
         Some(&mapping),
@@ -12950,6 +13170,7 @@ mod tests {
     ];
     let client = reqwest::Client::builder().build().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let signature_policy = Arc::new(SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new()));
 
     let package = runtime
       .block_on(ensure_package(
@@ -12959,6 +13180,7 @@ mod tests {
           cache_root: &temp.0.join("packages"),
           fallback_roots: &[],
           temp_root: &temp.0.join("scratch"),
+          signature_policy: &signature_policy,
         },
         &endpoints,
         None,
@@ -13161,12 +13383,80 @@ mod tests {
   }
 
   #[test]
-  fn required_signatures_fail_until_packages_are_actually_verified() {
-    let error = validate_signature_policy(SignatureValidationMode::Require).unwrap_err();
+  fn required_signatures_need_at_least_one_trusted_signer() {
+    let error = SignaturePolicy::new(SignatureValidationMode::Require, Vec::new()).validate().unwrap_err();
 
     assert_eq!(error.kind(), PackageErrorKind::Configuration);
-    assert!(error.to_string().contains("RES-015"));
-    validate_signature_policy(SignatureValidationMode::Accept).unwrap();
+    assert!(error.to_string().contains("trustedSigners"));
+    SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new()).validate().unwrap();
+  }
+
+  #[test]
+  fn signature_accept_allows_unsigned_packages_but_require_rejects_them() {
+    let temp = TempDirectory::new();
+    let package = write_test_package(&temp, "unsigned.nupkg", "Sample.Package", "1.2.3");
+    let accept = SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new());
+    assert!(!package_signature::verify_package(&package, &accept).unwrap());
+
+    let certificate = TrustedCertificate::parse(&"00".repeat(32), FingerprintAlgorithm::Sha256, true).unwrap();
+    let require = SignaturePolicy::new(
+      SignatureValidationMode::Require,
+      vec![TrustedSigner {
+        name: "test".to_owned(),
+        service_index: None,
+        owners: Box::new([]),
+        certificates: vec![certificate].into_boxed_slice(),
+        kind: TrustedSignerKind::Author,
+      }],
+    );
+    let error = package_signature::verify_package(&package, &require).unwrap_err();
+    assert!(error.to_string().contains("package is unsigned"));
+  }
+
+  #[test]
+  fn signature_accept_rejects_tampered_signed_packages() {
+    let temp = TempDirectory::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/author-signed.nupkg");
+    let mut bytes = fs::read(fixture).unwrap();
+    bytes[100] ^= 1;
+    let package = temp.write("tampered.nupkg", bytes);
+    let accept = SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new());
+
+    let error = package_signature::verify_package(&package, &accept).unwrap_err();
+    assert!(error.to_string().contains("content hash does not match"));
+  }
+
+  #[test]
+  fn trusted_signers_merge_as_typed_author_and_repository_policy() {
+    let temp = TempDirectory::new();
+    let fingerprint = "ab".repeat(32);
+    let lower = temp.write(
+      "lower.config",
+      format!(
+        r#"<configuration><trustedSigners>
+<author name="Contoso"><certificate fingerprint="{fingerprint}" hashAlgorithm="SHA256" allowUntrustedRoot="false" /></author>
+<repository name="Feed" serviceIndex="https://feed.example/v3/index.json"><owners>Alpha;Beta</owners><certificate fingerprint="{fingerprint}" hashAlgorithm="SHA256" allowUntrustedRoot="true" /></repository>
+</trustedSigners></configuration>"#
+      ),
+    );
+    let higher = temp.write(
+      "higher.config",
+      format!(
+        r#"<configuration><trustedSigners><author name="CONTOSO"><certificate fingerprint="{fingerprint}" hashAlgorithm="SHA256" allowUntrustedRoot="true" /></author></trustedSigners></configuration>"#
+      ),
+    );
+    let mut merged = NugetConfigMerge::default();
+
+    merge_config(&lower, &mut merged).unwrap();
+    merge_config(&higher, &mut merged).unwrap();
+
+    assert_eq!(merged.trusted_signers.len(), 2);
+    let author = &merged.trusted_signers[0];
+    assert_eq!(author.name, "CONTOSO");
+    assert!(author.certificates[0].allow_untrusted_root);
+    let repository = &merged.trusted_signers[1];
+    assert_eq!(repository.service_index.as_deref(), Some("https://feed.example/v3/index.json"));
+    assert_eq!(repository.owners.as_ref(), ["Alpha", "Beta"]);
   }
 
   #[test]
@@ -13463,13 +13753,14 @@ mod tests {
     let temp = TempDirectory::new();
     temp.write(".dv.metadata.json", "{}");
     let hash = BASE64.encode([0u8; 64]);
+    let signature_policy = SignaturePolicy::new(SignatureValidationMode::Accept, Vec::new());
 
-    validate_locked_package(&temp.0, &request(), &hash).unwrap();
+    validate_locked_package(&temp.0, &request(), &hash, &signature_policy).unwrap();
 
-    let error = validate_locked_package(&temp.0, &request(), "not-base64").unwrap_err();
+    let error = validate_locked_package(&temp.0, &request(), "not-base64", &signature_policy).unwrap_err();
     assert_eq!(error.kind(), PackageErrorKind::Integrity);
     fs::remove_file(temp.0.join(".dv.metadata.json")).unwrap();
-    let error = validate_locked_package(&temp.0, &request(), &hash).unwrap_err();
+    let error = validate_locked_package(&temp.0, &request(), &hash, &signature_policy).unwrap_err();
     assert_eq!(error.kind(), PackageErrorKind::Integrity);
   }
 

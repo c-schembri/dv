@@ -7,6 +7,8 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+cms.workspace = true
+der.workspace = true
 httpdate.workspace = true
 percent-encoding.workspace = true
 quick-xml.workspace = true
@@ -14,7 +16,12 @@ reqwest = { version = "0.13.4", default-features = false, features = ["native-tl
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1.workspace = true
+rustls-native-certs.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "io-util", "macros", "process", "sync", "time"] }
+x509-cert.workspace = true
 zeroize.workspace = true
 zip.workspace = true
 

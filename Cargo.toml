@@ -15,13 +15,20 @@ rust-version = "1.94"
 [workspace.dependencies]
 base64 = "0.22.1"
 bytes = "1.11.1"
+cms = { version = "0.2.3", features = ["std"] }
 ctrlc = "3.5.2"
+der = { version = "0.7.10", features = ["derive", "oid", "std"] }
 quick-xml = "0.41"
 httpdate = "1.0.3"
 percent-encoding = "2.3.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10.9"
+sha1 = "0.10.6"
+rustls-native-certs = "0.8.4"
+rustls-pki-types = "1.15.1"
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
+x509-cert = { version = "0.2.5", features = ["std"] }
 zeroize = "1.9.0"
 zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

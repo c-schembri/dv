@@ -5,10 +5,12 @@ replace the practical C# and .NET workflows normally orchestrated by the .NET
 CLI, MSBuild, NuGet, and test tooling, without using those tools as production
 fallbacks.
 
-It is a capability map, not a schedule. A checked item is present in the
-repository at the snapshot below. An unchecked item is required unless it is
-explicitly identified as a native `dv` addition. `REJECT` describes safe
-intermediate behavior for an unfinished compatibility row, not optional work.
+It is a capability map, not a schedule. The dependency-aware work sequence is
+maintained in [implementation-order.md](implementation-order.md). A checked
+item is present in the repository at the snapshot below. An unchecked item is
+required unless it is explicitly identified as a native `dv` addition.
+`REJECT` describes safe intermediate behavior for an unfinished compatibility
+row, not optional work.
 
 Snapshot: working tree on 2026-08-01.
 
@@ -745,11 +747,11 @@ boundary, not final drop-in parity.
   atomically on the global-cache volume. An official NuGet adapter plus an
   MSBuild property query validates the effective policy. The locked fallback
   oracle measures `523.051 ms` for Microsoft versus `5.370 ms` for `dv`
-  (`97.4x`) across 30 retained samples. Conditional HTTP caching, signature
-  verification, and vulnerability execution remain in `RES-017/018`,
-  `RES-015`, and `RES-024`. Encrypted proxy credentials and the remaining HTTP
-  transport policy are implemented by `NUGET-011`. `require` signatures and
-  enabled auditing fail explicitly until their consumers land. `P2`
+  (`97.4x`) across 30 retained samples. Conditional HTTP caching and
+  vulnerability execution remain in `RES-017/018` and `RES-024`; signature
+  verification is implemented by `RES-015`. Encrypted proxy credentials and
+  the remaining HTTP transport policy are implemented by `NUGET-011`. Enabled
+  auditing fails explicitly until its consumer lands. `P2`
 - [x] `NUGET-005` Accept CLI source/config/packages-folder overrides with
   documented precedence. Repeatable source URIs replace configured sources;
   the singleton config and packages paths resolve from the working directory,
@@ -998,8 +1000,20 @@ boundary, not final drop-in parity.
 - [x] `RES-014` Verify package identity, version, v2 source hash/size, ZIP
   structure, duplicate paths, traversal paths, entry sizes, and total
   expansion limits before cache commit. `P1`
-- [ ] `RES-015` Verify author/repository signatures and trusted-signers policy
-  with platform-correct certificate roots. `P2`
+- [x] `RES-015` Verify author and repository CMS signatures, repository
+  countersignatures, signing-certificate attributes, RFC 3161 timestamps,
+  archive content hashes, certificate chains, and hierarchical NuGet
+  `trustedSigners` policy. SHA-256/384/512 fingerprints, case-sensitive owners,
+  conflicting `allowUntrustedRoot` records, unsigned packages, tampering,
+  cache hits, and warm locks follow NuGet's security boundary. Windows uses
+  native roots; Linux and macOS use platform-correct system or selected-SDK
+  certificate bundles. A one-package local-feed oracle holds network work at
+  zero. Thirty cold samples measure `642.514 ms` for Microsoft versus
+  `27.736 ms` for `dv` (`23.2x`); warm locked validation measures `487.424 ms`
+  versus `11.565 ms` (`42.1x`). The
+  [transform contract](package-signature-contract.md) records layout and cost;
+  online revocation remains a focused
+  [compatibility follow-up](../issues/signature-revocation.md). `P2`
 - [~] `RES-016` Extract atomically into a NuGet-compatible global-packages
   layout with per-package concurrency coordination. `P1`
 - [~] `RES-017` Reuse the existing global package and HTTP caches when valid,

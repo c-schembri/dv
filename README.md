@@ -56,6 +56,12 @@ dv PackageReference policy       6.611 ms median
 dotnet legacy package pruning  492.588 ms median
 dv legacy package pruning        7.339 ms median
 
+dotnet signed restore (cold)    642.514 ms median
+dv signed restore (cold)         27.736 ms median
+
+dotnet signed restore (warm)    487.424 ms median
+dv signed restore (warm)         11.565 ms median
+
 dotnet central package restore 461.826 ms median
 dv central package restore      29.864 ms median
 
@@ -156,6 +162,7 @@ The project is in the first implementation phase.
 | NuGet package/audit sources, protocols, and pre-discovery source mapping | Implemented |
 | Bounded global and per-source NuGet request scheduling | Implemented |
 | NuGet storage, fallback, signature, proxy, and audit policy | Implemented |
+| Author/repository package signatures and trusted signers | Implemented |
 | NuGet CLI source, config, and package-folder overrides | Implemented |
 | NuGet flat and hierarchical local sources | Implemented |
 | NuGet interval and floating version selection | Implemented |
@@ -276,14 +283,17 @@ store selectors fail explicitly; public sources pay no certificate setup cost.
 
 Storage policy follows NuGet precedence for the writable global cache,
 read-only fallback folders, HTTP metadata cache, and scratch directory.
-Restore also retains typed signature-validation and project audit policy and
-constructs authenticated proxy and bypass policy only at the HTTP boundary.
+Restore verifies signed-package ZIP integrity, CMS signatures, author and
+repository identities, RFC 3161 timestamps, certificate chains, and typed
+`trustedSigners` policy before atomic publication. It also retains project
+audit policy and constructs authenticated proxy and bypass policy only at the
+HTTP boundary.
 Proxy URLs are stripped of credentials before retention; output reports only
 redacted policy flags. Remote work uses bounded per-source permits, secure-only
 redirects, NuGet-compatible retry controls, request and body-stall timeouts,
-and a zero-network offline path. Signature verification, advisory
-lookup, and conditional HTTP-cache semantics remain separately tracked parity
-work.
+and a zero-network offline path. Advisory lookup, conditional HTTP-cache
+semantics, and [online certificate revocation](issues/signature-revocation.md)
+remain separately tracked parity work.
 
 `dv build --plan` selects the newest installed reference pack matching the
 project target, parses its manifest, selects Roslyn plus built-in and package
@@ -364,7 +374,8 @@ Initial machine:
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
-  metadata, legacy package pruning, central package management, package conflict resolution, package
+  metadata, legacy package pruning, cold and warm signed-package validation,
+  central package management, package conflict resolution, package
   diagnostics, project-reference package batches, nuspec framework metadata,
   service-index capability discovery, source
   credentials, credential providers, the
@@ -401,6 +412,8 @@ Initial machine:
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
 | Apply .NET 9 Core and ASP.NET package pruning on a warm locked graph | `dotnet restore LegacyPruningProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore LegacyPruningProject.csproj --packages .packages --offline --json` | 492.588 ms | 7.339 ms | 67.1x | 544.651 ms | 8.434 ms |
+| Verify and publish a repository-signed package from empty local state | `dotnet restore PackageSignatures.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --json` | 642.514 ms | 27.736 ms | 23.2x | 672.632 ms | 33.677 ms |
+| Revalidate a repository-signed package on a warm locked restore | `dotnet restore PackageSignatures.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --offline --json` | 487.424 ms | 11.565 ms | 42.1x | 596.139 ms | 12.473 ms |
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
 | Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
@@ -498,6 +511,14 @@ same locked `Newtonsoft.Json` graph, while focused SDK-oracle checks require
 the same 420 pruning identities and stable patch ceilings. Thirty samples
 measure `492.588 ms` for Microsoft and `7.339 ms` for `dv` (`67.1x`), with no
 timed network or download work. The
+package-signature cases use the same `MessagePack.Annotations` 2.5.192 archive,
+the same required repository certificate fingerprint, and the same platform
+trust roots. The cold case starts with empty package and lock state, verifies
+the 20,900-byte signed archive, and publishes one package with zero HTTP
+requests. The warm case revalidates the immutable cached archive under the
+required policy with zero downloads. Thirty samples measure `642.514 ms`
+versus `27.736 ms` (`23.2x`) cold and `487.424 ms` versus `11.565 ms` (`42.1x`)
+warm. The
 central-package case resolves the same 54 identities through versionless
 direct references, an override, a global SourceLink reference, and a
 `Humanizer.Core` transitive pin. Preflight compares every exact version,
@@ -709,7 +730,9 @@ lifetime, stated memory/access costs, and a measurable definition of done.
 See:
 
 - [Project plan](PLAN.md)
+- [Feature parity implementation order](docs/implementation-order.md)
 - [Feature parity implementation map](docs/feature-parity-map.md)
+- [Package signature verification contract](docs/package-signature-contract.md)
 - [Data-oriented agent rules](AGENTS.md)
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Project evaluation contract](docs/project-evaluation.md)

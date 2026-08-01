@@ -39,6 +39,8 @@ enum CaseKind {
   PackageAssetPlan,
   PackageReferenceMetadata,
   PackagePruning,
+  PackageSignatureCold,
+  PackageSignatureWarm,
   NuspecFrameworkMetadata,
   PackageRidContentCold,
   PackageRidContentWarm,
@@ -84,6 +86,7 @@ struct Fixtures<'a> {
   unavailable_pack: &'a Path,
   package: &'a Path,
   package_reference_metadata: &'a Path,
+  package_signature: &'a Path,
   nuspec_framework_metadata: &'a Path,
   package_rid_content: &'a Path,
   central_package_management: &'a Path,
@@ -289,6 +292,36 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "LegacyPruningProject.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_signature_cold",
+    kind: CaseKind::PackageSignatureCold,
+    args: &[
+      "restore",
+      "PackageSignatures.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_signature_warm",
+    kind: CaseKind::PackageSignatureWarm,
+    args: &[
+      "restore",
+      "PackageSignatures.csproj",
       "--locked-mode",
       "--packages",
       ".packages",
@@ -751,6 +784,18 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_signature_cold",
+    kind: CaseKind::PackageSignatureCold,
+    args: &["restore", "PackageSignatures.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "package_signature_warm",
+    kind: CaseKind::PackageSignatureWarm,
+    args: &["restore", "PackageSignatures.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuspec_framework_metadata",
     kind: CaseKind::NuspecFrameworkMetadata,
     args: &["restore", "FrameworkMetadata.csproj", "--packages", ".packages", "--offline", "--json"],
@@ -1035,6 +1080,7 @@ fn run() -> Result<()> {
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
+  let package_signature_fixture = repository.join("benchmarks/fixtures/package-signatures");
   let nuspec_framework_metadata_fixture = repository.join("benchmarks/fixtures/nuspec-framework-metadata");
   let package_rid_content_fixture = repository.join("benchmarks/fixtures/package-rid-content");
   let central_package_management_fixture = repository.join("benchmarks/fixtures/central-package-management");
@@ -1066,6 +1112,7 @@ fn run() -> Result<()> {
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
+    package_signature: &package_signature_fixture,
     nuspec_framework_metadata: &nuspec_framework_metadata_fixture,
     package_rid_content: &package_rid_content_fixture,
     central_package_management: &central_package_management_fixture,
@@ -5041,6 +5088,8 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
       | CaseKind::PackagePruning
+      | CaseKind::PackageSignatureCold
+      | CaseKind::PackageSignatureWarm
       | CaseKind::NuspecFrameworkMetadata
       | CaseKind::PackageRidContentCold
       | CaseKind::PackageRidContentWarm
@@ -5403,6 +5452,33 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
         &["restore", "LegacyPruningProject.csproj", "--packages", ".packages", "--json"],
         workspace,
         "package-pruning setup",
+      )?;
+    }
+  }
+  if matches!(case.kind, CaseKind::PackageSignatureWarm) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "PackageSignatures.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "package-signature setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "PackageSignatures.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "package-signature setup",
       )?;
     }
   }
@@ -6476,6 +6552,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::PackageAssetPlan
     | CaseKind::PackageReferenceMetadata
     | CaseKind::PackagePruning
+    | CaseKind::PackageSignatureWarm
     | CaseKind::PackageRidContentWarm
     | CaseKind::CentralPackageManagement
     | CaseKind::NugetConfigHierarchy
@@ -6500,6 +6577,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::RuntimePackInventoryCold => reset_pack_inventory_cache(workspace),
     CaseKind::RestoreCold
     | CaseKind::PackageSyncCold
+    | CaseKind::PackageSignatureCold
     | CaseKind::PackageGraphCold
     | CaseKind::PackageGraphMassive
     | CaseKind::PackDiagnostic
@@ -6560,6 +6638,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata | CaseKind::PackagePruning => fixtures.package_reference_metadata,
+    CaseKind::PackageSignatureCold | CaseKind::PackageSignatureWarm => fixtures.package_signature,
     CaseKind::NuspecFrameworkMetadata => fixtures.nuspec_framework_metadata,
     CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => fixtures.package_rid_content,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
@@ -6596,6 +6675,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata | CaseKind::PackagePruning => Some("package-reference-metadata"),
+    CaseKind::PackageSignatureCold | CaseKind::PackageSignatureWarm => Some("package-signatures"),
     CaseKind::NuspecFrameworkMetadata => Some("nuspec-framework-metadata"),
     CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => Some("package-rid-content"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
@@ -6686,6 +6766,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
         | CaseKind::PackagePruning
+        | CaseKind::PackageSignatureCold
+        | CaseKind::PackageSignatureWarm
         | CaseKind::NuspecFrameworkMetadata
         | CaseKind::PackageRidContentCold
         | CaseKind::PackageRidContentWarm
@@ -7382,6 +7464,8 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "package_asset_plan"
           | "package_reference_metadata"
           | "package_pruning"
+          | "package_signature_cold"
+          | "package_signature_warm"
           | "package_rid_content_cold"
           | "package_rid_content_warm"
           | "package_sync_warm"
@@ -7528,6 +7612,8 @@ fn case_label(case: &str) -> &str {
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
     "package_pruning" => "Legacy package pruning",
+    "package_signature_cold" => "Cold package signature validation",
+    "package_signature_warm" => "Warm package signature validation",
     "nuspec_framework_metadata" => "NuGet framework metadata",
     "package_rid_content_cold" => "Cold RID/content asset plan",
     "package_rid_content_warm" => "Warm RID/content asset plan",
