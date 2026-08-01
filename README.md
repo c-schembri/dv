@@ -56,11 +56,11 @@ dv PackageReference policy       6.611 ms median
 dotnet legacy package pruning  492.588 ms median
 dv legacy package pruning        7.339 ms median
 
-dotnet signed restore (cold)    642.514 ms median
-dv signed restore (cold)         27.736 ms median
+dotnet signed restore (cold)    664.903 ms median
+dv signed restore (cold)         30.841 ms median
 
-dotnet signed restore (warm)    487.424 ms median
-dv signed restore (warm)         11.565 ms median
+dotnet signed restore (warm)    467.897 ms median
+dv signed restore (warm)         11.463 ms median
 
 dotnet central package restore 461.826 ms median
 dv central package restore      29.864 ms median
@@ -374,14 +374,14 @@ Initial machine:
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
-  metadata, legacy package pruning, cold and warm signed-package validation,
-  central package management, package conflict resolution, package
+  metadata, legacy package pruning, central package management, package conflict resolution, package
   diagnostics, project-reference package batches, nuspec framework metadata,
   service-index capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
-  case; compiler planning uses 5 warm-ups; 10
+  case; compiler planning and cold/warm signed-package validation use 5
+  warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -412,8 +412,8 @@ Initial machine:
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
 | Apply .NET 9 Core and ASP.NET package pruning on a warm locked graph | `dotnet restore LegacyPruningProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore LegacyPruningProject.csproj --packages .packages --offline --json` | 492.588 ms | 7.339 ms | 67.1x | 544.651 ms | 8.434 ms |
-| Verify and publish a repository-signed package from empty local state | `dotnet restore PackageSignatures.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --json` | 642.514 ms | 27.736 ms | 23.2x | 672.632 ms | 33.677 ms |
-| Revalidate a repository-signed package on a warm locked restore | `dotnet restore PackageSignatures.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --offline --json` | 487.424 ms | 11.565 ms | 42.1x | 596.139 ms | 12.473 ms |
+| Verify and publish a repository-signed package from empty local state | `dotnet restore PackageSignatures.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --json` | 664.903 ms | 30.841 ms | 21.6x | 1503.948 ms | 36.082 ms |
+| Revalidate a repository-signed package on a warm locked restore | `dotnet restore PackageSignatures.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore PackageSignatures.csproj --packages .packages --offline --json` | 467.897 ms | 11.463 ms | 40.8x | 488.129 ms | 13.841 ms |
 | Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Resolve nested direct-wins and cousin constraints from a warm package cache | `dotnet restore ConflictResolution.csproj --packages .packages -p:NoWarn=NU1605 --nologo --verbosity quiet` | `dv restore ConflictResolution.csproj --packages .packages --offline --json` | 604.023 ms | 16.971 ms | 35.6x | 689.544 ms | 19.661 ms |
 | Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
@@ -516,8 +516,8 @@ the same required repository certificate fingerprint, and the same platform
 trust roots. The cold case starts with empty package and lock state, verifies
 the 20,900-byte signed archive, and publishes one package with zero HTTP
 requests. The warm case revalidates the immutable cached archive under the
-required policy with zero downloads. Thirty samples measure `642.514 ms`
-versus `27.736 ms` (`23.2x`) cold and `487.424 ms` versus `11.565 ms` (`42.1x`)
+required policy with zero downloads. Thirty samples measure `664.903 ms`
+versus `30.841 ms` (`21.6x`) cold and `467.897 ms` versus `11.463 ms` (`40.8x`)
 warm. The
 central-package case resolves the same 54 identities through versionless
 direct references, an override, a global SourceLink reference, and a

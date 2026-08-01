@@ -1008,9 +1008,9 @@ boundary, not final drop-in parity.
   cache hits, and warm locks follow NuGet's security boundary. Windows uses
   native roots; Linux and macOS use platform-correct system or selected-SDK
   certificate bundles. A one-package local-feed oracle holds network work at
-  zero. Thirty cold samples measure `642.514 ms` for Microsoft versus
-  `27.736 ms` for `dv` (`23.2x`); warm locked validation measures `487.424 ms`
-  versus `11.565 ms` (`42.1x`). The
+  zero. Thirty cold samples measure `664.903 ms` for Microsoft versus
+  `30.841 ms` for `dv` (`21.6x`); warm locked validation measures `467.897 ms`
+  versus `11.463 ms` (`40.8x`). The
   [transform contract](package-signature-contract.md) records layout and cost;
   online revocation remains a focused
   [compatibility follow-up](../issues/signature-revocation.md). `P2`
