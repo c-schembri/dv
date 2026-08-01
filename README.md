@@ -147,7 +147,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, global output policy, and self-version | Implemented |
+| Lossless typed CLI, global output policy, compatibility exit profiles, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -191,6 +191,12 @@ The project is in the first implementation phase.
 SDK discovery supports all documented roll-forward policies, prerelease
 filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
+
+Use `--compat dotnet|msbuild|nuget|vstest` to select a pinned reference exit
+policy before command discovery. Native failures retain exit code 2; current
+reference-profile failures return 1. The selector adds no allocation and is
+removed from the typed command operands during the initial linear argument
+scan. Full drop-in grammar and output-layout work remains in progress.
 
 `dv sdk compatible-rids RID` loads the selected SDK's portable RID graph as
 data and returns NuGet-compatible breadth-first fallbacks. The compiled graph
@@ -392,6 +398,7 @@ Initial machine:
 |---|---|---|---:|---:|---:|---:|---:|
 | Select current SDK | `dotnet --version` | `dv sdk current` | 69.660 ms | 6.102 ms | 11.4x | 72.407 ms | 7.247 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
+| Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate TFM/RID/configuration conditional references | `dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release` property/item query | `dv project inspect ConditionalReferences.csproj --configuration Release --json` | 288.983 ms | 4.765 ms | 60.6x | 321.422 ms | 6.209 ms |
@@ -655,6 +662,7 @@ Reproduce the comparison:
 ```powershell
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
+cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case package_reference_conditions --samples 30 --warmups 3
@@ -737,6 +745,7 @@ See:
 - [Package signature verification contract](docs/package-signature-contract.md)
 - [Data-oriented agent rules](AGENTS.md)
 - [SDK discovery contract](docs/sdk-discovery.md)
+- [Exit behavior contract](docs/exit-behavior.md)
 - [Project evaluation contract](docs/project-evaluation.md)
 - [Runtime pack planning contract](docs/runtime-pack-planning.md)
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)

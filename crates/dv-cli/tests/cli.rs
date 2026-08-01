@@ -50,6 +50,7 @@ fn help_exposes_the_initial_command_surface() {
   assert!(stdout.contains("--json"));
   assert!(stdout.contains("--verbosity LEVEL"));
   assert!(stdout.contains("--color | --no-color"));
+  assert!(stdout.contains("--compat dotnet|msbuild|nuget|vstest"));
 }
 
 #[test]
@@ -107,6 +108,36 @@ fn unknown_command_is_an_explicit_failure() {
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert!(stderr.contains("error[DV0001]"));
   assert!(stderr.contains("unknown command"));
+}
+
+#[test]
+fn compatibility_profiles_preserve_reference_failure_codes() {
+  for profile in ["dotnet", "msbuild", "nuget", "vstest"] {
+    let output = dv().args(["--compat", profile, "frobnicate"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "profile {profile}");
+    assert!(String::from_utf8(output.stderr).unwrap().contains("error[DV0001]"));
+  }
+}
+
+#[test]
+fn compatibility_mode_is_selected_before_discovery_and_removed_from_operands() {
+  let selected = dv().args(["sdk", "--compat=dotnet", "current"]).output().unwrap();
+  let failed = dv().args(["--compat", "dotnet", "restore", "DefinitelyMissing.csproj"]).output().unwrap();
+
+  assert!(selected.status.success(), "{}", String::from_utf8_lossy(&selected.stderr));
+  assert_eq!(failed.status.code(), Some(1));
+  assert!(String::from_utf8(failed.stderr).unwrap().contains("DefinitelyMissing.csproj"));
+}
+
+#[test]
+fn invalid_compatibility_mode_is_a_native_usage_failure() {
+  let output = dv().args(["--compat", "mono", "restore", "DefinitelyMissing.csproj"]).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("unsupported compatibility mode"));
+  assert!(!stderr.contains("DefinitelyMissing.csproj"));
 }
 
 #[test]

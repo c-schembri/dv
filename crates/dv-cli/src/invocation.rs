@@ -10,6 +10,18 @@ pub(crate) const COMMAND_SYNTAX_VERSION: u16 = 1;
 #[repr(u8)]
 pub(crate) enum InvocationMode {
   Native,
+  Dotnet,
+  Msbuild,
+  Nuget,
+  Vstest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum FailureClass {
+  Usage,
+  Unsupported,
+  Operation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +85,39 @@ const _: () = assert!(size_of::<GlobalOptions>() == 3);
 const _: () = assert!(align_of::<GlobalOptions>() == 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InvocationOptions {
+  mode: InvocationMode,
+  globals: GlobalOptions,
+}
+
+impl InvocationOptions {
+  pub(crate) fn json(self) -> bool {
+    self.globals.json()
+  }
+
+  pub(crate) fn color(self) -> ColorChoice {
+    self.globals.color()
+  }
+
+  pub(crate) fn verbosity(self) -> DiagnosticVerbosity {
+    self.globals.verbosity()
+  }
+
+  pub(crate) fn failure_exit_code(self, class: FailureClass) -> u8 {
+    match (self.mode, class) {
+      (InvocationMode::Native, FailureClass::Usage | FailureClass::Unsupported | FailureClass::Operation) => 2,
+      (
+        InvocationMode::Dotnet | InvocationMode::Msbuild | InvocationMode::Nuget | InvocationMode::Vstest,
+        FailureClass::Usage | FailureClass::Unsupported | FailureClass::Operation,
+      ) => 1,
+    }
+  }
+}
+
+const _: () = assert!(size_of::<InvocationOptions>() == 4);
+const _: () = assert!(align_of::<InvocationOptions>() == 1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InvocationRequest {
   command_index: usize,
   syntax_version: u16,
@@ -86,8 +131,11 @@ impl InvocationRequest {
     self.command
   }
 
-  pub(crate) fn globals(self) -> GlobalOptions {
-    self.globals
+  pub(crate) fn options(self) -> InvocationOptions {
+    InvocationOptions {
+      mode: self.mode,
+      globals: self.globals,
+    }
   }
 }
 
@@ -204,13 +252,15 @@ impl InvocationBatch {
   pub(crate) fn capture(arguments: impl IntoIterator<Item = OsString>) -> Self {
     let raw_arguments = RawArguments::capture(arguments);
     let mut globals = GlobalOptions::default();
+    let mut mode = InvocationMode::Native;
+    let mut compat_explicit = false;
     let mut color_explicit = false;
     let mut command_index = None;
     let mut semantic_indices = None::<SemanticIndices>;
     let mut option_error = None;
     let mut index = 0;
     while raw_arguments.get(index).is_some() {
-      match parse_global_option(&raw_arguments, index, &mut globals, &mut color_explicit) {
+      match parse_global_option(&raw_arguments, index, &mut globals, &mut mode, &mut compat_explicit, &mut color_explicit) {
         Ok(Some(width)) => {
           if let Some(command) = command_index
             && semantic_indices.is_none()
@@ -253,7 +303,7 @@ impl InvocationBatch {
       request: InvocationRequest {
         command_index: command_index.unwrap_or(usize::MAX),
         syntax_version: COMMAND_SYNTAX_VERSION,
-        mode: InvocationMode::Native,
+        mode,
         command,
         globals,
       },
@@ -380,7 +430,14 @@ impl<'a> Iterator for CommandArgumentIter<'a> {
   }
 }
 
-fn parse_global_option(arguments: &RawArguments, index: usize, globals: &mut GlobalOptions, color_explicit: &mut bool) -> Result<Option<usize>, String> {
+fn parse_global_option(
+  arguments: &RawArguments,
+  index: usize,
+  globals: &mut GlobalOptions,
+  mode: &mut InvocationMode,
+  compat_explicit: &mut bool,
+  color_explicit: &mut bool,
+) -> Result<Option<usize>, String> {
   let argument = arguments.get(index).expect("global option index is valid");
   match argument.to_str() {
     Some("--json") => globals.json = true,
@@ -393,6 +450,22 @@ fn parse_global_option(arguments: &RawArguments, index: usize, globals: &mut Glo
     Some("--no-color") => {
       globals.color = ColorChoice::Never;
       *color_explicit = true;
+    },
+    Some("--compat") => {
+      if *compat_explicit {
+        return Err("--compat may be specified only once".into());
+      }
+      let value = arguments.get(index + 1).ok_or("--compat requires dotnet, msbuild, nuget, or vstest")?;
+      *mode = parse_compatibility_mode(value)?;
+      *compat_explicit = true;
+      return Ok(Some(2));
+    },
+    Some(value) if value.starts_with("--compat=") => {
+      if *compat_explicit {
+        return Err("--compat may be specified only once".into());
+      }
+      *mode = parse_compatibility_mode(OsStr::new(&value["--compat=".len()..]))?;
+      *compat_explicit = true;
     },
     Some("--verbosity") => {
       let value = arguments
@@ -407,6 +480,16 @@ fn parse_global_option(arguments: &RawArguments, index: usize, globals: &mut Glo
     _ => return Ok(None),
   }
   Ok(Some(1))
+}
+
+fn parse_compatibility_mode(value: &OsStr) -> Result<InvocationMode, String> {
+  match value.to_str() {
+    Some("dotnet") => Ok(InvocationMode::Dotnet),
+    Some("msbuild") => Ok(InvocationMode::Msbuild),
+    Some("nuget") => Ok(InvocationMode::Nuget),
+    Some("vstest") => Ok(InvocationMode::Vstest),
+    _ => Err(format!("unsupported compatibility mode {:?}", value.to_string_lossy())),
+  }
 }
 
 fn parse_verbosity(value: &OsStr) -> Result<DiagnosticVerbosity, String> {
@@ -446,7 +529,7 @@ mod tests {
     assert_eq!(batch.request().syntax_version, COMMAND_SYNTAX_VERSION);
     assert_eq!(batch.request().mode, InvocationMode::Native);
     assert_eq!(batch.request().command, CommandKind::Restore);
-    assert!(batch.request().globals().json());
+    assert!(batch.request().options().json());
     assert_eq!(batch.command_text(), Some("restore"));
     assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new(""), OsStr::new("App.csproj")]);
     assert_eq!(batch.raw_arguments(), ["--json", "restore", "", "App.csproj"]);
@@ -476,8 +559,8 @@ mod tests {
     let batch = InvocationBatch::capture(["--quiet", "restore", "App.csproj", "--verbosity", "diagnostic", "--no-color"].map(OsString::from));
 
     assert_eq!(batch.request().command, CommandKind::Restore);
-    assert_eq!(batch.request().globals().verbosity(), DiagnosticVerbosity::Diagnostic);
-    assert_eq!(batch.request().globals().color(), ColorChoice::Never);
+    assert_eq!(batch.request().options().verbosity(), DiagnosticVerbosity::Diagnostic);
+    assert_eq!(batch.request().options().color(), ColorChoice::Never);
     assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("App.csproj")]);
     assert!(matches!(batch.semantic_indices, Some(SemanticIndices::Inline { .. })));
   }
@@ -503,6 +586,57 @@ mod tests {
         OsString::from("current"),
         OsString::from("--json"),
         OsString::from("--color"),
+      ],
+    ] {
+      let batch = InvocationBatch::capture(arguments);
+      assert_eq!(batch.request().command, CommandKind::InvalidOptions);
+      assert!(batch.option_error().is_some());
+    }
+  }
+
+  #[test]
+  fn compatibility_mode_is_typed_and_removed_from_command_operands() {
+    for (name, expected) in [
+      ("dotnet", InvocationMode::Dotnet),
+      ("msbuild", InvocationMode::Msbuild),
+      ("nuget", InvocationMode::Nuget),
+      ("vstest", InvocationMode::Vstest),
+    ] {
+      let batch = InvocationBatch::capture([
+        OsString::from("sdk"),
+        OsString::from("--compat"),
+        OsString::from(name),
+        OsString::from("current"),
+      ]);
+
+      assert_eq!(batch.request().options().mode, expected);
+      assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("current")]);
+    }
+  }
+
+  #[test]
+  fn compatibility_mode_uses_reference_failure_codes() {
+    let native = InvocationBatch::capture([OsString::from("frobnicate")]).request().options();
+    let compat = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("frobnicate")])
+      .request()
+      .options();
+
+    for class in [FailureClass::Usage, FailureClass::Unsupported, FailureClass::Operation] {
+      assert_eq!(native.failure_exit_code(class), 2);
+      assert_eq!(compat.failure_exit_code(class), 1);
+    }
+  }
+
+  #[test]
+  fn malformed_or_repeated_compatibility_mode_is_rejected() {
+    for arguments in [
+      vec![OsString::from("--compat")],
+      vec![OsString::from("--compat=mono"), OsString::from("sdk")],
+      vec![
+        OsString::from("--compat=dotnet"),
+        OsString::from("sdk"),
+        OsString::from("--compat"),
+        OsString::from("msbuild"),
       ],
     ] {
       let batch = InvocationBatch::capture(arguments);

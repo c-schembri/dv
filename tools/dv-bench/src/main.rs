@@ -125,6 +125,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "sdk_current_compat",
+    kind: CaseKind::Startup,
+    args: &["--version"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
@@ -706,6 +712,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "sdk_current_compat",
+    kind: CaseKind::Startup,
+    args: &["--compat", "dotnet", "sdk", "current"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["sdk", "compatible-rids", "linux-musl-x64"],
@@ -1151,7 +1163,7 @@ fn run() -> Result<()> {
   let workspace = repository.join(format!("target/benchmark-work-{}", std::process::id()));
   let dv_executable = prepare_dv_executable(&repository, options.dv.as_deref())?;
   ensure_workspace_is_safe(&repository, &workspace)?;
-  if options.case.as_deref().is_none_or(|case| case == "sdk_current") {
+  if options.case.as_deref().is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat")) {
     verify_sdk_selection(&dv_executable, &fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
@@ -1310,6 +1322,10 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let dv_version = command_text(dv_executable, &["sdk", "current"], fixture)?;
   if dotnet_version != dv_version {
     return Err(format!("SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {dv_version:?}").into());
+  }
+  let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "sdk", "current"], fixture)?;
+  if dotnet_version != compatibility_version {
+    return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
   }
   Ok(())
 }
@@ -7609,6 +7625,7 @@ fn case_label(case: &str) -> &str {
   match case {
     "sdk_current" => "SDK selection",
     "sdk_current_globals" => "SDK selection + globals",
+    "sdk_current_compat" => "SDK selection + compatibility",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "package_reference_conditions" => "Conditional references",

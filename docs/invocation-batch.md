@@ -22,7 +22,7 @@ single process-lifetime allocation, not parsing correctness.`
    multi-token batch, retaining the exact platform encoding.
 2. One linear, predictable scan -> typed global output policy and first
    semantic token.
-3. First semantic token -> a typed native command request before SDK,
+3. First semantic token -> a typed native or explicit compatibility request before SDK,
    current-directory, project, filesystem, process, or network access.
 4. Command operands -> borrowed views. Text-only positions reject invalid
    Unicode; path positions construct `PathBuf` directly from the OS string.
@@ -57,6 +57,13 @@ non-Unicode, and unsupported verbosity values are rejected at the same boundary.
 Top-level help and self-version remain typed command requests and perform no
 SDK, current-directory, filesystem, process, or network work.
 
+`CLI-007` adds a one-byte compatibility mode selected by `--compat
+dotnet|msbuild|nuget|vstest`. It follows the same linear scan and indexed-view
+rules as output globals, so the selector is removed from semantic operands
+without copying tokens. Mode plus output policy forms one four-byte options
+record. Exit mappings and their pinned oracle evidence are documented in
+[exit-behavior.md](exit-behavior.md).
+
 ## Layout And Access
 
 `InvocationRequest` is 16 bytes and aligned to `usize` on supported 64-bit
@@ -84,8 +91,8 @@ human output.
 - Command names and text-only SDK operands must be valid Unicode.
 - Paths remain lossless OS strings until consumed by filesystem APIs.
 - The command syntax version is `1` and is independent of the JSON event schema.
-- Only native mode exists in this slice. Compatibility modes and precedence
-  remain explicitly partial under `DROP-002` and `DROP-003`.
+- Native and explicit compatibility modes exist. Automatic grammar inference,
+  aliases, and precedence remain partial under `DROP-002` and `DROP-003`.
 - End-of-options and child forwarding remain open under `CLI-012` and
   `DROP-013`; no unsupported syntax is silently accepted by this contract.
 
@@ -121,3 +128,10 @@ p95, a `10.6x` median improvement. The preceding boxed-index run measured
 `7.033 ms`; the `0.047 ms` difference is noise, so no speedup is
 claimed for the structural allocation removal. The retained inline-index raw
 samples are `benchmarks/results/baseline-1785567618.json`.
+
+The explicit compatibility case compares `dotnet --version` with `dv --compat
+dotnet sdk current` after preflight proves identical selected-SDK output.
+Thirty retained samples after three warm-ups measured `65.901 ms` median and
+`67.752 ms` p95 for `dotnet`, and `5.225 ms` median and `6.202 ms` p95 for
+`dv`, a `12.6x` median improvement. The raw samples are
+`benchmarks/results/baseline-1785569009.json`.

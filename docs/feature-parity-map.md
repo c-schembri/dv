@@ -271,9 +271,11 @@ contracts.
   request that retains lossless OS arguments where paths require it. `P1`
 - [x] `CLI-006` Define global `--help`, `--version`, `--json`, `--verbose`,
   `--quiet`, `--color`, `--no-color`, and diagnostic verbosity behavior. `P1`
-- [ ] `CLI-007` Preserve the reference tool's documented and observed exit
+- [x] `CLI-007` Preserve the reference tool's documented and observed exit
   behavior in compatibility mode, then map it to stable native `dv` outcome
-  classes internally. `P1`
+  classes internally. Explicit `dotnet`, MSBuild, NuGet, and VSTest profiles
+  map typed usage, unsupported, and operation failures to the exit behavior
+  observed from SDK `10.0.100`; native failures retain stable code 2. `P1`
 - [ ] `CLI-008` Support `--project`, explicit project/solution paths, and
   unambiguous current-directory defaults. `P1`
 - [ ] `CLI-009` Support repeated CLI property overrides without reparsing
@@ -325,9 +327,11 @@ contracts.
 - [ ] `DROP-010` Resolve ambiguous command words such as `restore`, `pack`,
   `push`, `list`, `add`, and `update` using an explicit precedence table that
   matches the input shape and never guesses after side effects begin. `P1`
-- [ ] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
+- [~] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
   diagnostics and ambiguous automation without requiring it for ordinary
-  executable-token replacement. `P1`
+  executable-token replacement. The typed selector and exit policy are
+  implemented; complete reference grammars and diagnostic layouts remain
+  open. `P1`
 - [ ] `DROP-012` Detect optional executable aliases or shims named `dotnet`,
   `msbuild`, `nuget`, and `vstest.console` through `argv[0]`, while keeping the
   same parser and execution transforms. `P5`
@@ -339,9 +343,11 @@ contracts.
 - [ ] `DROP-015` Preserve script-consumed stdout/stderr placement, encodings,
   line endings, quiet/verbosity behavior, JSON/XML schemas, result files, and
   binary formats. `P1-P4`
-- [ ] `DROP-016` Preserve success, usage, build, restore, test-failure,
+- [~] `DROP-016` Preserve success, usage, build, restore, test-failure,
   no-tests, cancellation, and child-process exit behavior per reference tool.
-  `P1-P3`
+  Current success, usage, unsupported, and operation failures have explicit
+  native/reference policies; build results, test results, cancellation, and
+  child-process exits remain open with their workflows. `P1-P3`
 - [ ] `DROP-017` Make help/version/info output expose both accepted
   compatibility syntax and canonical `dv` syntax without changing the result
   of reference `--help`, `/?`, or `help` forms. `P1`

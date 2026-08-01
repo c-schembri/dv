@@ -9,7 +9,7 @@ use std::{
 
 mod invocation;
 
-use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, GlobalOptions, InvocationBatch};
+use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, FailureClass, InvocationBatch, InvocationOptions};
 
 use dv_core::{
   CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
@@ -28,6 +28,7 @@ dv - a fast .NET development toolchain
 
 Usage:
   dv <command> [options]
+  dv --compat dotnet|msbuild|nuget|vstest <command> [options]
   dv --help
   dv --version
 
@@ -93,7 +94,7 @@ fn main() -> ExitCode {
   let started = Instant::now();
   let invocation = InvocationBatch::capture(env::args_os().skip(1));
   let request = invocation.request();
-  let globals = request.globals();
+  let globals = request.options();
   let json = globals.json();
   let command_args = invocation.command_arguments();
   match request.command() {
@@ -114,7 +115,7 @@ fn main() -> ExitCode {
     },
     CommandKind::KnownUnimplemented => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      fail(
+      unsupported(
         started,
         globals,
         command,
@@ -132,7 +133,7 @@ fn main() -> ExitCode {
     },
     CommandKind::Unknown => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      fail(
+      reject(
         started,
         globals,
         command,
@@ -148,7 +149,7 @@ fn main() -> ExitCode {
         ),
       )
     },
-    CommandKind::InvalidText => fail(
+    CommandKind::InvalidText => reject(
       started,
       globals,
       "<invalid>",
@@ -160,7 +161,7 @@ fn main() -> ExitCode {
         Some("Pass the command name as valid Unicode text."),
       ),
     ),
-    CommandKind::InvalidOptions => fail(
+    CommandKind::InvalidOptions => reject(
       started,
       globals,
       "<invalid>",
@@ -175,7 +176,7 @@ fn main() -> ExitCode {
   }
 }
 
-fn run_package_command(started: Instant, globals: GlobalOptions, command: &str, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
+fn run_package_command(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   let mut semantic = command_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
@@ -185,7 +186,7 @@ fn run_package_command(started: Instant, globals: GlobalOptions, command: &str, 
   let options = match parse_package_args(command, command_args) {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         command,
@@ -246,7 +247,7 @@ fn run_package_command(started: Instant, globals: GlobalOptions, command: &str, 
   }
   let options = match normalize_package_options(options, &current_directory, true) {
     Ok(options) => options,
-    Err(problem) => return fail(started, globals, command, args, diagnostic("DV0002", problem, None, None)),
+    Err(problem) => return reject(started, globals, command, args, diagnostic("DV0002", problem, None, None)),
   };
   let project_refs = projects.iter().collect::<Vec<_>>();
   let resolutions = match resolve_package_inputs(&project_refs, &options) {
@@ -456,7 +457,7 @@ fn write_credential_provider_log(message: &str) {
   let _ = writeln!(io::stderr().lock(), "credential provider: {message}");
 }
 
-fn run_build(started: Instant, globals: GlobalOptions, args: Vec<String>, build_args: CommandArguments<'_>) -> ExitCode {
+fn run_build(started: Instant, globals: InvocationOptions, args: Vec<String>, build_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   let mut semantic = build_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
@@ -464,7 +465,7 @@ fn run_build(started: Instant, globals: GlobalOptions, args: Vec<String>, build_
     return ExitCode::SUCCESS;
   }
   if !build_args.iter().any(|argument| argument == "--plan") {
-    return fail(
+    return unsupported(
       started,
       globals,
       "build",
@@ -480,7 +481,7 @@ fn run_build(started: Instant, globals: GlobalOptions, args: Vec<String>, build_
   let (requested_path, configuration) = match parse_project_args(build_args, true) {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         "build --plan",
@@ -755,7 +756,7 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args: CommandArguments<'_>) -> ExitCode {
+fn run_sdk(started: Instant, globals: InvocationOptions, args: Vec<String>, sdk_args: CommandArguments<'_>) -> ExitCode {
   let mut semantic = sdk_args.iter();
   let first = semantic.next();
   let second = semantic.next();
@@ -763,14 +764,14 @@ fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args
   let first_text = match first {
     Some(argument) => match argument.to_str() {
       Some(value) => Some(value),
-      None => return fail(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
+      None => return reject(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
     },
     None => None,
   };
   let second_text = match second {
     Some(argument) => match argument.to_str() {
       Some(value) => Some(value),
-      None => return fail(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
+      None => return reject(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
     },
     None => None,
   };
@@ -786,7 +787,7 @@ fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args
     (Some("current"), None, false) => sdk_current(started, globals, args),
     (Some("list"), None, false) => sdk_list(started, globals, args),
     (Some("compatible-rids"), Some(runtime_identifier), false) => sdk_compatible_rids(started, globals, args, runtime_identifier),
-    (Some("compatible-rids"), _, _) => fail(
+    (Some("compatible-rids"), _, _) => reject(
       started,
       globals,
       "sdk compatible-rids",
@@ -800,7 +801,7 @@ fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args
     ),
     _ => {
       let subcommand = first_text.unwrap_or("<missing>");
-      fail(
+      reject(
         started,
         globals,
         "sdk",
@@ -819,7 +820,7 @@ fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args
   }
 }
 
-fn sdk_current(started: Instant, globals: GlobalOptions, args: Vec<String>) -> ExitCode {
+fn sdk_current(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
   let json = globals.json();
   let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
@@ -851,7 +852,7 @@ fn sdk_current(started: Instant, globals: GlobalOptions, args: Vec<String>) -> E
   succeed(started, "sdk current", args, payload)
 }
 
-fn sdk_list(started: Instant, globals: GlobalOptions, args: Vec<String>) -> ExitCode {
+fn sdk_list(started: Instant, globals: InvocationOptions, args: Vec<String>) -> ExitCode {
   let json = globals.json();
   let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
@@ -890,10 +891,10 @@ fn sdk_list(started: Instant, globals: GlobalOptions, args: Vec<String>) -> Exit
   succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
 }
 
-fn sdk_compatible_rids(started: Instant, globals: GlobalOptions, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
+fn sdk_compatible_rids(started: Instant, globals: InvocationOptions, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
   let json = globals.json();
   if runtime_identifier.is_empty() {
-    return fail(
+    return reject(
       started,
       globals,
       "sdk compatible-rids",
@@ -942,7 +943,7 @@ fn sdk_compatible_rids(started: Instant, globals: GlobalOptions, args: Vec<Strin
   )
 }
 
-fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn run_project(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   if project_args.is_empty() {
     print!("{PROJECT_HELP}");
@@ -951,7 +952,7 @@ fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, proj
   let subcommand = match project_args.first().and_then(OsStr::to_str) {
     Some(value) => value,
     None => {
-      return fail(
+      return reject(
         started,
         globals,
         "project",
@@ -980,7 +981,7 @@ fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, proj
     return project_package_sources(started, globals, args, operands);
   }
   if subcommand != "inspect" {
-    return fail(
+    return reject(
       started,
       globals,
       "project",
@@ -1000,7 +1001,7 @@ fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, proj
   let (requested_path, configuration) = match parse_project_args(operands, false) {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         "project inspect",
@@ -1095,12 +1096,12 @@ fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, proj
   succeed(started, "project inspect", args, payload)
 }
 
-fn project_package_sources(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_package_sources(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   let parsed = match parse_package_args("project package-sources", project_args) {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         "project package-sources",
@@ -1133,7 +1134,7 @@ fn project_package_sources(started: Instant, globals: GlobalOptions, args: Vec<S
   };
   let options = match normalize_package_options(parsed, &current_directory, false) {
     Ok(options) => options,
-    Err(problem) => return fail(started, globals, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
+    Err(problem) => return reject(started, globals, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
   };
   let inventories = match inspect_package_sources(&[&project], &options) {
     Ok(inventories) => inventories,
@@ -1243,12 +1244,12 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn project_frameworks(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_frameworks(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         "project frameworks",
@@ -1325,12 +1326,12 @@ fn project_frameworks(started: Instant, globals: GlobalOptions, args: Vec<String
   )
 }
 
-fn project_runtime_packs(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+fn project_runtime_packs(started: Instant, globals: InvocationOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
   let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
-      return fail(
+      return reject(
         started,
         globals,
         "project runtime-packs",
@@ -1834,7 +1835,7 @@ fn package_downgrade_diagnostics(resolution: &PackageResolution) -> Vec<Diagnost
     .collect()
 }
 
-fn load_sdk_inventory(started: Instant, globals: GlobalOptions, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
+fn load_sdk_inventory(started: Instant, globals: InvocationOptions, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
   let current_directory = env::current_dir().map_err(|error| {
     fail(
       started,
@@ -2040,7 +2041,7 @@ fn succeed(started: Instant, command: &str, args: Vec<String>, payload: EventPay
 
 fn succeed_batch_with_diagnostics(
   started: Instant,
-  globals: GlobalOptions,
+  globals: InvocationOptions,
   command: &str,
   args: Vec<String>,
   diagnostics: Vec<Diagnostic>,
@@ -2071,7 +2072,7 @@ fn succeed_batch_with_diagnostics(
   ExitCode::SUCCESS
 }
 
-fn write_human_diagnostics(diagnostics: &[Diagnostic], globals: GlobalOptions) {
+fn write_human_diagnostics(diagnostics: &[Diagnostic], globals: InvocationOptions) {
   let mut stderr = io::stderr().lock();
   for diagnostic in diagnostics {
     if !diagnostic_visible(diagnostic.severity, globals.verbosity()) {
@@ -2132,7 +2133,19 @@ fn non_unicode_argument_diagnostic(argument: &OsStr, meaning: &str) -> Diagnosti
   )
 }
 
-fn fail(started: Instant, globals: GlobalOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+fn reject(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_class(started, globals, FailureClass::Usage, command, args, diagnostic)
+}
+
+fn unsupported(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_class(started, globals, FailureClass::Unsupported, command, args, diagnostic)
+}
+
+fn fail(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_class(started, globals, FailureClass::Operation, command, args, diagnostic)
+}
+
+fn fail_with_class(started: Instant, globals: InvocationOptions, class: FailureClass, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let json = globals.json();
 
@@ -2161,7 +2174,7 @@ fn fail(started: Instant, globals: GlobalOptions, command: &str, args: Vec<Strin
     write_human_diagnostics(std::slice::from_ref(&diagnostic), globals);
   }
 
-  ExitCode::from(2)
+  ExitCode::from(globals.failure_exit_code(class))
 }
 
 fn micros(duration: std::time::Duration) -> u64 {
