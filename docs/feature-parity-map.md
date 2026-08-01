@@ -914,8 +914,17 @@ boundary, not final drop-in parity.
   TFM, RID, configuration, three-package batch, project path, and explicit
   framework row. Thirty warm Windows samples measure `288.983 ms` for
   Microsoft versus `4.765 ms` for `dv` (`60.6x`). `P2`
-- [ ] `RES-006` Read `Directory.Packages.props` and implement central package
-  versions, version overrides, global references, and transitive pinning. `P2`
+- [x] `RES-006` The nearest bounded `Directory.Packages.props` is parsed into a
+  case-insensitive identity-ordered 16-byte central-version row batch.
+  Conditional `PackageVersion`, `VersionOverride`, fixed-policy
+  `GlobalPackageReference`, and exact transitive pin promotion are integrated
+  with project evaluation, graph convergence, lock fingerprinting, and schema
+  15 structured roles. Malformed, duplicate, missing, dynamic, unsupported,
+  and downgrade inputs fail explicitly before unrelated package work. A
+  Microsoft-oracled 54-package warm lock verifies every identity, version,
+  SHA-512, asset family, and `CentralTransitive` role. Thirty Windows samples
+  measure `461.826 ms` for Microsoft versus `29.864 ms` for `dv` (`15.5x`).
+  `P2`
 - [~] `RES-007` Lowest-applicable-version, direct-dependency-wins, and cousin
   convergence use an identity-ordered constraint table with stale-edge
   retraction and bounded non-convergence failure. The eShop-derived acceptance

@@ -57,7 +57,7 @@ const MAX_EXTRACTION_WORKERS: usize = 4;
 const MIN_PARALLEL_EXTRACTION_ENTRIES: usize = 8;
 const MAX_GRAPH_REVISIONS: u32 = 64;
 const PUBLISH_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(16)];
-const LOCK_SCHEMA_VERSION: u16 = 4;
+const LOCK_SCHEMA_VERSION: u16 = 5;
 const SERVICE_CAPABILITY_COUNT: usize = 5;
 const PACKAGE_BASE_TYPES: &[&str] = &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"];
 const REGISTRATION_TYPES: &[&str] = &[
@@ -453,6 +453,7 @@ pub struct ResolvedPackage {
   version: TextSpan,
   dependencies: ItemRange,
   direct: bool,
+  central_transitive: bool,
   cache_hit: bool,
 }
 
@@ -773,6 +774,7 @@ pub struct PackageResolution {
   source_name: TextSpan,
   source_location: TextSpan,
   prune_fingerprint: TextSpan,
+  central_package_fingerprint: TextSpan,
   source_protocol: NugetProtocol,
   signature_validation: SignatureValidationMode,
   audit_enabled: bool,
@@ -796,7 +798,7 @@ pub struct PackageResolution {
   downloaded_bytes: u64,
 }
 
-const _: () = assert!(size_of::<PackageResolution>() == 344);
+const _: () = assert!(size_of::<PackageResolution>() == 352);
 const _: () = assert!(align_of::<PackageResolution>() == align_of::<usize>());
 
 impl PackageResolution {
@@ -925,6 +927,11 @@ impl PackageResolution {
   /// Returns whether a package was directly referenced by the project.
   pub fn package_is_direct(&self, package: ResolvedPackage) -> bool {
     package.direct
+  }
+
+  /// Returns whether a transitive dependency was promoted by a central pin.
+  pub fn package_is_central_transitive(&self, package: ResolvedPackage) -> bool {
+    package.central_transitive
   }
 
   /// Returns the successful cache classification for a resolved package.
@@ -1136,9 +1143,10 @@ impl PackageResolution {
   }
 
   pub(crate) fn matches_project(&self, project: &ProjectSpec) -> bool {
-    let direct_count = self.packages.iter().filter(|package| package.direct).count();
+    let direct_count = self.direct_policies.len();
     self.target_framework() == project.target_framework()
       && self.lock_path() == project.project_directory().join("dv.lock.json")
+      && self.get(self.central_package_fingerprint) == project.central_package_fingerprint()
       && direct_count == project.package_references().len()
       && project.package_references().iter().all(|reference| {
         let Ok(range) = VersionRange::parse(project.package_version(*reference)) else {
@@ -1261,6 +1269,7 @@ struct PackageRequest {
   lower_id: String,
   version: String,
   direct: bool,
+  central_transitive: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1271,6 +1280,11 @@ struct PackageRequirement {
   direct: bool,
   include_assets: AssetFlags,
   suppress_parent: AssetFlags,
+}
+
+struct CentralPackagePin {
+  lower_id: String,
+  version: PackageVersion,
 }
 
 /// Parsed NuGet version used only while converging cold dependency metadata.
@@ -1760,6 +1774,7 @@ struct ResolutionContext<'a> {
   source_location: &'a str,
   sources: &'a [(String, PackageSource)],
   prune_fingerprint: &'a str,
+  central_package_fingerprint: &'a str,
   source_protocol: NugetProtocol,
   signature_validation: SignatureValidationMode,
   audit_enabled: bool,
@@ -1827,12 +1842,18 @@ struct ResolvedGraph {
   source_work: Vec<SourceWork>,
 }
 
+struct GraphRoots<'a> {
+  direct: &'a [PackageRequirement],
+  central_pins: &'a [CentralPackagePin],
+}
+
 /// Cold graph state is identity-ordered and owned by the resolver task. Parent
 /// identities key constraints so replacing a package version can retract its
 /// previous edges without retaining an object graph.
 struct ConstraintNode {
   id: String,
   direct: Option<VersionRange>,
+  central_pin: Option<PackageVersion>,
   constraints: BTreeMap<String, VersionRange>,
   selected: Option<PackageVersion>,
   metadata_version: Option<PackageVersion>,
@@ -2352,6 +2373,8 @@ struct LockFile {
   source_protocol: NugetProtocol,
   #[serde(default)]
   prune_fingerprint: String,
+  #[serde(default)]
+  central_package_fingerprint: String,
   direct: Vec<LockDirect>,
   packages: Vec<LockPackage>,
 }
@@ -2375,6 +2398,8 @@ struct LockPackage {
   version: String,
   sha512: String,
   direct: bool,
+  #[serde(default)]
+  central_transitive: bool,
   dependencies: Vec<LockDependency>,
   compile_assets: Vec<String>,
   runtime_assets: Vec<String>,
@@ -2579,6 +2604,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
   validate_audit_policy(project)?;
   let lock_path = project.project_directory().join("dv.lock.json");
   let direct = direct_requests(project)?;
+  let central_pins = central_package_pins(project)?;
   let target = project.target();
   let target_text = project.target_framework();
   let pruning = discover_package_pruning(project.project_directory(), target)?;
@@ -2592,7 +2618,18 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
     .enable_all()
     .build()
     .map_err(|error| PackageError::new(PackageErrorKind::Io, "package scheduler", format!("failed to create async runtime: {error}")))?;
-  let graph = runtime.block_on(resolve_streaming_graph(&client, &direct, &config, options, target, target_text, &pruning))?;
+  let graph = runtime.block_on(resolve_streaming_graph(
+    &client,
+    GraphRoots {
+      direct: &direct,
+      central_pins: &central_pins,
+    },
+    &config,
+    options,
+    target,
+    target_text,
+    &pruning,
+  ))?;
   let resolved = graph.packages;
 
   validate_acyclic(&resolved)?;
@@ -2623,6 +2660,7 @@ fn resolve_project(project: &ProjectSpec, options: &PackageResolveOptions) -> Re
       source_location: source_location.as_ref(),
       sources: &config.sources,
       prune_fingerprint: &pruning.fingerprint,
+      central_package_fingerprint: project.central_package_fingerprint(),
       source_protocol,
       signature_validation: config.signature_validation,
       audit_enabled: project.nuget_audit_enabled(),
@@ -2688,6 +2726,23 @@ fn direct_requests(project: &ProjectSpec) -> Result<Vec<PackageRequirement>, Pac
   }
   direct.sort_unstable_by(|left, right| left.lower_id.cmp(&right.lower_id));
   Ok(direct)
+}
+
+fn central_package_pins(project: &ProjectSpec) -> Result<Vec<CentralPackagePin>, PackageError> {
+  if !project.central_package_transitive_pinning_enabled() {
+    return Ok(Vec::new());
+  }
+  project
+    .central_package_versions()
+    .iter()
+    .map(|package| {
+      let id = project.central_package_id(*package);
+      Ok(CentralPackagePin {
+        lower_id: normalize_id(id)?,
+        version: minimum_version_from_range(&VersionRange::parse(project.central_package_version(*package).trim())?)?,
+      })
+    })
+    .collect()
 }
 
 fn discover_package_pruning(project_directory: &Path, target: TargetFramework) -> Result<PackagePruning, PackageError> {
@@ -5042,7 +5097,7 @@ fn with_trailing_slash(mut value: String) -> String {
 
 async fn resolve_streaming_graph(
   client: &reqwest::Client,
-  direct: &[PackageRequirement],
+  roots: GraphRoots<'_>,
   config: &NugetConfiguration,
   options: &PackageResolveOptions,
   target: TargetFramework,
@@ -5051,12 +5106,13 @@ async fn resolve_streaming_graph(
 ) -> Result<ResolvedGraph, PackageError> {
   let mut nodes = BTreeMap::<String, ConstraintNode>::new();
   let mut dirty = BTreeSet::new();
-  for request in direct {
+  for request in roots.direct {
     nodes.insert(
       request.lower_id.clone(),
       ConstraintNode {
         id: request.id.clone(),
         direct: Some(request.range.clone()),
+        central_pin: None,
         constraints: BTreeMap::new(),
         selected: None,
         metadata_version: None,
@@ -5093,6 +5149,7 @@ async fn resolve_streaming_graph(
         lower_id: lower_id.clone(),
         version: version.normalized.clone(),
         direct: node.direct.is_some(),
+        central_transitive: node.direct.is_none() && node.central_pin.is_some(),
       });
       // Exact cache misses can delegate selection directly to endpoint
       // discovery. Ranged identities need this precheck so an unmapped but
@@ -5215,7 +5272,7 @@ async fn resolve_streaming_graph(
             ready.insert(lower_id.clone());
           }
         } else {
-          install_node_dependencies(&lower_id, generation, dependencies, &mut nodes, &mut dirty)?;
+          install_node_dependencies(&lower_id, generation, dependencies, roots.central_pins, &mut nodes, &mut dirty)?;
         }
       },
     }
@@ -5238,6 +5295,7 @@ async fn resolve_streaming_graph(
         lower_id: lower_id.clone(),
         version: version.normalized.clone(),
         direct: node.direct.is_some(),
+        central_transitive: node.direct.is_none() && node.central_pin.is_some(),
       },
     );
   }
@@ -5300,7 +5358,7 @@ async fn resolve_streaming_graph(
     acquired.insert(request.lower_id.clone(), (request, cached));
   }
 
-  let asset_flags = flatten_asset_flags(&nodes, direct);
+  let asset_flags = flatten_asset_flags(&nodes, roots.direct);
   let mut resolved = BTreeMap::<String, WorkPackage>::new();
   for (lower_id, (request, cached)) in acquired {
     let dependencies = concrete_dependencies(&nodes, &request.lower_id)?;
@@ -5355,7 +5413,21 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
     }
   }
 
-  let allows_prerelease = node.direct.as_ref().map_or_else(
+  if node.direct.is_none()
+    && let Some(pin) = &node.central_pin
+  {
+    return if node.constraints.values().all(|range| range.contains(pin)) {
+      Ok(NodeSelection::Version(pin.clone()))
+    } else {
+      Err(resolution_error(
+        &node.id,
+        "central transitive pin is lower than or incompatible with a dependency requirement",
+      ))
+    };
+  }
+
+  let preferred = node.direct.as_ref();
+  let allows_prerelease = preferred.map_or_else(
     || node.constraints.values().any(VersionRange::allows_prerelease),
     VersionRange::allows_prerelease,
   );
@@ -5367,9 +5439,7 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
       )
   };
   if let Some(versions) = &node.available_versions {
-    let preference = node
-      .direct
-      .as_ref()
+    let preference = preferred
       .filter(|range| range.is_floating())
       .or_else(|| node.constraints.values().find(|range| range.is_floating()));
     let mut selected = None;
@@ -5386,7 +5456,7 @@ fn select_node_version(node: &ConstraintNode) -> Result<NodeSelection, PackageEr
       .map(NodeSelection::Version)
       .ok_or_else(|| resolution_error(&node.id, "no available package version satisfies the dependency constraints"));
   }
-  if node.direct.as_ref().is_some_and(VersionRange::is_floating) || node.constraints.values().any(VersionRange::is_floating) {
+  if preferred.is_some_and(VersionRange::is_floating) || node.constraints.values().any(VersionRange::is_floating) {
     return Ok(NodeSelection::Enumerate);
   }
   let mut candidate = None::<&PackageVersion>;
@@ -5432,7 +5502,7 @@ fn stabilize_constraint_nodes(
     };
     let pruned = next
       .as_ref()
-      .is_some_and(|version| node.direct.is_none() && pruning.contains(&lower_id, version));
+      .is_some_and(|version| node.direct.is_none() && node.central_pin.is_none() && pruning.contains(&lower_id, version));
     if next.is_some() && nodes.get(&lower_id).is_some_and(|node| node.selected == next && node.pruned == pruned) {
       continue;
     }
@@ -5465,6 +5535,7 @@ fn install_node_dependencies(
   lower_id: &str,
   generation: u32,
   dependencies: Vec<PackageRequirement>,
+  central_pins: &[CentralPackagePin],
   nodes: &mut BTreeMap<String, ConstraintNode>,
   dirty: &mut BTreeSet<String>,
 ) -> Result<(), PackageError> {
@@ -5491,9 +5562,14 @@ fn install_node_dependencies(
     node.dependencies = dependencies.clone();
   }
   for dependency in dependencies {
+    let central_pin = central_pins
+      .binary_search_by(|pin| pin.lower_id.as_str().cmp(&dependency.lower_id))
+      .ok()
+      .map(|index| central_pins[index].version.clone());
     let child = nodes.entry(dependency.lower_id.clone()).or_insert_with(|| ConstraintNode {
       id: dependency.id.clone(),
       direct: None,
+      central_pin: central_pin.clone(),
       constraints: BTreeMap::new(),
       selected: None,
       metadata_version: None,
@@ -5502,6 +5578,9 @@ fn install_node_dependencies(
       pruned: false,
       generation: 0,
     });
+    if child.central_pin.is_none() {
+      child.central_pin = central_pin;
+    }
     child.constraints.insert(lower_id.to_owned(), dependency.range);
     dirty.insert(dependency.lower_id);
   }
@@ -5529,6 +5608,7 @@ fn concrete_dependencies(nodes: &BTreeMap<String, ConstraintNode>, lower_id: &st
         lower_id: dependency.lower_id.clone(),
         version: selected.normalized.clone(),
         direct: false,
+        central_transitive: node.direct.is_none() && node.central_pin.is_some(),
       }))
     })
     .collect()
@@ -7256,6 +7336,7 @@ fn parse_nuspec(path: &Path, bytes: &[u8], request: &PackageRequest, target: Tar
         lower_id: requirement.lower_id,
         version: minimum_version_from_range(&requirement.range)?.normalized,
         direct: requirement.direct,
+        central_transitive: false,
       })
     })
     .collect()
@@ -7703,7 +7784,6 @@ fn collect_analyzers(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
   Ok(analyzers)
 }
 
-#[cfg(test)]
 fn minimum_version_from_range(range: &VersionRange) -> Result<PackageVersion, PackageError> {
   match &range.lower {
     Some(lower) if lower.inclusive && !range.is_floating() => Ok(lower.version.clone()),
@@ -7802,6 +7882,7 @@ fn materialize_resolution(
     + context.source_location.len()
     + context.sources.iter().map(|(name, _)| name.len()).sum::<usize>()
     + context.prune_fingerprint.len()
+    + context.central_package_fingerprint.len()
     + context
       .project
       .package_references()
@@ -7822,6 +7903,7 @@ fn materialize_resolution(
   let source_name_span = table.push(redact_report_location(context.source_name).as_ref())?;
   let source_location_span = table.push(context.source_location)?;
   let prune_fingerprint_span = table.push(context.prune_fingerprint)?;
+  let central_package_fingerprint_span = table.push(context.central_package_fingerprint)?;
   if context.sources.len() != source_work.len() {
     return Err(PackageError::new(
       PackageErrorKind::TextOverflow,
@@ -7916,6 +7998,7 @@ fn materialize_resolution(
         len: dependency_len,
       },
       direct: package.request.direct,
+      central_transitive: package.request.central_transitive,
       cache_hit: package.cache_hit,
     });
     package_roots.push(table.push_path(&package.root)?);
@@ -8005,6 +8088,7 @@ fn materialize_resolution(
     source_name: source_name_span,
     source_location: source_location_span,
     prune_fingerprint: prune_fingerprint_span,
+    central_package_fingerprint: central_package_fingerprint_span,
     source_protocol: context.source_protocol,
     signature_validation: context.signature_validation,
     audit_enabled: context.audit_enabled,
@@ -8102,10 +8186,12 @@ fn push_asset_range(table: &mut TextTable, target: &mut [TextSpan], cursor: &mut
 }
 
 fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageError> {
-  let mut table = TextTable::with_capacity(project.project_path().as_os_str().len() + project.target_framework().len() + 32);
+  let mut table =
+    TextTable::with_capacity(project.project_path().as_os_str().len() + project.target_framework().len() + project.central_package_fingerprint().len() + 32);
   let empty = table.push("")?;
   let lock = table.push_path(&project.project_directory().join("dv.lock.json"))?;
   let target_framework = table.push(project.target_framework())?;
+  let central_package_fingerprint = table.push(project.central_package_fingerprint())?;
   Ok(PackageResolution {
     text: table.text.into_boxed_str(),
     cache_root: empty,
@@ -8116,6 +8202,7 @@ fn empty_resolution(project: &ProjectSpec) -> Result<PackageResolution, PackageE
     source_name: empty,
     source_location: empty,
     prune_fingerprint: empty,
+    central_package_fingerprint,
     source_protocol: NugetProtocol::V3,
     signature_validation: SignatureValidationMode::Accept,
     audit_enabled: project.nuget_audit_enabled(),
@@ -8187,6 +8274,7 @@ fn read_warm_lock(
   if lock.schema_version != LOCK_SCHEMA_VERSION
     || lock.target_framework != target_text
     || lock.prune_fingerprint != prune_fingerprint
+    || lock.central_package_fingerprint != project.central_package_fingerprint()
     || !direct_matches
     || selected_source.is_none()
   {
@@ -8201,6 +8289,7 @@ fn read_warm_lock(
       version: normalize_version(&package.version)?,
       id: package.id,
       direct: package.direct,
+      central_transitive: package.central_transitive,
     };
     let root = find_package_root(&config.cache_root, &config.fallback_roots, &request).ok_or_else(|| {
       PackageError::new(
@@ -8249,6 +8338,7 @@ fn read_warm_lock(
           version: normalize_version(&dependency.version)?,
           id: dependency.id,
           direct: false,
+          central_transitive: false,
         })
       })
       .collect::<Result<Vec<_>, PackageError>>()?;
@@ -8311,6 +8401,7 @@ fn read_warm_lock(
       source_location: &lock.source,
       sources: &config.sources,
       prune_fingerprint,
+      central_package_fingerprint: project.central_package_fingerprint(),
       source_protocol: lock.source_protocol,
       signature_validation: config.signature_validation,
       audit_enabled: project.nuget_audit_enabled(),
@@ -8389,12 +8480,9 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
   for (index, package) in resolution.packages.iter().copied().enumerate() {
     let id = resolution.package_id(package).to_owned();
     let version = resolution.package_version(package).to_owned();
-    if package.direct {
-      let policy = resolution
-        .direct_policies
-        .iter()
-        .find(|policy| policy.package_index as usize == index)
-        .expect("every direct package has one policy row");
+    if package.direct
+      && let Some(policy) = resolution.direct_policies.iter().find(|policy| policy.package_index as usize == index)
+    {
       direct.push(LockDirect {
         id: id.clone(),
         version: version.clone(),
@@ -8417,6 +8505,7 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
       version,
       sha512: resolution.package_hash(index).to_owned(),
       direct: package.direct,
+      central_transitive: package.central_transitive,
       dependencies,
       compile_assets: relative_assets(root, resolution.package_compile_assets(index))?,
       runtime_assets: relative_assets(root, resolution.package_runtime_assets(index))?,
@@ -8445,6 +8534,7 @@ fn write_lock(resolution: &PackageResolution) -> Result<(), PackageError> {
     source: resolution.source_location().into(),
     source_protocol: resolution.source_protocol,
     prune_fingerprint: resolution.get(resolution.prune_fingerprint).into(),
+    central_package_fingerprint: resolution.get(resolution.central_package_fingerprint).into(),
     direct,
     packages,
   };
@@ -8626,6 +8716,7 @@ mod tests {
       lower_id: "sample.package".into(),
       version: "1.2.3".into(),
       direct: true,
+      central_transitive: false,
     }
   }
 
@@ -8664,6 +8755,29 @@ mod tests {
     assert!(alpha_two < alpha_ten);
     assert!(alpha_ten < stable);
     assert_eq!(stable.normalized, "1.0.0");
+  }
+
+  #[test]
+  fn central_transitive_pin_rejects_a_dependency_downgrade() {
+    let node = ConstraintNode {
+      id: "Pinned.Package".into(),
+      direct: None,
+      central_pin: Some(PackageVersion::parse("1.0.0").unwrap()),
+      constraints: [("parent.package".into(), VersionRange::parse("[2.0.0,)").unwrap())].into(),
+      selected: None,
+      metadata_version: None,
+      dependencies: Vec::new(),
+      available_versions: None,
+      pruned: false,
+      generation: 0,
+    };
+
+    let error = match select_node_version(&node) {
+      Err(error) => error,
+      Ok(_) => panic!("an incompatible central pin must fail"),
+    };
+    assert_eq!(error.kind(), PackageErrorKind::Resolution);
+    assert!(error.to_string().contains("central transitive pin"));
   }
 
   #[test]
@@ -8745,6 +8859,7 @@ mod tests {
     let node = ConstraintNode {
       id: "Floating.Package".into(),
       direct: Some(VersionRange::parse(range).unwrap()),
+      central_pin: None,
       constraints: BTreeMap::new(),
       selected: None,
       metadata_version: None,
@@ -8776,6 +8891,7 @@ mod tests {
     let node = ConstraintNode {
       id: "Floating.Package".into(),
       direct: Some(VersionRange::parse("1.2.*-rc.*").unwrap()),
+      central_pin: None,
       constraints: BTreeMap::new(),
       selected: None,
       metadata_version: None,
@@ -8878,6 +8994,7 @@ mod tests {
         ConstraintNode {
           id: "Framework.Package".into(),
           direct: None,
+          central_pin: None,
           constraints: BTreeMap::from([("parent.package".into(), VersionRange::parse("10.0").unwrap())]),
           selected: None,
           metadata_version: None,
@@ -8892,6 +9009,7 @@ mod tests {
         ConstraintNode {
           id: "Grandchild.Package".into(),
           direct: None,
+          central_pin: None,
           constraints: BTreeMap::from([("framework.package".into(), VersionRange::parse("1.0").unwrap())]),
           selected: Some(PackageVersion::parse("1.0.0").unwrap()),
           metadata_version: None,
@@ -8906,6 +9024,7 @@ mod tests {
         ConstraintNode {
           id: "Direct.Package".into(),
           direct: Some(VersionRange::parse("10.0").unwrap()),
+          central_pin: None,
           constraints: BTreeMap::new(),
           selected: None,
           metadata_version: None,
@@ -8932,6 +9051,7 @@ mod tests {
     let node = ConstraintNode {
       id: "Common.Package".into(),
       direct: None,
+      central_pin: None,
       constraints: BTreeMap::from([
         ("a".into(), VersionRange::parse("1.0").unwrap()),
         ("b".into(), VersionRange::parse("[2.0,3.0)").unwrap()),
@@ -8955,6 +9075,7 @@ mod tests {
     let node = ConstraintNode {
       id: "Direct.Package".into(),
       direct: Some(VersionRange::exact(PackageVersion::parse("1.0.0").unwrap())),
+      central_pin: None,
       constraints: BTreeMap::from([("parent".into(), VersionRange::parse("2.0").unwrap())]),
       selected: None,
       metadata_version: None,
@@ -8975,6 +9096,7 @@ mod tests {
     let node = ConstraintNode {
       id: "Stable.Package".into(),
       direct: Some(VersionRange::parse("[1.0,2.0)").unwrap()),
+      central_pin: None,
       constraints: BTreeMap::new(),
       selected: None,
       metadata_version: None,
@@ -9006,6 +9128,7 @@ mod tests {
         ConstraintNode {
           id: "Parent.Package".into(),
           direct: Some(VersionRange::exact(PackageVersion::parse("2.0.0").unwrap())),
+          central_pin: None,
           constraints: BTreeMap::new(),
           selected: Some(PackageVersion::parse("1.0.0").unwrap()),
           metadata_version: Some(PackageVersion::parse("1.0.0").unwrap()),
@@ -9020,6 +9143,7 @@ mod tests {
         ConstraintNode {
           id: "Child.Package".into(),
           direct: None,
+          central_pin: None,
           constraints: BTreeMap::from([("parent.package".into(), VersionRange::parse("1.0").unwrap())]),
           selected: Some(PackageVersion::parse("1.0.0").unwrap()),
           metadata_version: None,
@@ -9812,6 +9936,7 @@ mod tests {
       lower_id: "unmapped.package".to_owned(),
       version: "1.2.3".to_owned(),
       direct: true,
+      central_transitive: false,
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -10914,6 +11039,7 @@ mod tests {
         lower_id: "base.dependency".into(),
         version: "1.0.0".into(),
         direct: false,
+        central_transitive: false,
       }],
       AssetFlags::ALL,
     )
@@ -10982,6 +11108,72 @@ mod tests {
         .copied()
         .all(|package| resolution.package_cache_outcome(package) == CacheOutcome::Hit)
     );
+  }
+
+  #[test]
+  fn central_transitive_pinning_promotes_the_selected_dependency_and_survives_a_warm_lock() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "");
+    temp.write(
+      "Directory.Packages.props",
+      r#"<Project><PropertyGroup>
+<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+<CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+</PropertyGroup><ItemGroup>
+<PackageVersion Include="Meta.Package" Version="1.0.0" />
+<PackageVersion Include="Child.Package" Version="3.0.0" />
+</ItemGroup></Project>"#,
+    );
+    let project_path = temp.write(
+      "App.csproj",
+      r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup>
+<ItemGroup><PackageReference Include="Meta.Package" /></ItemGroup></Project>"#,
+    );
+    for (id, version, nuspec) in [
+      (
+        "meta.package",
+        "1.0.0",
+        r#"<package><metadata><id>Meta.Package</id><version>1.0.0</version><dependencies>
+<group targetFramework="netstandard2.0"><dependency id="Child.Package" version="[2.0.0,4.0.0)" /></group>
+</dependencies></metadata></package>"#,
+      ),
+      (
+        "child.package",
+        "3.0.0",
+        r#"<package><metadata><id>Child.Package</id><version>3.0.0</version></metadata></package>"#,
+      ),
+    ] {
+      let root = format!("packages/{id}/{version}");
+      temp.write(&format!("{root}/{id}.nuspec"), nuspec);
+      temp.write(&format!("{root}/{id}.{version}.nupkg"), []);
+      temp.write(&format!("{root}/{id}.{version}.nupkg.sha512"), BASE64.encode([0u8; 64]));
+      temp.write(&format!("{root}/.dv.metadata.json"), "{}");
+    }
+    temp.write("packages/child.package/3.0.0/lib/net6.0/Child.Package.dll", []);
+    let project = evaluate_project_path(&project_path, ProjectConfiguration::Debug).unwrap();
+    let options = PackageResolveOptions {
+      packages_directory: Some(temp.0.join("packages")),
+      config_file: None,
+      sources: Vec::new(),
+      offline: true,
+      write_lock: true,
+      ..PackageResolveOptions::default()
+    };
+
+    for resolution in [
+      resolve_package_inputs(&[&project], &options).unwrap().remove(0),
+      resolve_package_inputs(&[&project], &options).unwrap().remove(0),
+    ] {
+      let child = resolution
+        .packages()
+        .iter()
+        .copied()
+        .find(|package| resolution.package_id(*package) == "Child.Package")
+        .unwrap();
+      assert_eq!(resolution.package_version(child), "3.0.0");
+      assert!(!resolution.package_is_direct(child));
+      assert!(resolution.package_is_central_transitive(child));
+    }
   }
 
   #[test]

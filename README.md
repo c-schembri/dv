@@ -47,6 +47,9 @@ dv restore (warm locked)         7.019 ms median
 dotnet PackageReference policy 456.722 ms median
 dv PackageReference policy       6.611 ms median
 
+dotnet central package restore 461.826 ms median
+dv central package restore      29.864 ms median
+
 dotnet restore (config stack) 532.948 ms median
 dv restore (config stack)       5.651 ms median
 
@@ -142,6 +145,7 @@ The project is in the first implementation phase.
 | NuGet flat and hierarchical local sources | Implemented |
 | NuGet interval and floating version selection | Implemented |
 | PackageReference asset, warning, alias, and path-property policy | Implemented |
+| Central versions, overrides, global references, and transitive pinning | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -340,7 +344,7 @@ Initial machine:
   planning, NuGet configuration hierarchy, keyed configuration merge, source
   policy sections, request budgets, source telemetry, storage policy, CLI
   overrides, local sources, floating version selection, PackageReference
-  metadata, service-index
+  metadata, central package management, service-index
   capability discovery, source
   credentials, credential providers, the
   framework-reference plan,
@@ -375,6 +379,7 @@ Initial machine:
 | Restore from flat and hierarchical local sources | `dotnet restore LocalSources.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore LocalSources.csproj --packages .packages --offline --json` | 670.534 ms | 64.522 ms | 10.4x | 694.282 ms | 97.332 ms |
 | Resolve the highest stable floating version | `dotnet restore FloatingVersion.csproj --packages .packages --no-http-cache -p:NuGetAudit=false --nologo --verbosity quiet` | `dv restore FloatingVersion.csproj --packages .packages --offline --json` | 667.568 ms | 60.007 ms | 11.1x | 714.356 ms | 74.028 ms |
 | Apply direct PackageReference metadata on a warm locked graph | `dotnet restore MetadataProject.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore MetadataProject.csproj --packages .packages --offline --json` | 456.722 ms | 6.611 ms | 69.1x | 460.724 ms | 7.714 ms |
+| Apply central versions, overrides, global references, and transitive pinning on a warm 54-package graph | `dotnet restore CentralPackages.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore CentralPackages.csproj --packages .packages --offline --json` | 461.826 ms | 29.864 ms | 15.5x | 490.623 ms | 34.461 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -459,7 +464,12 @@ locked `Newtonsoft.Json` graph. Preflight compares Microsoft
 aliases, runtime exclusion, and the generated `PkgNewtonsoft_Json` root before
 retaining samples. The measured medians are `456.722 ms` for Microsoft and
 `6.611 ms` for `dv` (`69.1x`), with no timed network or download work. The
-unavailable-pack case
+central-package case resolves the same 54 identities through versionless
+direct references, an override, a global SourceLink reference, and a
+`Humanizer.Core` transitive pin. Preflight compares every exact version,
+archive hash, asset family, and Microsoft's `CentralTransitive` lock role.
+The measured medians are `461.826 ms` for Microsoft and `29.864 ms` for `dv`
+(`15.5x`), with zero timed network work. The unavailable-pack case
 uses an empty checked-in source and isolated package cache; both commands must
 fail and name
 `Microsoft.NETCore.App.Runtime.linux-arm`, while `dv` must also emit the exact
@@ -517,6 +527,7 @@ recorded in the curated
 [NuGet floating-version baseline](docs/performance-baselines/2026-08-01-nuget-floating-version-windows.md),
 [conditional-reference baseline](docs/performance-baselines/2026-08-01-package-reference-conditions-windows.md),
 [PackageReference metadata baseline](docs/performance-baselines/2026-08-01-package-reference-metadata-windows.md),
+[central package management baseline](docs/performance-baselines/2026-08-01-central-package-management-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -580,6 +591,7 @@ cargo bench-all --case nuget_cli_overrides --samples 30 --warmups 3
 cargo bench-all --case nuget_local_sources --samples 30 --warmups 3
 cargo bench-all --case nuget_floating_version --samples 30 --warmups 3
 cargo bench-all --case package_reference_metadata --samples 30 --warmups 3
+cargo bench-all --case central_package_management --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3
@@ -642,6 +654,7 @@ See:
 - [NuGet storage and restore policy contract](docs/nuget-storage-policy.md)
 - [NuGet CLI override contract](docs/nuget-cli-overrides.md)
 - [NuGet local source contract](docs/nuget-local-sources.md)
+- [Central package management contract](docs/central-package-management.md)
 - [NuGet service-index capability contract](docs/nuget-service-index.md)
 - [NuGet source credential contract](docs/nuget-credentials.md)
 - [NuGet credential-provider contract](docs/nuget-credential-providers.md)

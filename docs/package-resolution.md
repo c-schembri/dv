@@ -103,6 +103,15 @@ payload. `--configuration Debug|Release` selects conditional project, package,
 and framework references before resolution; Debug remains the default.
 Structured command lifecycle events retain the spelling invoked by the caller.
 
+When central package management is active, project evaluation supplies an
+identity-ordered central version batch. Direct references use their selected
+central value unless `VersionOverride` wins. Matching transitive identities are
+promoted to the exact central version before package metadata is scheduled;
+an incompatible lower pin fails rather than drifting upward. Central-transitive
+packages remain distinct from project-direct packages in lock schema 5 and
+event schema 15. See the
+[central package management contract](central-package-management.md).
+
 Exact `Newtonsoft.Json` `13.0.3` is the representative package. Its 2,441,966
 byte archive selects `lib/net6.0/Newtonsoft.Json.dll` for the `net10.0`
 fixture. A v3 miss performs two requests: service index and package content.

@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `13`;
+- schema version `15`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -55,7 +55,11 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
-Schema 13 adds a credential-free, configuration-ordered source-work batch to
+Schema 15 adds the evaluated central policy/version batch to
+`project_evaluated` and a `central_transitive` role bit to each resolved package.
+Schema 14 added configuration-selected conditional project, package, and
+framework reference batches. Schema 13 adds a credential-free,
+configuration-ordered source-work batch to
 package resolution and source inspection. Each row reports actual HTTP
 attempts, source bytes, and cumulative source-work microseconds; package
 rows report `hit` or `miss`. The selected source is now its configuration key

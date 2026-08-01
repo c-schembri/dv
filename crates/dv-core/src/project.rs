@@ -1,13 +1,47 @@
 use std::{
+  cmp::Ordering,
   error::Error,
   fmt, fs,
   path::{Component, Path, PathBuf},
 };
 
+fn compare_ascii_case_insensitive(left: &str, right: &str) -> Ordering {
+  left
+    .bytes()
+    .map(|byte| byte.to_ascii_lowercase())
+    .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+fn central_package_fingerprint(versions: &[RawCentralPackageVersion], management: bool, transitive_pinning: bool, version_override: bool) -> String {
+  use std::fmt::Write as _;
+
+  if !management {
+    return String::new();
+  }
+  let mut hash = Sha256::new();
+  hash.update(b"dv-central-packages-v1\0");
+  hash.update([u8::from(transitive_pinning), u8::from(version_override)]);
+  for package in versions {
+    for byte in package.id.bytes() {
+      hash.update([byte.to_ascii_lowercase()]);
+    }
+    hash.update([0]);
+    hash.update(package.version.as_deref().unwrap_or_default().trim().as_bytes());
+    hash.update([0]);
+  }
+  let digest = hash.finalize();
+  let mut output = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    write!(output, "{byte:02x}").expect("writing a String succeeds");
+  }
+  output
+}
+
 use quick_xml::{
   Reader, XmlVersion,
   events::{BytesRef, BytesStart, Event},
 };
+use sha2::{Digest, Sha256};
 
 use crate::{BENCHMARK_CACHE_LINE_BYTES, TargetFramework};
 
@@ -16,6 +50,8 @@ const MAX_XML_DEPTH: usize = 8;
 const MAX_REFERENCE_CONDITION_BYTES: usize = 1_024;
 const MAX_REFERENCE_CONDITION_OPERATORS: u8 = 32;
 const MAX_REFERENCE_CONDITION_DEPTH: u8 = 8;
+const MAX_CENTRAL_PACKAGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CENTRAL_PACKAGE_ROWS: usize = 100_000;
 const NO_REFERENCE_CONDITION: u32 = u32::MAX;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
@@ -149,6 +185,16 @@ pub struct FrameworkReference {
 
 const _: () = assert!(size_of::<FrameworkReference>() == 28);
 const _: () = assert!(align_of::<FrameworkReference>() == 4);
+
+/// One selected central package-version row retained for transitive pinning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CentralPackageVersion {
+  id: TextSpan,
+  version: TextSpan,
+}
+
+const _: () = assert!(size_of::<CentralPackageVersion>() == 16);
+const _: () = assert!(align_of::<CentralPackageVersion>() == 4);
 
 /// Runtime host roll-forward policy written to the generated runtime config.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +332,8 @@ pub struct ProjectSpec {
   sources: Box<[TextSpan]>,
   project_references: Box<[TextSpan]>,
   package_references: Box<[PackageReference]>,
+  central_package_versions: Box<[CentralPackageVersion]>,
+  central_package_fingerprint: TextSpan,
   framework_references: Box<[FrameworkReference]>,
   runtime_framework_version: TextSpan,
   runtime_identifier_index: u32,
@@ -297,6 +345,8 @@ pub struct ProjectSpec {
   deterministic: bool,
   self_contained: bool,
   nuget_audit_enabled: bool,
+  central_package_management: bool,
+  central_transitive_pinning: bool,
   nuget_audit_mode: NugetAuditMode,
   nuget_audit_level: NugetAuditLevel,
   target_latest_runtime_patch: Option<bool>,
@@ -440,6 +490,35 @@ impl ProjectSpec {
   /// Returns whether the package root must be exposed as a generated property.
   pub fn package_generate_path_property(&self, package: PackageReference) -> bool {
     package.generate_path_property
+  }
+
+  /// Returns whether package versions are supplied by central management.
+  pub fn central_package_management_enabled(&self) -> bool {
+    self.central_package_management
+  }
+
+  /// Returns whether selected central versions pin matching transitive nodes.
+  pub fn central_package_transitive_pinning_enabled(&self) -> bool {
+    self.central_transitive_pinning
+  }
+
+  /// Returns the selected identity-ordered central version batch.
+  pub fn central_package_versions(&self) -> &[CentralPackageVersion] {
+    &self.central_package_versions
+  }
+
+  /// Returns a central package identity.
+  pub fn central_package_id(&self, package: CentralPackageVersion) -> &str {
+    self.text(package.id)
+  }
+
+  /// Returns a central package version or range.
+  pub fn central_package_version(&self, package: CentralPackageVersion) -> &str {
+    self.text(package.version)
+  }
+
+  pub(crate) fn central_package_fingerprint(&self) -> &str {
+    self.text(self.central_package_fingerprint)
   }
 
   /// Returns the compact batch of explicit framework references.
@@ -586,6 +665,9 @@ enum Property {
   NugetAudit,
   NugetAuditMode,
   NugetAuditLevel,
+  ManagePackageVersionsCentrally,
+  CentralPackageTransitivePinningEnabled,
+  CentralPackageVersionOverrideEnabled,
 }
 
 #[derive(Clone, Copy)]
@@ -598,6 +680,7 @@ enum FrameworkMetadata {
 #[derive(Clone, Copy)]
 enum PackageMetadata {
   Version,
+  VersionOverride,
   IncludeAssets,
   ExcludeAssets,
   PrivateAssets,
@@ -620,6 +703,26 @@ enum Element {
   FrameworkMetadata(usize, FrameworkMetadata),
 }
 
+#[derive(Clone, Copy)]
+enum CentralProperty {
+  ManagePackageVersionsCentrally,
+  CentralPackageTransitivePinningEnabled,
+  CentralPackageVersionOverrideEnabled,
+}
+
+#[derive(Clone, Copy)]
+enum CentralElement {
+  Document,
+  Project,
+  PropertyGroup,
+  ItemGroup(u32),
+  Property(CentralProperty),
+  PackageVersion(usize),
+  PackageVersionValue(usize),
+  GlobalPackageReference(usize),
+  GlobalPackageMetadata(usize, PackageMetadata),
+}
+
 #[derive(Default)]
 struct RawProject {
   target_framework: Option<String>,
@@ -638,6 +741,9 @@ struct RawProject {
   nuget_audit: Option<String>,
   nuget_audit_mode: Option<String>,
   nuget_audit_level: Option<String>,
+  manage_package_versions_centrally: Option<String>,
+  central_package_transitive_pinning_enabled: Option<String>,
+  central_package_version_override_enabled: Option<String>,
   conditions: Vec<String>,
   project_references: Vec<RawProjectReference>,
   package_references: Vec<RawPackageReference>,
@@ -670,12 +776,31 @@ struct RawProjectReference {
 struct RawPackageReference {
   id: String,
   version: Option<String>,
+  version_override: Option<String>,
   include_assets: Option<String>,
   exclude_assets: Option<String>,
   private_assets: Option<String>,
   no_warn: Option<String>,
   aliases: Option<String>,
   generate_path_property: Option<String>,
+  conditions: RawReferenceConditions,
+  central_global: bool,
+}
+
+#[derive(Default)]
+struct RawCentralPackages {
+  path: Option<PathBuf>,
+  manage_package_versions_centrally: Option<String>,
+  central_package_transitive_pinning_enabled: Option<String>,
+  central_package_version_override_enabled: Option<String>,
+  conditions: Vec<String>,
+  versions: Vec<RawCentralPackageVersion>,
+  globals: Vec<RawPackageReference>,
+}
+
+struct RawCentralPackageVersion {
+  id: String,
+  version: Option<String>,
   conditions: RawReferenceConditions,
 }
 
@@ -736,7 +861,141 @@ pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfigur
     .to_owned();
   let bytes = fs::read(&project_path).map_err(|error| io_error("read", &project_path, error))?;
   let raw = parse_project(&project_path, &bytes)?;
-  materialize_project(project_path, &project_directory, configuration, raw)
+  let central = discover_central_packages(&project_directory)?;
+  materialize_project(project_path, &project_directory, configuration, raw, central)
+}
+
+fn discover_central_packages(project_directory: &Path) -> Result<RawCentralPackages, ProjectError> {
+  let mut directory = Some(project_directory);
+  while let Some(current) = directory {
+    let path = current.join("Directory.Packages.props");
+    match fs::metadata(&path) {
+      Ok(metadata) => {
+        if !metadata.is_file() {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            &path,
+            "Directory.Packages.props must be a regular file",
+          ));
+        }
+        if metadata.len() > MAX_CENTRAL_PACKAGE_FILE_BYTES {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            &path,
+            format!("Directory.Packages.props exceeds the {MAX_CENTRAL_PACKAGE_FILE_BYTES}-byte input limit"),
+          ));
+        }
+        let bytes = fs::read(&path).map_err(|error| io_error("read", &path, error))?;
+        let mut central = parse_central_packages(&path, &bytes)?;
+        central.path = Some(path);
+        return Ok(central);
+      },
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+      Err(error) => return Err(io_error("read", &path, error)),
+    }
+    directory = current.parent();
+  }
+  Ok(RawCentralPackages::default())
+}
+
+fn parse_central_packages(path: &Path, bytes: &[u8]) -> Result<RawCentralPackages, ProjectError> {
+  let mut reader = Reader::from_reader(bytes);
+  reader.config_mut().trim_text(true);
+  reader.config_mut().expand_empty_elements = true;
+  let mut raw = RawCentralPackages::default();
+  let mut stack = [CentralElement::Document; MAX_XML_DEPTH];
+  let mut depth = 1usize;
+  let mut text = String::new();
+  let mut root_seen = false;
+  loop {
+    match reader.read_event() {
+      Ok(Event::Start(element)) => {
+        let parent = stack[depth - 1];
+        let next = start_central_element(path, &reader, &element, parent, &mut raw, &mut root_seen)?;
+        if depth == MAX_XML_DEPTH {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            "Directory.Packages.props XML nesting is too deep",
+          ));
+        }
+        if matches!(
+          next,
+          CentralElement::Property(_) | CentralElement::PackageVersionValue(_) | CentralElement::GlobalPackageMetadata(_, _)
+        ) {
+          text.clear();
+        }
+        stack[depth] = next;
+        depth += 1;
+      },
+      Ok(Event::End(_)) => {
+        if depth == 1 {
+          return Err(ProjectError::new(
+            ProjectErrorKind::InvalidXml,
+            path,
+            "Directory.Packages.props contains an unexpected closing element",
+          ));
+        }
+        depth -= 1;
+        finish_central_element(path, stack[depth], &mut raw, &text)?;
+      },
+      Ok(Event::Text(value)) => {
+        if !matches!(
+          stack[depth - 1],
+          CentralElement::Property(_) | CentralElement::PackageVersionValue(_) | CentralElement::GlobalPackageMetadata(_, _)
+        ) {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            "Directory.Packages.props contains text outside a supported value",
+          ));
+        }
+        text.push_str(
+          &value
+            .xml10_content()
+            .map_err(|error| ProjectError::new(ProjectErrorKind::InvalidXml, path, format!("central package text is invalid: {error}")))?,
+        );
+      },
+      Ok(Event::GeneralRef(value)) => {
+        if !matches!(
+          stack[depth - 1],
+          CentralElement::Property(_) | CentralElement::PackageVersionValue(_) | CentralElement::GlobalPackageMetadata(_, _)
+        ) {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            "Directory.Packages.props contains an entity outside a supported value",
+          ));
+        }
+        append_reference(path, &value, &mut text)?;
+      },
+      Ok(Event::Comment(_) | Event::Decl(_)) => {},
+      Ok(Event::CData(_) | Event::PI(_) | Event::DocType(_)) => {
+        return Err(ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          path,
+          "Directory.Packages.props contains unsupported XML constructs",
+        ));
+      },
+      Ok(Event::Empty(_)) => unreachable!("empty elements are expanded by the reader"),
+      Ok(Event::Eof) => break,
+      Err(error) => {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidXml,
+          path,
+          format!("invalid Directory.Packages.props XML at byte {}: {error}", reader.error_position()),
+        ));
+      },
+    }
+  }
+  if depth != 1 || !root_seen {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidXml,
+      path,
+      "Directory.Packages.props does not contain one complete Project element",
+    ));
+  }
+  Ok(raw)
 }
 
 fn discover_project(directory: &Path) -> Result<PathBuf, ProjectError> {
@@ -865,6 +1124,188 @@ fn parse_project(path: &Path, bytes: &[u8]) -> Result<RawProject, ProjectError> 
   Ok(raw)
 }
 
+fn start_central_element(
+  path: &Path,
+  reader: &Reader<&[u8]>,
+  element: &BytesStart<'_>,
+  parent: CentralElement,
+  raw: &mut RawCentralPackages,
+  root_seen: &mut bool,
+) -> Result<CentralElement, ProjectError> {
+  let qualified_name = element.name();
+  let name = element_name(path, qualified_name.as_ref())?;
+  match parent {
+    CentralElement::Document if name == "Project" => {
+      if *root_seen {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidXml,
+          path,
+          "Directory.Packages.props contains multiple root elements",
+        ));
+      }
+      *root_seen = true;
+      validate_attributes(path, reader, element, &[])?;
+      Ok(CentralElement::Project)
+    },
+    CentralElement::Project if name == "PropertyGroup" => {
+      validate_attributes(path, reader, element, &["Label"])?;
+      Ok(CentralElement::PropertyGroup)
+    },
+    CentralElement::Project if name == "ItemGroup" => {
+      validate_attributes(path, reader, element, &["Label", "Condition"])?;
+      let condition = store_condition_value(path, reader, element, &mut raw.conditions)?;
+      Ok(CentralElement::ItemGroup(condition))
+    },
+    CentralElement::PropertyGroup => {
+      validate_attributes(path, reader, element, &[])?;
+      let property = match name {
+        "ManagePackageVersionsCentrally" => CentralProperty::ManagePackageVersionsCentrally,
+        "CentralPackageTransitivePinningEnabled" => CentralProperty::CentralPackageTransitivePinningEnabled,
+        "CentralPackageVersionOverrideEnabled" => CentralProperty::CentralPackageVersionOverrideEnabled,
+        _ => {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            format!("central package property {name} is outside the RES-006 compatibility contract"),
+          ));
+        },
+      };
+      Ok(CentralElement::Property(property))
+    },
+    CentralElement::ItemGroup(group) if name == "PackageVersion" => {
+      if raw.versions.len() == MAX_CENTRAL_PACKAGE_ROWS {
+        return Err(ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          path,
+          format!("Directory.Packages.props contains more than {MAX_CENTRAL_PACKAGE_ROWS} PackageVersion rows"),
+        ));
+      }
+      let include = required_attribute(path, reader, element, "Include", &["Version", "Condition"])?;
+      let conditions = RawReferenceConditions {
+        group,
+        item: store_condition_value(path, reader, element, &mut raw.conditions)?,
+      };
+      let index = raw.versions.len();
+      raw.versions.push(RawCentralPackageVersion {
+        id: include,
+        version: optional_attribute(path, reader, element, "Version")?,
+        conditions,
+      });
+      Ok(CentralElement::PackageVersion(index))
+    },
+    CentralElement::PackageVersion(index) if name == "Version" => {
+      validate_attributes(path, reader, element, &[])?;
+      Ok(CentralElement::PackageVersionValue(index))
+    },
+    CentralElement::ItemGroup(group) if name == "GlobalPackageReference" => {
+      if raw.globals.len() == MAX_CENTRAL_PACKAGE_ROWS {
+        return Err(ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          path,
+          format!("Directory.Packages.props contains more than {MAX_CENTRAL_PACKAGE_ROWS} GlobalPackageReference rows"),
+        ));
+      }
+      const METADATA: &[&str] = &["Version", "Condition"];
+      let include = required_attribute(path, reader, element, "Include", METADATA)?;
+      let conditions = RawReferenceConditions {
+        group,
+        item: store_condition_value(path, reader, element, &mut raw.conditions)?,
+      };
+      let index = raw.globals.len();
+      raw.globals.push(RawPackageReference {
+        id: include,
+        version: optional_attribute(path, reader, element, "Version")?,
+        version_override: None,
+        include_assets: None,
+        exclude_assets: None,
+        private_assets: None,
+        no_warn: None,
+        aliases: None,
+        generate_path_property: None,
+        conditions,
+        central_global: true,
+      });
+      Ok(CentralElement::GlobalPackageReference(index))
+    },
+    CentralElement::GlobalPackageReference(index) => {
+      validate_attributes(path, reader, element, &[])?;
+      let metadata = match name {
+        "Version" => PackageMetadata::Version,
+        _ => {
+          return Err(ProjectError::new(
+            ProjectErrorKind::Unsupported,
+            path,
+            format!("global-package metadata element {name} is not supported here"),
+          ));
+        },
+      };
+      Ok(CentralElement::GlobalPackageMetadata(index, metadata))
+    },
+    CentralElement::PackageVersion(_) => Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      path,
+      format!("PackageVersion metadata element {name} is not supported here"),
+    )),
+    CentralElement::Property(_) | CentralElement::PackageVersionValue(_) | CentralElement::GlobalPackageMetadata(_, _) => Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      path,
+      format!("nested element {name} is not supported in a central package value"),
+    )),
+    _ => Err(ProjectError::new(
+      ProjectErrorKind::Unsupported,
+      path,
+      format!("element {name} is outside the RES-006 Directory.Packages.props contract"),
+    )),
+  }
+}
+
+fn finish_central_element(path: &Path, element: CentralElement, raw: &mut RawCentralPackages, text: &str) -> Result<(), ProjectError> {
+  match element {
+    CentralElement::Property(property) => {
+      let slot = match property {
+        CentralProperty::ManagePackageVersionsCentrally => &mut raw.manage_package_versions_centrally,
+        CentralProperty::CentralPackageTransitivePinningEnabled => &mut raw.central_package_transitive_pinning_enabled,
+        CentralProperty::CentralPackageVersionOverrideEnabled => &mut raw.central_package_version_override_enabled,
+      };
+      *slot = Some(text.to_owned());
+    },
+    CentralElement::PackageVersionValue(index) => {
+      let package = &mut raw.versions[index];
+      if package.version.is_some() {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          path,
+          format!("central package {:?} declares Version more than once", package.id),
+        ));
+      }
+      package.version = Some(text.to_owned());
+    },
+    CentralElement::GlobalPackageMetadata(index, metadata) => {
+      let package = &mut raw.globals[index];
+      let (slot, name) = match metadata {
+        PackageMetadata::Version => (&mut package.version, "Version"),
+        PackageMetadata::VersionOverride => unreachable!("global packages do not accept VersionOverride"),
+        PackageMetadata::IncludeAssets => (&mut package.include_assets, "IncludeAssets"),
+        PackageMetadata::ExcludeAssets => (&mut package.exclude_assets, "ExcludeAssets"),
+        PackageMetadata::PrivateAssets => (&mut package.private_assets, "PrivateAssets"),
+        PackageMetadata::NoWarn => (&mut package.no_warn, "NoWarn"),
+        PackageMetadata::Aliases => (&mut package.aliases, "Aliases"),
+        PackageMetadata::GeneratePathProperty => (&mut package.generate_path_property, "GeneratePathProperty"),
+      };
+      if slot.is_some() {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          path,
+          format!("global package {:?} declares {name} more than once", package.id),
+        ));
+      }
+      *slot = Some(text.to_owned());
+    },
+    _ => {},
+  }
+  Ok(())
+}
+
 fn start_element(
   path: &Path,
   reader: &Reader<&[u8]>,
@@ -925,6 +1366,7 @@ fn start_element(
     Element::ItemGroup(group) if name == "PackageReference" => {
       const METADATA: &[&str] = &[
         "Version",
+        "VersionOverride",
         "IncludeAssets",
         "ExcludeAssets",
         "PrivateAssets",
@@ -935,6 +1377,7 @@ fn start_element(
       ];
       let include = required_attribute(path, reader, element, "Include", METADATA)?;
       let version = optional_attribute(path, reader, element, "Version")?;
+      let version_override = optional_attribute(path, reader, element, "VersionOverride")?;
       let conditions = RawReferenceConditions {
         group,
         item: store_condition(path, reader, element, raw)?,
@@ -943,6 +1386,7 @@ fn start_element(
       raw.package_references.push(RawPackageReference {
         id: include,
         version,
+        version_override,
         include_assets: optional_attribute(path, reader, element, "IncludeAssets")?,
         exclude_assets: optional_attribute(path, reader, element, "ExcludeAssets")?,
         private_assets: optional_attribute(path, reader, element, "PrivateAssets")?,
@@ -950,6 +1394,7 @@ fn start_element(
         aliases: optional_attribute(path, reader, element, "Aliases")?,
         generate_path_property: optional_attribute(path, reader, element, "GeneratePathProperty")?,
         conditions,
+        central_global: false,
       });
       Ok(Element::PackageReference(index))
     },
@@ -979,6 +1424,7 @@ fn start_element(
       validate_attributes(path, reader, element, &[])?;
       let metadata = match name {
         "Version" => PackageMetadata::Version,
+        "VersionOverride" => PackageMetadata::VersionOverride,
         "IncludeAssets" => PackageMetadata::IncludeAssets,
         "ExcludeAssets" => PackageMetadata::ExcludeAssets,
         "PrivateAssets" => PackageMetadata::PrivateAssets,
@@ -1055,11 +1501,15 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::NugetAudit => raw.nuget_audit = Some(text.to_owned()),
       Property::NugetAuditMode => raw.nuget_audit_mode = Some(text.to_owned()),
       Property::NugetAuditLevel => raw.nuget_audit_level = Some(text.to_owned()),
+      Property::ManagePackageVersionsCentrally => raw.manage_package_versions_centrally = Some(text.to_owned()),
+      Property::CentralPackageTransitivePinningEnabled => raw.central_package_transitive_pinning_enabled = Some(text.to_owned()),
+      Property::CentralPackageVersionOverrideEnabled => raw.central_package_version_override_enabled = Some(text.to_owned()),
     },
     Element::PackageMetadata(index, metadata) => {
       let package = &mut raw.package_references[index];
       let (slot, name) = match metadata {
         PackageMetadata::Version => (&mut package.version, "Version"),
+        PackageMetadata::VersionOverride => (&mut package.version_override, "VersionOverride"),
         PackageMetadata::IncludeAssets => (&mut package.include_assets, "IncludeAssets"),
         PackageMetadata::ExcludeAssets => (&mut package.exclude_assets, "ExcludeAssets"),
         PackageMetadata::PrivateAssets => (&mut package.private_assets, "PrivateAssets"),
@@ -1102,6 +1552,7 @@ fn materialize_project(
   project_directory: &Path,
   configuration: ProjectConfiguration,
   raw: RawProject,
+  central: RawCentralPackages,
 ) -> Result<ProjectSpec, ProjectError> {
   let target_framework = required_property(&project_path, "TargetFramework", raw.target_framework)?;
   let parsed_target =
@@ -1130,6 +1581,36 @@ fn materialize_project(
   let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
   let self_contained = parse_bool(&project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
   let nuget_audit_enabled = parse_bool(&project_path, "NuGetAudit", raw.nuget_audit.as_deref(), true)?;
+  let central_path = central.path.as_deref().unwrap_or(&project_path);
+  let central_package_management = central.path.is_some()
+    && parse_bool(
+      central_path,
+      "ManagePackageVersionsCentrally",
+      raw
+        .manage_package_versions_centrally
+        .as_deref()
+        .or(central.manage_package_versions_centrally.as_deref()),
+      false,
+    )?;
+  let central_transitive_pinning = central_package_management
+    && parse_bool(
+      central_path,
+      "CentralPackageTransitivePinningEnabled",
+      raw
+        .central_package_transitive_pinning_enabled
+        .as_deref()
+        .or(central.central_package_transitive_pinning_enabled.as_deref()),
+      false,
+    )?;
+  let central_version_override_enabled = parse_bool(
+    central_path,
+    "CentralPackageVersionOverrideEnabled",
+    raw
+      .central_package_version_override_enabled
+      .as_deref()
+      .or(central.central_package_version_override_enabled.as_deref()),
+    true,
+  )?;
   let nuget_audit_mode = match raw.nuget_audit_mode.as_deref() {
     Some(value) => NugetAuditMode::parse(value).ok_or_else(|| {
       ProjectError::new(
@@ -1232,12 +1713,110 @@ fn materialize_project(
       project_references.push(normalize_project_reference(&project_path, &reference.path)?);
     }
   }
-  let mut selected_package_references = Vec::with_capacity(raw.package_references.len());
-  for reference in raw.package_references {
+  let mut selected_central_versions = Vec::with_capacity(central.versions.len() + central.globals.len());
+  let mut selected_global_references = Vec::with_capacity(central.globals.len());
+  if central_package_management {
+    for package in central.versions {
+      if !reference_conditions_match(central_path, &central.conditions, package.conditions, &condition_context)? {
+        continue;
+      }
+      let version = package.version.as_deref().ok_or_else(|| {
+        ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          central_path,
+          format!("central package {:?} requires a Version", package.id),
+        )
+      })?;
+      if package.id.is_empty() || package.id.contains("$(") || !is_literal_package_version(version) {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          central_path,
+          format!("central package {:?} requires a literal identity and version", package.id),
+        ));
+      }
+      selected_central_versions.push(package);
+    }
+    for reference in central.globals {
+      if !reference_conditions_match(central_path, &central.conditions, reference.conditions, &condition_context)? {
+        continue;
+      }
+      let version = reference.version.as_deref().ok_or_else(|| {
+        ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          central_path,
+          format!("global package {:?} requires a Version", reference.id),
+        )
+      })?;
+      if reference.id.is_empty() || reference.id.contains("$(") || !is_literal_package_version(version) {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          central_path,
+          format!("global package {:?} requires a literal identity and version", reference.id),
+        ));
+      }
+      selected_central_versions.push(RawCentralPackageVersion {
+        id: reference.id.clone(),
+        version: reference.version.clone(),
+        conditions: RawReferenceConditions::default(),
+      });
+      selected_global_references.push(reference);
+    }
+    selected_central_versions.sort_unstable_by(|left, right| compare_ascii_case_insensitive(&left.id, &right.id));
+    for duplicate in selected_central_versions.windows(2) {
+      if duplicate[0].id.eq_ignore_ascii_case(&duplicate[1].id) {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          central_path,
+          format!("central package {:?} has more than one selected PackageVersion", duplicate[1].id),
+        ));
+      }
+    }
+  }
+  let central_package_fingerprint = central_package_fingerprint(
+    &selected_central_versions,
+    central_package_management,
+    central_transitive_pinning,
+    central_version_override_enabled,
+  );
+  let mut selected_package_references = Vec::with_capacity(raw.package_references.len() + selected_global_references.len());
+  for mut reference in raw.package_references {
     if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+      if let Some(version_override) = reference.version_override.take() {
+        if central_package_management && !central_version_override_enabled {
+          return Err(ProjectError::new(
+            ProjectErrorKind::InvalidProperty,
+            &project_path,
+            format!("package {:?} cannot use VersionOverride because central overrides are disabled", reference.id),
+          ));
+        }
+        reference.version = Some(version_override);
+      } else if central_package_management {
+        if reference.version.is_some() {
+          return Err(ProjectError::new(
+            ProjectErrorKind::InvalidProperty,
+            &project_path,
+            format!(
+              "centrally managed package {:?} must use PackageVersion or VersionOverride instead of Version",
+              reference.id
+            ),
+          ));
+        }
+        reference.version = selected_central_versions
+          .binary_search_by(|candidate| compare_ascii_case_insensitive(&candidate.id, &reference.id))
+          .ok()
+          .and_then(|index| selected_central_versions[index].version.clone());
+        if reference.version.is_none() {
+          return Err(ProjectError::new(
+            ProjectErrorKind::InvalidProperty,
+            &project_path,
+            format!("centrally managed package {:?} has no selected PackageVersion", reference.id),
+          ));
+        }
+      }
       selected_package_references.push(reference);
     }
   }
+  selected_package_references.extend(selected_global_references);
   let mut selected_framework_references = Vec::with_capacity(raw.framework_references.len());
   for reference in raw.framework_references {
     if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
@@ -1256,6 +1835,11 @@ fn materialize_project(
     + runtime_dimensions.iter().map(|value| value.len()).sum::<usize>()
     + sources.iter().map(String::len).sum::<usize>()
     + project_references.iter().map(String::len).sum::<usize>()
+    + central_package_fingerprint.len()
+    + selected_central_versions
+      .iter()
+      .map(|package| package.id.len() + package.version.as_ref().map_or(0, String::len))
+      .sum::<usize>()
     + selected_package_references
       .iter()
       .map(|package| {
@@ -1287,6 +1871,16 @@ fn materialize_project(
     .iter()
     .map(|reference| table.push(reference, &project_path))
     .collect::<Result<Box<_>, _>>()?;
+  let central_package_fingerprint_span = table.push(&central_package_fingerprint, &project_path)?;
+  let central_package_versions = selected_central_versions
+    .iter()
+    .map(|package| {
+      Ok(CentralPackageVersion {
+        id: table.push(&package.id, &project_path)?,
+        version: table.push(package.version.as_deref().expect("selected central versions were validated"), &project_path)?,
+      })
+    })
+    .collect::<Result<Box<_>, ProjectError>>()?;
   let mut package_references = Vec::with_capacity(selected_package_references.len());
   for package in selected_package_references {
     let version = package.version.ok_or_else(|| {
@@ -1303,13 +1897,27 @@ fn materialize_project(
         format!("package {:?} version {version:?} is not a literal version or range", package.id),
       ));
     }
-    let include_assets = parse_package_assets(&project_path, "IncludeAssets", package.include_assets.as_deref(), PackageAssetFlags::ALL)?;
+    let default_include_assets = if package.central_global {
+      PackageAssetFlags::RUNTIME
+        .union(PackageAssetFlags::BUILD)
+        .union(PackageAssetFlags::BUILD_MULTI_TARGETING)
+        .union(PackageAssetFlags::NATIVE)
+        .union(PackageAssetFlags::CONTENT_FILES)
+        .union(PackageAssetFlags::ANALYZERS)
+    } else {
+      PackageAssetFlags::ALL
+    };
+    let include_assets = parse_package_assets(&project_path, "IncludeAssets", package.include_assets.as_deref(), default_include_assets)?;
     let exclude_assets = parse_package_assets(&project_path, "ExcludeAssets", package.exclude_assets.as_deref(), PackageAssetFlags::NONE)?;
     let private_assets = parse_package_assets(
       &project_path,
       "PrivateAssets",
       package.private_assets.as_deref(),
-      PackageAssetFlags::DEFAULT_PRIVATE,
+      if package.central_global {
+        PackageAssetFlags::ALL
+      } else {
+        PackageAssetFlags::DEFAULT_PRIVATE
+      },
     )?;
     let no_warn = optional_literal_metadata(&project_path, "NoWarn", package.no_warn.as_deref())?
       .map(|value| table.push(value, &project_path))
@@ -1392,6 +2000,8 @@ fn materialize_project(
     sources: source_spans,
     project_references: reference_spans,
     package_references: package_references.into_boxed_slice(),
+    central_package_versions,
+    central_package_fingerprint: central_package_fingerprint_span,
     framework_references: framework_references.into_boxed_slice(),
     runtime_framework_version: runtime_framework_version_span,
     runtime_identifier_index,
@@ -1403,6 +2013,8 @@ fn materialize_project(
     deterministic,
     self_contained,
     nuget_audit_enabled,
+    central_package_management,
+    central_transitive_pinning,
     nuget_audit_mode,
     nuget_audit_level,
     target_latest_runtime_patch,
@@ -1833,6 +2445,9 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
     "NuGetAudit" => Ok(Property::NugetAudit),
     "NuGetAuditMode" => Ok(Property::NugetAuditMode),
     "NuGetAuditLevel" => Ok(Property::NugetAuditLevel),
+    "ManagePackageVersionsCentrally" => Ok(Property::ManagePackageVersionsCentrally),
+    "CentralPackageTransitivePinningEnabled" => Ok(Property::CentralPackageTransitivePinningEnabled),
+    "CentralPackageVersionOverrideEnabled" => Ok(Property::CentralPackageVersionOverrideEnabled),
     _ => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
@@ -1914,6 +2529,10 @@ fn optional_attribute(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<
 }
 
 fn store_condition(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<'_>, raw: &mut RawProject) -> Result<u32, ProjectError> {
+  store_condition_value(path, reader, element, &mut raw.conditions)
+}
+
+fn store_condition_value(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<'_>, conditions: &mut Vec<String>) -> Result<u32, ProjectError> {
   let Some(condition) = optional_attribute(path, reader, element, "Condition")? else {
     return Ok(NO_REFERENCE_CONDITION);
   };
@@ -1931,9 +2550,9 @@ fn store_condition(path: &Path, reader: &Reader<&[u8]>, element: &BytesStart<'_>
       format!("reference Condition exceeds the {MAX_REFERENCE_CONDITION_BYTES}-byte evaluation limit"),
     ));
   }
-  let index = u32::try_from(raw.conditions.len())
+  let index = u32::try_from(conditions.len())
     .map_err(|_| ProjectError::new(ProjectErrorKind::Unsupported, path, "project contains more than 4 billion reference conditions"))?;
-  raw.conditions.push(condition);
+  conditions.push(condition);
   Ok(index)
 }
 
@@ -2606,6 +3225,162 @@ mod tests {
     assert_eq!(debug.package_references().len(), 1);
     assert_eq!(debug.package_id(debug.package_references()[0]), "Debug.Package");
     assert!(debug.framework_references().is_empty());
+  }
+
+  #[test]
+  fn applies_central_versions_overrides_globals_and_transitive_pin_policy() {
+    let temp = TempDirectory::new();
+    temp.write(
+      "Directory.Packages.props",
+      r#"<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Direct.Package" Version="1.2.3" />
+    <PackageVersion Include="Pinned.Package" Version="[2.0.0]" />
+    <PackageVersion Include="Conditional.Package" Version="3.0.0" Condition="'$(TargetFramework)' == 'net10.0'" />
+    <PackageVersion Include="Conditional.Package" Version="9.0.0" Condition="'$(TargetFramework)' == 'net9.0'" />
+    <GlobalPackageReference Include="Global.Tool" Version="4.0.0" />
+  </ItemGroup>
+</Project>"#,
+    );
+    temp.write("src/Program.cs", "");
+    let project = temp.write(
+      "src/App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup>
+          <PackageReference Include="Direct.Package" />
+          <PackageReference Include="Conditional.Package" VersionOverride="3.1.0" />
+        </ItemGroup>"#,
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Release).unwrap();
+    let packages = result
+      .package_references()
+      .iter()
+      .map(|package| (result.package_id(*package), result.package_version(*package)))
+      .collect::<Vec<_>>();
+    assert_eq!(
+      packages,
+      [("Direct.Package", "1.2.3"), ("Conditional.Package", "3.1.0"), ("Global.Tool", "4.0.0")]
+    );
+    assert!(result.central_package_management_enabled());
+    assert!(result.central_package_transitive_pinning_enabled());
+    let central = result
+      .central_package_versions()
+      .iter()
+      .map(|package| (result.central_package_id(*package), result.central_package_version(*package)))
+      .collect::<Vec<_>>();
+    assert_eq!(
+      central,
+      [
+        ("Conditional.Package", "3.0.0"),
+        ("Direct.Package", "1.2.3"),
+        ("Global.Tool", "4.0.0"),
+        ("Pinned.Package", "[2.0.0]")
+      ]
+    );
+    let global = result.package_references()[2];
+    assert_eq!(
+      result.package_include_assets(global),
+      PackageAssetFlags::RUNTIME
+        .union(PackageAssetFlags::BUILD)
+        .union(PackageAssetFlags::BUILD_MULTI_TARGETING)
+        .union(PackageAssetFlags::NATIVE)
+        .union(PackageAssetFlags::CONTENT_FILES)
+        .union(PackageAssetFlags::ANALYZERS)
+    );
+    assert_eq!(result.package_private_assets(global), PackageAssetFlags::ALL);
+  }
+
+  #[test]
+  fn rejects_invalid_central_package_contracts_before_resolution() {
+    for (name, central_property, package) in [
+      (
+        "ProjectVersion",
+        "<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>",
+        r#"<PackageReference Include="Example" Version="1.0.0" />"#,
+      ),
+      (
+        "MissingVersion",
+        "<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>",
+        r#"<PackageReference Include="Missing" />"#,
+      ),
+      (
+        "DisabledOverride",
+        "<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally><CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>",
+        r#"<PackageReference Include="Example" VersionOverride="2.0.0" />"#,
+      ),
+    ] {
+      let temp = TempDirectory::new();
+      temp.write(
+        "Directory.Packages.props",
+        &format!(
+          r#"<Project><PropertyGroup>{central_property}</PropertyGroup><ItemGroup><PackageVersion Include="Example" Version="1.0.0" /></ItemGroup></Project>"#
+        ),
+      );
+      let project = temp.write(&format!("src/{name}.csproj"), &project_xml("", &format!("<ItemGroup>{package}</ItemGroup>")));
+      let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+      assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty, "{name}: {error}");
+    }
+  }
+
+  #[test]
+  fn version_override_wins_with_or_without_central_management() {
+    let standalone = TempDirectory::new();
+    let standalone_project = standalone.write(
+      "Standalone.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Example" Version="1.0.0" VersionOverride="2.0.0" /></ItemGroup>"#,
+      ),
+    );
+    let result = evaluate_project_path(&standalone_project, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(result.package_version(result.package_references()[0]), "2.0.0");
+
+    let central = TempDirectory::new();
+    central.write(
+      "Directory.Packages.props",
+      r#"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+<ItemGroup><PackageVersion Include="Example" Version="1.0.0" /></ItemGroup></Project>"#,
+    );
+    let central_project = central.write(
+      "Central.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><PackageReference Include="Example" Version="1.5.0" VersionOverride="2.0.0" /></ItemGroup>"#,
+      ),
+    );
+    let result = evaluate_project_path(&central_project, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(result.package_version(result.package_references()[0]), "2.0.0");
+  }
+
+  #[test]
+  fn nearest_directory_packages_props_wins_without_merging_its_parent() {
+    let temp = TempDirectory::new();
+    temp.write(
+      "Directory.Packages.props",
+      r#"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+<ItemGroup><PackageVersion Include="Example" Version="1.0.0" /><PackageVersion Include="Parent.Only" Version="9.0.0" /></ItemGroup></Project>"#,
+    );
+    temp.write(
+      "child/Directory.Packages.props",
+      r#"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+<ItemGroup><PackageVersion Include="Example" Version="2.0.0" /></ItemGroup></Project>"#,
+    );
+    let project = temp.write(
+      "child/src/App.csproj",
+      &project_xml("", r#"<ItemGroup><PackageReference Include="Example" /></ItemGroup>"#),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(result.package_version(result.package_references()[0]), "2.0.0");
+    assert_eq!(result.central_package_versions().len(), 1);
+    assert_eq!(result.central_package_id(result.central_package_versions()[0]), "Example");
   }
 
   #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 14;
+pub const EVENT_SCHEMA_VERSION: u16 = 15;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,6 +186,15 @@ pub struct ProjectPackageEvent {
   pub generate_path_property: bool,
 }
 
+/// One selected central package version materialized at the reporter boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CentralPackageVersionEvent {
+  /// Case-preserving package identity.
+  pub id: String,
+  /// Selected version or range.
+  pub version: String,
+}
+
 /// Sparse compiler alias attached to one materialized reference.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompilerReferenceAliasEvent {
@@ -270,6 +279,8 @@ pub struct ResolvedPackageEvent {
   pub sha512: String,
   /// Whether this package is directly referenced.
   pub direct: bool,
+  /// Whether this transitive package was promoted by central pinning.
+  pub central_transitive: bool,
   /// Number of outgoing dependency edges.
   pub dependency_count: u32,
   /// Whether the package was reused or acquired for this command.
@@ -435,6 +446,12 @@ pub enum EventPayload {
     project_references: Vec<String>,
     /// Ordered exact package references.
     package_references: Vec<ProjectPackageEvent>,
+    /// Whether central package version management is active.
+    central_package_management: bool,
+    /// Whether selected central versions promote matching transitive packages.
+    central_transitive_pinning: bool,
+    /// Selected central package versions in case-insensitive identity order.
+    central_package_versions: Vec<CentralPackageVersionEvent>,
     /// Ordered explicit framework references.
     framework_references: Vec<ProjectFrameworkReferenceEvent>,
     /// Project-wide runtime framework version override.

@@ -21,6 +21,7 @@ diagnostic rather than approximate Microsoft behavior.
 | Implicit usings | `enable` or `disable` | Implemented |
 | Project references | acyclic SDK-style references | Paths captured; graph validation planned |
 | Package references | one target, HTTPS NuGet v2/v3, explicitly opted-in HTTP, or local flat/hierarchical source, exact versions first | Initial resolution, verified cache, lock, and nine family-partitioned asset ranges implemented |
+| Central package management | nearest `Directory.Packages.props`, selected literal versions, overrides, globals, and transitive pins | Conditional version tables, fixed global policy, exact pin promotion, lock invalidation, and distinct central-transitive roles implemented |
 | NuGet configuration discovery | machine, additional-user, user, drive/repository, or one explicit file | Platform roots, filename casing, precedence, and explicit isolation implemented |
 | NuGet configuration merge | keyed sources, disabled sources, package folder, and `%NAME%` values | Case-insensitive add/replace/remove/clear and single-pass environment expansion implemented |
 | NuGet source policy | package/audit sources, local/v2/v3 metadata, package-source mappings, and v3 service capabilities | Typed source batches, v2 Atom version enumeration, official registration/package-content/search/vulnerability/publish selection, longest-pattern package routing before source discovery, lazy endpoint activation, and typed unmapped-identity failure are implemented |

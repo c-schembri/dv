@@ -8,14 +8,14 @@ use std::{
 };
 
 use dv_core::{
-  CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent,
-  Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags,
-  PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions,
-  PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError,
-  ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError,
-  RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity,
-  discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages,
-  plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContextField, Diagnostic, DiagnosticCode,
+  DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement,
+  PackageAssetFlags, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution,
+  PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration,
+  ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
+  RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
+  SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
+  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -536,6 +536,7 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
       version: resolution.package_version(package).into(),
       sha512: resolution.package_hash(index).into(),
       direct: resolution.package_is_direct(package),
+      central_transitive: resolution.package_is_central_transitive(package),
       dependency_count: resolution.package_dependencies(package).len() as u32,
       cache_outcome: resolution.package_cache_outcome(package),
     })
@@ -642,14 +643,14 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   writeln!(output, "  Cache          {}", resolution.cache_root().display()).expect("writing a String succeeds");
   writeln!(output, "  Lock           {}", resolution.lock_path().display()).expect("writing a String succeeds");
   for package in resolution.packages().iter().copied() {
-    writeln!(
-      output,
-      "  {} {}{}",
-      resolution.package_id(package),
-      resolution.package_version(package),
-      if resolution.package_is_direct(package) { " (direct)" } else { "" }
-    )
-    .expect("writing a String succeeds");
+    let role = if resolution.package_is_direct(package) {
+      " (direct)"
+    } else if resolution.package_is_central_transitive(package) {
+      " (central transitive)"
+    } else {
+      ""
+    };
+    writeln!(output, "  {} {}{}", resolution.package_id(package), resolution.package_version(package), role).expect("writing a String succeeds");
   }
   io::stdout()
     .lock()
@@ -953,6 +954,16 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     sources: project.sources().map(str::to_owned).collect(),
     project_references: project.project_references().map(str::to_owned).collect(),
     package_references: packages,
+    central_package_management: project.central_package_management_enabled(),
+    central_transitive_pinning: project.central_package_transitive_pinning_enabled(),
+    central_package_versions: project
+      .central_package_versions()
+      .iter()
+      .map(|package| CentralPackageVersionEvent {
+        id: project.central_package_id(*package).to_owned(),
+        version: project.central_package_version(*package).to_owned(),
+      })
+      .collect(),
     framework_references: frameworks,
     runtime_framework_version: project.runtime_framework_version().map(str::to_owned),
     target_latest_runtime_patch: project.target_latest_runtime_patch(),
@@ -1464,6 +1475,17 @@ fn write_project(project: &ProjectSpec) -> ExitCode {
   writeln!(output, "Project references  {}", project.project_references().len()).expect("writing a String succeeds");
   for reference in project.project_references() {
     writeln!(output, "  {reference}").expect("writing a String succeeds");
+  }
+  writeln!(output, "Central packages     {}", project.central_package_management_enabled()).expect("writing a String succeeds");
+  writeln!(output, "Transitive pinning   {}", project.central_package_transitive_pinning_enabled()).expect("writing a String succeeds");
+  for package in project.central_package_versions() {
+    writeln!(
+      output,
+      "  {} {}",
+      project.central_package_id(*package),
+      project.central_package_version(*package)
+    )
+    .expect("writing a String succeeds");
   }
   writeln!(output, "Package references  {}", project.package_references().len()).expect("writing a String succeeds");
   for package in project.package_references() {

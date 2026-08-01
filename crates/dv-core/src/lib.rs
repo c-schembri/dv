@@ -22,8 +22,8 @@ pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_
 pub use credential_provider::{CredentialProviderLogSink, PackageCancellation};
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
-  CacheOutcome, CompilerReferenceAliasEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError, Outcome,
-  PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceWorkEvent,
+  CacheOutcome, CentralPackageVersionEvent, CompilerReferenceAliasEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError,
+  Outcome, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceWorkEvent,
   ProjectFrameworkReferenceEvent, ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent, SdkInstallationEvent,
   validate_events,
 };
@@ -37,8 +37,8 @@ pub use package::{
   PackageSourceInventory, ResolvedPackage, RuntimeTargetKind, SignatureValidationMode, inspect_package_sources, resolve_package_inputs,
 };
 pub use project::{
-  FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError, ProjectErrorKind,
-  ProjectOutputType, ProjectSpec, RuntimeRollForward, evaluate_project, evaluate_project_path,
+  CentralPackageVersion, FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError,
+  ProjectErrorKind, ProjectOutputType, ProjectSpec, RuntimeRollForward, evaluate_project, evaluate_project_path,
 };
 pub use reporter::write_json_lines;
 pub use runtime_graph::{RuntimeGraphError, RuntimeGraphErrorKind, RuntimeIdentifierGraph, load_portable_runtime_graph};

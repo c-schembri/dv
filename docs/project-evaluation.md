@@ -29,6 +29,8 @@ The supported property and item subset is:
 - default recursive `.cs` source discovery excluding `bin` and `obj`;
 - literal C# `ProjectReference` paths;
 - `PackageReference` items with exact, interval, or floating literal versions;
+- nearest `Directory.Packages.props` central versions, overrides, global
+  references, and selected transitive-pin policy;
 - explicit `FrameworkReference` items;
 - conditions on reference `ItemGroup` elements and individual project,
   package, or framework references, evaluated against `TargetFramework`,

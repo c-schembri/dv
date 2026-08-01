@@ -12,7 +12,10 @@
 /benchmarks/fixtures/**/bin/
 /benchmarks/fixtures/**/obj/
 /benchmarks/fixtures/**/.packages/
+/benchmarks/fixtures/**/.dv-packages/
 /benchmarks/fixtures/**/.oracle-packages/
+/benchmarks/fixtures/**/dv.lock.json
+/benchmarks/fixtures/**/packages.lock.json
 /benchmarks/fixtures/nuget-storage-policy/.seed/
 /benchmarks/fixtures/nuget-storage-policy/policy/
 /benchmarks/fixtures/nuget-storage-policy/dv.lock.json

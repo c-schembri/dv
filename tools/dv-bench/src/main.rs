@@ -38,6 +38,7 @@ enum CaseKind {
   PackageGraphMassive,
   PackageAssetPlan,
   PackageReferenceMetadata,
+  CentralPackageManagement,
   PackageSyncWarm,
   NugetConfigHierarchy,
   NugetConfigMerge,
@@ -76,6 +77,7 @@ struct Fixtures<'a> {
   unavailable_pack: &'a Path,
   package: &'a Path,
   package_reference_metadata: &'a Path,
+  central_package_management: &'a Path,
   package_reference_conditions: &'a Path,
   nuget_config: &'a Path,
   nuget_config_merge: &'a Path,
@@ -262,6 +264,21 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "MetadataProject.csproj",
+      "--locked-mode",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "central_package_management",
+    kind: CaseKind::CentralPackageManagement,
+    args: &[
+      "restore",
+      "CentralPackages.csproj",
       "--locked-mode",
       "--packages",
       ".packages",
@@ -624,6 +641,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "central_package_management",
+    kind: CaseKind::CentralPackageManagement,
+    args: &["restore", "CentralPackages.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "nuget_config_hierarchy",
     kind: CaseKind::NugetConfigHierarchy,
     args: &["restore", "ConfigHierarchy.csproj", "--offline", "--json"],
@@ -866,6 +889,7 @@ fn run() -> Result<()> {
   let unavailable_pack_fixture = repository.join("benchmarks/fixtures/unavailable-pack-project");
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
+  let central_package_management_fixture = repository.join("benchmarks/fixtures/central-package-management");
   let package_reference_conditions_fixture = repository.join("benchmarks/fixtures/package-reference-conditions");
   let nuget_config_fixture = repository.join("benchmarks/fixtures/nuget-config-hierarchy");
   let nuget_config_merge_fixture = repository.join("benchmarks/fixtures/nuget-config-merge");
@@ -893,6 +917,7 @@ fn run() -> Result<()> {
     unavailable_pack: &unavailable_pack_fixture,
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
+    central_package_management: &central_package_management_fixture,
     package_reference_conditions: &package_reference_conditions_fixture,
     nuget_config: &nuget_config_fixture,
     nuget_config_merge: &nuget_config_merge_fixture,
@@ -956,6 +981,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "package_reference_metadata") {
     verify_package_reference_metadata(&repository, &dv_executable, &package_reference_metadata_fixture)?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "central_package_management") {
+    verify_central_package_management(&repository, &dv_executable, &central_package_management_fixture)?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "nuget_config_hierarchy") {
     verify_nuget_config_hierarchy(&repository, &dv_executable, &nuget_config_fixture)?;
   }
@@ -1017,7 +1045,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 20,
+    schema_version: 21,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2154,6 +2182,88 @@ fn verify_package_reference_metadata(repository: &Path, dv_executable: &Path, fi
     return Err("dv compiler plan generated a different package property name".into());
   }
   assert_relative_policy_path(plan_property, "value", &dv_workspace, ".packages/newtonsoft.json/13.0.3")?;
+  Ok(())
+}
+
+fn verify_central_package_management(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  verify_package_sync(repository, dv_executable, fixture, "CentralPackages.csproj", 54)?;
+  let root = repository.join(format!("target/benchmark-centralpackages-verification-{}", std::process::id()));
+  let dotnet_workspace = root.join("dotnet");
+  let dv_workspace = root.join("dv");
+  run_checked(
+    Path::new("dotnet"),
+    &[
+      "restore",
+      "CentralPackages.csproj",
+      "--use-lock-file",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    &dotnet_workspace,
+    "central package management lock oracle",
+  )?;
+  let lock: serde_json::Value = serde_json::from_slice(&fs::read(dotnet_workspace.join("packages.lock.json"))?)?;
+  let central_role = lock.pointer("/dependencies/net10.0/Humanizer.Core/type").and_then(serde_json::Value::as_str);
+  if central_role != Some("CentralTransitive") {
+    return Err(format!("Microsoft central pin oracle changed: Humanizer.Core role={central_role:?}").into());
+  }
+
+  let inspect = command_text(dv_executable, &["project", "inspect", "CentralPackages.csproj", "--json"], &dv_workspace)?;
+  let project = json_event(&inspect, "project_evaluated").ok_or("dv central project inspection omitted project_evaluated")?;
+  if project.get("central_package_management").and_then(serde_json::Value::as_bool) != Some(true)
+    || project.get("central_transitive_pinning").and_then(serde_json::Value::as_bool) != Some(true)
+  {
+    return Err("dv did not expose the enabled central package policy".into());
+  }
+  let central_versions = project
+    .get("central_package_versions")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv project inspection omitted central package versions")?;
+  let expected = [
+    ("Humanizer", "2.14.1"),
+    ("Humanizer.Core", "2.14.1"),
+    ("Microsoft.SourceLink.GitHub", "8.0.0"),
+    ("Newtonsoft.Json", "13.0.3"),
+  ];
+  let actual = central_versions
+    .iter()
+    .map(|package| {
+      Ok((
+        package.get("id").and_then(serde_json::Value::as_str).ok_or("central package omitted id")?,
+        package
+          .get("version")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("central package omitted version")?,
+      ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  if actual != expected {
+    return Err(format!("dv selected a different central version batch: {actual:?}").into());
+  }
+
+  let restored = command_text(
+    dv_executable,
+    &["restore", "CentralPackages.csproj", "--packages", ".packages", "--offline", "--json"],
+    &dv_workspace,
+  )?;
+  let resolution = json_event(&restored, "package_resolution_created").ok_or("dv central restore omitted package_resolution_created")?;
+  let pinned = resolution
+    .get("packages")
+    .and_then(serde_json::Value::as_array)
+    .and_then(|packages| {
+      packages
+        .iter()
+        .find(|package| package.get("id").and_then(serde_json::Value::as_str) == Some("Humanizer.Core"))
+    })
+    .ok_or("dv central restore omitted Humanizer.Core")?;
+  if pinned.get("central_transitive").and_then(serde_json::Value::as_bool) != Some(true)
+    || pinned.get("direct").and_then(serde_json::Value::as_bool) != Some(false)
+  {
+    return Err("dv did not preserve the central-transitive package role".into());
+  }
   Ok(())
 }
 
@@ -3675,6 +3785,13 @@ fn item_identities(document: &serde_json::Value, item: &str) -> Result<Vec<Strin
     .collect()
 }
 
+fn json_event(text: &str, kind: &str) -> Option<serde_json::Value> {
+  text
+    .lines()
+    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some(kind))
+}
+
 fn string_array(document: &serde_json::Value, field: &str) -> Result<Vec<String>> {
   document
     .get(field)
@@ -3869,6 +3986,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageAssetPlan
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
+      | CaseKind::CentralPackageManagement
       | CaseKind::NugetConfigHierarchy
       | CaseKind::NugetConfigMerge
       | CaseKind::NugetSourceSections
@@ -4197,6 +4315,33 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
         &["restore", "MetadataProject.csproj", "--packages", ".packages", "--json"],
         workspace,
         "PackageReference metadata setup",
+      )?;
+    }
+  }
+  if matches!(case.kind, CaseKind::CentralPackageManagement) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "CentralPackages.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "central package management setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "CentralPackages.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "central package management setup",
       )?;
     }
   }
@@ -4852,6 +4997,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan
     | CaseKind::PackageReferenceMetadata
+    | CaseKind::CentralPackageManagement
     | CaseKind::NugetConfigHierarchy
     | CaseKind::NugetConfigMerge
     | CaseKind::NugetSourceSections
@@ -4929,6 +5075,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackDiagnostic => fixtures.unavailable_pack,
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
+    CaseKind::CentralPackageManagement => fixtures.central_package_management,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
     CaseKind::NugetConfigHierarchy => fixtures.nuget_config,
     CaseKind::NugetConfigMerge => fixtures.nuget_config_merge,
@@ -4961,6 +5108,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackDiagnostic => Some("unavailable-pack-project"),
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
+    CaseKind::CentralPackageManagement => Some("central-package-management"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
     CaseKind::NugetConfigHierarchy => Some("nuget-config-hierarchy"),
     CaseKind::NugetConfigMerge => Some("nuget-config-merge"),
@@ -5038,6 +5186,7 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageGraphMassive
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
+        | CaseKind::CentralPackageManagement
         | CaseKind::PackageSyncWarm
         | CaseKind::NugetConfigHierarchy
         | CaseKind::NugetConfigMerge
@@ -5542,7 +5691,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     if entry.file_type()?.is_dir() {
       if matches!(
         entry.file_name().to_str(),
-        Some("obj" | "bin" | ".packages" | ".oracle-packages" | ".seed" | ".seed-project")
+        Some("obj" | "bin" | ".packages" | ".dv-packages" | ".oracle-packages" | ".seed" | ".seed-project")
       ) || (generated_policy_root && entry.file_name() == OsStr::new("policy"))
         || (local_sources_root && entry.file_name() == OsStr::new("feeds"))
       {
@@ -5550,7 +5699,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
       }
       copy_directory(&source_path, &destination_path)?;
     } else {
-      if (generated_policy_root || local_sources_root) && matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
+      if matches!(entry.file_name().to_str(), Some("dv.lock.json" | "packages.lock.json")) {
         continue;
       }
       fs::copy(source_path, destination_path)?;
@@ -5795,6 +5944,7 @@ fn case_label(case: &str) -> &str {
     "package_graph_massive" => "Cold massive solution graph",
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
+    "central_package_management" => "Central package management",
     "package_sync_warm" => "Warm locked restore",
     "nuget_config_hierarchy" => "NuGet.Config hierarchy",
     "nuget_config_merge" => "NuGet.Config keyed merge",
