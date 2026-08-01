@@ -37,8 +37,8 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 69 rows are implemented;
-- 30 rows have partial foundations;
+- 70 rows are implemented;
+- 29 rows have partial foundations;
 - 369 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
@@ -133,8 +133,8 @@ cache publication. Network work is outside the verification benchmark.
 ### Wave 1: Invocation And Manifest Spine
 
 Status: in progress; `CLI-005` through `CLI-008`, `CLI-011` through
-`CLI-015`, `CLI-017`, `DROP-001` through `DROP-003`, and `DROP-010` are
-complete.
+`CLI-015`, `CLI-017`, `DROP-001` through `DROP-003`, `DROP-010`, and
+`DROP-011` are complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
@@ -149,7 +149,7 @@ All 20 currently accepted native command spellings normalize to 15 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
 24 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
-The broader foundations of `DROP-011` and `DROP-016` remain partial.
+The broader foundation of `DROP-016` remains partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command
 batch and can be reached by canonical and supported drop-in spellings.

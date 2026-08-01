@@ -171,6 +171,22 @@ activate the child delimiter; a word in another profile cannot cross into
 child orchestration. Routed but unimplemented operations return a typed
 pre-I/O failure rather than falling through to native restore/build.
 
+## Explicit Profile Diagnostics
+
+`DROP-011` keeps compatibility provenance out of the six-byte semantic
+request and reads it only at the shared terminal failure boundary. When an
+explicit `dotnet`, `msbuild`, `nuget`, or `vstest` profile has been selected,
+that boundary appends one ordered `compatibility_profile` context record to
+the existing diagnostic batch. The human and JSON reporters consume the same
+record; neither reporter reconstructs the profile from arguments or prose.
+
+Native failures omit the record. Invalid and repeated selectors reject before
+a profile is established, so they also omit it and retain native usage exit
+policy. The common successful dispatch path performs no new branch,
+allocation, copy, filesystem operation, process launch, or network request.
+The rare error path allocates the two variable-sized strings required by the
+owned diagnostic wire record and grows its context vector by one element.
+
 ## Layout And Access
 
 `InvocationRequest` is 6 bytes and aligned to 2 on every supported target: a
@@ -398,6 +414,12 @@ Fifty retained samples after ten warm-ups measured `152.984 ms` versus
 faster at this like-for-like boundary. The selected-SDK control remained
 `12.0x` faster. Full evidence is retained in the
 [invocation-mode baseline](performance-baselines/2026-08-01-invocation-mode-windows.md).
+
+`DROP-011` remeasures that same rejection after requiring stable selected-
+profile context in human and JSON diagnostics. Fifty retained samples after
+ten warm-ups measured `133.281 ms` for Microsoft and `5.125 ms` for `dv`, a
+`26.0x` median improvement; p95 was `147.033 ms` and `6.256 ms`. Full evidence
+is retained in the [compatibility-diagnostics baseline](performance-baselines/2026-08-02-cli-compat-diagnostics-windows.md).
 
 `DROP-010` compares `dotnet pack --definitely-unknown` with `dv --compat
 dotnet pack --definitely-unknown`. Both reject the same invalid pack option;

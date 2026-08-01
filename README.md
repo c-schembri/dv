@@ -208,6 +208,13 @@ with global policy, and malformed or duplicate selectors reject before SDK,
 project, filesystem, process, or network work. Full executable-name inference,
 drop-in grammar, and output-layout work remains in progress.
 
+Selected-profile failures carry one stable `compatibility_profile` context
+field in both human and JSON diagnostics. Native failures and invalid or
+repeated selectors omit it, so automation can distinguish a deliberate
+reference grammar from native parsing without scraping prose. This annotation
+is created only on the error path and adds no state or allocation to successful
+dispatch.
+
 Reaped child processes retain their exact 32-bit exit code instead of passing
 through those failure mappings. Launch and wait failures are separate typed
 states, while Unix signals remain distinct until the owning run/test workflow
@@ -461,6 +468,8 @@ Accepted command spelling normalization has a like-for-like pre-I/O baseline
 in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
 Explicit invocation-mode classification has a like-for-like pre-I/O baseline
 in the [invocation-mode evidence](docs/performance-baselines/2026-08-01-invocation-mode-windows.md).
+Structured explicit-profile diagnostics have updated like-for-like evidence in
+the [compatibility-diagnostics baseline](docs/performance-baselines/2026-08-02-cli-compat-diagnostics-windows.md).
 Ambiguous command precedence has a like-for-like pre-I/O baseline in the
 [route-precedence evidence](docs/performance-baselines/2026-08-01-cli-route-precedence-windows.md).
 
@@ -496,7 +505,7 @@ Initial machine:
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
-| Select the `dotnet` invocation mode and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 152.984 ms | 5.641 ms | 27.1x | 193.102 ms | 6.630 ms |
+| Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
 | Route ambiguous `pack` and reject before discovery | `dotnet pack --definitely-unknown` | `dv --compat dotnet pack --definitely-unknown` | 280.174 ms | 5.242 ms | 53.4x | 306.891 ms | 5.841 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |

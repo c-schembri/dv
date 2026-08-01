@@ -447,11 +447,17 @@ contracts.
   `280.174 ms` for `dotnet pack` and `5.242 ms` for the corresponding `dv`
   route, a `53.4x` median improvement.
   `P1`
-- [~] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
+- [x] `DROP-011` Permit explicit `--compat dotnet|msbuild|nuget|vstest` for
   diagnostics and ambiguous automation without requiring it for ordinary
   executable-token replacement. The typed selector and exit policy are
-  implemented; complete reference grammars and diagnostic layouts remain
-  open. `P1`
+  complete. Every selected-profile failure now appends exactly one stable
+  `compatibility_profile` context field to both human and JSON diagnostics;
+  native failures and invalid or repeated selectors omit it. This failure-only
+  transform adds no request state or successful-path allocation. Complete
+  reference grammars and byte-exact diagnostic layouts remain owned by their
+  dedicated rows. Fifty like-for-like Windows rejection samples measured
+  `133.281 ms` for `dotnet` and `5.125 ms` for `dv`, a `26.0x` median
+  improvement. `P1`
 - [ ] `DROP-012` Detect optional executable aliases or shims named `dotnet`,
   `msbuild`, `nuget`, and `vstest.console` through `argv[0]`, while keeping the
   same parser and execution transforms. `P5`

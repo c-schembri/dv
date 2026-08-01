@@ -33,6 +33,18 @@ pub(crate) enum InvocationMode {
   Vstest,
 }
 
+impl InvocationMode {
+  const fn profile(self) -> Option<&'static str> {
+    match self {
+      Self::Native => None,
+      Self::Dotnet => Some("dotnet"),
+      Self::Msbuild => Some("msbuild"),
+      Self::Nuget => Some("nuget"),
+      Self::Vstest => Some("vstest"),
+    }
+  }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum FailureClass {
@@ -192,6 +204,7 @@ impl InvocationScan {
 
   fn select_mode(&mut self, value: &OsStr) -> Result<(), String> {
     if self.is_explicit(MODE_EXPLICIT) {
+      self.mode = InvocationMode::Native;
       return Err("--compat may be specified only once".into());
     }
     self.mode = parse_compatibility_mode(value)?;
@@ -230,6 +243,10 @@ impl InvocationOptions {
 
   pub(crate) fn verbosity(self) -> DiagnosticVerbosity {
     self.globals.verbosity()
+  }
+
+  pub(crate) fn compatibility_profile(self) -> Option<&'static str> {
+    self.mode.profile()
   }
 
   pub(crate) fn failure_exit_code(self, class: FailureClass) -> u8 {
@@ -1307,6 +1324,7 @@ mod tests {
       let batch = InvocationBatch::capture(arguments);
       assert_eq!(batch.request().command, CommandKind::InvalidOptions);
       assert!(batch.option_error().is_some());
+      assert_eq!(batch.options().compatibility_profile(), None);
     }
   }
 

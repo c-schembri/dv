@@ -2766,11 +2766,18 @@ fn fail_with_outcome(
   class: FailureClass,
   command: &str,
   args: Vec<String>,
-  diagnostic: Diagnostic,
+  mut diagnostic: Diagnostic,
   outcome: Outcome,
 ) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let json = globals.json();
+  if let Some(profile) = globals.compatibility_profile() {
+    // Error wire fields own their text; successful dispatch never pays this allocation.
+    diagnostic.context.push(ContextField {
+      name: "compatibility_profile".into(),
+      value: profile.into(),
+    });
+  }
 
   if json {
     let events = [

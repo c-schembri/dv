@@ -522,8 +522,23 @@ fn compatibility_profiles_preserve_reference_failure_codes() {
     let output = dv().args(["--compat", profile, "frobnicate"]).output().unwrap();
 
     assert_eq!(output.status.code(), Some(1), "profile {profile}");
-    assert!(String::from_utf8(output.stderr).unwrap().contains(diagnostic));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(diagnostic));
+    assert!(stderr.contains(&format!("compatibility_profile: {profile}")));
   }
+}
+
+#[test]
+fn compatibility_profile_is_one_structured_context_row_and_native_omits_it() {
+  let json = dv().args(["--json", "--compat", "nuget", "frobnicate"]).output().unwrap();
+  let native = dv().arg("frobnicate").output().unwrap();
+
+  assert_eq!(json.status.code(), Some(1));
+  assert!(json.stderr.is_empty());
+  let stdout = String::from_utf8(json.stdout).unwrap();
+  assert_eq!(stdout.matches("\"name\":\"compatibility_profile\"").count(), 1);
+  assert!(stdout.contains("\"name\":\"compatibility_profile\",\"value\":\"nuget\""));
+  assert!(!String::from_utf8(native.stderr).unwrap().contains("compatibility_profile"));
 }
 
 #[test]
@@ -570,6 +585,16 @@ fn invalid_compatibility_mode_is_a_native_usage_failure() {
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert!(stderr.contains("unsupported compatibility mode"));
   assert!(!stderr.contains("DefinitelyMissing.csproj"));
+}
+
+#[test]
+fn repeated_compatibility_mode_is_an_unselected_native_usage_failure() {
+  let output = dv().args(["--compat", "dotnet", "--compat", "nuget", "restore"]).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("--compat may be specified only once"));
+  assert!(!stderr.contains("compatibility_profile"));
 }
 
 #[test]

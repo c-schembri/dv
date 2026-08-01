@@ -69,6 +69,14 @@ corresponding `DROP-*` rows. Compatibility manifest version 1 records those
 surfaces and their partial/missing states instead of implying that capture
 equals execution support.
 
+`DROP-011` also makes an explicitly selected profile observable without
+scraping diagnostic prose. Every selected-profile failure carries exactly one
+ordered `compatibility_profile` context field in the shared structured
+diagnostic batch, so human and JSON output expose the same value. Native
+failures and malformed, unsupported, or repeated selectors omit the field.
+This reporting transform does not alter failure classification or exit-code
+selection.
+
 ## Evidence
 
 Integration tests cover every explicit profile, native and compatibility
@@ -85,3 +93,9 @@ like-for-like rejection benchmark measured `dotnet build
 --compat dotnet build --definitely-unknown` at `5.641 ms` median and `6.630 ms`
 p95, a `27.1x` median improvement. Its raw samples are retained in
 `benchmarks/results/2026-08-01-invocation-mode-windows.json`.
+The `DROP-011` diagnostic-context run strengthened the same benchmark
+preflight to require `compatibility_profile: dotnet`. Fifty Windows samples
+after ten warm-ups measured `133.281 ms` median and `147.033 ms` p95 for
+`dotnet`, versus `5.125 ms` median and `6.256 ms` p95 for `dv`, a `26.0x`
+median improvement. Raw samples are retained in
+`benchmarks/results/2026-08-02-cli-compat-diagnostics-windows.json`.

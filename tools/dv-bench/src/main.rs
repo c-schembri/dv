@@ -1670,6 +1670,7 @@ fn validate_mode_classification_failure(output: &Output, reference: bool) -> Res
     || !output.stdout.is_empty()
     || !text.contains("error[DV0002]")
     || !text.contains("unknown build option \"--definitely-unknown\"")
+    || !text.contains("compatibility_profile: dotnet")
   {
     return Err(format!("dv dotnet mode did not apply its typed pre-I/O failure policy: {text}").into());
   }
