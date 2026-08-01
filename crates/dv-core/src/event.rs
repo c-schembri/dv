@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 18;
+pub const EVENT_SCHEMA_VERSION: u16 = 19;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -310,10 +310,21 @@ pub struct ResolvedPackageEvent {
 pub enum EventPayload {
   /// The parsed command is about to execute.
   CommandStarted {
+    /// Version of the command grammar which produced the typed request.
+    command_syntax_version: u16,
     /// Stable command name.
     command: String,
     /// Command arguments after the executable name, with sensitive values redacted.
     args: Vec<String>,
+  },
+  /// The executable and its independently versioned compatibility surfaces were reported.
+  ToolVersion {
+    /// `dv` package version.
+    version: String,
+    /// Current command grammar version.
+    command_syntax_version: u16,
+    /// Current JSON event schema version.
+    event_schema_version: u16,
   },
   /// A batch of work is about to execute.
   WorkStarted {

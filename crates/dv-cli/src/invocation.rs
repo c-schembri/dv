@@ -8,7 +8,20 @@ use std::{
 
 use crate::{environment::directive_assignment, output};
 
-pub(crate) const COMMAND_SYNTAX_VERSION: u16 = 1;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct CommandSyntaxVersion(u16);
+
+impl CommandSyntaxVersion {
+  pub(crate) const fn get(self) -> u16 {
+    self.0
+  }
+}
+
+const _: () = assert!(size_of::<CommandSyntaxVersion>() == 2);
+const _: () = assert!(align_of::<CommandSyntaxVersion>() == 2);
+
+pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -178,13 +191,17 @@ const _: () = assert!(align_of::<InvocationOptions>() == 1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InvocationRequest {
   command_index: usize,
-  syntax_version: u16,
+  syntax_version: CommandSyntaxVersion,
   mode: InvocationMode,
   command: CommandKind,
   globals: GlobalOptions,
 }
 
 impl InvocationRequest {
+  pub(crate) fn syntax_version(self) -> CommandSyntaxVersion {
+    self.syntax_version
+  }
+
   pub(crate) fn command(self) -> CommandKind {
     self.command
   }

@@ -13,7 +13,7 @@ mod invocation;
 mod output;
 
 use environment::{ChildEnvironmentPlan, EnvironmentError};
-use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, FailureClass, InvocationBatch, InvocationOptions};
+use invocation::{COMMAND_SYNTAX_VERSION, ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, FailureClass, InvocationBatch, InvocationOptions};
 use output::redact_argument_text;
 
 use dv_core::{
@@ -198,8 +198,21 @@ fn run() -> ExitCode {
           diagnostic("DV0002", problem, None, Some("Use `dv --version` without command operands.")),
         );
       }
-      println!("dv {}", env!("CARGO_PKG_VERSION"));
-      ExitCode::SUCCESS
+      if json {
+        succeed(
+          started,
+          "version",
+          invocation.event_arguments(true),
+          EventPayload::ToolVersion {
+            version: env!("CARGO_PKG_VERSION").into(),
+            command_syntax_version: request.syntax_version().get(),
+            event_schema_version: dv_core::EVENT_SCHEMA_VERSION,
+          },
+        )
+      } else {
+        println!("dv {}", env!("CARGO_PKG_VERSION"));
+        ExitCode::SUCCESS
+      }
     },
     CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
@@ -2498,10 +2511,18 @@ fn optional_path_text(path: Option<&Path>, meaning: &str) -> Result<Option<Strin
   path.map(|path| path_text(path, meaning)).transpose()
 }
 
+fn command_started(command: &str, args: Vec<String>) -> EventPayload {
+  EventPayload::CommandStarted {
+    command_syntax_version: COMMAND_SYNTAX_VERSION.get(),
+    command: command.into(),
+    args,
+  }
+}
+
 fn succeed(started: Instant, command: &str, args: Vec<String>, payload: EventPayload) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let events = [
-    Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }),
+    Event::new(0, 0, command_started(command, args)),
     Event::new(1, elapsed_us, payload),
     Event::new(
       2,
@@ -2527,7 +2548,7 @@ fn succeed_batch_with_diagnostics(
 ) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let mut events = Vec::with_capacity(diagnostics.len() + payloads.len() + 2);
-  events.push(Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }));
+  events.push(Event::new(0, 0, command_started(command, args)));
   for diagnostic in diagnostics
     .into_iter()
     .filter(|diagnostic| diagnostic_visible(diagnostic.severity, globals.verbosity()))
@@ -2666,7 +2687,7 @@ fn fail_with_outcome(
 
   if json {
     let events = [
-      Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }),
+      Event::new(0, 0, command_started(command, args)),
       Event::new(
         1,
         elapsed_us,

@@ -373,8 +373,16 @@ contracts.
 - [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,
   quoting, comments, default response-file discovery, opt-out, cycles, and
   size/depth bounds. `P2`
-- [ ] `CLI-017` Version command syntax and JSON compatibility independently so
-  a CLI alias does not mutate the event protocol. `P1`
+- [x] `CLI-017` Version command syntax and JSON compatibility independently so
+  a CLI alias does not mutate the event protocol. The 16-byte typed invocation
+  request now carries a two-byte syntax-version value while the reporter owns
+  schema version 19. `version`, `--version`, `-V`, and the explicit `dotnet`
+  compatibility spelling normalize to one typed command and emit the same
+  `command_started`, `tool_version`, and `command_finished` contract; raw alias
+  arguments remain reporter evidence rather than protocol selection. The
+  structural query measured `4.479 ms` median and `5.593 ms` p95 on Windows;
+  Microsoft has no equivalent dual-version query, so its result is explicitly
+  TBI. The like-for-like SDK control remains `13.1x` faster. `P1`
 - [x] `CLI-018` Expose the initial evaluator through human and JSON
   `project inspect` output.
 

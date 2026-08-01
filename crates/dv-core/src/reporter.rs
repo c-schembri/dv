@@ -27,6 +27,7 @@ mod tests {
         0,
         0,
         EventPayload::CommandStarted {
+          command_syntax_version: 1,
           command: "build".into(),
           args: vec!["--json".into()],
         },

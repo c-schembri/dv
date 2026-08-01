@@ -11,8 +11,8 @@ Roslyn remains the compiler and Microsoft .NET remains the runtime; `dv` owns
 the expensive orchestration around them.
 
 ```text
-dotnet --version               60.637 ms median
-dv sdk current                  3.798 ms median
+dotnet --version               63.022 ms median
+dv sdk current                  4.828 ms median
 
 dotnet NuGet RID expansion     36.217 ms median
 dv sdk compatible-rids          6.049 ms median
@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and self-version | Implemented |
+| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -209,6 +209,12 @@ through those failure mappings. Launch and wait failures are separate typed
 states, while Unix signals remain distinct until the owning run/test workflow
 selects an explicit policy. Application launch itself is still planned, so the
 current command surface never claims that a TBI child executed.
+
+Command syntax version `1` and JSON event schema version `19` advance
+independently. `dv --json --version` reports the executable and both protocol
+versions in one validated event batch, while human `dv --version` remains
+unchanged. Version aliases normalize to the same typed command and cannot
+select a different wire schema.
 
 Human output defaults can be set with `DV_COLOR=auto|always|never` and
 `DV_VERBOSITY=quiet|minimal|normal|detailed|diagnostic`; a non-empty
@@ -416,6 +422,9 @@ does not claim like-for-like run performance. See the
 The current SDK row includes early handler installation; its deadline and
 signal gates are recorded in the
 [cancellation baseline](docs/performance-baselines/2026-08-01-cli-cancellation-windows.md).
+Command syntax and JSON event schema versioning have a separate structural
+baseline because Microsoft has no equivalent dual-version query. See the
+[protocol-version baseline](docs/performance-baselines/2026-08-01-cli-protocol-version-windows.md).
 
 Initial machine:
 
@@ -444,7 +453,7 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
-| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 68.400 ms | 5.302 ms | 12.9x | 72.780 ms | 6.346 ms |
+| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 63.022 ms | 4.828 ms | 13.1x | 64.736 ms | 5.252 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
@@ -651,6 +660,7 @@ recorded in the curated
 [unknown-option baseline](docs/performance-baselines/2026-08-01-unknown-option-windows.md),
 [cancellation baseline](docs/performance-baselines/2026-08-01-cli-cancellation-windows.md),
 [child-exit baseline](docs/performance-baselines/2026-08-01-cli-child-exit-windows.md),
+[protocol-version baseline](docs/performance-baselines/2026-08-01-cli-protocol-version-windows.md),
 [invocation environment baseline](docs/performance-baselines/2026-08-01-cli-environment-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
@@ -727,6 +737,7 @@ cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3
 cargo bench-all --case cli_forwarding --samples 30 --warmups 5
 cargo bench-all --case cli_child_exit --samples 30 --warmups 5
+cargo bench-all --case cli_protocol_version --samples 30 --warmups 5
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case project_select_named --samples 30 --warmups 3
@@ -812,6 +823,7 @@ See:
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Exit behavior contract](docs/exit-behavior.md)
 - [Child process exit contract](docs/child-process-exit.md)
+- [Command and event protocol versioning](docs/protocol-versioning.md)
 - [Project evaluation contract](docs/project-evaluation.md)
 - [Runtime pack planning contract](docs/runtime-pack-planning.md)
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)

@@ -495,9 +495,46 @@ fn json_failure_is_a_versioned_event_batch() {
   let stdout = String::from_utf8(output.stdout).unwrap();
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
-  assert!(lines[0].contains("\"schema_version\":18"));
+  assert!(lines[0].contains("\"schema_version\":19"));
+  assert!(lines[0].contains("\"command_syntax_version\":1"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
+}
+
+#[test]
+fn version_aliases_share_one_independently_versioned_json_contract() {
+  for arguments in [
+    &["--json", "version"][..],
+    &["--json", "--version"],
+    &["-V", "--json"],
+    &["--compat", "dotnet", "--json", "version"],
+  ] {
+    let output = dv().args(arguments).output().unwrap();
+    assert!(output.status.success(), "arguments={arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty(), "arguments={arguments:?}");
+    let events = output
+      .stdout
+      .split(|byte| *byte == b'\n')
+      .filter(|line| !line.is_empty())
+      .map(serde_json::from_slice::<serde_json::Value>)
+      .collect::<Result<Vec<_>, _>>()
+      .unwrap();
+
+    assert_eq!(events.len(), 3, "arguments={arguments:?}");
+    assert!(
+      events
+        .iter()
+        .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(19))
+    );
+    assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
+    assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
+    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(1));
+    assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
+    assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(1));
+    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(19));
+    assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
+  }
 }
 
 #[test]
@@ -826,7 +863,7 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 
   assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
   let stdout = String::from_utf8(alias.stdout).unwrap();
-  assert!(stdout.contains("\"type\":\"command_started\",\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":1,\"command\":\"restore\""));
   assert!(stdout.contains("\"type\":\"package_resolution_created\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));

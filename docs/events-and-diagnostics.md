@@ -8,7 +8,7 @@ logic never emits prose for another subsystem to scrape.
 Input layout:
 
 - a contiguous slice of `Event`;
-- schema version `15`;
+- schema version `19`;
 - sequence numbers exactly `0..count`;
 - monotonic microseconds from one command-local clock.
 
@@ -39,6 +39,7 @@ items.
 ## Event Types
 
 - `command_started`
+- `tool_version`
 - `work_started`
 - `work_finished`
 - `cache_decision`
@@ -55,6 +56,11 @@ items.
 - `command_finished`
 
 New variants require a real consumer and a version-compatibility decision.
+Schema 19 adds the independently versioned command grammar to
+`command_started` and introduces `tool_version`, which reports the executable,
+command-syntax, and event-schema versions without coupling any of them. The
+current version-command aliases normalize before event construction and
+therefore cannot select a different wire shape.
 Schema 18 changes `command_started.args` to an explicitly reporter-safe view:
 argument count and order remain stable, while sensitive assignments/options
 and credential-bearing URL components are replaced before serialization. The

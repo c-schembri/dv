@@ -166,6 +166,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_protocol_version",
+    kind: CaseKind::Startup,
+    args: &[],
+    implemented: false,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
@@ -861,6 +867,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_protocol_version",
+    kind: CaseKind::Startup,
+    args: &["--json", "--version"],
+    implemented: true,
+  },
+  Case {
     name: "sync_cold",
     kind: CaseKind::RestoreCold,
     args: &["sync", "--json"],
@@ -1257,6 +1269,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_cancellation") {
     verify_cancellation_boundary(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_protocol_version") {
+    verify_protocol_version_boundary(&dv_executable, &fixture)?;
   }
   if options.case.as_deref() == Some("cli_cancellation") {
     let provider_workspace = repository.join(format!("target/benchmark-cli-cancellation-verification-{}", std::process::id()));
@@ -1871,6 +1886,77 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
     if actual != Some(expected) {
       return Err(format!("dv child-exit boundary reported {name}={actual:?}, expected {expected}").into());
     }
+  }
+  Ok(())
+}
+
+const EVENT_SCHEMA_VERSION: u64 = 19;
+const COMMAND_SYNTAX_VERSION: u64 = 1;
+const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[
+  &["--json", "version"],
+  &["--json", "--version"],
+  &["-V", "--json"],
+  &["--compat", "dotnet", "--json", "version"],
+];
+
+fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  for arguments in PROTOCOL_VERSION_ALIASES {
+    let output = Command::new(dv_executable).args(*arguments).current_dir(fixture).output()?;
+    validate_protocol_version_output(&output, arguments)?;
+  }
+  Ok(())
+}
+
+fn validate_protocol_version_output(output: &Output, expected_arguments: &[&str]) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(format!("dv protocol-version query failed with status {:?}", output.status.code()).into());
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  if events.len() != 3 {
+    return Err(format!("dv protocol-version query emitted {} events; expected 3", events.len()).into());
+  }
+  for (sequence, event) in events.iter().enumerate() {
+    if event.get("schema_version").and_then(serde_json::Value::as_u64) != Some(EVENT_SCHEMA_VERSION)
+      || event.get("sequence").and_then(serde_json::Value::as_u64) != Some(sequence as u64)
+    {
+      return Err(format!("dv protocol-version event {sequence} has the wrong schema or sequence").into());
+    }
+  }
+  let started = &events[0];
+  let arguments = started
+    .get("args")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv protocol-version start omitted args")?;
+  if started.get("type").and_then(serde_json::Value::as_str) != Some("command_started")
+    || started.get("command").and_then(serde_json::Value::as_str) != Some("version")
+    || started.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(COMMAND_SYNTAX_VERSION)
+    || arguments.len() != expected_arguments.len()
+    || !arguments
+      .iter()
+      .zip(expected_arguments)
+      .all(|(actual, expected)| actual.as_str() == Some(*expected))
+  {
+    return Err("dv protocol-version start did not preserve the alias under one syntax version".into());
+  }
+  let version = &events[1];
+  if version.get("type").and_then(serde_json::Value::as_str) != Some("tool_version")
+    || version.get("version").and_then(serde_json::Value::as_str).is_none_or(str::is_empty)
+    || version.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(COMMAND_SYNTAX_VERSION)
+    || version.get("event_schema_version").and_then(serde_json::Value::as_u64) != Some(EVENT_SCHEMA_VERSION)
+  {
+    return Err("dv tool_version did not report both independent protocol versions".into());
+  }
+  let finished = &events[2];
+  if finished.get("type").and_then(serde_json::Value::as_str) != Some("command_finished")
+    || finished.get("command").and_then(serde_json::Value::as_str) != Some("version")
+    || finished.get("outcome").and_then(serde_json::Value::as_str) != Some("succeeded")
+  {
+    return Err("dv protocol-version query omitted its successful terminal event".into());
   }
   Ok(())
 }
@@ -7329,7 +7415,9 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   }
   let output = command.output()?;
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-  if matches!(case.kind, CaseKind::PackDiagnostic) {
+  if case.name == "cli_protocol_version" {
+    validate_protocol_version_output(&output, case.args)?;
+  } else if matches!(case.kind, CaseKind::PackDiagnostic) {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
@@ -8035,8 +8123,9 @@ fn render_summary(report: &Report, color: bool) -> String {
     .unwrap_or(6)
     .max(6);
   let widths = [tool_width, case_width, metric_width, metric_width, metric_width, metric_width];
-  let sample_count = report.runs.first().map(|run| run.samples_ns.len()).unwrap_or(0);
-  let warmup_count = report.runs.first().map(|run| run.warmups).unwrap_or(0);
+  let measured_run = report.runs.iter().find(|run| run.statistics_ns.is_some());
+  let sample_count = measured_run.map(|run| run.samples_ns.len()).unwrap_or(0);
+  let warmup_count = measured_run.map(|run| run.warmups).unwrap_or(0);
   let sample_label = if sample_count == 1 { "sample" } else { "samples" };
   let warmup_label = if warmup_count == 1 { "warm-up" } else { "warm-ups" };
   let mut output = String::new();
@@ -8237,6 +8326,7 @@ fn case_label(case: &str) -> &str {
     "cli_child_exit" => "Child exit policy (run TBI)",
     "cli_cancellation" => "Cancellation-ready SDK selection",
     "cli_version" => "CLI self-version",
+    "cli_protocol_version" => "Syntax + JSON protocol versions",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "package_reference_conditions" => "Conditional references",

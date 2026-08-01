@@ -209,6 +209,23 @@ The design is disproved if a supported path cannot round-trip through
 `PathBuf`, classification performs external I/O, or process-level startup
 regresses beyond benchmark noise relative to the prior release baseline.
 
+## Independent Protocol Versions
+
+`CLI-017` stores command syntax version 1 as a two-byte transparent value in
+the existing 16-byte invocation request. Event schema version 19 remains a
+reporter constant. `version`, `--version`, `-V`, and `--compat dotnet version`
+all produce the same typed `version` request; the original alias tokens remain
+only in the reporter-safe argument batch.
+
+Human `dv --version` retains its single-line output and does not allocate an
+event batch. JSON version output materializes three cold events:
+`command_started` with the syntax version, `tool_version` with the executable
+and both protocol versions, and `command_finished`. The common non-JSON parser
+adds no filesystem access, network request, managed process, dynamic
+allocation, or branch selected by alias spelling. Syntax versions are
+build-owned rather than inferred from argv; unsupported event schemas are
+rejected by the reporter boundary rather than guessed from an alias.
+
 ## Windows Evidence
 
 Thirty retained samples after three warm-ups on the repository benchmark
@@ -305,3 +322,14 @@ median and `5.980 ms` p95 (`12.2x`). This remains below the earlier published
 `6.102 ms` `dv` median, so the three exact environment lookups show no practical
 startup regression. Raw samples are
 `benchmarks/results/sdk-current-cli013-control.json`.
+
+The `CLI-017` structural query validates all four version aliases before
+timing `dv --json --version`. Thirty retained samples after five warm-ups
+measured `4.479 ms` median and `5.593 ms` p95. Microsoft has no command that
+reports both its command grammar and dv's JSON event contract, so the harness
+prints TBI rather than manufacturing a comparison. The separate like-for-like
+SDK control measured `dotnet --version` at `63.022 ms` median and `64.736 ms`
+p95, while `dv sdk current` measured `4.828 ms` median and `5.252 ms` p95,
+leaving `dv` `13.1x` faster at the median. Raw samples are retained as
+`benchmarks/results/2026-08-01-cli-protocol-version-windows.json` and
+`benchmarks/results/2026-08-01-cli-protocol-version-sdk-control-windows.json`.
