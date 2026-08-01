@@ -200,13 +200,17 @@ filtering, JSON comments, custom errors, .NET 10 search `paths`, and `$host$`
 without launching `dotnet`.
 
 Use `--compat dotnet|msbuild|nuget|vstest` to select a pinned reference exit
-policy before command discovery. Native failures retain exit code 2; current
-reference-profile failures return 1. The selector adds no allocation and is
-removed from the typed command operands during the initial linear argument
-scan. The scan-only state is a compile-time-checked five-byte record shared
-with global policy, and malformed or duplicate selectors reject before SDK,
-project, filesystem, process, or network work. Full executable-name inference,
-drop-in grammar, and output-layout work remains in progress.
+policy before command discovery. A 45-byte read-only matrix covers success,
+usage, unsupported, operation, build, restore, test failure, no-tests, and
+cancellation results across the five invocation profiles. Inapplicable tool
+outcomes use an explicit sentinel rather than a plausible exit. Native failures
+retain exit code 2; current reference-profile failures return 1. Selection is
+one indexed byte read with no allocation, filesystem access, or process launch.
+The selector is removed from typed command operands during the initial linear
+argument scan. The scan-only state is a compile-time-checked five-byte record
+shared with global policy, and malformed or duplicate selectors reject before
+SDK, project, filesystem, process, or network work. Full executable-name
+inference, drop-in grammar, and output-layout work remains in progress.
 
 Selected-profile failures carry one stable `compatibility_profile` context
 field in both human and JSON diagnostics. Native failures and invalid or
@@ -504,8 +508,8 @@ Initial machine:
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
   case; command normalization, cancellation-ready SDK selection, compiler
   planning, and cold/warm signed-package validation use 5 warm-ups; invocation
-  mode, lexical preservation, and route precedence use 50 retained samples
-  after 10 warm-ups; 10
+  mode, exit policy, lexical preservation, and route precedence use 50 retained
+  samples after 10 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -520,6 +524,7 @@ Initial machine:
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Select the `dotnet` mode, report its profile, and reject before discovery | `dotnet build --definitely-unknown` | `dv --compat dotnet build --definitely-unknown` | 133.281 ms | 5.125 ms | 26.0x | 147.033 ms | 6.256 ms |
+| Preserve missing-project restore failure status | `dotnet restore DefinitelyMissing.csproj` | `dv --compat dotnet restore DefinitelyMissing.csproj` | 122.756 ms | 5.158 ms | 23.8x | 134.338 ms | 6.073 ms |
 | Preserve a combined configuration token before sentinel rejection | `dotnet build -c:Release --definitely-unknown` | `dv --compat dotnet build -c:Release --definitely-unknown` | 141.461 ms | 4.912 ms | 28.8x | 176.976 ms | 6.003 ms |
 | Route ambiguous `pack` and reject before discovery | `dotnet pack --definitely-unknown` | `dv --compat dotnet pack --definitely-unknown` | 280.174 ms | 5.242 ms | 53.4x | 306.891 ms | 5.841 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
@@ -799,6 +804,7 @@ cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
 cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_mode_classification --samples 50 --warmups 10
+cargo bench-all --case cli_exit_policy --samples 50 --warmups 10
 cargo bench-all --case cli_lexical_preservation --samples 50 --warmups 10
 cargo bench-all --case cli_route_precedence --samples 50 --warmups 10
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5

@@ -14,7 +14,7 @@ mod invocation;
 mod output;
 
 use environment::{ChildEnvironmentPlan, EnvironmentError};
-use invocation::{COMMAND_SYNTAX_VERSION, ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, FailureClass, InvocationBatch, InvocationOptions};
+use invocation::{COMMAND_SYNTAX_VERSION, ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, ExitClass, InvocationBatch, InvocationOptions};
 use output::redact_argument_text;
 
 use dv_core::{
@@ -124,7 +124,7 @@ const _: () = assert!(std::mem::size_of::<ExitCode>() == 4);
 const _: () = assert!(std::mem::align_of::<ExitCode>() == 4);
 
 impl ExitCode {
-  const SUCCESS: Self = Self(0);
+  const SUCCESS: Self = Self(ExitClass::Success as i32);
 
   fn get(self) -> i32 {
     self.0
@@ -526,7 +526,7 @@ fn run_package_command(
   let current_directory = match env::current_dir() {
     Ok(directory) => directory,
     Err(error) => {
-      return fail(
+      return restore_fail(
         started,
         globals,
         command,
@@ -542,11 +542,11 @@ fn run_package_command(
   for requested in roots {
     let root = match load_project(&current_directory, requested, configuration) {
       Ok(project) => project,
-      Err(error) => return fail(started, globals, command, args, project_diagnostic(error)),
+      Err(error) => return restore_fail(started, globals, command, args, project_diagnostic(error)),
     };
     let closure = match evaluate_project_closure(root) {
       Ok(projects) => projects,
-      Err(error) => return fail(started, globals, command, args, project_diagnostic(error)),
+      Err(error) => return restore_fail(started, globals, command, args, project_diagnostic(error)),
     };
     for project in closure {
       match seen.binary_search_by(|path| path.as_path().cmp(project.project_path())) {
@@ -565,7 +565,7 @@ fn run_package_command(
   let project_refs = projects.iter().collect::<Vec<_>>();
   let resolutions = match resolve_package_inputs(&project_refs, &options) {
     Ok(resolutions) => resolutions,
-    Err(error) => return package_failure(started, globals, command, args, error),
+    Err(error) => return package_failure(started, globals, ExitClass::RestoreFailure, command, args, error),
   };
   if cancellation.is_cancelled() {
     return cancelled(started, globals, command, args);
@@ -903,7 +903,7 @@ fn run_build(
   let current_directory = match env::current_dir() {
     Ok(directory) => directory,
     Err(error) => {
-      return fail(
+      return build_fail(
         started,
         globals,
         "build --plan",
@@ -914,11 +914,11 @@ fn run_build(
   };
   let project = match load_project(&current_directory, requested_path.path(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, globals, "build --plan", args, project_diagnostic(error)),
+    Err(error) => return build_fail(started, globals, "build --plan", args, project_diagnostic(error)),
   };
   let inventory = match discover_sdks(&current_directory) {
     Ok(inventory) => inventory,
-    Err(error) => return fail(started, globals, "build --plan", args, sdk_diagnostic(&current_directory, error)),
+    Err(error) => return build_fail(started, globals, "build --plan", args, sdk_diagnostic(&current_directory, error)),
   };
   let package_options = PackageResolveOptions {
     packages_directory: None,
@@ -932,18 +932,18 @@ fn run_build(
   let runtime_graph = if !project.package_references().is_empty() && project.runtime_identifier().is_some() {
     match load_portable_runtime_graph(&inventory) {
       Ok(graph) => Some(graph),
-      Err(error) => return fail(started, globals, "build --plan", args, runtime_graph_diagnostic(error)),
+      Err(error) => return build_fail(started, globals, "build --plan", args, runtime_graph_diagnostic(error)),
     }
   } else {
     None
   };
   let package_resolutions = match resolve_package_inputs_with_runtime_graph(&[&project], &package_options, runtime_graph.as_ref(), Some(&inventory)) {
     Ok(resolutions) => resolutions,
-    Err(error) => return package_failure(started, globals, "build --plan", args, error),
+    Err(error) => return package_failure(started, globals, ExitClass::BuildFailure, "build --plan", args, error),
   };
   let plans = match plan_compiler_inputs_with_packages(&[&project], &inventory, &package_resolutions) {
     Ok(plans) => plans,
-    Err(error) => return fail(started, globals, "build --plan", args, compiler_plan_diagnostic(error)),
+    Err(error) => return build_fail(started, globals, "build --plan", args, compiler_plan_diagnostic(error)),
   };
   if cancellation.is_cancelled() {
     return cancelled(started, globals, "build --plan", args);
@@ -1679,7 +1679,7 @@ fn project_package_sources(
   };
   let inventories = match inspect_package_sources(&[&project], &options) {
     Ok(inventories) => inventories,
-    Err(error) => return package_failure(started, globals, "project package-sources", args, error),
+    Err(error) => return package_failure(started, globals, ExitClass::Operation, "project package-sources", args, error),
   };
   if cancellation.is_cancelled() {
     return cancelled(started, globals, "project package-sources", args);
@@ -2762,22 +2762,30 @@ fn non_unicode_argument_diagnostic(argument: &OsStr, meaning: &str) -> Diagnosti
 }
 
 fn reject(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
-  fail_with_class(started, globals, FailureClass::Usage, command, args, diagnostic)
+  fail_with_class(started, globals, ExitClass::Usage, command, args, diagnostic)
 }
 
 fn unsupported(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
-  fail_with_class(started, globals, FailureClass::Unsupported, command, args, diagnostic)
+  fail_with_class(started, globals, ExitClass::Unsupported, command, args, diagnostic)
 }
 
 fn fail(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
-  fail_with_class(started, globals, FailureClass::Operation, command, args, diagnostic)
+  fail_with_class(started, globals, ExitClass::Operation, command, args, diagnostic)
 }
 
-fn package_failure(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, error: PackageError) -> ExitCode {
+fn build_fail(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_class(started, globals, ExitClass::BuildFailure, command, args, diagnostic)
+}
+
+fn restore_fail(started: Instant, globals: InvocationOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+  fail_with_class(started, globals, ExitClass::RestoreFailure, command, args, diagnostic)
+}
+
+fn package_failure(started: Instant, globals: InvocationOptions, class: ExitClass, command: &str, args: Vec<String>, error: PackageError) -> ExitCode {
   if error.kind() == PackageErrorKind::Cancelled {
     cancelled(started, globals, command, args)
   } else {
-    fail(started, globals, command, args, package_diagnostic(error))
+    fail_with_class(started, globals, class, command, args, package_diagnostic(error))
   }
 }
 
@@ -2785,7 +2793,7 @@ fn cancelled(started: Instant, globals: InvocationOptions, command: &str, args: 
   fail_with_outcome(
     started,
     globals,
-    FailureClass::Operation,
+    ExitClass::Cancelled,
     command,
     args,
     diagnostic(
@@ -2798,14 +2806,14 @@ fn cancelled(started: Instant, globals: InvocationOptions, command: &str, args: 
   )
 }
 
-fn fail_with_class(started: Instant, globals: InvocationOptions, class: FailureClass, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+fn fail_with_class(started: Instant, globals: InvocationOptions, class: ExitClass, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
   fail_with_outcome(started, globals, class, command, args, diagnostic, Outcome::Failed)
 }
 
 fn fail_with_outcome(
   started: Instant,
   globals: InvocationOptions,
-  class: FailureClass,
+  class: ExitClass,
   command: &str,
   args: Vec<String>,
   mut diagnostic: Diagnostic,
@@ -2846,7 +2854,7 @@ fn fail_with_outcome(
     write_human_diagnostics(std::slice::from_ref(&diagnostic), globals);
   }
 
-  ExitCode::from(globals.failure_exit_code(class))
+  ExitCode::from(globals.exit_code(class).expect("the routed command owns its terminal outcome class"))
 }
 
 fn micros(duration: std::time::Duration) -> u64 {

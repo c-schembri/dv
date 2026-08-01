@@ -26,6 +26,7 @@ enum CaseKind {
   CliUnknownOption,
   CliCommandNormalization,
   CliModeClassification,
+  CliExitPolicy,
   CliLexicalPreservation,
   CliRoutePrecedence,
   CliEnvironment,
@@ -161,6 +162,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_mode_classification",
     kind: CaseKind::CliModeClassification,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_exit_policy",
+    kind: CaseKind::CliExitPolicy,
+    args: &["restore", "DefinitelyMissing.csproj"],
     implemented: true,
   },
   Case {
@@ -829,6 +836,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_exit_policy",
+    kind: CaseKind::CliExitPolicy,
+    args: &["--compat", "dotnet", "restore", "DefinitelyMissing.csproj"],
+    implemented: true,
+  },
+  Case {
     name: "cli_lexical_preservation",
     kind: CaseKind::CliLexicalPreservation,
     args: &["--compat", "dotnet", "build", "-c:Release", "--definitely-unknown"],
@@ -1355,6 +1368,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_mode_classification") {
     verify_mode_classification_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-mode-classification"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_exit_policy") {
+    verify_exit_policy_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-exit-policy"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_lexical_preservation") {
     verify_lexical_preservation_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-lexical-preservation"))?;
   }
@@ -1692,6 +1708,42 @@ fn validate_mode_classification_failure(output: &Output, reference: bool) -> Res
   }
   if text.contains("error[DV01") || text.contains("error[DV02") {
     return Err(format!("dv dotnet mode performed discovery before classified rejection: {text}").into());
+  }
+  Ok(())
+}
+
+fn verify_exit_policy_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["restore", "DefinitelyMissing.csproj"][..], true),
+    (dv_executable, "dv", &["--compat", "dotnet", "restore", "DefinitelyMissing.csproj"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_exit_policy_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} exit-policy preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_exit_policy_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.code() != Some(1) {
+    return Err(format!("exit-policy boundary returned status {:?}", output.status.code()).into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    if !text.contains("MSB1009") || !text.contains("DefinitelyMissing.csproj") {
+      return Err(format!("dotnet restore exit-policy oracle omitted its missing-project diagnostic: {text}").into());
+    }
+  } else if !output.stdout.is_empty()
+    || !text.contains("error[DV0200]")
+    || !text.contains("DefinitelyMissing.csproj")
+    || !text.contains("compatibility_profile: dotnet")
+  {
+    return Err(format!("dv restore did not apply its typed compatibility exit policy: {text}").into());
   }
   Ok(())
 }
@@ -6070,6 +6122,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliUnknownOption
       | CaseKind::CliCommandNormalization
       | CaseKind::CliModeClassification
+      | CaseKind::CliExitPolicy
       | CaseKind::CliLexicalPreservation
       | CaseKind::CliRoutePrecedence
       | CaseKind::CliEnvironment
@@ -7515,6 +7568,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::CliUnknownOption
     | CaseKind::CliCommandNormalization
     | CaseKind::CliModeClassification
+    | CaseKind::CliExitPolicy
     | CaseKind::CliLexicalPreservation
     | CaseKind::CliRoutePrecedence
     | CaseKind::CliEnvironment
@@ -7723,6 +7777,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliModeClassification) {
     validate_mode_classification_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliExitPolicy) {
+    validate_exit_policy_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliLexicalPreservation) {
     validate_lexical_preservation_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliRoutePrecedence) {
@@ -8629,6 +8685,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_command_normalization" => "Command spelling normalization",
     "cli_mode_classification" => "Invocation mode classification",
+    "cli_exit_policy" => "Restore failure exit policy",
     "cli_lexical_preservation" => "Lexical argument preservation",
     "cli_route_precedence" => "Ambiguous command routing",
     "cli_environment" => "Environment precedence + redaction",

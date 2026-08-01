@@ -56,11 +56,46 @@ impl InvocationMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub(crate) enum FailureClass {
+pub(crate) enum ExitClass {
+  Success,
   Usage,
   Unsupported,
   Operation,
+  BuildFailure,
+  RestoreFailure,
+  TestFailure,
+  NoTests,
+  Cancelled,
 }
+
+const EXIT_CLASSES: [ExitClass; 9] = [
+  ExitClass::Success,
+  ExitClass::Usage,
+  ExitClass::Unsupported,
+  ExitClass::Operation,
+  ExitClass::BuildFailure,
+  ExitClass::RestoreFailure,
+  ExitClass::TestFailure,
+  ExitClass::NoTests,
+  ExitClass::Cancelled,
+];
+const EXIT_CLASS_COUNT: usize = EXIT_CLASSES.len();
+const INVOCATION_MODE_COUNT: usize = InvocationMode::Vstest as usize + 1;
+const EXIT_NOT_APPLICABLE: u8 = u8::MAX;
+
+// Rows are invocation profiles; columns are ExitClass discriminants. The hot
+// terminal path is one bounds-proven lookup with no formatting or allocation.
+const EXIT_CODES: [[u8; EXIT_CLASS_COUNT]; INVOCATION_MODE_COUNT] = [
+  [0, 2, 2, 2, 2, 2, 2, 0, 2],
+  [0, 1, 1, 1, 1, 1, 1, 0, 1],
+  [0, 1, 1, 1, 1, 1, EXIT_NOT_APPLICABLE, EXIT_NOT_APPLICABLE, 1],
+  [0, 1, 1, 1, EXIT_NOT_APPLICABLE, 1, EXIT_NOT_APPLICABLE, EXIT_NOT_APPLICABLE, 1],
+  [0, 1, 1, 1, EXIT_NOT_APPLICABLE, EXIT_NOT_APPLICABLE, 1, 0, 1],
+];
+
+const _: () = assert!(size_of::<ExitClass>() == 1);
+const _: () = assert!(align_of::<ExitClass>() == 1);
+const _: () = assert!(size_of::<[[u8; EXIT_CLASS_COUNT]; INVOCATION_MODE_COUNT]>() == 45);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -264,14 +299,9 @@ impl InvocationOptions {
     self.mode.argument_is_option(argument)
   }
 
-  pub(crate) fn failure_exit_code(self, class: FailureClass) -> u8 {
-    match (self.mode, class) {
-      (InvocationMode::Native, FailureClass::Usage | FailureClass::Unsupported | FailureClass::Operation) => 2,
-      (
-        InvocationMode::Dotnet | InvocationMode::Msbuild | InvocationMode::Nuget | InvocationMode::Vstest,
-        FailureClass::Usage | FailureClass::Unsupported | FailureClass::Operation,
-      ) => 1,
-    }
+  pub(crate) const fn exit_code(self, class: ExitClass) -> Option<u8> {
+    let code = EXIT_CODES[self.mode as usize][class as usize];
+    if code == EXIT_NOT_APPLICABLE { None } else { Some(code) }
   }
 }
 
@@ -1445,14 +1475,47 @@ mod tests {
   }
 
   #[test]
-  fn compatibility_mode_uses_reference_failure_codes() {
+  fn compatibility_mode_uses_reference_exit_codes() {
     let native = InvocationBatch::capture([OsString::from("frobnicate")]).options();
-    let compat = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("frobnicate")]).options();
-
-    for class in [FailureClass::Usage, FailureClass::Unsupported, FailureClass::Operation] {
-      assert_eq!(native.failure_exit_code(class), 2);
-      assert_eq!(compat.failure_exit_code(class), 1);
+    assert_eq!(native.exit_code(ExitClass::Success), Some(0));
+    let failures = [
+      ExitClass::Usage,
+      ExitClass::Unsupported,
+      ExitClass::Operation,
+      ExitClass::BuildFailure,
+      ExitClass::RestoreFailure,
+      ExitClass::TestFailure,
+      ExitClass::Cancelled,
+    ];
+    for class in failures {
+      assert_eq!(native.exit_code(class), Some(2));
     }
+
+    let dotnet = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("frobnicate")]).options();
+    assert_eq!(dotnet.exit_code(ExitClass::Success), Some(0));
+    for class in failures {
+      assert_eq!(dotnet.exit_code(class), Some(1), "class {class:?}");
+    }
+
+    assert_eq!(native.exit_code(ExitClass::NoTests), Some(0));
+    assert_eq!(dotnet.exit_code(ExitClass::NoTests), Some(0));
+  }
+
+  #[test]
+  fn reference_profiles_mark_inapplicable_outcomes_instead_of_guessing() {
+    let msbuild = InvocationBatch::capture([OsString::from("--compat=msbuild"), OsString::from("project.csproj")]).options();
+    let nuget = InvocationBatch::capture([OsString::from("--compat=nuget"), OsString::from("restore")]).options();
+    let vstest = InvocationBatch::capture([OsString::from("--compat=vstest"), OsString::from("tests.dll")]).options();
+
+    assert_eq!(msbuild.exit_code(ExitClass::TestFailure), None);
+    assert_eq!(msbuild.exit_code(ExitClass::NoTests), None);
+    assert_eq!(nuget.exit_code(ExitClass::BuildFailure), None);
+    assert_eq!(nuget.exit_code(ExitClass::TestFailure), None);
+    assert_eq!(nuget.exit_code(ExitClass::NoTests), None);
+    assert_eq!(vstest.exit_code(ExitClass::BuildFailure), None);
+    assert_eq!(vstest.exit_code(ExitClass::RestoreFailure), None);
+    assert_eq!(vstest.exit_code(ExitClass::TestFailure), Some(1));
+    assert_eq!(vstest.exit_code(ExitClass::NoTests), Some(0));
   }
 
   #[test]

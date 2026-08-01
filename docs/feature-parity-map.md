@@ -482,9 +482,14 @@ contracts.
   binary formats. `P1-P4`
 - [~] `DROP-016` Preserve success, usage, build, restore, test-failure,
   no-tests, cancellation, and child-process exit behavior per reference tool.
-  Current success, usage, unsupported, and operation failures have explicit
-  native/reference policies; build results, test results, cancellation, and
-  child-process exits remain open with their workflows. `P1-P3`
+  Success, usage, unsupported, operation, build, restore, test-failure,
+  no-tests, and cancellation results use one 45-byte profile/result matrix;
+  inapplicable tool/outcome pairs are explicit sentinels. Reachable Phase 1
+  build and restore errors are classified before its allocation-free indexed
+  lookup. Normal child exits retain their exact typed `i32` result. Executed
+  child, test execution, and signal/cancellation parity remain open with their
+  owning workflows. A missing-project restore measured `122.756 ms` for
+  `dotnet` and `5.158 ms` for `dv`, a `23.8x` median improvement. `P1-P3`
 - [ ] `DROP-017` Make help/version/info output expose both accepted
   compatibility syntax and canonical `dv` syntax without changing the result
   of reference `--help`, `/?`, or `help` forms. `P1`

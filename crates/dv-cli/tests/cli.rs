@@ -566,6 +566,32 @@ fn compatibility_profiles_preserve_reference_failure_codes() {
 }
 
 #[test]
+fn phase_one_build_and_restore_failures_use_the_selected_exit_profile() {
+  let temp = TempDirectory::new();
+  for (arguments, expected, profile) in [
+    (vec!["restore", "DefinitelyMissing.csproj"], 2, None),
+    (vec!["build", "--plan", "DefinitelyMissing.csproj"], 2, None),
+    (vec!["--compat", "dotnet", "restore", "DefinitelyMissing.csproj"], 1, Some("dotnet")),
+    (vec!["--compat", "dotnet", "build", "--plan", "DefinitelyMissing.csproj"], 1, Some("dotnet")),
+  ] {
+    let output = dv().args(&arguments).current_dir(&temp.0).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(expected), "arguments={arguments:?}");
+    assert!(output.stdout.is_empty(), "arguments={arguments:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("DefinitelyMissing.csproj"), "arguments={arguments:?}: {stderr}");
+    assert_eq!(
+      stderr.contains("compatibility_profile: dotnet"),
+      profile.is_some(),
+      "arguments={arguments:?}: {stderr}"
+    );
+  }
+
+  assert!(!temp.0.join("obj").exists());
+  assert!(!temp.0.join(".packages").exists());
+}
+
+#[test]
 fn compatibility_profile_is_one_structured_context_row_and_native_omits_it() {
   let json = dv().args(["--json", "--compat", "nuget", "frobnicate"]).output().unwrap();
   let native = dv().arg("frobnicate").output().unwrap();

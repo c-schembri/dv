@@ -140,6 +140,11 @@ pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
 command-lifetime cancellation with a bounded child deadline, and lossless
 child termination classification are available.
+The reachable `DROP-016` Phase 1 surface now classifies success, usage,
+unsupported, operation, build, restore, test-failure, no-tests, and
+cancellation into one compact exit policy matrix. Inapplicable profile/result
+pairs are explicit. Executed child, test, and signal/cancellation semantics
+remain partial with their owning workflows.
 Command syntax version 1 and JSON event schema version 19 are independent;
 all supported version aliases normalize to one typed request and event shape.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
@@ -149,7 +154,7 @@ All 20 currently accepted native command spellings normalize to 15 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
 24 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
-The broader foundation of `DROP-016` remains partial.
+The broader workflow-dependent surface of `DROP-016` remains partial.
 
 **Outcome:** Every subsequent workflow starts from a lossless typed command
 batch and can be reached by canonical and supported drop-in spellings.
