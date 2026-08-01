@@ -129,6 +129,7 @@ Initial codes:
 | `DV0003` | Known but unsupported Phase 0 command |
 | `DV0004` | Ctrl+C/SIGINT handler installation failed |
 | `DV0005` | Command cancelled before completion |
+| `DV0006` | Compatibility manifest output failed |
 | `DV0100` | No .NET installation root |
 | `DV0101` | SDK discovery filesystem failure |
 | `DV0102` | Invalid `global.json` |

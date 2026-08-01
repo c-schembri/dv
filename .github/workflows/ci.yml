@@ -38,7 +38,9 @@ jobs:
         run: rustup show
       - name: Run reference benchmark smoke test
         run: cargo run -p dv-bench -- --case sdk_current --samples 1 --warmups 0 --output target/benchmark-smoke.json
+      - name: Run compatibility manifest benchmark smoke test
+        run: cargo run -p dv-bench -- --case cli_compat_manifest --samples 1 --warmups 0 --output target/benchmark-compat-manifest-smoke.json
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-smoke
-          path: target/benchmark-smoke.json
+          path: target/benchmark-*-smoke.json

@@ -51,6 +51,7 @@ pub(crate) enum CommandKind {
   Build,
   Restore,
   Sync,
+  Compat,
   KnownUnimplemented,
   Unknown,
   InvalidText,
@@ -711,6 +712,7 @@ fn classify_command(command: &OsStr) -> CommandKind {
     Some("build") => CommandKind::Build,
     Some("restore") => CommandKind::Restore,
     Some("sync") => CommandKind::Sync,
+    Some("compat") => CommandKind::Compat,
     Some("init" | "add" | "remove" | "run" | "test" | "pack" | "publish") => CommandKind::KnownUnimplemented,
     Some(_) => CommandKind::Unknown,
     None => CommandKind::InvalidText,
@@ -963,6 +965,14 @@ mod tests {
 
     assert!(matches!(batch.raw_arguments, RawArguments::One(_)));
     assert_eq!(batch.request().command, CommandKind::Version);
+  }
+
+  #[test]
+  fn compatibility_manifest_query_has_a_typed_command_kind() {
+    let batch = InvocationBatch::capture([OsString::from("compat"), OsString::from("manifest")]);
+
+    assert_eq!(batch.request().command, CommandKind::Compat);
+    assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("manifest")]);
   }
 
   #[test]

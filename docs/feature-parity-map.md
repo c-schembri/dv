@@ -388,9 +388,20 @@ contracts.
 
 ## 1A. Drop-In Invocation Routing
 
-- [ ] `DROP-001` Generate a versioned compatibility manifest from the selected
+- [x] `DROP-001` Generate a versioned compatibility manifest from the selected
   reference SDK/tool set, covering every command, option alias, argument
-  position, default, environment input, exit case, and output format. `P1`
+  position, default, environment input, exit case, and output format. Manifest
+  schema/version 1 is generated from .NET SDK `10.0.100`, MSBuild
+  `18.0.2.52411`, NuGet `7.0.0.0`, and VSTest `18.0.1`. A bounded recursive
+  help walk retains 115 command paths, 769 option records with expanded MSBuild
+  prefixes/short forms, 74 argument records, declared environment and output
+  contracts, four observed failure exits, and all 468 parity rows. Every
+  captured child has a record; support is dimensional and missing work remains
+  explicit. `dv compat manifest` writes the embedded 270,082-byte artifact
+  without discovery, parsing, allocation of a manifest model, filesystem, or
+  network work. Thirty Windows samples measured `4.795 ms` median and
+  `5.267 ms` p95; Microsoft has no equivalent query and is TBI. The
+  like-for-like selected-SDK control remains `14.1x` faster. `P1`
 - [~] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
   all accepted tool spellings into one typed command batch. `P1`
 - [~] `DROP-003` Classify invocation mode deterministically before project,

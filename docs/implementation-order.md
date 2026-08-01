@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 65 rows are implemented;
+- 66 rows are implemented;
 - 32 rows have partial foundations;
-- 371 rows are missing;
+- 370 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -133,7 +133,7 @@ cache publication. Network work is outside the verification benchmark.
 ### Wave 1: Invocation And Manifest Spine
 
 Status: in progress; `CLI-005` through `CLI-008`, `CLI-011` through
-`CLI-015`, and `CLI-017` are complete.
+`CLI-015`, `CLI-017`, and `DROP-001` are complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
 environment precedence, secret-safe invocation reporting, early
@@ -141,6 +141,9 @@ command-lifetime cancellation with a bounded child deadline, and lossless
 child termination classification are available.
 Command syntax version 1 and JSON event schema version 19 are independent;
 all supported version aliases normalize to one typed request and event shape.
+Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
+NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
+parity records with explicit per-dimension support state.
 The broader foundations of `DROP-002`, `DROP-003`, `DROP-011`, and `DROP-016`
 remain partial.
 

@@ -3,6 +3,7 @@ members = [
     "crates/dv-cli",
     "crates/dv-core",
     "tools/dv-bench",
+    "tools/dv-compat-manifest",
     "tools/nuget-plugin-dv-fixture",
 ]
 resolver = "3"

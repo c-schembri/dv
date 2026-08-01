@@ -117,6 +117,41 @@ fn help_exposes_the_initial_command_surface() {
   assert!(stdout.contains("--verbosity LEVEL"));
   assert!(stdout.contains("--color | --no-color"));
   assert!(stdout.contains("--compat dotnet|msbuild|nuget|vstest"));
+  assert!(stdout.contains("compat"));
+}
+
+#[test]
+fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery() {
+  let expected = include_bytes!("../../../compatibility/manifest.json");
+  let plain = dv().args(["compat", "manifest"]).output().unwrap();
+  let json_global = dv().args(["--json", "compat", "manifest"]).output().unwrap();
+  let json_after = dv().args(["compat", "manifest", "--json"]).output().unwrap();
+
+  for output in [plain, json_global, json_after] {
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, expected);
+  }
+
+  let manifest: serde_json::Value = serde_json::from_slice(expected).unwrap();
+  assert_eq!(manifest["schema_version"], 1);
+  assert_eq!(manifest["manifest_version"], 1);
+  assert_eq!(manifest["command_syntax_version"], 1);
+  assert_eq!(manifest["event_schema_version"], 19);
+  assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
+  assert!(manifest["commands"].as_array().unwrap().len() >= 100);
+  assert_eq!(manifest["parity_rows"].as_array().unwrap().len(), 468);
+}
+
+#[test]
+fn malformed_compatibility_manifest_queries_fail_explicitly() {
+  for arguments in [&["compat", "unknown"][..], &["compat", "manifest", "unexpected"]] {
+    let output = dv().args(arguments).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("unknown compat query"));
+  }
 }
 
 #[test]

@@ -58,6 +58,7 @@ Invalid input behavior:
 | `cli_cancellation` | no project state; typed run-boundary deadline preflight outside timing | process launch, Ctrl+C/SIGINT handler installation, SDK discovery, selection, and output |
 | `cli_version` | none | `dv` process launch and self-version output |
 | `cli_protocol_version` | immutable `small-console` directory; four-alias schema preflight outside timing | `dv` process launch and one validated schema-19 protocol-version event batch; Microsoft has no equivalent command and reports TBI |
+| `cli_compat_manifest` | embedded manifest; byte-identity and schema/completeness preflight outside timing | `dv` process launch and one 270,082-byte static manifest write; Microsoft has no equivalent query and reports TBI |
 | `cli_environment` | immutable `small-console` fixture; identical `NO_COLOR`, `DV_COLOR`, and `DV_VERBOSITY` values | process launch, typed environment precedence, pre-I/O unknown-option rejection, ANSI suppression, and secret-free failure output |
 | `cli_child_exit` | prebuilt `argument-forwarding` fixture; child-exit parity and typed TBI-boundary preflight outside timing | Microsoft launches the managed child; `dv` captures the declared exit policy and emits its TBI boundary |
 | `rid_graph` | selected SDK graph; prebuilt official NuGet oracle adapter | process launch, SDK selection, graph read/parse, breadth-first RID expansion, and text output |

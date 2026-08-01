@@ -11,8 +11,8 @@ Roslyn remains the compiler and Microsoft .NET remains the runtime; `dv` owns
 the expensive orchestration around them.
 
 ```text
-dotnet --version               63.022 ms median
-dv sdk current                  4.828 ms median
+dotnet --version               63.347 ms median
+dv sdk current                  4.501 ms median
 
 dotnet NuGet RID expansion     36.217 ms median
 dv sdk compatible-rids          6.049 ms median
@@ -188,6 +188,7 @@ The project is in the first implementation phase.
 | Family-partitioned package asset planning | Implemented |
 | Human and JSON diagnostics/events | Implemented |
 | Reference benchmark harness | Implemented |
+| Generated, versioned compatibility manifest | Implemented |
 | Exact package resolution, v2/v3 sources, verified cache, and lock | Initial implementation |
 | Direct Roslyn compilation | Planned |
 | Incremental and no-op builds | Planned |
@@ -215,6 +216,14 @@ independently. `dv --json --version` reports the executable and both protocol
 versions in one validated event batch, while human `dv --version` remains
 unchanged. Version aliases normalize to the same typed command and cannot
 select a different wire schema.
+
+`dv compat manifest` emits compatibility manifest version `1` as a static JSON
+artifact. It records the selected .NET 10 SDK, MSBuild, NuGet, and VSTest
+versions; 115 command paths; 769 option records; 74 argument records; observed
+environment/exit/output contracts; and every parity row with explicit support
+state. The query does not discover an SDK or parse the manifest at runtime.
+The [manifest contract](docs/compatibility-manifest.md) documents regeneration,
+bounds, and the intentionally explicit missing-work states.
 
 Human output defaults can be set with `DV_COLOR=auto|always|never` and
 `DV_VERBOSITY=quiet|minimal|normal|detailed|diagnostic`; a non-empty
@@ -398,6 +407,9 @@ cargo run -p dv-cli --release -- restore path\to\App.csproj --offline
 # `sync` is an exact alias
 cargo run -p dv-cli --release -- sync path\to\App.csproj
 
+# Inspect the selected-tool compatibility surface and support ledger
+cargo run -p dv-cli --release -- compat manifest
+
 # Run all implemented and reference benchmarks
 cargo bench-all
 ```
@@ -425,6 +437,9 @@ signal gates are recorded in the
 Command syntax and JSON event schema versioning have a separate structural
 baseline because Microsoft has no equivalent dual-version query. See the
 [protocol-version baseline](docs/performance-baselines/2026-08-01-cli-protocol-version-windows.md).
+The generated compatibility manifest has its own structural baseline because
+Microsoft publishes no equivalent query. See the
+[compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
 
 Initial machine:
 
@@ -453,7 +468,7 @@ Initial machine:
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
-| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 63.022 ms | 4.828 ms | 13.1x | 64.736 ms | 5.252 ms |
+| Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 63.347 ms | 4.501 ms | 14.1x | 66.926 ms | 5.029 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |

@@ -172,6 +172,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: false,
   },
   Case {
+    name: "cli_compat_manifest",
+    kind: CaseKind::Startup,
+    args: &[],
+    implemented: false,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
@@ -873,6 +879,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_compat_manifest",
+    kind: CaseKind::Startup,
+    args: &["compat", "manifest"],
+    implemented: true,
+  },
+  Case {
     name: "sync_cold",
     kind: CaseKind::RestoreCold,
     args: &["sync", "--json"],
@@ -1272,6 +1284,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_protocol_version") {
     verify_protocol_version_boundary(&dv_executable, &fixture)?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_compat_manifest") {
+    verify_compatibility_manifest_boundary(&dv_executable, &fixture)?;
   }
   if options.case.as_deref() == Some("cli_cancellation") {
     let provider_workspace = repository.join(format!("target/benchmark-cli-cancellation-verification-{}", std::process::id()));
@@ -1903,6 +1918,53 @@ fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Res
   for arguments in PROTOCOL_VERSION_ALIASES {
     let output = Command::new(dv_executable).args(*arguments).current_dir(fixture).output()?;
     validate_protocol_version_output(&output, arguments)?;
+  }
+  Ok(())
+}
+
+fn verify_compatibility_manifest_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let plain = Command::new(dv_executable).args(["compat", "manifest"]).current_dir(fixture).output()?;
+  let json_global = Command::new(dv_executable)
+    .args(["--json", "compat", "manifest"])
+    .current_dir(fixture)
+    .output()?;
+  check_output(plain.clone(), dv_executable, &["compat", "manifest"], "compatibility manifest preflight")?;
+  check_output(
+    json_global.clone(),
+    dv_executable,
+    &["--json", "compat", "manifest"],
+    "compatibility manifest JSON-global preflight",
+  )?;
+  if plain.stdout != json_global.stdout {
+    return Err("compatibility manifest bytes changed under the global JSON selector".into());
+  }
+  validate_compatibility_manifest_output(&plain)?;
+  Ok(())
+}
+
+fn validate_compatibility_manifest_output(output: &Output) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err("compatibility manifest query did not produce a clean success".into());
+  }
+  let manifest: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  if manifest.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1)
+    || manifest.get("manifest_version").and_then(serde_json::Value::as_u64) != Some(1)
+    || manifest.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(1)
+    || manifest.get("event_schema_version").and_then(serde_json::Value::as_u64) != Some(19)
+    || manifest
+      .pointer("/reference/dotnet_sdk")
+      .and_then(serde_json::Value::as_str)
+      .is_none_or(str::is_empty)
+    || manifest
+      .get("commands")
+      .and_then(serde_json::Value::as_array)
+      .is_none_or(|commands| commands.len() < 100)
+    || manifest
+      .get("parity_rows")
+      .and_then(serde_json::Value::as_array)
+      .is_none_or(|rows| rows.len() != 468)
+  {
+    return Err("compatibility manifest query returned an incomplete or incompatible artifact".into());
   }
   Ok(())
 }
@@ -7417,6 +7479,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
   let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
   if case.name == "cli_protocol_version" {
     validate_protocol_version_output(&output, case.args)?;
+  } else if case.name == "cli_compat_manifest" {
+    validate_compatibility_manifest_output(&output)?;
   } else if matches!(case.kind, CaseKind::PackDiagnostic) {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
@@ -8327,6 +8391,7 @@ fn case_label(case: &str) -> &str {
     "cli_cancellation" => "Cancellation-ready SDK selection",
     "cli_version" => "CLI self-version",
     "cli_protocol_version" => "Syntax + JSON protocol versions",
+    "cli_compat_manifest" => "Compatibility manifest query",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "package_reference_conditions" => "Conditional references",

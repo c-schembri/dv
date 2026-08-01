@@ -8,6 +8,7 @@ use std::{
 };
 
 mod cancellation;
+mod compatibility;
 mod environment;
 mod invocation;
 mod output;
@@ -50,6 +51,7 @@ Commands:
   publish    Publish deployable output
   sdk        Manage SDKs and runtimes
   project    Inspect project inputs
+  compat     Inspect the versioned compatibility manifest
 
 Output:
   --json                  Emit the versioned JSON event protocol
@@ -107,6 +109,11 @@ Usage:
           [-s|--source SOURCE]... [--packages PATH]
           [--configfile PATH] [--offline] [--interactive]
           [--configuration Debug|Release]
+";
+
+const COMPAT_HELP: &str = "\
+Usage:
+  dv compat manifest    Write the release compatibility manifest as JSON
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,6 +228,7 @@ fn run() -> ExitCode {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       run_package_command(started, globals, command, invocation.event_arguments(json), command_args, cancellation.as_ref())
     },
+    CommandKind::Compat => run_compat(started, globals, invocation.event_arguments(json), command_args),
     CommandKind::KnownUnimplemented => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       if matches!(command, "run" | "test") {
@@ -302,6 +310,50 @@ fn command_requires_cancellation(command: CommandKind, command_text: Option<&str
     CommandKind::Sdk | CommandKind::Project | CommandKind::Build | CommandKind::Restore | CommandKind::Sync
   );
   (work_command && !command_help_only(command, command_args)) || matches!((command, command_text), (CommandKind::KnownUnimplemented, Some("run" | "test")))
+}
+
+fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
+  let mut semantic = command_args.iter();
+  match semantic.next() {
+    None => {
+      print!("{COMPAT_HELP}");
+      ExitCode::SUCCESS
+    },
+    Some(value) if matches!(value.to_str(), Some("help" | "--help" | "-h")) && semantic.next().is_none() => {
+      print!("{COMPAT_HELP}");
+      ExitCode::SUCCESS
+    },
+    Some(value) if value == "manifest" && semantic.next().is_none() => {
+      let stdout = io::stdout();
+      match compatibility::write_manifest(stdout.lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => reject(
+          started,
+          globals,
+          "compat",
+          args,
+          diagnostic(
+            "DV0006",
+            format!("could not write the compatibility manifest: {error}"),
+            None,
+            Some("Redirect output to a writable destination or retry with an open stdout pipe."),
+          ),
+        ),
+      }
+    },
+    Some(value) => reject(
+      started,
+      globals,
+      "compat",
+      args,
+      diagnostic(
+        "DV0002",
+        format!("unknown compat query {:?}", redact_argument_text(value)),
+        None,
+        Some("Use `dv compat manifest` to emit the current compatibility artifact."),
+      ),
+    ),
+  }
 }
 
 fn command_help_only(command: CommandKind, command_args: CommandArguments<'_>) -> bool {
