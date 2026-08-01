@@ -44,6 +44,12 @@ dv restore (50 packages)       598.220 ms median
 dotnet restore (warm locked)   552.265 ms median
 dv restore (warm locked)         7.019 ms median
 
+dotnet RID/content (cold)      600.782 ms median
+dv RID/content (cold)           23.186 ms median
+
+dotnet RID/content (warm)      456.098 ms median
+dv RID/content (warm)            7.589 ms median
+
 dotnet PackageReference policy 456.722 ms median
 dv PackageReference policy       6.611 ms median
 
@@ -156,6 +162,7 @@ The project is in the first implementation phase.
 | Stable package downgrade, conflict, cycle, missing, and compatibility diagnostics | Implemented |
 | Project-reference closure restore with shared package metadata and downloads | Implemented |
 | Nuspec framework references and legacy framework assemblies | Implemented |
+| Concrete package RID selection and `contentFiles` metadata | Implemented |
 | NuGet v3 service-index capability discovery | Implemented |
 | NuGet Basic/PAT source credentials | Implemented |
 | NuGet V2 credential-provider authentication | Implemented |
@@ -395,6 +402,8 @@ Initial machine:
 | Diagnose a cold local-package constraint conflict | `dotnet restore ConflictFailure.csproj --packages .packages --nologo --verbosity minimal` | `dv restore ConflictFailure.csproj --packages .packages --offline --json` | 569.423 ms | 13.797 ms | 41.3x | 581.503 ms | 17.209 ms |
 | Restore a two-project shared package graph from a cold local cache | `dotnet restore PackageBatch.csproj --packages .packages --nologo --verbosity quiet` | `dv restore PackageBatch.csproj --packages .packages --offline --json` | 700.911 ms | 51.502 ms | 13.6x | 880.634 ms | 64.606 ms |
 | Select package framework metadata from a cold local source | `dotnet restore FrameworkMetadata.csproj --packages .packages --nologo --verbosity quiet` | `dv restore FrameworkMetadata.csproj --packages .packages --offline --json` | 558.832 ms | 15.989 ms | 35.0x | 578.305 ms | 18.009 ms |
+| Select concrete RID and content assets from a cold local source | `dotnet restore WindowsFallback.csproj --packages .packages --no-http-cache --nologo --verbosity quiet` | `dv restore WindowsFallback.csproj --packages .packages --offline --json` | 600.782 ms | 23.186 ms | 25.9x | 2009.103 ms | 33.821 ms |
+| Reuse a locked concrete RID and content plan | `dotnet restore WindowsFallback.csproj --locked-mode --packages .packages --nologo --verbosity quiet` | `dv restore WindowsFallback.csproj --packages .packages --offline --json` | 456.098 ms | 7.589 ms | 60.1x | 486.470 ms | 9.101 ms |
 | Discover NuGet v3 service endpoints | `dotnet oracle/bin/Release/ServiceIndexOracle.dll https://api.nuget.org/v3/index.json` | `dv project package-sources ServiceIndex.csproj --json` | 344.113 ms | 277.336 ms | 1.2x | 868.499 ms | 289.483 ms |
 | Select and contain NuGet source credentials | `dotnet oracle/bin/Release/CredentialOracle.dll .` | `dv project package-sources CredentialProject.csproj --offline --json` | 73.624 ms | 4.615 ms | 16.0x | 75.971 ms | 5.388 ms |
 | Acquire private-feed credentials through a provider | `dotnet oracle/bin/Release/CredentialProviderOracle.dll https://private.example.test/v3/index.json` | `dv project package-sources CredentialProviderProject.csproj --offline --probe-credentials --json` | 115.621 ms | 22.519 ms | 5.1x | 2238.289 ms | 28.833 ms |
@@ -568,6 +577,7 @@ recorded in the curated
 [package diagnostic baseline](docs/performance-baselines/2026-08-01-package-diagnostics-windows.md),
 [package batch-resolution baseline](docs/performance-baselines/2026-08-01-package-batch-resolution-windows.md),
 [nuspec framework-metadata baseline](docs/performance-baselines/2026-08-01-nuspec-framework-metadata-windows.md),
+[package RID/content baseline](docs/performance-baselines/2026-08-01-package-rid-content-windows.md),
 [NuGet service-index baseline](docs/performance-baselines/2026-08-01-nuget-service-index-windows.md),
 [NuGet credential baseline](docs/performance-baselines/2026-08-01-nuget-credentials-windows.md),
 [NuGet credential-provider baseline](docs/performance-baselines/2026-08-01-nuget-credential-provider-windows.md),
@@ -636,6 +646,8 @@ cargo bench-all --case package_conflict_resolution --samples 30 --warmups 3
 cargo bench-all --case package_diagnostics --samples 30 --warmups 3
 cargo bench-all --case package_batch_resolution --samples 30 --warmups 3
 cargo bench-all --case nuspec_framework_metadata --samples 30 --warmups 3
+cargo bench-all --case package_rid_content_cold --samples 30 --warmups 3
+cargo bench-all --case package_rid_content_warm --samples 30 --warmups 3
 cargo bench-all --case nuget_service_index --samples 30 --warmups 3
 cargo bench-all --case nuget_credentials --samples 30 --warmups 3
 cargo bench-all --case nuget_credential_provider --samples 30 --warmups 3

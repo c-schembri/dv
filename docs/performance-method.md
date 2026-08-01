@@ -68,6 +68,8 @@ Invalid input behavior:
 | `package_graph_cold` | fresh `large-package-graph` copy, empty isolated packages, reference HTTP cache bypassed | the same cold transform across a real 50-package closure |
 | `package_graph_massive` | fresh `massive-package-graph` copy, empty isolated packages, reference HTTP and audit queries bypassed | a 51-direct-reference, 203-selected-package real-solution workload with package and portable-asset oracle comparison |
 | `package_asset_plan` | unchanged `massive-package-graph`, populated isolated packages, matching tool-native lock | process launch, 203-package locked validation, family-partitioned asset-plan materialization, and output |
+| `package_rid_content_cold` | four projects and one deterministic local RID/content package; isolated packages, outputs, and locks removed per sample | process launch, SDK RID-graph loading, nearest runtime/resource/native selection, ordered content-rule application, one archive publication, lock write, and output |
+| `package_rid_content_warm` | the same four-project oracle with populated isolated packages and matching locks | process launch, semantic RID-fingerprint validation, locked asset/content materialization, and output |
 | `package_sync_warm` | unchanged project, populated isolated packages, matching lock | process launch, locked dependency validation, and output |
 | `nuspec_framework_metadata` | two deterministic local archives, empty isolated package cache, outputs, and locks | process launch, one-pass manifest parsing, independent nearest dependency/shared-framework/legacy-assembly selection, two-package publication, lock write, and output |
 | `package_conflict_resolution` | fifteen deterministic local archives and a populated package cache; restore outputs and locks removed per sample | process launch, nested direct-wins, cousin and diamond convergence, stale-edge retraction, eleven-package materialization, and output |
@@ -117,10 +119,11 @@ directional decisions.`
 | `multi-project` | 3 projects, 3 edges, shared dependency | discovery, graph ordering, invalidation | checked in |
 | `large-package-graph` | 1 project, 1 direct reference, 50 resolved packages, 3,241,550 payload bytes | streaming dependency scheduling and many-small-archive publication | executable |
 | `massive-package-graph` | union of 51 direct eShop references, 203 selected packages, 272 reference archives, 197,860,237 reference payload bytes | real-solution restore scale, range convergence, asset diversity, and network throughput | executable for both tools with package/asset parity preflight |
+| `package-rid-content` | 4 `net10.0` projects covering portable, exact Windows/Linux, and Windows fallback; 1 generated archive with portable and RID runtime/resource/native assets plus ordered content rules | concrete RID fallback, runtime-target retention, content metadata, and cold/warm lock parity | executable for both tools with complete `project.assets.json` family/metadata preflight |
 | `package-conflict-resolution` | 1 project, 15 local archives, 11 selected identities, one nested downgrade, different-depth and alternate-root cousin convergence, and one retracted stale edge | advanced NuGet graph conflict selection without network variance | executable for both tools with exact version-batch preflight |
 | `package-conflict-resolution` diagnostic projects | 5 projects, 8 local archives, exact cousin conflict, cycle, absent identity, absent version, and incompatible TFM | stable structured failure categories and cold diagnostic latency without network variance | executable for both tools with six Microsoft/`dv` diagnostic-category pairs and cold/warm warning preflight |
 | `package-conflict-resolution` batch projects | 1 root, 2 project-reference children, 15 available local archives, 8 selected identities per child | project-closure ordering plus command-local metadata/download deduplication | executable for both tools with exact child graph parity, 16-row/eight-publication evidence, and zero-request preflight |
-| `nuspec-framework-metadata` | 1 `net10.0` timed project, 1 `net48` legacy oracle project, 2 local archives, conflicting dependency/framework groups, 4 legacy assembly rows | isolated nuspec-container parsing, nearest target selection, legacy `Any` fallback, and warm-lock preservation | executable for both tools with Microsoft `project.assets.json`, cold/warm `dv` event, schema-7 lock, two-publication, and zero-request preflight |
+| `nuspec-framework-metadata` | 1 `net10.0` timed project, 1 `net48` legacy oracle project, 2 local archives, conflicting dependency/framework groups, 4 legacy assembly rows | isolated nuspec-container parsing, nearest target selection, legacy `Any` fallback, and warm-lock preservation | executable for both tools with Microsoft `project.assets.json`, cold/warm `dv` event, schema-8 lock, two-publication, and zero-request preflight |
 | `nuget-config-merge` | 1 project, 4 config levels, 1 enabled and 1 disabled final source, 1 package | keyed precedence, clear/remove, disabled membership, environment expansion | executable for both tools with source/cache/package parity preflight |
 | `nuget-source-sections` | 1 project, 4 config levels, 2 package sources, 1 audit source, 2 final mapping groups, 1 package | typed source/protocol precedence and nested longest-pattern mapping | executable for both tools with official `NuGet.Configuration` and package parity preflight |
 | `nuget-source-mapping` | 1 `net10.0` project, 1 exact package request, empty cache, 1 unreachable v3 source, and 1 nonmatching mapping pattern | mapping-before-discovery behavior and typed unmapped failure | executable for both tools with expected-failure, diagnostic, and zero-request preflight |
@@ -364,4 +367,12 @@ populated isolated caches:
 
 ```text
 cargo bench-all --case package_asset_plan --samples 30 --warmups 3
+```
+
+Measure concrete RID selection and content metadata from a cold local package,
+then from matching native locks:
+
+```text
+cargo bench-all --case package_rid_content_cold --samples 30 --warmups 3
+cargo bench-all --case package_rid_content_warm --samples 30 --warmups 3
 ```

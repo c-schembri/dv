@@ -8,14 +8,15 @@ use std::{
 };
 
 use dv_core::{
-  CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContextField, Diagnostic, DiagnosticCode,
-  DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement,
-  PackageAssetFlags, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution,
+  CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
+  DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome,
+  PackRequirement, PackageAssetFlags, PackageCancellation, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution,
   PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration,
   ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent,
   RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind,
   SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
-  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, write_json_lines,
+  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
+  resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -503,7 +504,15 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[Stri
     write_lock: true,
     ..PackageResolveOptions::default()
   };
-  let package_resolutions = match resolve_package_inputs(&[&project], &package_options) {
+  let runtime_graph = if !project.package_references().is_empty() && project.runtime_identifier().is_some() {
+    match load_portable_runtime_graph(&inventory) {
+      Ok(graph) => Some(graph),
+      Err(error) => return fail(started, json, "build --plan", args, runtime_graph_diagnostic(error)),
+    }
+  } else {
+    None
+  };
+  let package_resolutions = match resolve_package_inputs_with_runtime_graph(&[&project], &package_options, runtime_graph.as_ref(), Some(&inventory)) {
     Ok(resolutions) => resolutions,
     Err(error) => return fail(started, json, "build --plan", args, package_diagnostic(error)),
   };
@@ -625,6 +634,7 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
     proxy_configured: resolution.proxy_configured(),
     lock_path: resolution.lock_path().display().to_string(),
     target_framework: resolution.target_framework().into(),
+    runtime_identifier: resolution.runtime_identifier().map(str::to_owned),
     source: resolution.source().into(),
     source_protocol: resolution.source_protocol().into(),
     source_work: resolution
@@ -643,7 +653,15 @@ fn package_resolution_payload(project: &ProjectSpec, resolution: &PackageResolut
     runtime_assets: resolution.runtime_assets().map(|path| path.display().to_string()).collect(),
     analyzers: resolution.analyzers().map(|path| path.display().to_string()).collect(),
     resource_assets: resolution.resource_assets().map(|path| path.display().to_string()).collect(),
-    content_files: resolution.content_files().map(|path| path.display().to_string()).collect(),
+    content_files: resolution
+      .content_files_with_metadata()
+      .map(|(path, build_action, copy_to_output, flatten)| ContentFileEvent {
+        path: path.display().to_string(),
+        build_action: build_action.to_owned(),
+        copy_to_output,
+        flatten,
+      })
+      .collect(),
     build_assets: resolution.build_assets().map(|path| path.display().to_string()).collect(),
     build_multi_targeting_assets: resolution.build_multi_targeting_assets().map(|path| path.display().to_string()).collect(),
     build_transitive_assets: resolution.build_transitive_assets().map(|path| path.display().to_string()).collect(),

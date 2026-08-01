@@ -39,6 +39,8 @@ enum CaseKind {
   PackageAssetPlan,
   PackageReferenceMetadata,
   NuspecFrameworkMetadata,
+  PackageRidContentCold,
+  PackageRidContentWarm,
   CentralPackageManagement,
   PackageConflictResolution,
   PackageBatchResolution,
@@ -82,6 +84,7 @@ struct Fixtures<'a> {
   package: &'a Path,
   package_reference_metadata: &'a Path,
   nuspec_framework_metadata: &'a Path,
+  package_rid_content: &'a Path,
   central_package_management: &'a Path,
   package_conflict_resolution: &'a Path,
   package_reference_conditions: &'a Path,
@@ -285,6 +288,36 @@ const DOTNET_CASES: &[Case] = &[
     args: &[
       "restore",
       "FrameworkMetadata.csproj",
+      "--packages",
+      ".packages",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_rid_content_cold",
+    kind: CaseKind::PackageRidContentCold,
+    args: &[
+      "restore",
+      "WindowsFallback.csproj",
+      "--packages",
+      ".packages",
+      "--no-http-cache",
+      "--nologo",
+      "--verbosity",
+      "quiet",
+    ],
+    implemented: true,
+  },
+  Case {
+    name: "package_rid_content_warm",
+    kind: CaseKind::PackageRidContentWarm,
+    args: &[
+      "restore",
+      "WindowsFallback.csproj",
+      "--locked-mode",
       "--packages",
       ".packages",
       "--nologo",
@@ -702,6 +735,18 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "package_rid_content_cold",
+    kind: CaseKind::PackageRidContentCold,
+    args: &["restore", "WindowsFallback.csproj", "--packages", ".packages", "--json"],
+    implemented: true,
+  },
+  Case {
+    name: "package_rid_content_warm",
+    kind: CaseKind::PackageRidContentWarm,
+    args: &["restore", "WindowsFallback.csproj", "--packages", ".packages", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "central_package_management",
     kind: CaseKind::CentralPackageManagement,
     args: &["restore", "CentralPackages.csproj", "--packages", ".packages", "--offline", "--json"],
@@ -969,6 +1014,7 @@ fn run() -> Result<()> {
   let package_fixture = repository.join("benchmarks/fixtures/package-console");
   let package_reference_metadata_fixture = repository.join("benchmarks/fixtures/package-reference-metadata");
   let nuspec_framework_metadata_fixture = repository.join("benchmarks/fixtures/nuspec-framework-metadata");
+  let package_rid_content_fixture = repository.join("benchmarks/fixtures/package-rid-content");
   let central_package_management_fixture = repository.join("benchmarks/fixtures/central-package-management");
   let package_conflict_resolution_fixture = repository.join("benchmarks/fixtures/package-conflict-resolution");
   let package_reference_conditions_fixture = repository.join("benchmarks/fixtures/package-reference-conditions");
@@ -999,6 +1045,7 @@ fn run() -> Result<()> {
     package: &package_fixture,
     package_reference_metadata: &package_reference_metadata_fixture,
     nuspec_framework_metadata: &nuspec_framework_metadata_fixture,
+    package_rid_content: &package_rid_content_fixture,
     central_package_management: &central_package_management_fixture,
     package_conflict_resolution: &package_conflict_resolution_fixture,
     package_reference_conditions: &package_reference_conditions_fixture,
@@ -1066,6 +1113,13 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "nuspec_framework_metadata") {
     verify_nuspec_framework_metadata(&repository, &dv_executable, &nuspec_framework_metadata_fixture)?;
+  }
+  if options
+    .case
+    .as_deref()
+    .is_none_or(|case| matches!(case, "package_rid_content_cold" | "package_rid_content_warm"))
+  {
+    verify_package_rid_content(&repository, &dv_executable, &package_rid_content_fixture)?;
   }
   if options.case.as_deref().is_none_or(|case| case == "central_package_management") {
     verify_central_package_management(&repository, &dv_executable, &central_package_management_fixture)?;
@@ -1144,7 +1198,7 @@ fn run() -> Result<()> {
 
   let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let report = Report {
-    schema_version: 21,
+    schema_version: 22,
     generated_unix_seconds,
     environment: Environment {
       os: env::consts::OS,
@@ -2473,8 +2527,8 @@ fn verify_nuspec_framework_metadata(repository: &Path, dv_executable: &Path, fix
     return Err("dv framework metadata preflight did not exercise cold publication and warm-lock reuse".into());
   }
   let lock: serde_json::Value = serde_json::from_slice(&fs::read(root.join("dv.lock.json"))?)?;
-  if lock.get("schema_version").and_then(serde_json::Value::as_u64) != Some(7) {
-    return Err("dv framework metadata lock did not use schema 7".into());
+  if lock.get("schema_version").and_then(serde_json::Value::as_u64) != Some(8) {
+    return Err("dv framework metadata lock did not use schema 8".into());
   }
   remove_generated_path(&root.join("obj"))?;
   remove_generated_path(&root.join("dv.lock.json"))?;
@@ -2527,6 +2581,247 @@ fn verify_nuspec_framework_metadata(repository: &Path, dv_executable: &Path, fix
     return Err("dv legacy framework metadata preflight did not exercise cold publication and warm-lock reuse".into());
   }
   Ok(())
+}
+
+fn verify_package_rid_content(repository: &Path, dv_executable: &Path, fixture: &Path) -> Result<()> {
+  let root = repository.join(format!("target/benchmark-rid-content-verification-{}", std::process::id()));
+  ensure_workspace_is_safe(repository, &root)?;
+  reset_fixture(fixture, &root)?;
+  write_rid_content_package(&root.join("feed"))?;
+
+  for (project, target, project_rid, asset_rid) in [
+    ("Portable.csproj", "net10.0", None, None),
+    ("WindowsExact.csproj", "net10.0/win-x64", Some("win-x64"), Some("win-x64")),
+    ("LinuxExact.csproj", "net10.0/linux-x64", Some("linux-x64"), Some("linux-x64")),
+    ("WindowsFallback.csproj", "net10.0/win-arm64", Some("win-arm64"), Some("win")),
+  ] {
+    remove_generated_path(&root.join("obj"))?;
+    run_checked(
+      Path::new("dotnet"),
+      &[
+        "restore",
+        project,
+        "--packages",
+        "dotnet-packages",
+        "--no-http-cache",
+        "--nologo",
+        "--verbosity",
+        "quiet",
+      ],
+      &root,
+      "Microsoft RID/content asset oracle",
+    )?;
+    let assets: serde_json::Value = serde_json::from_slice(&fs::read(root.join("obj/project.assets.json"))?)?;
+    let microsoft = assets
+      .get("targets")
+      .and_then(serde_json::Value::as_object)
+      .and_then(|targets| targets.get(target))
+      .and_then(serde_json::Value::as_object)
+      .and_then(|target| target.get("Rid.Content.Metadata/1.0.0"))
+      .ok_or_else(|| format!("Microsoft assets omitted Rid.Content.Metadata from {target}"))?;
+
+    remove_generated_path(&root.join("dv.lock.json"))?;
+    remove_generated_path(&root.join("dv-packages"))?;
+    remove_generated_path(&root.join("dv-packages"))?;
+    let cold = command_text(dv_executable, &["restore", project, "--packages", "dv-packages", "--offline", "--json"], &root)?;
+    let warm = command_text(dv_executable, &["restore", project, "--packages", "dv-packages", "--offline", "--json"], &root)?;
+    let cold_event = json_event(&cold, "package_resolution_created").ok_or("dv RID/content cold restore omitted its resolution")?;
+    let warm_event = json_event(&warm, "package_resolution_created").ok_or("dv RID/content warm restore omitted its resolution")?;
+    if cold_event.get("downloaded_packages").and_then(serde_json::Value::as_u64) != Some(1)
+      || warm_event.get("cache_hits").and_then(serde_json::Value::as_u64) != Some(1)
+    {
+      return Err(format!("{project} did not exercise one cold publication followed by one warm lock hit").into());
+    }
+    let actual_project_rid = cold_event.get("runtime_identifier").and_then(serde_json::Value::as_str);
+    if actual_project_rid != project_rid || (project_rid.is_none() && !cold_event.get("runtime_identifier").is_some_and(serde_json::Value::is_null)) {
+      return Err(format!("{project} reported the wrong runtime identifier").into());
+    }
+
+    for (microsoft_family, dv_family) in [
+      ("compile", "compile_assets"),
+      ("runtime", "runtime_assets"),
+      ("resource", "resource_assets"),
+      ("native", "native_assets"),
+    ] {
+      let expected = object_keys(microsoft.get(microsoft_family));
+      let actual = dv_package_paths(&cold_event, dv_family)?;
+      if expected != actual {
+        return Err(format!("{project} {microsoft_family} assets differ: Microsoft={expected:?} dv={actual:?}").into());
+      }
+      if actual != dv_package_paths(&warm_event, dv_family)? {
+        return Err(format!("{project} {microsoft_family} assets changed on the warm lock path").into());
+      }
+    }
+
+    let expected_runtime_targets = microsoft_runtime_targets(microsoft.get("runtimeTargets"))?;
+    let actual_runtime_targets = dv_runtime_targets(&cold_event)?;
+    if expected_runtime_targets != actual_runtime_targets || actual_runtime_targets != dv_runtime_targets(&warm_event)? {
+      return Err(format!("{project} runtimeTargets differ: Microsoft={expected_runtime_targets:?} dv={actual_runtime_targets:?}").into());
+    }
+    if let Some(expected_rid) = asset_rid {
+      if !expected_runtime_targets.is_empty() {
+        return Err(format!("concrete project {project} unexpectedly retained portable runtimeTargets").into());
+      }
+      let runtime = dv_package_paths(&cold_event, "runtime_assets")?;
+      if runtime.iter().any(|path| !path.starts_with(&format!("runtimes/{expected_rid}/"))) {
+        return Err(format!("{project} did not select the expected {expected_rid} runtime group: {runtime:?}").into());
+      }
+    } else if expected_runtime_targets.len() < 9 {
+      return Err(format!("portable oracle did not exercise all runtime/resource/native RID targets: {expected_runtime_targets:?}").into());
+    }
+
+    let expected_content = microsoft_content_files(microsoft.get("contentFiles"))?;
+    let actual_content = dv_content_files(&cold_event)?;
+    if expected_content != actual_content || actual_content != dv_content_files(&warm_event)? {
+      return Err(format!("{project} contentFiles differ: Microsoft={expected_content:?} dv={actual_content:?}").into());
+    }
+  }
+
+  let lock: serde_json::Value = serde_json::from_slice(&fs::read(root.join("dv.lock.json"))?)?;
+  if lock.get("schema_version").and_then(serde_json::Value::as_u64) != Some(8) {
+    return Err("RID/content lock did not use schema 8".into());
+  }
+  Ok(())
+}
+
+fn object_keys(value: Option<&serde_json::Value>) -> Vec<String> {
+  let mut keys = value
+    .and_then(serde_json::Value::as_object)
+    .map(|values| values.keys().cloned().collect::<Vec<_>>())
+    .unwrap_or_default();
+  keys.sort_unstable();
+  keys
+}
+
+fn dv_package_relative_path(path: &str) -> Result<String> {
+  let normalized = path.replace('\\', "/");
+  let marker = "/rid.content.metadata/1.0.0/";
+  normalized
+    .to_ascii_lowercase()
+    .find(marker)
+    .map(|index| normalized[index + marker.len()..].to_owned())
+    .ok_or_else(|| format!("dv asset is outside Rid.Content.Metadata: {path}").into())
+}
+
+fn dv_package_paths(event: &serde_json::Value, field: &str) -> Result<Vec<String>> {
+  let mut paths = event
+    .get(field)
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| format!("dv RID/content event omitted {field}"))?
+    .iter()
+    .map(|value| {
+      value
+        .as_str()
+        .ok_or_else(|| format!("dv {field} contains a non-string path").into())
+        .and_then(dv_package_relative_path)
+    })
+    .collect::<Result<Vec<_>>>()?;
+  paths.sort_unstable();
+  Ok(paths)
+}
+
+fn microsoft_runtime_targets(value: Option<&serde_json::Value>) -> Result<Vec<(String, String, String)>> {
+  let mut targets = value
+    .and_then(serde_json::Value::as_object)
+    .map(|targets| {
+      targets
+        .iter()
+        .map(|(path, metadata)| {
+          Ok((
+            path.clone(),
+            metadata
+              .get("rid")
+              .and_then(serde_json::Value::as_str)
+              .ok_or("Microsoft runtime target omitted rid")?
+              .to_owned(),
+            metadata
+              .get("assetType")
+              .and_then(serde_json::Value::as_str)
+              .ok_or("Microsoft runtime target omitted assetType")?
+              .to_owned(),
+          ))
+        })
+        .collect::<Result<Vec<_>>>()
+    })
+    .transpose()?
+    .unwrap_or_default();
+  targets.sort_unstable();
+  Ok(targets)
+}
+
+fn dv_runtime_targets(event: &serde_json::Value) -> Result<Vec<(String, String, String)>> {
+  let mut targets = event
+    .get("runtime_targets")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv RID/content event omitted runtime_targets")?
+    .iter()
+    .map(|target| {
+      Ok((
+        dv_package_relative_path(target.get("path").and_then(serde_json::Value::as_str).ok_or("dv runtime target omitted path")?)?,
+        target
+          .get("runtime_identifier")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("dv runtime target omitted runtime_identifier")?
+          .to_owned(),
+        target
+          .get("kind")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("dv runtime target omitted kind")?
+          .to_owned(),
+      ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  targets.sort_unstable();
+  Ok(targets)
+}
+
+fn microsoft_content_files(value: Option<&serde_json::Value>) -> Result<Vec<(String, String, bool, bool)>> {
+  let mut files = value
+    .and_then(serde_json::Value::as_object)
+    .ok_or("Microsoft assets omitted contentFiles")?
+    .iter()
+    .map(|(path, metadata)| {
+      let build_action = metadata.get("buildAction").and_then(serde_json::Value::as_str).unwrap_or("Compile").to_owned();
+      let copy = metadata.get("copyToOutput").is_some_and(|value| {
+        value
+          .as_bool()
+          .unwrap_or_else(|| value.as_str().is_some_and(|value| value.eq_ignore_ascii_case("true")))
+      });
+      let flatten = path.ends_with("template.cs.pp");
+      (path.clone(), build_action, copy, flatten)
+    })
+    .collect::<Vec<_>>();
+  files.sort_unstable();
+  Ok(files)
+}
+
+fn dv_content_files(event: &serde_json::Value) -> Result<Vec<(String, String, bool, bool)>> {
+  let mut files = event
+    .get("content_files")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv RID/content event omitted content_files")?
+    .iter()
+    .map(|file| {
+      Ok((
+        dv_package_relative_path(file.get("path").and_then(serde_json::Value::as_str).ok_or("dv content file omitted path")?)?,
+        file
+          .get("build_action")
+          .and_then(serde_json::Value::as_str)
+          .ok_or("dv content file omitted build_action")?
+          .to_owned(),
+        file
+          .get("copy_to_output")
+          .and_then(serde_json::Value::as_bool)
+          .ok_or("dv content file omitted copy_to_output")?,
+        file
+          .get("flatten")
+          .and_then(serde_json::Value::as_bool)
+          .ok_or("dv content file omitted flatten")?,
+      ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  files.sort_unstable();
+  Ok(files)
 }
 
 fn json_string_array<'a>(value: Option<&'a serde_json::Value>, meaning: &str) -> Result<Vec<&'a str>> {
@@ -4400,7 +4695,7 @@ fn compare_package_asset_family(
   reference.sort_unstable();
   let mut actual = Vec::new();
   for field in actual_fields {
-    for path in string_array(dv, field)? {
+    for path in package_event_asset_paths(dv, field)? {
       actual.push(package_relative_path(&path)?);
     }
   }
@@ -4418,6 +4713,22 @@ fn compare_package_asset_family(
     );
   }
   Ok(())
+}
+
+fn package_event_asset_paths(document: &serde_json::Value, field: &str) -> Result<Vec<String>> {
+  document
+    .get(field)
+    .and_then(serde_json::Value::as_array)
+    .ok_or_else(|| -> Box<dyn Error> { format!("dv package event omitted {field}").into() })?
+    .iter()
+    .map(|value| {
+      value
+        .as_str()
+        .or_else(|| value.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("dv {field} contains an asset without a path").into())
+    })
+    .collect()
 }
 
 fn package_relative_path(path: &str) -> Result<String> {
@@ -4673,6 +4984,8 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::PackageSyncWarm
       | CaseKind::PackageReferenceMetadata
       | CaseKind::NuspecFrameworkMetadata
+      | CaseKind::PackageRidContentCold
+      | CaseKind::PackageRidContentWarm
       | CaseKind::CentralPackageManagement
       | CaseKind::PackageConflictResolution
       | CaseKind::PackageBatchResolution
@@ -5010,6 +5323,36 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::NuspecFrameworkMetadata) {
     prepare_nuspec_framework_metadata(workspace)?;
+  }
+  if matches!(case.kind, CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm) {
+    prepare_package_rid_content(workspace)?;
+  }
+  if matches!(case.kind, CaseKind::PackageRidContentWarm) {
+    if is_dotnet(executable) {
+      run_checked(
+        executable,
+        &[
+          "restore",
+          "WindowsFallback.csproj",
+          "--use-lock-file",
+          "--packages",
+          ".packages",
+          "--no-http-cache",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+        ],
+        workspace,
+        "warm RID/content restore setup",
+      )?;
+    } else {
+      run_checked(
+        executable,
+        &["restore", "WindowsFallback.csproj", "--packages", ".packages", "--json"],
+        workspace,
+        "warm RID/content sync setup",
+      )?;
+    }
   }
   if matches!(case.kind, CaseKind::CentralPackageManagement) {
     if is_dotnet(executable) {
@@ -5451,6 +5794,56 @@ fn write_nuspec_framework_packages(feed: &Path) -> Result<()> {
     archive.finish()?;
   }
   Ok(())
+}
+
+fn write_rid_content_package(feed: &Path) -> Result<()> {
+  use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+  fs::create_dir_all(feed)?;
+  let mut archive = ZipWriter::new(fs::File::create(feed.join("Rid.Content.Metadata.1.0.0.nupkg"))?);
+  let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+  let manifest = r#"<?xml version="1.0"?><package><metadata>
+<id>Rid.Content.Metadata</id><version>1.0.0</version><authors>dv</authors>
+<description>RID and contentFiles selection oracle.</description>
+<contentFiles>
+  <files include="**/*" buildAction="Content" copyToOutput="false" flatten="false" />
+  <files include="cs/**/*.pp" buildAction="Compile" copyToOutput="true" flatten="true" />
+  <files include="any/**" copyToOutput="true" />
+  <files include="**/*.json" buildAction="None" copyToOutput="true" flatten="false" />
+</contentFiles>
+</metadata></package>"#;
+  archive.start_file("Rid.Content.Metadata.nuspec", options)?;
+  archive.write_all(manifest.as_bytes())?;
+  for path in [
+    "lib/net10.0/Rid.Content.Metadata.dll",
+    "lib/net10.0/fr/Rid.Content.Metadata.resources.dll",
+    "native/portable.bin",
+    "runtimes/win-x64/lib/net10.0/Rid.Content.Metadata.dll",
+    "runtimes/win-x64/lib/net10.0/fr/Rid.Content.Metadata.resources.dll",
+    "runtimes/win-x64/native/exact-win-x64.bin",
+    "runtimes/win/lib/net10.0/Rid.Content.Metadata.dll",
+    "runtimes/win/lib/net10.0/fr/Rid.Content.Metadata.resources.dll",
+    "runtimes/win/native/fallback-win.bin",
+    "runtimes/linux-x64/lib/net10.0/Rid.Content.Metadata.dll",
+    "runtimes/linux-x64/lib/net10.0/fr/Rid.Content.Metadata.resources.dll",
+    "runtimes/linux-x64/native/exact-linux-x64.so",
+    "contentFiles/any/any/readme.txt",
+    "contentFiles/cs/net8.0/old.cs",
+    "contentFiles/cs/net10.0/generated/template.cs.pp",
+    "contentFiles/cs/net10.0/config/settings.json",
+    "contentFiles/vb/any/sample.vb",
+  ] {
+    archive.start_file(path, options)?;
+    archive.write_all(b"deterministic RID/content fixture payload")?;
+  }
+  archive.finish()?;
+  Ok(())
+}
+
+fn prepare_package_rid_content(workspace: &Path) -> Result<()> {
+  let feed = workspace.join("feed");
+  remove_generated_path(&feed)?;
+  write_rid_content_package(&feed)
 }
 
 fn prepare_nuspec_framework_metadata(workspace: &Path) -> Result<()> {
@@ -5960,6 +6353,13 @@ fn reset_nuspec_framework_metadata_iteration(workspace: &Path) -> Result<()> {
   Ok(())
 }
 
+fn reset_package_rid_content_iteration(workspace: &Path) -> Result<()> {
+  for relative in [".packages", "obj", "dv.lock.json", "packages.lock.json"] {
+    remove_generated_path(&workspace.join(relative))?;
+  }
+  Ok(())
+}
+
 fn remove_generated_path(path: &Path) -> Result<()> {
   const RETRIES: [Duration; 4] = [
     Duration::from_millis(10),
@@ -5990,6 +6390,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::CompilerPlan
     | CaseKind::PackageAssetPlan
     | CaseKind::PackageReferenceMetadata
+    | CaseKind::PackageRidContentWarm
     | CaseKind::CentralPackageManagement
     | CaseKind::NugetConfigHierarchy
     | CaseKind::NugetConfigMerge
@@ -5997,6 +6398,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
     CaseKind::NuspecFrameworkMetadata => reset_nuspec_framework_metadata_iteration(workspace),
+    CaseKind::PackageRidContentCold => reset_package_rid_content_iteration(workspace),
     CaseKind::NugetCredentials
     | CaseKind::NugetCredentialProvider
     | CaseKind::NugetClientCertificates
@@ -6073,6 +6475,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => fixtures.package,
     CaseKind::PackageReferenceMetadata => fixtures.package_reference_metadata,
     CaseKind::NuspecFrameworkMetadata => fixtures.nuspec_framework_metadata,
+    CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => fixtures.package_rid_content,
     CaseKind::CentralPackageManagement => fixtures.central_package_management,
     CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => fixtures.package_conflict_resolution,
     CaseKind::PackageReferenceConditions => fixtures.package_reference_conditions,
@@ -6108,6 +6511,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::PackageSyncCold | CaseKind::PackageSyncWarm => Some("package-console"),
     CaseKind::PackageReferenceMetadata => Some("package-reference-metadata"),
     CaseKind::NuspecFrameworkMetadata => Some("nuspec-framework-metadata"),
+    CaseKind::PackageRidContentCold | CaseKind::PackageRidContentWarm => Some("package-rid-content"),
     CaseKind::CentralPackageManagement => Some("central-package-management"),
     CaseKind::PackageConflictResolution | CaseKind::PackageBatchResolution | CaseKind::PackageDiagnostics => Some("package-conflict-resolution"),
     CaseKind::PackageReferenceConditions => Some("package-reference-conditions"),
@@ -6196,6 +6600,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
         | CaseKind::PackageAssetPlan
         | CaseKind::PackageReferenceMetadata
         | CaseKind::NuspecFrameworkMetadata
+        | CaseKind::PackageRidContentCold
+        | CaseKind::PackageRidContentWarm
         | CaseKind::CentralPackageManagement
         | CaseKind::PackageConflictResolution
         | CaseKind::PackageSyncWarm
@@ -6224,6 +6630,16 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
       && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(2) || evidence.resolved_packages != Some(2))
     {
       return Err(format!("nuspec-framework sample did not acquire two local packages with zero network work: {evidence:?}").into());
+    }
+    if matches!(case.kind, CaseKind::PackageRidContentCold)
+      && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(1) || evidence.resolved_packages != Some(1))
+    {
+      return Err(format!("cold RID/content sample did not acquire one local package with zero network work: {evidence:?}").into());
+    }
+    if matches!(case.kind, CaseKind::PackageRidContentWarm)
+      && (evidence.network_requests != Some(0) || evidence.downloaded_packages != Some(0) || evidence.resolved_packages != Some(1))
+    {
+      return Err(format!("warm RID/content sample did not reuse one locked package with zero network work: {evidence:?}").into());
     }
     Some(evidence)
   } else if !is_dotnet(executable)
@@ -6878,6 +7294,8 @@ fn render_summary(report: &Report, color: bool) -> String {
           | "package_graph_massive"
           | "package_asset_plan"
           | "package_reference_metadata"
+          | "package_rid_content_cold"
+          | "package_rid_content_warm"
           | "package_sync_warm"
           | "nuget_config_hierarchy"
           | "nuget_config_merge"
@@ -7022,6 +7440,8 @@ fn case_label(case: &str) -> &str {
     "package_asset_plan" => "Warm package asset plan",
     "package_reference_metadata" => "PackageReference metadata",
     "nuspec_framework_metadata" => "NuGet framework metadata",
+    "package_rid_content_cold" => "Cold RID/content asset plan",
+    "package_rid_content_warm" => "Warm RID/content asset plan",
     "central_package_management" => "Central package management",
     "package_conflict_resolution" => "Package conflict resolution",
     "package_batch_resolution" => "Two-project package batch",

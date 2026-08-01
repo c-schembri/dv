@@ -964,21 +964,25 @@ boundary, not final drop-in parity.
   selection; unscoped assemblies are fallback-only, modern targets ignore
   legacy assemblies, and runtime asset exclusion removes only legacy
   assemblies. Selected names occupy sparse 20-byte package rows plus one
-  contiguous text-span batch, persist in lock schema 7, and publish through
-  event schema 16 and human output. Microsoft-oracled `net10.0` and `net48`
+  contiguous text-span batch, persist in lock schema 8, and publish through
+  event schema 17 and human output. Microsoft-oracled `net10.0` and `net48`
   preflight verifies dependency, shared-framework, legacy-assembly, cold, and
   warm-lock parity. Thirty cold local-source Windows samples measure
   `558.832 ms` for Microsoft versus `15.989 ms` for `dv` (`35.0x`). `P1`
-- [~] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
+- [x] `RES-011` Select `ref`, `lib`, `runtimes`, native, resource,
   `contentFiles`, analyzer, `build`, `buildMultiTargeting`, and
   `buildTransitive` assets by compatible TFM and NuGet include/exclude
-  propagation. Lock schema 7 and event schema 16 preserve every selected family
-  in compact per-package ranges. The 203-package massive acceptance graph now
-  matches `project.assets.json` across portable asset paths and runtime-target
-  RID/type metadata and is benchmarked end to end. Selecting one concrete RID
-  from the now-available SDK graph plus `contentFiles` build-action,
-  copy, and flatten metadata remain. `P2`
-  See `issues/0007-package-content-metadata-and-rid-selection.md`.
+  propagation. Concrete RID restores traverse the selected SDK's compatibility
+  graph and choose the nearest runtime/resource and native groups independently;
+  portable restores retain typed runtime targets. One bounded nuspec pass
+  records ordered `contentFiles` rules, with later attributes overriding earlier
+  matches and unmatched files retaining NuGet defaults. Content metadata uses a
+  parallel 12-byte row batch. Lock schema 8 fingerprints the semantic RID chain,
+  and event schema 17 preserves runtime identity and content metadata across
+  cold and warm restores. Microsoft-oracled portable, exact Windows/Linux, and
+  Windows-fallback projects verify all asset families. Thirty Windows samples
+  measure cold local restore at `600.782 ms` versus `23.186 ms` (`25.9x`) and
+  warm locked restore at `456.098 ms` versus `7.589 ms` (`60.1x`). `P2`
 - [~] `RES-012` .NET 10 package pruning reads the selected SDK's
   `PrunePackageData` or matching reference-pack `PackageOverrides.txt`, applies
   the SDK's stable patch ceiling, retracts pruned graph edges, and fingerprints

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Diagnostic, RuntimeTargetKind};
 
 /// Current version of the JSON event protocol.
-pub const EVENT_SCHEMA_VERSION: u16 = 16;
+pub const EVENT_SCHEMA_VERSION: u16 = 17;
 
 /// The result of a command or work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -163,6 +163,19 @@ pub struct RuntimeTargetEvent {
   pub runtime_identifier: String,
   /// Whether the target is managed runtime code or native code.
   pub kind: RuntimeTargetKind,
+}
+
+/// One package content file and its evaluated nuspec metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContentFileEvent {
+  /// Full selected content path.
+  pub path: String,
+  /// MSBuild item type used for the content file.
+  pub build_action: String,
+  /// Whether the file is copied to the build output.
+  pub copy_to_output: bool,
+  /// Whether copying discards its relative directory structure.
+  pub flatten: bool,
 }
 
 /// One exact package dependency materialized at the reporter boundary.
@@ -552,6 +565,8 @@ pub enum EventPayload {
     lock_path: String,
     /// Evaluated target framework.
     target_framework: String,
+    /// Evaluated runtime identifier, or `null` for a portable graph.
+    runtime_identifier: Option<String>,
     /// Credential-free configuration key or redacted CLI identity for the selected source.
     source: String,
     /// Selected NuGet protocol generation.
@@ -570,8 +585,8 @@ pub enum EventPayload {
     analyzers: Vec<String>,
     /// Ordered satellite resource assemblies.
     resource_assets: Vec<String>,
-    /// Ordered package content files.
-    content_files: Vec<String>,
+    /// Ordered package content files and evaluated nuspec metadata.
+    content_files: Vec<ContentFileEvent>,
     /// Ordered inner-build imports from `build`.
     build_assets: Vec<String>,
     /// Ordered outer-build imports from `buildMultiTargeting`.

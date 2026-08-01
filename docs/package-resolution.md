@@ -110,8 +110,8 @@ identity-ordered central version batch. Direct references use their selected
 central value unless `VersionOverride` wins. Matching transitive identities are
 promoted to the exact central version before package metadata is scheduled;
 an incompatible lower pin fails rather than drifting upward. Central-transitive
-packages remain distinct from project-direct packages in lock schema 7 and
-event schema 16. See the
+packages remain distinct from project-direct packages in lock schema 8 and
+event schema 17. See the
 [central package management contract](central-package-management.md).
 
 Version constraints are owned by one identity-ordered graph node and keyed by
@@ -216,8 +216,28 @@ package with selected framework metadata. Each row holds two contiguous name
 ranges plus its package index; names share the resolution text table through
 eight-byte spans. The batch metadata cache retains its 40-byte hot dependency
 row and carries framework ownership in a parallel `u32` index, so the common
-package does not pay for two vectors in the hot record. Lock schema 7 and event
-schema 16 preserve the selected names across cold and warm restores.
+package does not pay for two vectors in the hot record. Lock schema 8 and event
+schema 17 preserve the selected names across cold and warm restores.
+
+Concrete runtime selection is another batch transform. The project contributes
+zero or one evaluated RID; the selected SDK contributes one immutable
+compatibility graph; and each package contributes sorted runtime, resource, and
+native candidate groups. The resolver walks the compatible RID sequence once
+and chooses the nearest non-empty group independently for managed/resource and
+native assets. Portable projects instead retain every runtime target with its
+RID and kind. The semantic compatibility sequence is fingerprinted into the
+lock, so SDK graph changes invalidate warm state without tying the protocol to
+an SDK version or installation path.
+
+Nuspec `contentFiles` rules are parsed in the existing bounded XML pass. Ordered
+rules are applied linearly to selected paths; later matching attributes replace
+earlier values, while unmatched files use `Compile`, no output copy, and no
+flattening. Invalid absolute/traversal patterns, oversized rules, and malformed
+metadata fail explicitly. Selected files retain their path in the existing span
+batch and carry build action plus two flags in a parallel 12-byte,
+four-byte-aligned record. The variable-sized external rules and build-action
+text allocate only in cold package metadata; warm execution reads the compact
+lock representation.
 
 Project graphs converge sequentially. This deliberately avoids duplicate
 downloads, publication races, graph locks, and completion-order instability;
@@ -270,11 +290,12 @@ span allocation. Actual per-package roots and ordered fallback roots are cold
 parallel path-span batches, so fallback support does not enlarge the hot
 package scan. `PackageAssetRanges` is 72 bytes with 4-byte alignment; every
 path is an 8-byte offset/length span into one owned UTF-8 buffer. The
-pointer-aligned `PackageResolution` header is 400 bytes. Schema 7 adds two
-framework-metadata slice owners to the previous 368-byte header; the common
-package still adds no row or name allocation. Assuming the benchmark machine's
-observed 64-byte cache line, eight spans fit per line. Reporters and compiler
-planning scan only the ranges they consume.
+pointer-aligned `PackageResolution` header is 432 bytes. Schema 8 adds the
+runtime identifier, runtime-graph fingerprint, and content-metadata owner to
+the previous schema. The common package still adds no content row or
+build-action allocation. Assuming the benchmark machine's observed 64-byte
+cache line, eight spans fit per line. Reporters and compiler planning scan only
+the ranges they consume.
 
 The cold scheduler uses one command-scoped two-thread Tokio runtime and a
 `JoinSet` capped at twenty-four active package tasks. The runtime exists only
@@ -335,7 +356,7 @@ Two rows fit the benchmark host's assumed 64-byte cache line. Text shares the
 resolution buffer and the common no-warning path owns an empty boxed slice,
 so it performs no row allocation. A single post-convergence scan reads package
 constraints linearly and enters the graph ancestry path only for relevant
-transitive multi-parent constraints. Lock schema 7 persists this batch, which
+transitive multi-parent constraints. Lock schema 8 persists this batch, which
 lets a warm locked restore reproduce `DV0413` without reopening manifests or
 rescanning the graph.
 
@@ -418,6 +439,20 @@ separately for both the single-package startup boundary and the 203-package
 asset-plan boundary.
 `dv` package, request, and payload counts are recorded as typed benchmark
 evidence.
+
+The RID/content preflight generates one deterministic package and compares
+portable, exact Windows, exact Linux, and Windows-fallback projects against
+Microsoft `project.assets.json`. It checks runtime, resource, native, and
+content paths plus RID/type and build-action/copy/flatten metadata on both cold
+publication and warm lock reuse:
+
+```powershell
+cargo bench-all --case package_rid_content_cold --samples 30 --warmups 3
+cargo bench-all --case package_rid_content_warm --samples 30 --warmups 3
+```
+
+The retained distributions are in the
+[RID/content baseline](performance-baselines/2026-08-01-package-rid-content-windows.md).
 
 The source-telemetry case uses the same six-package, two-source cold fixture,
 then checks each `dv` source row and aggregate against the loopback servers'

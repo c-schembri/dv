@@ -22,10 +22,10 @@ pub use compiler::{CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, plan_
 pub use credential_provider::{CredentialProviderLogSink, PackageCancellation};
 pub use diagnostic::{ContextField, Diagnostic, DiagnosticCode, DiagnosticCodeError, Severity};
 pub use event::{
-  CacheOutcome, CentralPackageVersionEvent, CompilerReferenceAliasEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload, EventStreamError,
-  Outcome, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceWorkEvent,
-  ProjectFrameworkReferenceEvent, ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent, SdkInstallationEvent,
-  validate_events,
+  CacheOutcome, CentralPackageVersionEvent, CompilerReferenceAliasEvent, ContentFileEvent, DirectPackagePolicyEvent, EVENT_SCHEMA_VERSION, Event, EventPayload,
+  EventStreamError, Outcome, PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
+  PackageSourceWorkEvent, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeTargetEvent,
+  SdkInstallationEvent, validate_events,
 };
 pub use framework::{FrameworkFamily, TargetFramework, TargetFrameworkError};
 pub use framework_reference::{
@@ -35,6 +35,7 @@ pub use pack_requirement::{PackAcquisition, PackKind, PackRequirement};
 pub use package::{
   PackageAssetFamily, PackageError, PackageErrorKind, PackageResolution, PackageResolveOptions, PackageServiceKind, PackageSourceAuthentication,
   PackageSourceInventory, ResolvedPackage, RuntimeTargetKind, SignatureValidationMode, inspect_package_sources, resolve_package_inputs,
+  resolve_package_inputs_with_runtime_graph,
 };
 pub use project::{
   CentralPackageVersion, FrameworkReference, NugetAuditLevel, NugetAuditMode, PackageAssetFlags, PackageReference, ProjectConfiguration, ProjectError,
