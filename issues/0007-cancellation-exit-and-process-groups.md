@@ -10,9 +10,11 @@ Windows, Linux, and macOS?
 
 `CLI-014` owns early signal installation, one absolute two-second child grace,
 cooperative NuGet provider cancellation, forced kill/reap, stable `DV0005`, and
-the JSON `cancelled` outcome. Native cancellation currently uses the existing
-operation-failure process code. Application, compiler, and test child creation
-remain TBI, so `dv` does not yet claim process-tree or reference exit parity.
+the JSON `cancelled` outcome. `CLI-015` retains reaped child exits and separates
+launch/wait failure, while declaring preserve versus command-result policy.
+Native cancellation currently uses the existing operation-failure process
+code. Application, compiler, and test child creation remain TBI, so `dv` does
+not yet claim process-tree, signal-exit, or reference cancellation parity.
 
 ## Evidence Needed
 
@@ -27,6 +29,7 @@ remain TBI, so `dv` does not yet claim process-tree or reference exit parity.
 
 ## Decision Trigger
 
-Resolve this with `CLI-015`, `RUN-006`, and `RUN-009` before claiming child-exit
-or cancellation parity. Keep the existing typed outcome and deadline; change
-only the profile exit mapping and platform child owner proven by the oracle.
+Resolve the remaining signal and process-group questions with `RUN-006` and
+`RUN-009` before claiming application child-exit or cancellation parity. Keep
+the existing typed termination, outcome, and deadline; change only the profile
+signal mapping and platform child owner proven by the oracle.

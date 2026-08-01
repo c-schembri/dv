@@ -1,6 +1,7 @@
 //! Stable data contracts shared by dv commands and reporters.
 
 mod cancellation;
+mod child_process;
 mod compiler;
 mod credential_provider;
 mod diagnostic;
@@ -22,6 +23,7 @@ mod sdk;
 pub(crate) const BENCHMARK_CACHE_LINE_BYTES: usize = 64;
 
 pub use cancellation::CancellationToken;
+pub use child_process::{ChildExitPolicy, ChildProcessFailure, ChildProcessFailureStage, ChildTermination, classify_child_termination};
 /// Compatibility name for the package-only cancellation handle shipped by
 /// earlier dv releases.
 pub type PackageCancellation = CancellationToken;

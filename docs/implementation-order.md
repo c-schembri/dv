@@ -133,11 +133,12 @@ cache publication. Network work is outside the verification benchmark.
 ### Wave 1: Invocation And Manifest Spine
 
 Status: in progress; `CLI-005` through `CLI-008` and `CLI-011` through
-`CLI-014` are complete.
+`CLI-015` are complete.
 Explicit compatibility exit profiles, allocation-free named project selection,
 pre-I/O unknown-option rejection, lossless child-argument tails, typed
-environment precedence, secret-safe invocation reporting, and early
-command-lifetime cancellation with a bounded child deadline are available.
+environment precedence, secret-safe invocation reporting, early
+command-lifetime cancellation with a bounded child deadline, and lossless
+child termination classification are available.
 The broader foundations of `DROP-002`, `DROP-003`, `DROP-011`, and `DROP-016`
 remain partial.
 

@@ -354,8 +354,19 @@ contracts.
   selection at `68.400 ms` for Microsoft and `5.302 ms` for `dv` (`12.9x`
   faster); `dv --version`, which deliberately skips installation, remains
   `4.330 ms`. `P1`
-- [ ] `CLI-015` Preserve child exit codes where the command contract requires
-  it and distinguish launch failure from child failure. `P1`
+- [x] `CLI-015` Preserve child exit codes where the command contract requires
+  it and distinguish launch failure from child failure. Reaped children now
+  produce one eight-byte typed termination record containing an exact `i32`
+  exit, Unix signal, or explicit unknown state; launch and wait errors remain
+  cold, separately staged failures. The CLI terminates through a four-byte
+  `i32` boundary, so numeric child exits bypass compatibility failure remapping
+  without `u8` truncation. A one-byte policy declares application exits
+  preserved and test-host failures mapped into the aggregated test result.
+  Real cross-platform process tests retain `0`, `37`, and `211`, distinguish a
+  nonexistent executable from a nonzero child, and keep Unix `SIGTERM`
+  separate from numeric exits. Application launch,
+  process-group ownership, and signal policy remain ordered under `RUN-006`
+  and `RUN-009`. `P1`
 - [ ] `CLI-016` Support tool-compatible response files, nesting, encoding,
   quoting, comments, default response-file discovery, opt-out, cycles, and
   size/depth bounds. `P2`

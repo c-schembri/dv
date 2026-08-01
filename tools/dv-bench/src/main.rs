@@ -26,6 +26,7 @@ enum CaseKind {
   CliUnknownOption,
   CliEnvironment,
   CliForwarding,
+  CliChildExit,
   RidGraph,
   ProjectEvaluate,
   PackageReferenceConditions,
@@ -156,6 +157,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_forwarding",
     kind: CaseKind::CliForwarding,
     args: &["bin/Release/net10.0/ArgumentForwarding.dll", "alpha", "", "--color", "two words"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_child_exit",
+    kind: CaseKind::CliChildExit,
+    args: &["bin/Release/net10.0/ArgumentForwarding.dll", "exit", "23"],
     implemented: true,
   },
   Case {
@@ -782,6 +789,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_child_exit",
+    kind: CaseKind::CliChildExit,
+    args: &["--json", "run", "--", "exit", "23"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["sdk", "compatible-rids", "linux-musl-x64"],
@@ -1264,6 +1277,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "cli_forwarding") {
     verify_forwarding_boundary(&dv_executable, &argument_forwarding_fixture, &workspace.join("verify-cli-forwarding"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "cli_child_exit") {
+    verify_child_exit_boundary(&dv_executable, &argument_forwarding_fixture, &workspace.join("verify-cli-child-exit"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "rid_graph") {
     verify_rid_graph(&repository, &dv_executable, &rid_graph_fixture)?;
@@ -1768,6 +1784,93 @@ fn validate_forwarding_output(output: &Output, reference: bool) -> Result<()> {
   });
   if forwarded_count != Some("4") {
     return Err(format!("dv forwarding boundary reported the wrong typed batch count: {forwarded_count:?}").into());
+  }
+  Ok(())
+}
+
+const CHILD_EXIT_CODE: i32 = 23;
+const DOTNET_CHILD_EXIT_ORACLE_ARGS: &[&str] = &[
+  "run",
+  "--project",
+  "ArgumentForwarding.csproj",
+  "--configuration",
+  "Release",
+  "--no-build",
+  "--no-restore",
+  "--",
+  "exit",
+  "23",
+];
+
+fn verify_child_exit_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  let dotnet_workspace = verification.join("dotnet");
+  let dv_workspace = verification.join("dv");
+  reset_fixture(fixture, &dotnet_workspace)?;
+  reset_fixture(fixture, &dv_workspace)?;
+  run_checked(
+    Path::new("dotnet"),
+    &["build", "ArgumentForwarding.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
+    &dotnet_workspace,
+    "child-exit oracle build",
+  )?;
+
+  let reference = Command::new("dotnet")
+    .args(DOTNET_CHILD_EXIT_ORACLE_ARGS)
+    .current_dir(&dotnet_workspace)
+    .output()?;
+  validate_child_exit_output(&reference, true)?;
+
+  let actual = Command::new(dv_executable)
+    .args(DV_CASES.iter().find(|case| case.name == "cli_child_exit").expect("child-exit case exists").args)
+    .current_dir(&dv_workspace)
+    .output()?;
+  validate_child_exit_output(&actual, false)
+}
+
+fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
+  if reference {
+    if output.status.code() != Some(CHILD_EXIT_CODE) || !output.stdout.is_empty() || !output.stderr.is_empty() {
+      return Err(
+        format!(
+          "Microsoft child-exit oracle returned status {:?}: stdout={} stderr={}",
+          output.status.code(),
+          String::from_utf8_lossy(&output.stdout),
+          String::from_utf8_lossy(&output.stderr)
+        )
+        .into(),
+      );
+    }
+    return Ok(());
+  }
+
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(format!("dv child-exit boundary returned status {:?}", output.status.code()).into());
+  }
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv child-exit boundary omitted its diagnostic")?;
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0003") {
+    return Err("dv child-exit boundary did not reach the typed run request".into());
+  }
+  for (name, expected) in [("forwarded_argument_count", "2"), ("child_exit_policy", "preserve")] {
+    let actual = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+      context.iter().find_map(|field| {
+        (field.get("name").and_then(serde_json::Value::as_str) == Some(name))
+          .then(|| field.get("value").and_then(serde_json::Value::as_str))
+          .flatten()
+      })
+    });
+    if actual != Some(expected) {
+      return Err(format!("dv child-exit boundary reported {name}={actual:?}, expected {expected}").into());
+    }
   }
   Ok(())
 }
@@ -5593,6 +5696,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::CliUnknownOption
       | CaseKind::CliEnvironment
       | CaseKind::CliForwarding
+      | CaseKind::CliChildExit
       | CaseKind::BuildNoOp
       | CaseKind::RunWarm
   ) {
@@ -5601,7 +5705,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
   }
-  if matches!(case.kind, CaseKind::CliForwarding) && is_dotnet(executable) {
+  if matches!(case.kind, CaseKind::CliForwarding | CaseKind::CliChildExit) && is_dotnet(executable) {
     run_checked(
       executable,
       &["build", "ArgumentForwarding.csproj", "-c", "Release", "--nologo", "--verbosity", "quiet"],
@@ -7033,6 +7137,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     CaseKind::CliUnknownOption
     | CaseKind::CliEnvironment
     | CaseKind::CliForwarding
+    | CaseKind::CliChildExit
     | CaseKind::RidGraph
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
@@ -7122,7 +7227,7 @@ fn case_cwd<'a>(case: &Case, fixture: &'a Path, workspace: &'a Path) -> &'a Path
 
 fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
   match case.kind {
-    CaseKind::CliForwarding => fixtures.argument_forwarding,
+    CaseKind::CliForwarding | CaseKind::CliChildExit => fixtures.argument_forwarding,
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
@@ -7160,7 +7265,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
 fn fixture_name(case: &Case) -> Option<&'static str> {
   match case.kind {
     CaseKind::Startup => None,
-    CaseKind::CliForwarding => Some("argument-forwarding"),
+    CaseKind::CliForwarding | CaseKind::CliChildExit => Some("argument-forwarding"),
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
@@ -7232,6 +7337,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_environment_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliForwarding) {
     validate_forwarding_output(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliChildExit) {
+    validate_child_exit_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -8127,6 +8234,7 @@ fn case_label(case: &str) -> &str {
     "cli_unknown_option" => "Unknown-option rejection",
     "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
+    "cli_child_exit" => "Child exit policy (run TBI)",
     "cli_cancellation" => "Cancellation-ready SDK selection",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",

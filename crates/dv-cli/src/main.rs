@@ -3,7 +3,7 @@ use std::{
   ffi::OsStr,
   io::{self, IsTerminal, Write},
   path::{Path, PathBuf},
-  process::ExitCode,
+  process,
   time::Instant,
 };
 
@@ -17,15 +17,15 @@ use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity
 use output::redact_argument_text;
 
 use dv_core::{
-  CancellationToken, CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent,
-  ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind,
-  FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent,
-  PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent,
-  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError,
-  SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources,
-  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
-  resolve_package_inputs_with_runtime_graph, write_json_lines,
+  CancellationToken, CentralPackageVersionEvent, ChildExitPolicy, ChildTermination, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind,
+  CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic, DiagnosticCode, DirectPackagePolicyEvent, Event, EventPayload,
+  FrameworkReferenceError, FrameworkReferenceErrorKind, FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind,
+  PackageHttpPolicyEvent, PackagePathPropertyEvent, PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent,
+  PackageSourceInventory, PackageSourceWorkEvent, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent,
+  ProjectSpec, ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimePackError, RuntimePackErrorKind,
+  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, Severity, discover_sdks, evaluate_project, evaluate_project_closure,
+  evaluate_project_path, inspect_package_sources, load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references,
+  plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -109,7 +109,46 @@ Usage:
           [--configuration Debug|Release]
 ";
 
-fn main() -> ExitCode {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+struct ExitCode(i32);
+
+const _: () = assert!(std::mem::size_of::<ExitCode>() == 4);
+const _: () = assert!(std::mem::align_of::<ExitCode>() == 4);
+
+impl ExitCode {
+  const SUCCESS: Self = Self(0);
+
+  fn get(self) -> i32 {
+    self.0
+  }
+}
+
+impl From<u8> for ExitCode {
+  fn from(code: u8) -> Self {
+    Self(i32::from(code))
+  }
+}
+
+impl From<i32> for ExitCode {
+  fn from(code: i32) -> Self {
+    Self(code)
+  }
+}
+
+impl TryFrom<ChildTermination> for ExitCode {
+  type Error = ChildTermination;
+
+  fn try_from(termination: ChildTermination) -> Result<Self, Self::Error> {
+    termination.exit_code().map(Self).ok_or(termination)
+  }
+}
+
+fn main() {
+  process::exit(run().get());
+}
+
+fn run() -> ExitCode {
   let started = Instant::now();
   let invocation = InvocationBatch::capture_process(env::args_os().skip(1));
   let request = invocation.request();
@@ -310,6 +349,10 @@ fn unsupported_child_command(
       value: forwarded.as_slice().len().to_string(),
     });
   }
+  problem.context.push(ContextField {
+    name: "child_exit_policy".into(),
+    value: child_exit_policy(command).as_str().into(),
+  });
   if environment.edit_count() != 0 {
     problem.context.push(ContextField {
       name: "environment_edit_count".into(),
@@ -325,6 +368,14 @@ fn unsupported_child_command(
     value: cancellation.child_grace().as_millis().to_string(),
   });
   unsupported(started, globals, command, args, problem)
+}
+
+fn child_exit_policy(command: &str) -> ChildExitPolicy {
+  match command {
+    "run" => ChildExitPolicy::Preserve,
+    "test" => ChildExitPolicy::MapToCommandFailure,
+    _ => unreachable!("only child commands reach the child-exit boundary"),
+  }
 }
 
 fn unexpected_leaf_argument(command: &str, arguments: CommandArguments<'_>) -> Option<String> {
@@ -2754,6 +2805,15 @@ mod argument_tests {
     assert!(diagnostic_visible(Severity::Warning, DiagnosticVerbosity::Minimal));
     assert!(!diagnostic_visible(Severity::Info, DiagnosticVerbosity::Normal));
     assert!(diagnostic_visible(Severity::Info, DiagnosticVerbosity::Detailed));
+  }
+
+  #[test]
+  fn numeric_child_exit_bypasses_failure_code_remapping() {
+    for code in [0, 37, 211, -2_147_450_751] {
+      assert_eq!(ExitCode::try_from(ChildTermination::Exited(code)).unwrap().get(), code);
+    }
+    assert_eq!(ExitCode::try_from(ChildTermination::Signalled(15)), Err(ChildTermination::Signalled(15)));
+    assert_eq!(ExitCode::try_from(ChildTermination::Unknown), Err(ChildTermination::Unknown));
   }
 
   #[test]

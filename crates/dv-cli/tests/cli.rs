@@ -207,12 +207,14 @@ fn compatibility_unknown_options_use_reference_failure_exit_without_io() {
 #[test]
 fn child_delimiter_keeps_trailing_global_spellings_opaque() {
   for command in ["run", "test"] {
+    let exit_policy = if command == "run" { "preserve" } else { "map_to_command_failure" };
     let human = dv().args([command, "--", "--json", "--verbosity", "loud", ""]).output().unwrap();
     assert_eq!(human.status.code(), Some(2));
     assert!(human.stdout.is_empty());
     let stderr = String::from_utf8(human.stderr).unwrap();
     assert!(stderr.contains("error[DV0003]"));
     assert!(stderr.contains("forwarded_argument_count: 4"));
+    assert!(stderr.contains(&format!("child_exit_policy: {exit_policy}")));
     assert!(stderr.contains("cancellation_grace_ms: 2000"));
 
     let json = dv().args(["--json", command, "--", "--no-color", "--verbosity", "loud", ""]).output().unwrap();
@@ -221,6 +223,7 @@ fn child_delimiter_keeps_trailing_global_spellings_opaque() {
     let stdout = String::from_utf8(json.stdout).unwrap();
     assert!(stdout.contains("\"code\":\"DV0003\""));
     assert!(stdout.contains("\"name\":\"forwarded_argument_count\",\"value\":\"4\""));
+    assert!(stdout.contains(&format!("\"name\":\"child_exit_policy\",\"value\":\"{exit_policy}\"")));
     assert!(stdout.contains("\"name\":\"cancellation_grace_ms\",\"value\":\"2000\""));
     assert!(stdout.contains("\"args\":[\"--json\""));
     assert!(stdout.contains("\"--no-color\",\"--verbosity\",\"loud\",\"\"]"));

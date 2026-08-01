@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, and self-version | Implemented |
+| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -203,6 +203,12 @@ policy before command discovery. Native failures retain exit code 2; current
 reference-profile failures return 1. The selector adds no allocation and is
 removed from the typed command operands during the initial linear argument
 scan. Full drop-in grammar and output-layout work remains in progress.
+
+Reaped child processes retain their exact 32-bit exit code instead of passing
+through those failure mappings. Launch and wait failures are separate typed
+states, while Unix signals remain distinct until the owning run/test workflow
+selects an explicit policy. Application launch itself is still planned, so the
+current command surface never claims that a TBI child executed.
 
 Human output defaults can be set with `DV_COLOR=auto|always|never` and
 `DV_VERBOSITY=quiet|minimal|normal|detailed|diagnostic`; a non-empty
@@ -441,7 +447,7 @@ Initial machine:
 | Select current SDK with cancellation installed before work | `dotnet --version` | `dv sdk current` | 68.400 ms | 5.302 ms | 12.9x | 72.780 ms | 6.346 ms |
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
-| Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 146.054 ms | 4.827 ms | 30.3x | 152.690 ms | 6.424 ms |
+| Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
@@ -644,6 +650,7 @@ recorded in the curated
 [project selection baseline](docs/performance-baselines/2026-08-01-project-selection-windows.md),
 [unknown-option baseline](docs/performance-baselines/2026-08-01-unknown-option-windows.md),
 [cancellation baseline](docs/performance-baselines/2026-08-01-cli-cancellation-windows.md),
+[child-exit baseline](docs/performance-baselines/2026-08-01-cli-child-exit-windows.md),
 [invocation environment baseline](docs/performance-baselines/2026-08-01-cli-environment-windows.md),
 [RID graph baseline](docs/performance-baselines/2026-08-01-rid-graph-windows.md),
 [runtime evaluation baseline](docs/performance-baselines/2026-08-01-runtime-evaluation-windows.md),
@@ -719,6 +726,7 @@ cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3
 cargo bench-all --case cli_forwarding --samples 30 --warmups 5
+cargo bench-all --case cli_child_exit --samples 30 --warmups 5
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case project_select_named --samples 30 --warmups 3
@@ -803,6 +811,7 @@ See:
 - [Data-oriented agent rules](AGENTS.md)
 - [SDK discovery contract](docs/sdk-discovery.md)
 - [Exit behavior contract](docs/exit-behavior.md)
+- [Child process exit contract](docs/child-process-exit.md)
 - [Project evaluation contract](docs/project-evaluation.md)
 - [Runtime pack planning contract](docs/runtime-pack-planning.md)
 - [SDK pack inventory cache contract](docs/sdk-pack-inventory-cache.md)

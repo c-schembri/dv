@@ -1,5 +1,10 @@
 using System.Text.Json;
 
+if (args is ["exit", var requestedExit])
+{
+    return int.Parse(requestedExit);
+}
+
 if (args is ["environment"])
 {
     Console.WriteLine(JsonSerializer.Serialize(new
@@ -12,3 +17,5 @@ else
 {
     Console.WriteLine(JsonSerializer.Serialize(args));
 }
+
+return 0;

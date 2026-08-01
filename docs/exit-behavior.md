@@ -20,6 +20,7 @@ The retained probes produced this matrix:
 | `dotnet msbuild --definitely-invalid` | 1 |
 | `dotnet nuget frobnicate` | 1 |
 | `dotnet vstest DefinitelyMissing.dll` | 1 |
+| `dotnet run --project ArgumentForwarding.csproj --no-build --no-restore -- exit 23` | 23 |
 
 The P1 compatibility policy therefore maps every currently reachable typed
 failure class to `1` for `dotnet`, `msbuild`, `nuget`, and `vstest` profiles.
@@ -44,9 +45,11 @@ global-option policy.
 Failures are classified internally as usage, unsupported surface, or operation
 failure before an exit profile is applied. `CLI-014` adds a distinct cancelled
 event outcome and `DV0005`, but deliberately retains the current operation
-failure process code. Reference-specific test, no-tests, child-exit, launch
-failure, and cancellation exit policies remain partial under `DROP-016` and
-`CLI-015`.
+failure process code. `CLI-015` separates launch/wait failure from a reaped
+child and retains the latter's exact `i32` exit without compatibility
+remapping. Reference-specific test, no-tests, signal, launch-failure, and
+cancellation exit policies remain partial under `DROP-016`, `RUN-009`, and
+their workflows.
 
 `--compat` currently changes exit policy only. Full reference grammar,
 diagnostic prose, stdout/stderr formats, automatic executable-token inference,
