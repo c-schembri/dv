@@ -1,7 +1,7 @@
 use std::{
   env,
-  ffi::{OsStr, OsString},
-  io::{self, Write},
+  ffi::OsStr,
+  io::{self, IsTerminal, Write},
   path::{Path, PathBuf},
   process::ExitCode,
   time::Instant,
@@ -9,7 +9,7 @@ use std::{
 
 mod invocation;
 
-use invocation::{CommandKind, InvocationBatch};
+use invocation::{ColorChoice, CommandArguments, CommandKind, DiagnosticVerbosity, GlobalOptions, InvocationBatch};
 
 use dv_core::{
   CentralPackageVersionEvent, CompilerPlan, CompilerPlanError, CompilerPlanErrorKind, CompilerReferenceAliasEvent, ContentFileEvent, ContextField, Diagnostic,
@@ -46,7 +46,11 @@ Commands:
   project    Inspect project inputs
 
 Output:
-  --json     Emit the versioned JSON event protocol
+  --json                  Emit the versioned JSON event protocol
+  --verbose               Show detailed diagnostics
+  --quiet                 Show errors only
+  --verbosity LEVEL       quiet|minimal|normal|detailed|diagnostic
+  --color | --no-color    Always or never color human diagnostics
 ";
 
 const SDK_HELP: &str = "\
@@ -89,7 +93,8 @@ fn main() -> ExitCode {
   let started = Instant::now();
   let invocation = InvocationBatch::capture(env::args_os().skip(1));
   let request = invocation.request();
-  let json = invocation.json();
+  let globals = request.globals();
+  let json = globals.json();
   let command_args = invocation.command_arguments();
   match request.command() {
     CommandKind::Help => {
@@ -100,18 +105,18 @@ fn main() -> ExitCode {
       println!("dv {}", env!("CARGO_PKG_VERSION"));
       ExitCode::SUCCESS
     },
-    CommandKind::Sdk => run_sdk(started, json, invocation.event_arguments(json), command_args),
-    CommandKind::Project => run_project(started, json, invocation.event_arguments(json), command_args),
-    CommandKind::Build => run_build(started, json, invocation.event_arguments(json), command_args),
+    CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args),
+    CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args),
+    CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args),
     CommandKind::Restore | CommandKind::Sync => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      run_package_command(started, json, command, invocation.event_arguments(json), command_args)
+      run_package_command(started, globals, command, invocation.event_arguments(json), command_args)
     },
     CommandKind::KnownUnimplemented => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       fail(
         started,
-        json,
+        globals,
         command,
         invocation.event_arguments(json),
         diagnostic(
@@ -129,7 +134,7 @@ fn main() -> ExitCode {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       fail(
         started,
-        json,
+        globals,
         command,
         invocation.event_arguments(json),
         diagnostic(
@@ -145,7 +150,7 @@ fn main() -> ExitCode {
     },
     CommandKind::InvalidText => fail(
       started,
-      json,
+      globals,
       "<invalid>",
       invocation.event_arguments(json),
       diagnostic(
@@ -155,11 +160,24 @@ fn main() -> ExitCode {
         Some("Pass the command name as valid Unicode text."),
       ),
     ),
+    CommandKind::InvalidOptions => fail(
+      started,
+      globals,
+      "<invalid>",
+      invocation.event_arguments(json),
+      diagnostic(
+        "DV0002",
+        invocation.option_error().unwrap_or("invalid global option combination"),
+        None,
+        Some("Use `dv --help` to inspect global output options."),
+      ),
+    ),
   }
 }
 
-fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<String>, command_args: &[OsString]) -> ExitCode {
-  let mut semantic = command_args.iter().filter(|argument| *argument != "--json");
+fn run_package_command(started: Instant, globals: GlobalOptions, command: &str, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
+  let mut semantic = command_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{PACKAGE_HELP}");
     return ExitCode::SUCCESS;
@@ -169,7 +187,7 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         command,
         args,
         diagnostic(
@@ -186,7 +204,7 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         command,
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -210,11 +228,11 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
   for requested in roots {
     let root = match load_project(&current_directory, requested, configuration) {
       Ok(project) => project,
-      Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
+      Err(error) => return fail(started, globals, command, args, project_diagnostic(error)),
     };
     let closure = match evaluate_project_closure(root) {
       Ok(projects) => projects,
-      Err(error) => return fail(started, json, command, args, project_diagnostic(error)),
+      Err(error) => return fail(started, globals, command, args, project_diagnostic(error)),
     };
     for project in closure {
       match seen.binary_search_by(|path| path.as_path().cmp(project.project_path())) {
@@ -228,16 +246,16 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
   }
   let options = match normalize_package_options(options, &current_directory, true) {
     Ok(options) => options,
-    Err(problem) => return fail(started, json, command, args, diagnostic("DV0002", problem, None, None)),
+    Err(problem) => return fail(started, globals, command, args, diagnostic("DV0002", problem, None, None)),
   };
   let project_refs = projects.iter().collect::<Vec<_>>();
   let resolutions = match resolve_package_inputs(&project_refs, &options) {
     Ok(resolutions) => resolutions,
-    Err(error) => return fail(started, json, command, args, package_diagnostic(error)),
+    Err(error) => return fail(started, globals, command, args, package_diagnostic(error)),
   };
   let diagnostics = resolutions.iter().flat_map(package_downgrade_diagnostics).collect::<Vec<_>>();
   if !json {
-    write_human_diagnostics(&diagnostics);
+    write_human_diagnostics(&diagnostics, globals);
     for (project, resolution) in projects.iter().zip(&resolutions) {
       if projects.len() > 1 {
         println!("Project {}", project.project_path().display());
@@ -254,7 +272,7 @@ fn run_package_command(started: Instant, json: bool, command: &str, args: Vec<St
     .zip(&resolutions)
     .map(|(project, resolution)| package_resolution_payload(project, resolution))
     .collect();
-  succeed_batch_with_diagnostics(started, command, args, diagnostics, payloads)
+  succeed_batch_with_diagnostics(started, globals, command, args, diagnostics, payloads)
 }
 
 fn normalize_package_options(options: PackageCommandOptions, current_directory: &Path, write_lock: bool) -> Result<PackageResolveOptions, String> {
@@ -305,7 +323,7 @@ struct PackageCommandOptions {
   probe_credentials: bool,
 }
 
-fn parse_package_args(command: &str, arguments: &[OsString]) -> Result<PackageCommandOptions, String> {
+fn parse_package_args(command: &str, arguments: CommandArguments<'_>) -> Result<PackageCommandOptions, String> {
   let mut options = PackageCommandOptions {
     project: None,
     additional_projects: Vec::new(),
@@ -320,7 +338,6 @@ fn parse_package_args(command: &str, arguments: &[OsString]) -> Result<PackageCo
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].to_str() {
-      Some("--json") => {},
       Some("--configuration") if options.configuration.is_some() => return Err("--configuration cannot be specified more than once".into()),
       Some("--configuration") => {
         let value = take_semantic_value(arguments, &mut index, false, "--configuration requires Debug or Release")?
@@ -402,11 +419,11 @@ fn parse_package_args(command: &str, arguments: &[OsString]) -> Result<PackageCo
   Ok(options)
 }
 
-fn take_semantic_value<'a>(arguments: &'a [OsString], index: &mut usize, ignore_plan: bool, missing: &'static str) -> Result<&'a OsString, &'static str> {
+fn take_semantic_value<'a>(arguments: CommandArguments<'a>, index: &mut usize, ignore_plan: bool, missing: &'static str) -> Result<&'a OsStr, &'static str> {
   loop {
     *index += 1;
     let value = arguments.get(*index).ok_or(missing)?;
-    if value != "--json" && (!ignore_plan || value != "--plan") {
+    if !ignore_plan || value != "--plan" {
       return Ok(value);
     }
   }
@@ -439,8 +456,9 @@ fn write_credential_provider_log(message: &str) {
   let _ = writeln!(io::stderr().lock(), "credential provider: {message}");
 }
 
-fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsString]) -> ExitCode {
-  let mut semantic = build_args.iter().filter(|argument| *argument != "--json");
+fn run_build(started: Instant, globals: GlobalOptions, args: Vec<String>, build_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
+  let mut semantic = build_args.iter();
   if matches!(semantic.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h")) && semantic.next().is_none() {
     print!("{BUILD_HELP}");
     return ExitCode::SUCCESS;
@@ -448,7 +466,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsSt
   if !build_args.iter().any(|argument| argument == "--plan") {
     return fail(
       started,
-      json,
+      globals,
       "build",
       args,
       diagnostic(
@@ -464,7 +482,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsSt
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         "build --plan",
         args,
         diagnostic("DV0002", problem, None, Some("Use `dv build --help` to inspect the accepted arguments.")),
@@ -476,7 +494,7 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsSt
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         "build --plan",
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -485,11 +503,11 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsSt
   };
   let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "build --plan", args, project_diagnostic(error)),
+    Err(error) => return fail(started, globals, "build --plan", args, project_diagnostic(error)),
   };
   let inventory = match discover_sdks(&current_directory) {
     Ok(inventory) => inventory,
-    Err(error) => return fail(started, json, "build --plan", args, sdk_diagnostic(&current_directory, error)),
+    Err(error) => return fail(started, globals, "build --plan", args, sdk_diagnostic(&current_directory, error)),
   };
   let package_options = PackageResolveOptions {
     packages_directory: None,
@@ -502,18 +520,18 @@ fn run_build(started: Instant, json: bool, args: Vec<String>, build_args: &[OsSt
   let runtime_graph = if !project.package_references().is_empty() && project.runtime_identifier().is_some() {
     match load_portable_runtime_graph(&inventory) {
       Ok(graph) => Some(graph),
-      Err(error) => return fail(started, json, "build --plan", args, runtime_graph_diagnostic(error)),
+      Err(error) => return fail(started, globals, "build --plan", args, runtime_graph_diagnostic(error)),
     }
   } else {
     None
   };
   let package_resolutions = match resolve_package_inputs_with_runtime_graph(&[&project], &package_options, runtime_graph.as_ref(), Some(&inventory)) {
     Ok(resolutions) => resolutions,
-    Err(error) => return fail(started, json, "build --plan", args, package_diagnostic(error)),
+    Err(error) => return fail(started, globals, "build --plan", args, package_diagnostic(error)),
   };
   let plans = match plan_compiler_inputs_with_packages(&[&project], &inventory, &package_resolutions) {
     Ok(plans) => plans,
-    Err(error) => return fail(started, json, "build --plan", args, compiler_plan_diagnostic(error)),
+    Err(error) => return fail(started, globals, "build --plan", args, compiler_plan_diagnostic(error)),
   };
   let plan = &plans[0];
   let packages = &package_resolutions[0];
@@ -737,22 +755,22 @@ fn write_package_resolution(resolution: &PackageResolution) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[OsString]) -> ExitCode {
-  let mut semantic = sdk_args.iter().filter(|argument| *argument != "--json");
+fn run_sdk(started: Instant, globals: GlobalOptions, args: Vec<String>, sdk_args: CommandArguments<'_>) -> ExitCode {
+  let mut semantic = sdk_args.iter();
   let first = semantic.next();
   let second = semantic.next();
   let has_more = semantic.next().is_some();
   let first_text = match first {
     Some(argument) => match argument.to_str() {
       Some(value) => Some(value),
-      None => return fail(started, json, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
+      None => return fail(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "SDK command")),
     },
     None => None,
   };
   let second_text = match second {
     Some(argument) => match argument.to_str() {
       Some(value) => Some(value),
-      None => return fail(started, json, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
+      None => return fail(started, globals, "sdk", args, non_unicode_argument_diagnostic(argument, "runtime identifier")),
     },
     None => None,
   };
@@ -765,12 +783,12 @@ fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[OsString
       print!("{SDK_HELP}");
       ExitCode::SUCCESS
     },
-    (Some("current"), None, false) => sdk_current(started, json, args),
-    (Some("list"), None, false) => sdk_list(started, json, args),
-    (Some("compatible-rids"), Some(runtime_identifier), false) => sdk_compatible_rids(started, json, args, runtime_identifier),
+    (Some("current"), None, false) => sdk_current(started, globals, args),
+    (Some("list"), None, false) => sdk_list(started, globals, args),
+    (Some("compatible-rids"), Some(runtime_identifier), false) => sdk_compatible_rids(started, globals, args, runtime_identifier),
     (Some("compatible-rids"), _, _) => fail(
       started,
-      json,
+      globals,
       "sdk compatible-rids",
       args,
       diagnostic(
@@ -784,7 +802,7 @@ fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[OsString
       let subcommand = first_text.unwrap_or("<missing>");
       fail(
         started,
-        json,
+        globals,
         "sdk",
         args,
         diagnostic(
@@ -801,8 +819,9 @@ fn run_sdk(started: Instant, json: bool, args: Vec<String>, sdk_args: &[OsString
   }
 }
 
-fn sdk_current(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
-  let inventory = match load_sdk_inventory(started, json, &args) {
+fn sdk_current(started: Instant, globals: GlobalOptions, args: Vec<String>) -> ExitCode {
+  let json = globals.json();
+  let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
     Err(exit_code) => return exit_code,
   };
@@ -826,14 +845,15 @@ fn sdk_current(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
       global_json,
     },
     (Err(diagnostic), _, _) | (_, Err(diagnostic), _) | (_, _, Err(diagnostic)) => {
-      return fail(started, true, "sdk current", args, *diagnostic);
+      return fail(started, globals, "sdk current", args, *diagnostic);
     },
   };
   succeed(started, "sdk current", args, payload)
 }
 
-fn sdk_list(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
-  let inventory = match load_sdk_inventory(started, json, &args) {
+fn sdk_list(started: Instant, globals: GlobalOptions, args: Vec<String>) -> ExitCode {
+  let json = globals.json();
+  let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
     Err(exit_code) => return exit_code,
   };
@@ -861,20 +881,21 @@ fn sdk_list(started: Instant, json: bool, args: Vec<String>) -> ExitCode {
     .collect();
   let installations = match installations {
     Ok(installations) => installations,
-    Err(diagnostic) => return fail(started, true, "sdk list", args, *diagnostic),
+    Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
   };
   let global_json = match optional_path_text(inventory.global_json.as_deref(), "global.json") {
     Ok(path) => path,
-    Err(diagnostic) => return fail(started, true, "sdk list", args, *diagnostic),
+    Err(diagnostic) => return fail(started, globals, "sdk list", args, *diagnostic),
   };
   succeed(started, "sdk list", args, EventPayload::SdkInventory { installations, global_json })
 }
 
-fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
+fn sdk_compatible_rids(started: Instant, globals: GlobalOptions, args: Vec<String>, runtime_identifier: &str) -> ExitCode {
+  let json = globals.json();
   if runtime_identifier.is_empty() {
     return fail(
       started,
-      json,
+      globals,
       "sdk compatible-rids",
       args,
       diagnostic(
@@ -885,13 +906,13 @@ fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_
       ),
     );
   }
-  let inventory = match load_sdk_inventory(started, json, &args) {
+  let inventory = match load_sdk_inventory(started, globals, &args) {
     Ok(inventory) => inventory,
     Err(exit_code) => return exit_code,
   };
   let graph = match load_portable_runtime_graph(&inventory) {
     Ok(graph) => graph,
-    Err(error) => return fail(started, json, "sdk compatible-rids", args, runtime_graph_diagnostic(error)),
+    Err(error) => return fail(started, globals, "sdk compatible-rids", args, runtime_graph_diagnostic(error)),
   };
 
   if !json {
@@ -903,7 +924,7 @@ fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_
 
   let graph_path = match path_text(graph.source(), "portable RID graph") {
     Ok(path) => path,
-    Err(diagnostic) => return fail(started, true, "sdk compatible-rids", args, *diagnostic),
+    Err(diagnostic) => return fail(started, globals, "sdk compatible-rids", args, *diagnostic),
   };
   succeed(
     started,
@@ -921,25 +942,26 @@ fn sdk_compatible_rids(started: Instant, json: bool, args: Vec<String>, runtime_
   )
 }
 
-fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
-  let Some(subcommand_index) = project_args.iter().position(|argument| argument != "--json") else {
+fn run_project(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
+  if project_args.is_empty() {
     print!("{PROJECT_HELP}");
     return ExitCode::SUCCESS;
-  };
-  let subcommand = match project_args[subcommand_index].to_str() {
+  }
+  let subcommand = match project_args.first().and_then(OsStr::to_str) {
     Some(value) => value,
     None => {
       return fail(
         started,
-        json,
+        globals,
         "project",
         args,
-        non_unicode_argument_diagnostic(&project_args[subcommand_index], "project command"),
+        non_unicode_argument_diagnostic(&project_args[0], "project command"),
       );
     },
   };
-  let operands = &project_args[subcommand_index + 1..];
-  let mut semantic_operands = operands.iter().filter(|argument| *argument != "--json");
+  let operands = project_args.slice_from(1);
+  let mut semantic_operands = operands.iter();
   if matches!(subcommand, "help" | "--help" | "-h")
     || (matches!(subcommand, "inspect" | "frameworks" | "runtime-packs" | "package-sources")
       && matches!(semantic_operands.next().and_then(|argument| argument.to_str()), Some("help" | "--help" | "-h"))
@@ -949,18 +971,18 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     return ExitCode::SUCCESS;
   }
   if subcommand == "runtime-packs" {
-    return project_runtime_packs(started, json, args, operands);
+    return project_runtime_packs(started, globals, args, operands);
   }
   if subcommand == "frameworks" {
-    return project_frameworks(started, json, args, operands);
+    return project_frameworks(started, globals, args, operands);
   }
   if subcommand == "package-sources" {
-    return project_package_sources(started, json, args, operands);
+    return project_package_sources(started, globals, args, operands);
   }
   if subcommand != "inspect" {
     return fail(
       started,
-      json,
+      globals,
       "project",
       args,
       diagnostic(
@@ -980,7 +1002,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         "project inspect",
         args,
         diagnostic(
@@ -997,7 +1019,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         "project inspect",
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -1006,7 +1028,7 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   };
   let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "project inspect", args, project_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project inspect", args, project_diagnostic(error)),
   };
 
   if !json {
@@ -1073,13 +1095,14 @@ fn run_project(started: Instant, json: bool, args: Vec<String>, project_args: &[
   succeed(started, "project inspect", args, payload)
 }
 
-fn project_package_sources(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
+fn project_package_sources(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
   let parsed = match parse_package_args("project package-sources", project_args) {
     Ok(options) => options,
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         "project package-sources",
         args,
         diagnostic(
@@ -1096,7 +1119,7 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         "project package-sources",
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -1106,15 +1129,15 @@ fn project_package_sources(started: Instant, json: bool, args: Vec<String>, proj
   let configuration = parsed.configuration.unwrap_or(ProjectConfiguration::Debug);
   let project = match load_project(&current_directory, parsed.project.as_deref(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "project package-sources", args, project_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project package-sources", args, project_diagnostic(error)),
   };
   let options = match normalize_package_options(parsed, &current_directory, false) {
     Ok(options) => options,
-    Err(problem) => return fail(started, json, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
+    Err(problem) => return fail(started, globals, "project package-sources", args, diagnostic("DV0002", problem, None, None)),
   };
   let inventories = match inspect_package_sources(&[&project], &options) {
     Ok(inventories) => inventories,
-    Err(error) => return fail(started, json, "project package-sources", args, package_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project package-sources", args, package_diagnostic(error)),
   };
   let inventory = &inventories[0];
   if !json {
@@ -1220,13 +1243,14 @@ fn write_package_sources(inventory: &PackageSourceInventory) -> ExitCode {
   ExitCode::SUCCESS
 }
 
-fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
+fn project_frameworks(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "frameworks") {
     Ok(options) => options,
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         "project frameworks",
         args,
         diagnostic(
@@ -1243,7 +1267,7 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         "project frameworks",
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -1252,18 +1276,18 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
   };
   let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "project frameworks", args, project_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project frameworks", args, project_diagnostic(error)),
   };
   let inventory = match discover_sdks(project.project_directory()) {
     Ok(inventory) => inventory,
     Err(error) => {
       let directory = project.project_directory();
-      return fail(started, json, "project frameworks", args, sdk_diagnostic(directory, error));
+      return fail(started, globals, "project frameworks", args, sdk_diagnostic(directory, error));
     },
   };
   let plans = match plan_framework_references(&[&project], &inventory, packages_directory.as_deref()) {
     Ok(plans) => plans,
-    Err(error) => return fail(started, json, "project frameworks", args, framework_reference_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project frameworks", args, framework_reference_diagnostic(error)),
   };
   let plan = &plans[0];
 
@@ -1301,13 +1325,14 @@ fn project_frameworks(started: Instant, json: bool, args: Vec<String>, project_a
   )
 }
 
-fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, project_args: &[OsString]) -> ExitCode {
+fn project_runtime_packs(started: Instant, globals: GlobalOptions, args: Vec<String>, project_args: CommandArguments<'_>) -> ExitCode {
+  let json = globals.json();
   let (requested_path, packages_directory, configuration) = match parse_pack_plan_args(project_args, "runtime-packs") {
     Ok(options) => options,
     Err(problem) => {
       return fail(
         started,
-        json,
+        globals,
         "project runtime-packs",
         args,
         diagnostic(
@@ -1324,7 +1349,7 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
     Err(error) => {
       return fail(
         started,
-        json,
+        globals,
         "project runtime-packs",
         args,
         diagnostic("DV0202", format!("failed to read the current directory: {error}"), None, None),
@@ -1333,18 +1358,18 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
   };
   let project = match load_project(&current_directory, requested_path.as_deref(), configuration) {
     Ok(project) => project,
-    Err(error) => return fail(started, json, "project runtime-packs", args, project_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project runtime-packs", args, project_diagnostic(error)),
   };
   let inventory = match discover_sdks(project.project_directory()) {
     Ok(inventory) => inventory,
     Err(error) => {
       let directory = project.project_directory();
-      return fail(started, json, "project runtime-packs", args, sdk_diagnostic(directory, error));
+      return fail(started, globals, "project runtime-packs", args, sdk_diagnostic(directory, error));
     },
   };
   let plan = match plan_runtime_packs(&project, &inventory, packages_directory.as_deref()) {
     Ok(plan) => plan,
-    Err(error) => return fail(started, json, "project runtime-packs", args, runtime_pack_diagnostic(error)),
+    Err(error) => return fail(started, globals, "project runtime-packs", args, runtime_pack_diagnostic(error)),
   };
 
   if !json {
@@ -1375,14 +1400,13 @@ fn project_runtime_packs(started: Instant, json: bool, args: Vec<String>, projec
   )
 }
 
-fn parse_pack_plan_args(arguments: &[OsString], command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_pack_plan_args(arguments: CommandArguments<'_>, command: &str) -> Result<(Option<PathBuf>, Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut packages = None;
   let mut configuration = None;
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].to_str() {
-      Some("--json") => {},
       Some("--packages") => {
         packages = Some(PathBuf::from(take_semantic_value(arguments, &mut index, false, "--packages requires a path")?));
       },
@@ -1409,13 +1433,12 @@ fn parse_pack_plan_args(arguments: &[OsString], command: &str) -> Result<(Option
   Ok((project, packages, configuration.unwrap_or(ProjectConfiguration::Debug)))
 }
 
-fn parse_project_args(arguments: &[OsString], ignore_plan: bool) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
+fn parse_project_args(arguments: CommandArguments<'_>, ignore_plan: bool) -> Result<(Option<PathBuf>, ProjectConfiguration), String> {
   let mut project = None;
   let mut configuration = ProjectConfiguration::Debug;
   let mut index = 0;
   while index < arguments.len() {
     match arguments[index].to_str() {
-      Some("--json") => {},
       Some("--plan") if ignore_plan => {},
       Some("-h" | "--help" | "help") => return Err("help must be requested as `dv project --help`".into()),
       Some("--configuration") => {
@@ -1811,17 +1834,17 @@ fn package_downgrade_diagnostics(resolution: &PackageResolution) -> Vec<Diagnost
     .collect()
 }
 
-fn load_sdk_inventory(started: Instant, json: bool, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
+fn load_sdk_inventory(started: Instant, globals: GlobalOptions, args: &[String]) -> Result<dv_core::SdkInventory, ExitCode> {
   let current_directory = env::current_dir().map_err(|error| {
     fail(
       started,
-      json,
+      globals,
       "sdk",
       args.to_vec(),
       diagnostic("DV0101", format!("failed to read the current directory: {error}"), None, None),
     )
   })?;
-  discover_sdks(&current_directory).map_err(|error| fail(started, json, "sdk", args.to_vec(), sdk_diagnostic(&current_directory, error)))
+  discover_sdks(&current_directory).map_err(|error| fail(started, globals, "sdk", args.to_vec(), sdk_diagnostic(&current_directory, error)))
 }
 
 fn sdk_diagnostic(current_directory: &Path, error: SdkError) -> Diagnostic {
@@ -2015,11 +2038,21 @@ fn succeed(started: Instant, command: &str, args: Vec<String>, payload: EventPay
   ExitCode::SUCCESS
 }
 
-fn succeed_batch_with_diagnostics(started: Instant, command: &str, args: Vec<String>, diagnostics: Vec<Diagnostic>, payloads: Vec<EventPayload>) -> ExitCode {
+fn succeed_batch_with_diagnostics(
+  started: Instant,
+  globals: GlobalOptions,
+  command: &str,
+  args: Vec<String>,
+  diagnostics: Vec<Diagnostic>,
+  payloads: Vec<EventPayload>,
+) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
   let mut events = Vec::with_capacity(diagnostics.len() + payloads.len() + 2);
   events.push(Event::new(0, 0, EventPayload::CommandStarted { command: command.into(), args }));
-  for diagnostic in diagnostics {
+  for diagnostic in diagnostics
+    .into_iter()
+    .filter(|diagnostic| diagnostic_visible(diagnostic.severity, globals.verbosity()))
+  {
     events.push(Event::new(events.len() as u64, elapsed_us, EventPayload::Diagnostic { diagnostic }));
   }
   for payload in payloads {
@@ -2038,15 +2071,28 @@ fn succeed_batch_with_diagnostics(started: Instant, command: &str, args: Vec<Str
   ExitCode::SUCCESS
 }
 
-fn write_human_diagnostics(diagnostics: &[Diagnostic]) {
+fn write_human_diagnostics(diagnostics: &[Diagnostic], globals: GlobalOptions) {
   let mut stderr = io::stderr().lock();
   for diagnostic in diagnostics {
+    if !diagnostic_visible(diagnostic.severity, globals.verbosity()) {
+      continue;
+    }
     let severity = match diagnostic.severity {
       Severity::Error => "error",
       Severity::Warning => "warning",
       Severity::Info => "info",
     };
-    writeln!(stderr, "{severity}[{}]: {}", diagnostic.code, diagnostic.message).expect("writing diagnostics to stderr succeeds");
+    let color = match diagnostic.severity {
+      Severity::Error => 31,
+      Severity::Warning => 33,
+      Severity::Info => 36,
+    };
+    let use_color = matches!(globals.color(), ColorChoice::Always) || (matches!(globals.color(), ColorChoice::Auto) && stderr.is_terminal());
+    if use_color {
+      writeln!(stderr, "\x1b[{color}m{severity}[{}]: {}\x1b[0m", diagnostic.code, diagnostic.message).expect("writing colored diagnostics to stderr succeeds");
+    } else {
+      writeln!(stderr, "{severity}[{}]: {}", diagnostic.code, diagnostic.message).expect("writing diagnostics to stderr succeeds");
+    }
     for field in &diagnostic.context {
       writeln!(stderr, "  {}: {}", field.name, field.value).expect("writing diagnostic context succeeds");
     }
@@ -2056,6 +2102,14 @@ fn write_human_diagnostics(diagnostics: &[Diagnostic]) {
     if let Some(help) = &diagnostic.help {
       writeln!(stderr, "  help: {help}").expect("writing diagnostic help succeeds");
     }
+  }
+}
+
+fn diagnostic_visible(severity: Severity, verbosity: DiagnosticVerbosity) -> bool {
+  match severity {
+    Severity::Error => true,
+    Severity::Warning => verbosity >= DiagnosticVerbosity::Minimal,
+    Severity::Info => verbosity >= DiagnosticVerbosity::Detailed,
   }
 }
 
@@ -2078,8 +2132,9 @@ fn non_unicode_argument_diagnostic(argument: &OsStr, meaning: &str) -> Diagnosti
   )
 }
 
-fn fail(started: Instant, json: bool, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
+fn fail(started: Instant, globals: GlobalOptions, command: &str, args: Vec<String>, diagnostic: Diagnostic) -> ExitCode {
   let elapsed_us = micros(started.elapsed());
+  let json = globals.json();
 
   if json {
     let events = [
@@ -2103,7 +2158,7 @@ fn fail(started: Instant, json: bool, command: &str, args: Vec<String>, diagnost
     ];
     write_json_lines(&events, io::stdout().lock()).expect("writing structured output to stdout succeeds");
   } else {
-    write_human_diagnostics(std::slice::from_ref(&diagnostic));
+    write_human_diagnostics(std::slice::from_ref(&diagnostic), globals);
   }
 
   ExitCode::from(2)
@@ -2116,6 +2171,7 @@ fn micros(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod argument_tests {
   use super::*;
+  use std::ffi::OsString;
 
   #[cfg(windows)]
   fn non_unicode_path() -> OsString {
@@ -2134,7 +2190,8 @@ mod argument_tests {
   #[test]
   fn project_path_operands_retain_their_os_encoding() {
     let path = non_unicode_path();
-    let (parsed, configuration) = parse_project_args(std::slice::from_ref(&path), false).unwrap();
+    let batch = InvocationBatch::capture([OsString::from("project"), path.clone()]);
+    let (parsed, configuration) = parse_project_args(batch.command_arguments(), false).unwrap();
 
     assert_eq!(parsed, Some(PathBuf::from(path)));
     assert_eq!(configuration, ProjectConfiguration::Debug);
@@ -2143,25 +2200,39 @@ mod argument_tests {
   #[test]
   fn option_path_values_retain_their_os_encoding() {
     let path = non_unicode_path();
-    let arguments = [OsString::from("--packages"), path.clone(), OsString::from("App.csproj")];
-    let parsed = parse_package_args("restore", &arguments).unwrap();
+    let batch = InvocationBatch::capture([
+      OsString::from("restore"),
+      OsString::from("--packages"),
+      path.clone(),
+      OsString::from("App.csproj"),
+    ]);
+    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
 
     assert_eq!(parsed.packages_directory, Some(PathBuf::from(path)));
   }
 
   #[test]
   fn global_json_does_not_become_an_option_value() {
-    let arguments = [OsString::from("--packages"), OsString::from("--json"), OsString::from("packages")];
-    let parsed = parse_package_args("restore", &arguments).unwrap();
+    let batch = InvocationBatch::capture(["restore", "--packages", "--json", "packages"].map(OsString::from));
+    let parsed = parse_package_args("restore", batch.command_arguments()).unwrap();
 
     assert_eq!(parsed.packages_directory, Some(PathBuf::from("packages")));
   }
 
   #[test]
   fn build_plan_marker_does_not_become_an_option_value() {
-    let arguments = [OsString::from("--configuration"), OsString::from("--plan"), OsString::from("Release")];
-    let (_, configuration) = parse_project_args(&arguments, true).unwrap();
+    let batch = InvocationBatch::capture(["build", "--configuration", "--plan", "Release"].map(OsString::from));
+    let (_, configuration) = parse_project_args(batch.command_arguments(), true).unwrap();
 
     assert_eq!(configuration, ProjectConfiguration::Release);
+  }
+
+  #[test]
+  fn diagnostic_verbosity_has_explicit_severity_boundaries() {
+    assert!(diagnostic_visible(Severity::Error, DiagnosticVerbosity::Quiet));
+    assert!(!diagnostic_visible(Severity::Warning, DiagnosticVerbosity::Quiet));
+    assert!(diagnostic_visible(Severity::Warning, DiagnosticVerbosity::Minimal));
+    assert!(!diagnostic_visible(Severity::Info, DiagnosticVerbosity::Normal));
+    assert!(diagnostic_visible(Severity::Info, DiagnosticVerbosity::Detailed));
   }
 }

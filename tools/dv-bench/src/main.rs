@@ -119,6 +119,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "sdk_current_globals",
+    kind: CaseKind::Startup,
+    args: &["--version"],
+    implemented: true,
+  },
+  Case {
     name: "rid_graph",
     kind: CaseKind::RidGraph,
     args: &["bin/Release/RidGraphOracle.dll", "linux-musl-x64"],
@@ -691,6 +697,12 @@ const DV_CASES: &[Case] = &[
     name: "sdk_current",
     kind: CaseKind::Startup,
     args: &["sdk", "current"],
+    implemented: true,
+  },
+  Case {
+    name: "sdk_current_globals",
+    kind: CaseKind::Startup,
+    args: &["sdk", "--quiet", "--no-color", "current"],
     implemented: true,
   },
   Case {
@@ -7596,6 +7608,7 @@ fn write_row(output: &mut String, widths: &[usize; 6], values: [&str; 6], bold: 
 fn case_label(case: &str) -> &str {
   match case {
     "sdk_current" => "SDK selection",
+    "sdk_current_globals" => "SDK selection + globals",
     "cli_version" => "CLI self-version",
     "project_evaluate" => "Project evaluation",
     "package_reference_conditions" => "Conditional references",

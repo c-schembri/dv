@@ -48,6 +48,47 @@ fn help_exposes_the_initial_command_surface() {
   assert!(stdout.contains("sync"));
   assert!(stdout.contains("project"));
   assert!(stdout.contains("--json"));
+  assert!(stdout.contains("--verbosity LEVEL"));
+  assert!(stdout.contains("--color | --no-color"));
+}
+
+#[test]
+fn global_output_options_normalize_before_and_after_the_command() {
+  let before = dv().args(["--quiet", "--json", "sdk", "current"]).output().unwrap();
+  let after = dv().args(["sdk", "--verbosity", "quiet", "current", "--json"]).output().unwrap();
+
+  assert!(before.status.success());
+  assert!(after.status.success());
+  assert!(before.stderr.is_empty());
+  assert!(after.stderr.is_empty());
+  assert!(String::from_utf8(before.stdout).unwrap().contains("\"type\":\"sdk_selected\""));
+  assert!(String::from_utf8(after.stdout).unwrap().contains("\"type\":\"sdk_selected\""));
+}
+
+#[test]
+fn malformed_globals_fail_before_project_discovery() {
+  let output = dv().args(["restore", "DefinitelyMissing.csproj", "--verbosity", "loud"]).output().unwrap();
+
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("unsupported diagnostic verbosity"));
+  assert!(!stderr.contains("DefinitelyMissing.csproj"));
+}
+
+#[test]
+fn explicit_color_policy_affects_only_human_diagnostics() {
+  let colored = dv().args(["frobnicate", "--color"]).output().unwrap();
+  let plain = dv().args(["frobnicate", "--no-color"]).output().unwrap();
+  let invalid_json = dv().args(["frobnicate", "--json", "--color"]).output().unwrap();
+
+  assert!(String::from_utf8(colored.stderr).unwrap().contains("\u{1b}[31merror[DV0001]"));
+  assert!(!String::from_utf8(plain.stderr).unwrap().contains('\u{1b}'));
+  assert!(invalid_json.stderr.is_empty());
+  assert!(
+    String::from_utf8(invalid_json.stdout)
+      .unwrap()
+      .contains("explicit color options cannot be combined with --json")
+  );
 }
 
 #[test]

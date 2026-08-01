@@ -147,7 +147,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Native CLI and self-version | Implemented |
+| Lossless typed CLI, global output policy, and self-version | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -391,6 +391,7 @@ Initial machine:
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Median ratio | Reference p95 | `dv` p95 |
 |---|---|---|---:|---:|---:|---:|---:|
 | Select current SDK | `dotnet --version` | `dv sdk current` | 69.660 ms | 6.102 ms | 11.4x | 72.407 ms | 7.247 ms |
+| Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
 | Evaluate TFM/RID/configuration conditional references | `dotnet msbuild ConditionalReferences.csproj --nologo -p:Configuration=Release` property/item query | `dv project inspect ConditionalReferences.csproj --configuration Release --json` | 288.983 ms | 4.765 ms | 60.6x | 321.422 ms | 6.209 ms |
@@ -653,6 +654,7 @@ Reproduce the comparison:
 
 ```powershell
 cargo bench-all --case sdk_current --samples 30 --warmups 3
+cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case rid_graph --samples 30 --warmups 3
 cargo bench-all --case project_evaluate --samples 30 --warmups 3
 cargo bench-all --case package_reference_conditions --samples 30 --warmups 3

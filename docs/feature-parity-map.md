@@ -269,7 +269,7 @@ contracts.
 - [x] `CLI-004` Offer one `--json` event stream for current commands.
 - [x] `CLI-005` Replace string matching with a typed, batch-first command
   request that retains lossless OS arguments where paths require it. `P1`
-- [ ] `CLI-006` Define global `--help`, `--version`, `--json`, `--verbose`,
+- [x] `CLI-006` Define global `--help`, `--version`, `--json`, `--verbose`,
   `--quiet`, `--color`, `--no-color`, and diagnostic verbosity behavior. `P1`
 - [ ] `CLI-007` Preserve the reference tool's documented and observed exit
   behavior in compatibility mode, then map it to stable native `dv` outcome
