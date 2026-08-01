@@ -654,6 +654,6 @@ mod tests {
     let batch = InvocationBatch::capture([OsString::from("restore"), path.clone()]);
 
     assert_eq!(batch.request().command, CommandKind::Restore);
-    assert_eq!(batch.command_arguments().first(), Some(&path));
+    assert_eq!(batch.command_arguments().first(), Some(path.as_os_str()));
   }
 }
