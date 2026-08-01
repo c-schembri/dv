@@ -397,13 +397,21 @@ contracts.
   prefixes/short forms, 74 argument records, declared environment and output
   contracts, four observed failure exits, and all 468 parity rows. Every
   captured child has a record; support is dimensional and missing work remains
-  explicit. `dv compat manifest` writes the embedded 270,082-byte artifact
+  explicit. The initial `dv compat manifest` query wrote a 270,082-byte artifact
   without discovery, parsing, allocation of a manifest model, filesystem, or
   network work. Thirty Windows samples measured `4.795 ms` median and
   `5.267 ms` p95; Microsoft has no equivalent query and is TBI. The
   like-for-like selected-SDK control remains `14.1x` faster. `P1`
-- [~] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
-  all accepted tool spellings into one typed command batch. `P1`
+- [x] `DROP-002` Store raw arguments once as lossless OS strings, then normalize
+  all accepted tool spellings into one typed command batch. All 19 accepted
+  spellings map to 14 exact semantic command kinds; `sync` and `restore` share
+  `Restore`, while raw spelling and compatibility provenance remain cold
+  reporting/failure-policy data. Moving the raw command index out of the hot
+  semantic record reduced it from 16 bytes at machine-word alignment to 6
+  bytes at alignment 2. The transform remains one linear scan with no new
+  allocation or I/O. Thirty Windows rejection samples measured `121.211 ms`
+  for `dotnet restore` and `5.462 ms` for normalized `dv sync`, a `22.2x`
+  median improvement; the SDK control remained `13.3x` faster. `P1`
 - [~] `DROP-003` Classify invocation mode deterministically before project,
   SDK, filesystem, process, or network work. `P1`
 - [ ] `DROP-004` Treat a first token matching a `.csproj`, `.fsproj`, `.vbproj`,

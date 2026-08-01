@@ -159,10 +159,10 @@ fn run() -> ExitCode {
   let started = Instant::now();
   let invocation = InvocationBatch::capture_process(env::args_os().skip(1));
   let request = invocation.request();
-  let globals = request.options();
+  let globals = invocation.options();
   let json = globals.json();
   let command_args = invocation.command_arguments();
-  let cancellation = if command_requires_cancellation(request.command(), invocation.command_text(), command_args) {
+  let cancellation = if command_requires_cancellation(request.command(), command_args) {
     match cancellation::install() {
       Ok(cancellation) => Some(cancellation),
       Err(problem) => {
@@ -224,24 +224,25 @@ fn run() -> ExitCode {
     CommandKind::Sdk => run_sdk(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Project => run_project(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
     CommandKind::Build => run_build(started, globals, invocation.event_arguments(json), command_args, cancellation.as_ref()),
-    CommandKind::Restore | CommandKind::Sync => {
+    CommandKind::Restore => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
       run_package_command(started, globals, command, invocation.event_arguments(json), command_args, cancellation.as_ref())
     },
     CommandKind::Compat => run_compat(started, globals, invocation.event_arguments(json), command_args),
-    CommandKind::KnownUnimplemented => {
+    CommandKind::Run | CommandKind::Test => {
       let command = invocation.command_text().expect("classified native commands are Unicode");
-      if matches!(command, "run" | "test") {
-        return unsupported_child_command(
-          started,
-          globals,
-          command,
-          invocation.event_arguments(json),
-          invocation.forwarded_arguments(),
-          ChildEnvironmentPlan::capture(invocation.environment_directives(), command_args),
-          cancellation.as_ref().expect("run/test commands install cancellation"),
-        );
-      }
+      unsupported_child_command(
+        started,
+        globals,
+        command,
+        invocation.event_arguments(json),
+        invocation.forwarded_arguments(),
+        ChildEnvironmentPlan::capture(invocation.environment_directives(), command_args),
+        cancellation.as_ref().expect("run/test commands install cancellation"),
+      )
+    },
+    CommandKind::Init | CommandKind::Add | CommandKind::Remove | CommandKind::Pack | CommandKind::Publish => {
+      let command = invocation.command_text().expect("classified native commands are Unicode");
       unsupported(
         started,
         globals,
@@ -304,12 +305,9 @@ fn run() -> ExitCode {
   }
 }
 
-fn command_requires_cancellation(command: CommandKind, command_text: Option<&str>, command_args: CommandArguments<'_>) -> bool {
-  let work_command = matches!(
-    command,
-    CommandKind::Sdk | CommandKind::Project | CommandKind::Build | CommandKind::Restore | CommandKind::Sync
-  );
-  (work_command && !command_help_only(command, command_args)) || matches!((command, command_text), (CommandKind::KnownUnimplemented, Some("run" | "test")))
+fn command_requires_cancellation(command: CommandKind, command_args: CommandArguments<'_>) -> bool {
+  let work_command = matches!(command, CommandKind::Sdk | CommandKind::Project | CommandKind::Build | CommandKind::Restore);
+  (work_command && !command_help_only(command, command_args)) || matches!(command, CommandKind::Run | CommandKind::Test)
 }
 
 fn run_compat(started: Instant, globals: InvocationOptions, args: Vec<String>, command_args: CommandArguments<'_>) -> ExitCode {
@@ -2893,7 +2891,7 @@ mod argument_tests {
   fn only_work_bearing_commands_install_cancellation() {
     fn requires(arguments: &[&str]) -> bool {
       let batch = InvocationBatch::capture(arguments.iter().map(OsString::from));
-      command_requires_cancellation(batch.request().command(), batch.command_text(), batch.command_arguments())
+      command_requires_cancellation(batch.request().command(), batch.command_arguments())
     }
 
     for arguments in [

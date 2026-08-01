@@ -50,9 +50,14 @@ pub(crate) enum CommandKind {
   Project,
   Build,
   Restore,
-  Sync,
   Compat,
-  KnownUnimplemented,
+  Init,
+  Add,
+  Remove,
+  Run,
+  Test,
+  Pack,
+  Publish,
   Unknown,
   InvalidText,
   InvalidOptions,
@@ -191,9 +196,7 @@ const _: () = assert!(align_of::<InvocationOptions>() == 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InvocationRequest {
-  command_index: usize,
   syntax_version: CommandSyntaxVersion,
-  mode: InvocationMode,
   command: CommandKind,
   globals: GlobalOptions,
 }
@@ -206,23 +209,18 @@ impl InvocationRequest {
   pub(crate) fn command(self) -> CommandKind {
     self.command
   }
-
-  pub(crate) fn options(self) -> InvocationOptions {
-    InvocationOptions {
-      mode: self.mode,
-      globals: self.globals,
-    }
-  }
 }
 
-const _: () = assert!(size_of::<InvocationRequest>() == 16);
-const _: () = assert!(align_of::<InvocationRequest>() == align_of::<usize>());
+const _: () = assert!(size_of::<InvocationRequest>() == 6);
+const _: () = assert!(align_of::<InvocationRequest>() == 2);
 
 pub(crate) struct InvocationBatch {
   raw_arguments: RawArguments,
   semantic_indices: Option<SemanticIndices>,
   forwarded_index: Option<NonZeroUsize>,
+  command_index: usize,
   request: InvocationRequest,
+  mode: InvocationMode,
   option_error: Option<String>,
 }
 
@@ -458,13 +456,13 @@ impl InvocationBatch {
       raw_arguments,
       semantic_indices,
       forwarded_index,
+      command_index: command_index.unwrap_or(usize::MAX),
       request: InvocationRequest {
-        command_index: command_index.unwrap_or(usize::MAX),
         syntax_version: COMMAND_SYNTAX_VERSION,
-        mode,
         command,
         globals,
       },
+      mode,
       option_error,
     }
   }
@@ -473,16 +471,23 @@ impl InvocationBatch {
     self.request
   }
 
+  pub(crate) fn options(&self) -> InvocationOptions {
+    InvocationOptions {
+      mode: self.mode,
+      globals: self.request.globals,
+    }
+  }
+
   pub(crate) fn command_text(&self) -> Option<&str> {
     self.command_os().and_then(OsStr::to_str)
   }
 
   pub(crate) fn command_os(&self) -> Option<&OsStr> {
-    self.raw_arguments.get(self.request.command_index).map(OsString::as_os_str)
+    self.raw_arguments.get(self.command_index).map(OsString::as_os_str)
   }
 
   pub(crate) fn command_arguments(&self) -> CommandArguments<'_> {
-    let start = self.request.command_index.saturating_add(1);
+    let start = self.command_index.saturating_add(1);
     let end = self.forwarded_index.map(|index| index.get() - 1);
     CommandArguments {
       storage: self.semantic_indices.as_ref().map_or_else(
@@ -710,17 +715,22 @@ fn classify_command(command: &OsStr) -> CommandKind {
     Some("sdk") => CommandKind::Sdk,
     Some("project") => CommandKind::Project,
     Some("build") => CommandKind::Build,
-    Some("restore") => CommandKind::Restore,
-    Some("sync") => CommandKind::Sync,
+    Some("restore" | "sync") => CommandKind::Restore,
     Some("compat") => CommandKind::Compat,
-    Some("init" | "add" | "remove" | "run" | "test" | "pack" | "publish") => CommandKind::KnownUnimplemented,
+    Some("init") => CommandKind::Init,
+    Some("add") => CommandKind::Add,
+    Some("remove") => CommandKind::Remove,
+    Some("run") => CommandKind::Run,
+    Some("test") => CommandKind::Test,
+    Some("pack") => CommandKind::Pack,
+    Some("publish") => CommandKind::Publish,
     Some(_) => CommandKind::Unknown,
     None => CommandKind::InvalidText,
   }
 }
 
 fn accepts_forwarded_arguments(command: &OsStr) -> bool {
-  matches!(command.to_str(), Some("run" | "test"))
+  matches!(classify_command(command), CommandKind::Run | CommandKind::Test)
 }
 
 #[cfg(test)]
@@ -732,9 +742,9 @@ mod tests {
     let batch = InvocationBatch::capture(["--json", "restore", "", "App.csproj"].map(OsString::from));
 
     assert_eq!(batch.request().syntax_version, COMMAND_SYNTAX_VERSION);
-    assert_eq!(batch.request().mode, InvocationMode::Native);
+    assert_eq!(batch.mode, InvocationMode::Native);
     assert_eq!(batch.request().command, CommandKind::Restore);
-    assert!(batch.request().options().json());
+    assert!(batch.options().json());
     assert_eq!(batch.command_text(), Some("restore"));
     assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new(""), OsStr::new("App.csproj")]);
     assert_eq!(batch.raw_arguments(), ["--json", "restore", "", "App.csproj"]);
@@ -753,14 +763,14 @@ mod tests {
     let inherited = InvocationBatch::capture_with_environment([OsString::from("version")], environment);
     let overridden = InvocationBatch::capture_with_environment(["--no-color", "--verbosity", "minimal", "version"].map(OsString::from), environment);
 
-    assert_eq!(inherited.request().options().color(), ColorChoice::Always);
-    assert_eq!(inherited.request().options().verbosity(), DiagnosticVerbosity::Diagnostic);
-    assert_eq!(overridden.request().options().color(), ColorChoice::Never);
-    assert_eq!(overridden.request().options().verbosity(), DiagnosticVerbosity::Minimal);
+    assert_eq!(inherited.options().color(), ColorChoice::Always);
+    assert_eq!(inherited.options().verbosity(), DiagnosticVerbosity::Diagnostic);
+    assert_eq!(overridden.options().color(), ColorChoice::Never);
+    assert_eq!(overridden.options().verbosity(), DiagnosticVerbosity::Minimal);
 
     let standard = InvocationEnvironment::capture_with(|name| (name == "NO_COLOR").then(|| "1".into()));
     let no_color = InvocationBatch::capture_with_environment([OsString::from("version")], standard);
-    assert_eq!(no_color.request().options().color(), ColorChoice::Never);
+    assert_eq!(no_color.options().color(), ColorChoice::Never);
   }
 
   #[test]
@@ -897,11 +907,11 @@ mod tests {
       opaque.clone(),
     ]);
 
-    assert_eq!(batch.request().command, CommandKind::KnownUnimplemented);
-    assert_eq!(batch.request().options().verbosity(), DiagnosticVerbosity::Quiet);
+    assert_eq!(batch.request().command, CommandKind::Run);
+    assert_eq!(batch.options().verbosity(), DiagnosticVerbosity::Quiet);
     assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("project.csproj")]);
     let forwarded = batch.forwarded_arguments().expect("delimiter creates a forwarded batch");
-    assert_eq!(batch.request().mode, InvocationMode::Native);
+    assert_eq!(batch.mode, InvocationMode::Native);
     assert_eq!(forwarded.as_slice().len(), 5);
     assert_eq!(
       forwarded.as_slice(),
@@ -976,12 +986,72 @@ mod tests {
   }
 
   #[test]
+  fn every_accepted_spelling_normalizes_without_losing_the_raw_command() {
+    let cases = [
+      ("-h", CommandKind::Help),
+      ("--help", CommandKind::Help),
+      ("help", CommandKind::Help),
+      ("-V", CommandKind::Version),
+      ("--version", CommandKind::Version),
+      ("version", CommandKind::Version),
+      ("sdk", CommandKind::Sdk),
+      ("project", CommandKind::Project),
+      ("build", CommandKind::Build),
+      ("restore", CommandKind::Restore),
+      ("sync", CommandKind::Restore),
+      ("compat", CommandKind::Compat),
+      ("init", CommandKind::Init),
+      ("add", CommandKind::Add),
+      ("remove", CommandKind::Remove),
+      ("run", CommandKind::Run),
+      ("test", CommandKind::Test),
+      ("pack", CommandKind::Pack),
+      ("publish", CommandKind::Publish),
+    ];
+
+    for (spelling, expected) in cases {
+      let batch = InvocationBatch::capture([OsString::from(spelling), OsString::from("operand")]);
+      assert_eq!(batch.request().command(), expected, "{spelling}");
+      assert_eq!(batch.command_text(), Some(spelling));
+      assert_eq!(batch.command_arguments().first(), Some(OsStr::new("operand")));
+    }
+  }
+
+  #[test]
+  fn aliases_and_compatibility_provenance_share_the_semantic_request() {
+    let restore = InvocationBatch::capture([OsString::from("restore"), OsString::from("App.csproj")]);
+    let sync = InvocationBatch::capture([OsString::from("sync"), OsString::from("App.csproj")]);
+    let dotnet = InvocationBatch::capture([
+      OsString::from("--compat"),
+      OsString::from("dotnet"),
+      OsString::from("restore"),
+      OsString::from("App.csproj"),
+    ]);
+
+    assert_eq!(restore.request(), sync.request());
+    assert_eq!(restore.request(), dotnet.request());
+    assert_eq!(
+      restore.command_arguments().iter().collect::<Vec<_>>(),
+      sync.command_arguments().iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+      restore.command_arguments().iter().collect::<Vec<_>>(),
+      dotnet.command_arguments().iter().collect::<Vec<_>>()
+    );
+    assert_eq!(restore.command_text(), Some("restore"));
+    assert_eq!(sync.command_text(), Some("sync"));
+    assert_eq!(dotnet.command_text(), Some("restore"));
+    assert_eq!(restore.options().mode, InvocationMode::Native);
+    assert_eq!(dotnet.options().mode, InvocationMode::Dotnet);
+  }
+
+  #[test]
   fn globals_normalize_before_and_after_the_command() {
     let batch = InvocationBatch::capture(["--quiet", "restore", "App.csproj", "--verbosity", "diagnostic", "--no-color"].map(OsString::from));
 
     assert_eq!(batch.request().command, CommandKind::Restore);
-    assert_eq!(batch.request().options().verbosity(), DiagnosticVerbosity::Diagnostic);
-    assert_eq!(batch.request().options().color(), ColorChoice::Never);
+    assert_eq!(batch.options().verbosity(), DiagnosticVerbosity::Diagnostic);
+    assert_eq!(batch.options().color(), ColorChoice::Never);
     assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("App.csproj")]);
     assert!(matches!(batch.semantic_indices, Some(SemanticIndices::Inline { .. })));
   }
@@ -1048,17 +1118,15 @@ mod tests {
         OsString::from("current"),
       ]);
 
-      assert_eq!(batch.request().options().mode, expected);
+      assert_eq!(batch.options().mode, expected);
       assert_eq!(batch.command_arguments().iter().collect::<Vec<_>>(), [OsStr::new("current")]);
     }
   }
 
   #[test]
   fn compatibility_mode_uses_reference_failure_codes() {
-    let native = InvocationBatch::capture([OsString::from("frobnicate")]).request().options();
-    let compat = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("frobnicate")])
-      .request()
-      .options();
+    let native = InvocationBatch::capture([OsString::from("frobnicate")]).options();
+    let compat = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("frobnicate")]).options();
 
     for class in [FailureClass::Usage, FailureClass::Unsupported, FailureClass::Operation] {
       assert_eq!(native.failure_exit_code(class), 2);

@@ -153,7 +153,7 @@ The project is in the first implementation phase.
 
 | Capability | Status |
 |---|---|
-| Lossless typed CLI, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
+| Lossless typed CLI, command-spelling normalization, environment precedence, secret-safe reporting, child-argument forwarding, early option rejection, global output policy, compatibility exit profiles, child termination classification, and independent command/event protocol versions | Implemented |
 | Installed SDK discovery | Implemented |
 | `global.json` SDK selection | Implemented |
 | Initial SDK-style project evaluation | Implemented |
@@ -216,6 +216,13 @@ independently. `dv --json --version` reports the executable and both protocol
 versions in one validated event batch, while human `dv --version` remains
 unchanged. Version aliases normalize to the same typed command and cannot
 select a different wire schema.
+
+All 19 command spellings currently accepted by `dv` normalize to 14 exact
+semantic kinds. In particular, `sync` and `restore` share one `Restore`
+request; the original OS spelling remains only in the cold argument owner for
+diagnostics and events. Compatibility provenance is likewise separate from
+semantics. This keeps the hot request at 6 bytes rather than carrying the raw
+command index through dispatch.
 
 `dv compat manifest` emits compatibility manifest version `1` as a static JSON
 artifact. It records the selected .NET 10 SDK, MSBuild, NuGet, and VSTest
@@ -440,6 +447,8 @@ baseline because Microsoft has no equivalent dual-version query. See the
 The generated compatibility manifest has its own structural baseline because
 Microsoft publishes no equivalent query. See the
 [compatibility-manifest baseline](docs/performance-baselines/2026-08-01-compatibility-manifest-windows.md).
+Accepted command spelling normalization has a like-for-like pre-I/O baseline
+in the [command-normalization evidence](docs/performance-baselines/2026-08-01-cli-command-normalization-windows.md).
 
 Initial machine:
 
@@ -458,8 +467,8 @@ Initial machine:
   credentials, credential providers, the
   framework-reference plan,
   unavailable-pack diagnostic, 203-package asset plan, and one-package cold
-  case; cancellation-ready SDK selection, compiler planning, and cold/warm
-  signed-package validation use 5 warm-ups; 10
+  case; command normalization, cancellation-ready SDK selection, compiler
+  planning, and cold/warm signed-package validation use 5 warm-ups; 10
   retained samples after 2 warm-ups for the large cold graph; warm locked
   restore uses 10 retained samples after 3 warm-ups; the massive graph uses
   5 retained samples after 1 warm-up
@@ -472,6 +481,7 @@ Initial machine:
 | Select current SDK with typed global output policy | `dotnet --version` | `dv sdk --quiet --no-color current` | 74.362 ms | 6.986 ms | 10.6x | 78.493 ms | 7.957 ms |
 | Select current SDK through the `dotnet` compatibility profile | `dotnet --version` | `dv --compat dotnet sdk current` | 65.901 ms | 5.225 ms | 12.6x | 67.752 ms | 6.202 ms |
 | Reject an unknown build option before unrelated work | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 125.249 ms | 4.406 ms | 28.4x | 130.131 ms | 5.615 ms |
+| Normalize `sync` to restore and reject an invalid option before work | `dotnet restore --definitely-unknown` | `dv sync --definitely-unknown` | 121.211 ms | 5.462 ms | 22.2x | 128.378 ms | 6.337 ms |
 | Apply environment defaults and reject an unknown option without exposing environment data | `dotnet build --definitely-unknown` | `dv build --definitely-unknown` | 134.218 ms | 5.503 ms | 24.4x | 150.374 ms | 6.314 ms |
 | Expand a portable RID | `dotnet bin/Release/RidGraphOracle.dll linux-musl-x64` | `dv sdk compatible-rids linux-musl-x64` | 36.217 ms | 6.049 ms | 6.0x | 39.263 ms | 6.859 ms |
 | Evaluate small project | `dotnet msbuild SmallConsole.csproj` property/item query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x | 287.600 ms | 4.074 ms |
@@ -747,6 +757,7 @@ Reproduce the comparison:
 cargo bench-all --case sdk_current --samples 30 --warmups 3
 cargo bench-all --case sdk_current_globals --samples 30 --warmups 3
 cargo bench-all --case sdk_current_compat --samples 30 --warmups 3
+cargo bench-all --case cli_command_normalization --samples 30 --warmups 5
 cargo bench-all --case cli_cancellation --samples 30 --warmups 5
 cargo bench-all --case cli_unknown_option --samples 30 --warmups 3
 cargo bench-all --case cli_environment --samples 30 --warmups 3

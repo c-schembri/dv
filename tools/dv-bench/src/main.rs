@@ -24,6 +24,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 enum CaseKind {
   Startup,
   CliUnknownOption,
+  CliCommandNormalization,
   CliEnvironment,
   CliForwarding,
   CliChildExit,
@@ -145,6 +146,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "cli_unknown_option",
     kind: CaseKind::CliUnknownOption,
     args: &["build", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
+    name: "cli_command_normalization",
+    kind: CaseKind::CliCommandNormalization,
+    args: &["restore", "--definitely-unknown"],
     implemented: true,
   },
   Case {
@@ -789,6 +796,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_command_normalization",
+    kind: CaseKind::CliCommandNormalization,
+    args: &["sync", "--definitely-unknown"],
+    implemented: true,
+  },
+  Case {
     name: "cli_environment",
     kind: CaseKind::CliEnvironment,
     args: &["build", "--definitely-unknown"],
@@ -1297,6 +1310,9 @@ fn run() -> Result<()> {
   if options.case.as_deref().is_none_or(|case| case == "cli_unknown_option") {
     verify_unknown_option_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-unknown-option"))?;
   }
+  if options.case.as_deref().is_none_or(|case| case == "cli_command_normalization") {
+    verify_command_normalization_boundary(&dv_executable, &fixture, &workspace.join("verify-cli-command-normalization"))?;
+  }
   if options.case.as_deref().is_none_or(|case| case == "cli_environment") {
     verify_environment_boundary(
       &dv_executable,
@@ -1550,6 +1566,45 @@ fn validate_unknown_option_failure(output: &Output, reference: bool) -> Result<(
     if text.contains("error[DV01") || text.contains("error[DV02") {
       return Err(format!("dv unknown-option command performed discovery before rejection: {text}").into());
     }
+  }
+  Ok(())
+}
+
+fn verify_command_normalization_boundary(dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  for (executable, name, arguments, reference) in [
+    (Path::new("dotnet"), "dotnet", &["restore", "--definitely-unknown"][..], true),
+    (dv_executable, "dv", &["sync", "--definitely-unknown"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_command_normalization_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} command-normalization preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn validate_command_normalization_failure(output: &Output, reference: bool) -> Result<()> {
+  if output.status.success() {
+    return Err("command-normalization boundary unexpectedly succeeded".into());
+  }
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    let lower = text.to_ascii_lowercase();
+    if output.status.code() != Some(1) || !text.contains("MSB1001") || !lower.contains("unknown switch") || !text.contains("--definitely-unknown") {
+      return Err(format!("dotnet restore normalization oracle omitted MSB1001/Unknown switch: {text}").into());
+    }
+  } else if output.status.code() != Some(2)
+    || !output.stdout.is_empty()
+    || !text.contains("error[DV0002]")
+    || !text.contains("unknown sync option \"--definitely-unknown\"")
+  {
+    return Err(format!("dv sync did not retain its raw spelling at the typed restore rejection boundary: {text}").into());
+  } else if text.contains("error[DV01") || text.contains("error[DV02") {
+    return Err(format!("dv sync performed discovery before normalized rejection: {text}").into());
   }
   Ok(())
 }
@@ -5842,6 +5897,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::NugetHttpPolicy
       | CaseKind::NugetSourceSecurity
       | CaseKind::CliUnknownOption
+      | CaseKind::CliCommandNormalization
       | CaseKind::CliEnvironment
       | CaseKind::CliForwarding
       | CaseKind::CliChildExit
@@ -7283,6 +7339,7 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: &Path) -> Result<()> {
   match case.kind {
     CaseKind::CliUnknownOption
+    | CaseKind::CliCommandNormalization
     | CaseKind::CliEnvironment
     | CaseKind::CliForwarding
     | CaseKind::CliChildExit
@@ -7485,6 +7542,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_pack_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliUnknownOption) {
     validate_unknown_option_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::CliCommandNormalization) {
+    validate_command_normalization_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliEnvironment) {
     validate_environment_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::CliForwarding) {
@@ -8385,6 +8444,7 @@ fn case_label(case: &str) -> &str {
     "sdk_current_globals" => "SDK selection + globals",
     "sdk_current_compat" => "SDK selection + compatibility",
     "cli_unknown_option" => "Unknown-option rejection",
+    "cli_command_normalization" => "Command spelling normalization",
     "cli_environment" => "Environment precedence + redaction",
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
     "cli_child_exit" => "Child exit policy (run TBI)",

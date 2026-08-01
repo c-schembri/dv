@@ -30,10 +30,12 @@ and operation failures to `2`, preserving `CLI-003` and existing automation.
 ## Typed Boundary
 
 `InvocationMode` is a one-byte enum selected by
-`--compat dotnet|msbuild|nuget|vstest`. It lives beside the three-byte global
-output record in a four-byte `InvocationOptions` value. `InvocationRequest`
-remains 16 bytes and pointer-aligned, so compatibility does not enlarge the hot
-dispatch record or add an allocation.
+`--compat dotnet|msbuild|nuget|vstest`. The process-lifetime invocation owner
+retains it as cold provenance and combines it with the three-byte global output
+record only when producing a four-byte `InvocationOptions` value. The semantic
+`InvocationRequest` no longer carries provenance or the raw command index: it
+is 6 bytes at alignment 2, so compatibility does not enlarge the hot dispatch
+record or add an allocation.
 
 The parser removes the selector from semantic command operands during its one
 linear argument scan. Selection therefore completes before current-directory,

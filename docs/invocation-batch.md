@@ -1,8 +1,9 @@
 # Invocation Batch Contract
 
-`CLI-005` establishes the process-entry transform used by later canonical and
-compatibility grammars. Compatibility aliases and their generated manifest are
-separate open rows in the parity map.
+`CLI-005` establishes the process-entry transform used by canonical and
+compatibility grammars. `DROP-002` makes every currently accepted spelling
+normalize to one exact semantic command kind while retaining the original OS
+tokens only in the owning batch.
 
 ## Observed Input
 
@@ -29,8 +30,9 @@ batches preserve behavior through contiguous spill storage.`
    multi-token batch, retaining the exact platform encoding.
 3. One linear, predictable scan -> typed global output policy and first
    semantic token.
-4. First semantic token -> a typed native or explicit compatibility request before SDK,
-   current-directory, project, filesystem, process, or network access.
+4. First semantic token -> one of 14 exact semantic command kinds before SDK,
+   current-directory, project, filesystem, process, or network access. The raw
+   command index and compatibility provenance stay outside the hot request.
 5. Command operands -> borrowed views. Text-only positions reject invalid
    Unicode; path positions construct `PathBuf` directly from the OS string.
 6. JSON reporting -> display strings allocated and secret-shaped values
@@ -77,8 +79,8 @@ pre-discovery usage failure that names only the variable, never its value.
 The transient environment policy is five bytes with byte alignment and compile
 time layout checks. Safe values become enums immediately; invalid raw values
 are dropped without entering a diagnostic. Unset variables allocate nothing.
-The 16-byte invocation request and its common dispatch/cache behavior remain
-unchanged.
+The semantic invocation request is 6 bytes at alignment 2. Environment and
+output policy do not enlarge it.
 
 At the output edge, JSON argument materialization preserves argument count and
 order while replacing separated and combined API keys, passwords, tokens,
@@ -123,19 +125,23 @@ comparison is case-sensitive.
 `CLI-007` adds a one-byte compatibility mode selected by `--compat
 dotnet|msbuild|nuget|vstest`. It follows the same linear scan and indexed-view
 rules as output globals, so the selector is removed from semantic operands
-without copying tokens. Mode plus output policy forms one four-byte options
-record. Exit mappings and their pinned oracle evidence are documented in
+without copying tokens. Mode is cold provenance rather than part of the
+semantic request; mode plus output policy forms one four-byte options record.
+Exit mappings and their pinned oracle evidence are documented in
 [exit-behavior.md](exit-behavior.md).
 
 ## Layout And Access
 
-`InvocationRequest` is 16 bytes and aligned to `usize` on supported 64-bit
-targets. Its layout is protected by compile-time assertions. The raw token
-array is contiguous; capture and classification are linear. Command dispatch
-reads the hot request record once, while cold raw text is read only by the
-selected parser and reporter. No cache-line alignment is added: one request is
-read-only, never shared between workers, and padding it to the assumed 64-byte
-benchmark cache line would waste 48 bytes without reducing contention.
+`InvocationRequest` is 6 bytes and aligned to 2 on every supported target: a
+two-byte syntax version, one-byte semantic command, and three-byte output
+policy. Its layout is protected by compile-time assertions. Ten requests fit
+in an assumed 64-byte cache line with four bytes unused, although production
+owns only one request per process. The raw command index and one-byte
+compatibility provenance remain in the cold owning batch. The raw token array
+is contiguous; capture and classification are linear. Command dispatch reads
+the hot request once, while cold raw text is read only by the selected parser
+and reporter. Explicit cache-line alignment would waste 58 bytes and cannot
+prevent contention because the request is read-only and not shared.
 
 The borrowed command-argument view is 32 bytes and aligned to `usize`, allowing
 two views per assumed 64-byte cache line. Its tagged storage packs either one
@@ -200,8 +206,10 @@ environment, cancellation, and child-exit contracts.
 - Command names and text-only SDK operands must be valid Unicode.
 - Paths remain lossless OS strings until consumed by filesystem APIs.
 - The command syntax version is `1` and is independent of the JSON event schema.
-- Native and explicit compatibility modes exist. Automatic grammar inference,
-  aliases, and precedence remain partial under `DROP-002` and `DROP-003`.
+- Every currently accepted alias normalizes to one semantic command kind.
+  Automatic grammar inference and precedence remain partial under `DROP-003`;
+  future compatibility aliases remain explicitly unsupported in their owning
+  `DROP-*` rows.
 - Automatic drop-in forwarding aliases remain open under `DROP-013`; no
   unsupported syntax is silently accepted by this contract.
 
@@ -212,7 +220,7 @@ regresses beyond benchmark noise relative to the prior release baseline.
 ## Independent Protocol Versions
 
 `CLI-017` stores command syntax version 1 as a two-byte transparent value in
-the existing 16-byte invocation request. Event schema version 19 remains a
+the 6-byte invocation request. Event schema version 19 remains a
 reporter constant. `version`, `--version`, `-V`, and `--compat dotnet version`
 all produce the same typed `version` request; the original alias tokens remain
 only in the reporter-safe argument batch.
@@ -333,3 +341,11 @@ p95, while `dv sdk current` measured `4.828 ms` median and `5.252 ms` p95,
 leaving `dv` `13.1x` faster at the median. Raw samples are retained as
 `benchmarks/results/2026-08-01-cli-protocol-version-windows.json` and
 `benchmarks/results/2026-08-01-cli-protocol-version-sdk-control-windows.json`.
+
+`DROP-002` validates all 19 accepted spellings in unit coverage and measures
+`dotnet restore --definitely-unknown` against normalized `dv sync
+--definitely-unknown`. Thirty retained samples after five warm-ups measured
+`121.211 ms` versus `5.462 ms` median and `128.378 ms` versus `6.337 ms` p95,
+so `dv` is `22.2x` faster at this like-for-like pre-I/O boundary. The SDK
+control remained `13.3x` faster. Full evidence is retained in the
+[command-normalization baseline](performance-baselines/2026-08-01-cli-command-normalization-windows.md).

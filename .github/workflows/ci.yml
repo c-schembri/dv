@@ -40,6 +40,8 @@ jobs:
         run: cargo run -p dv-bench -- --case sdk_current --samples 1 --warmups 0 --output target/benchmark-smoke.json
       - name: Run compatibility manifest benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_compat_manifest --samples 1 --warmups 0 --output target/benchmark-compat-manifest-smoke.json
+      - name: Run command normalization benchmark smoke test
+        run: cargo run -p dv-bench -- --case cli_command_normalization --samples 1 --warmups 0 --output target/benchmark-command-normalization-smoke.json
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-smoke
