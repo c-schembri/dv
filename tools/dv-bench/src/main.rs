@@ -107,6 +107,7 @@ enum CaseKind {
   RidGraph,
   RepositoryRoot,
   WorkspaceInputs,
+  PathIdentity,
   ProjectEvaluate,
   PackageReferenceConditions,
   RuntimeEvaluate,
@@ -164,6 +165,7 @@ struct Fixtures<'a> {
   small: &'a Path,
   repository_root: &'a Path,
   workspace_inputs: &'a Path,
+  path_identity: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
@@ -366,6 +368,12 @@ const DOTNET_CASES: &[Case] = &[
       "--nologo",
       "-getProperty:GlobalJson,NuGetConfigs,DirectoryBuildProps,DirectoryBuildTargets,DirectoryPackagesProps",
     ],
+    implemented: true,
+  },
+  Case {
+    name: "path_identity",
+    kind: CaseKind::PathIdentity,
+    args: &["msbuild", "Microsoft.proj", "--nologo", "-t:ResolveProjectIdentities"],
     implemented: true,
   },
   Case {
@@ -1096,6 +1104,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "path_identity",
+    kind: CaseKind::PathIdentity,
+    args: &["restore", "Root.csproj", "--offline", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
@@ -1501,6 +1515,7 @@ fn run() -> Result<()> {
   let fixture = repository.join("benchmarks/fixtures/small-console");
   let repository_root_fixture = repository.join("benchmarks/fixtures/repository-root");
   let workspace_inputs_fixture = repository.join("benchmarks/fixtures/workspace-inputs");
+  let path_identity_fixture = repository.join("benchmarks/fixtures/path-identity");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
@@ -1536,6 +1551,7 @@ fn run() -> Result<()> {
     small: &fixture,
     repository_root: &repository_root_fixture,
     workspace_inputs: &workspace_inputs_fixture,
+    path_identity: &path_identity_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
@@ -1656,6 +1672,9 @@ fn run() -> Result<()> {
       &workspace_inputs_fixture,
       &workspace.join("verify-workspace-inputs"),
     )?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "path_identity") {
+    verify_path_identity(&repository, &dv_executable, &path_identity_fixture, &workspace.join("verify-path-identity"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
@@ -3124,6 +3143,29 @@ fn verify_workspace_inputs(repository: &Path, dv_executable: &Path, fixture: &Pa
   let after = snapshot_tree(workspace)?;
   if before != after {
     return Err("workspace-input queries mutated the fixture".into());
+  }
+  Ok(())
+}
+
+fn verify_path_identity(repository: &Path, dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, verification)?;
+  for (executable, name, arguments, reference) in [
+    (
+      Path::new("dotnet"),
+      "dotnet",
+      &["msbuild", "Microsoft.proj", "--nologo", "-t:ResolveProjectIdentities"][..],
+      true,
+    ),
+    (dv_executable, "dv", &["restore", "Root.csproj", "--offline", "--json"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_path_identity_failure(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} path-identity preflight mutated the input workspace").into());
+    }
   }
   Ok(())
 }
@@ -6943,6 +6985,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
     CaseKind::RidGraph
       | CaseKind::RepositoryRoot
       | CaseKind::WorkspaceInputs
+      | CaseKind::PathIdentity
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
@@ -8454,6 +8497,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::RidGraph
     | CaseKind::RepositoryRoot
     | CaseKind::WorkspaceInputs
+    | CaseKind::PathIdentity
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -8546,6 +8590,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::RidGraph => fixtures.rid_graph,
     CaseKind::RepositoryRoot => fixtures.repository_root,
     CaseKind::WorkspaceInputs => fixtures.workspace_inputs,
+    CaseKind::PathIdentity => fixtures.path_identity,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
@@ -8586,6 +8631,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::RidGraph => Some("rid-graph-oracle"),
     CaseKind::RepositoryRoot => Some("repository-root"),
     CaseKind::WorkspaceInputs => Some("workspace-inputs"),
+    CaseKind::PathIdentity => Some("path-identity"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
@@ -8691,6 +8737,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_repository_root_output(&output, cwd)?;
   } else if matches!(case.kind, CaseKind::WorkspaceInputs) {
     validate_workspace_inputs_output(&output, cwd, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::PathIdentity) {
+    validate_path_identity_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -8899,6 +8947,55 @@ fn validate_workspace_inputs_output(output: &Output, workspace: &Path, dotnet: b
   };
   if global != expected_global || configs != expected_configs || props != expected_props || targets != expected_targets || packages != expected_packages {
     return Err(format!("workspace-input mismatch: global={global:?} configs={configs:?} props={props:?} targets={targets:?} packages={packages:?}").into());
+  }
+  Ok(())
+}
+
+fn validate_path_identity_failure(output: &Output, reference: bool) -> Result<()> {
+  const SPELLING: &str = "missing/../missing/Absent.csproj";
+  let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+  if reference {
+    if output.status.code() != Some(1) || !text.contains("MSB3202") || !text.contains(SPELLING) {
+      return Err(format!("MSBuild path-identity oracle omitted its lexical missing-project diagnostic: {text}").into());
+    }
+    return Ok(());
+  }
+
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(format!("dv path-identity sample returned an unstable process result: {text}").into());
+  }
+  let events = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  if events.len() != 3 {
+    return Err(format!("dv path-identity sample emitted {} events instead of three", events.len()).into());
+  }
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv path-identity sample omitted its diagnostic event")?;
+  let context_path = diagnostic.get("context").and_then(serde_json::Value::as_array).and_then(|context| {
+    context.iter().find_map(|entry| {
+      (entry.get("name").and_then(serde_json::Value::as_str) == Some("path"))
+        .then(|| entry.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+    })
+  });
+  let message = diagnostic.get("message").and_then(serde_json::Value::as_str).unwrap_or_default();
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0200")
+    || !message.contains(SPELLING)
+    || context_path.is_none_or(|path| !path.contains(SPELLING))
+    || text.to_ascii_lowercase().contains("canonicalize")
+  {
+    return Err(format!("dv did not retain lexical spelling for the missing project reference: {text}").into());
+  }
+  let finished = events.last().ok_or("dv path-identity sample omitted command_finished")?;
+  if finished.get("type").and_then(serde_json::Value::as_str) != Some("command_finished")
+    || finished.get("outcome").and_then(serde_json::Value::as_str) != Some("failed")
+  {
+    return Err(format!("dv path-identity sample omitted its failed completion: {finished}").into());
   }
   Ok(())
 }
@@ -9717,6 +9814,7 @@ fn case_label(case: &str) -> &str {
     "cli_compat_check" => "Static compatibility check",
     "repository_root" => "Repository root discovery",
     "workspace_inputs" => "Ancestor build input discovery",
+    "path_identity" => "Missing reference path identity",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "workspace_discovery" => "Implicit workspace discovery",

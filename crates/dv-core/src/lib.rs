@@ -11,6 +11,7 @@ mod framework_reference;
 mod legacy_pruning;
 mod pack_requirement;
 mod package;
+mod path;
 mod project;
 mod redaction;
 mod reporter;
@@ -22,6 +23,8 @@ mod workspace;
 /// ASSUMPTION: current benchmark hosts expose 64-byte cache lines. This value
 /// documents packing evidence only; it does not define a wire or ABI layout.
 pub(crate) const BENCHMARK_CACHE_LINE_BYTES: usize = 64;
+
+pub(crate) use path::absolute_lexical;
 
 pub use cancellation::CancellationToken;
 pub use child_process::{ChildExitPolicy, ChildProcessFailure, ChildProcessFailureStage, ChildTermination, classify_child_termination};

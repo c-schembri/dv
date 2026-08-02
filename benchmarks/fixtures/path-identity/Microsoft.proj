@@ -1,0 +1,8 @@
+<Project>
+  <ItemGroup>
+    <ProjectReference Include="missing/../missing/Absent.csproj" />
+  </ItemGroup>
+  <Target Name="ResolveProjectIdentities">
+    <MSBuild Projects="@(ProjectReference)" Targets="GetTargetPath" BuildInParallel="false" />
+  </Target>
+</Project>

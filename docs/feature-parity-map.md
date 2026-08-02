@@ -746,8 +746,16 @@ contracts.
   Windows samples measured Microsoft at `139.917 ms` median and `145.349 ms`
   p95 versus `4.845 ms` and `6.203 ms` for `dv`, a `28.9x` median improvement.
   `P1`
-- [ ] `WS-006` Canonicalize only where required; preserve user spelling for
-  diagnostics and avoid turning missing paths into false identities. `P1`
+- [x] `WS-006` Canonicalize only where required; preserve user spelling for
+  diagnostics and avoid turning missing paths into false identities. Project
+  selection and reference closure validation now separate borrowed diagnostic
+  spelling from one owned absolute lexical identity, validate existence before
+  allocating that identity, and insert it into the sorted command-local batch
+  only after evaluation succeeds. Physical canonicalization remains only for
+  resolving the Unix `dotnet` host symlink to its installation root. Thirty
+  warm Windows samples measured Microsoft at `200.255 ms` median and
+  `221.558 ms` p95 versus `5.423 ms` and `6.631 ms` for `dv`, a `36.9x`
+  median improvement. `P1`
 - [ ] `WS-007` Detect symlink/junction cycles and workspace escape attempts.
   `P1`
 - [ ] `WS-008` Respect case sensitivity of the active filesystem rather than

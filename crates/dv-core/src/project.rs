@@ -44,7 +44,8 @@ use quick_xml::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-  AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, BENCHMARK_CACHE_LINE_BYTES, FrameworkFamily, TargetFramework, discover_ancestor_inputs,
+  AncestorInputErrorKind, AncestorInputKind, AncestorInputRequest, BENCHMARK_CACHE_LINE_BYTES, FrameworkFamily, TargetFramework, absolute_lexical,
+  discover_ancestor_inputs,
 };
 
 const SUPPORTED_SDK: &str = "Microsoft.NET.Sdk";
@@ -61,6 +62,18 @@ const WORKSPACE_PATH_CAPACITY: usize = 256;
 const NO_REFERENCE_CONDITION: u32 = u32::MAX;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
+
+struct ResolvedProjectPath<'a> {
+  spelling: &'a Path,
+  identity: PathBuf,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<ResolvedProjectPath<'static>>() == 48);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<ResolvedProjectPath<'static>>() == 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<ResolvedProjectPath<'static>>() == align_of::<usize>());
 
 /// A supported build configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -887,6 +900,13 @@ impl ProjectError {
     self
   }
 
+  fn preserve_input_spelling(mut self, identity: &Path, spelling: &Path) -> Self {
+    if self.path == identity {
+      self.path = spelling.to_owned();
+    }
+    self
+  }
+
   /// Iterates ordered machine-readable context retained on the cold error path.
   pub fn diagnostic_context(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
     self
@@ -1313,6 +1333,11 @@ fn probe_repository_marker(cursor: &mut PathBuf) -> Result<bool, ProjectError> {
 
 /// Evaluates one explicit SDK-style `.csproj`.
 pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
+  let resolved = resolve_project_path(project_path)?;
+  evaluate_resolved_project_path(&resolved, configuration)
+}
+
+fn resolve_project_path(project_path: &Path) -> Result<ResolvedProjectPath<'_>, ProjectError> {
   if !is_csproj(project_path) {
     return Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
@@ -1339,15 +1364,23 @@ pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfigur
     ));
   }
 
-  let project_path = absolute_path(project_path)?;
-  let project_directory = project_path
+  Ok(ResolvedProjectPath {
+    spelling: project_path,
+    identity: absolute_path(project_path)?,
+  })
+}
+
+fn evaluate_resolved_project_path(resolved: &ResolvedProjectPath<'_>, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
+  let project_directory = resolved
+    .identity
     .parent()
-    .ok_or_else(|| ProjectError::new(ProjectErrorKind::NotFound, &project_path, "project path has no parent directory"))?
+    .ok_or_else(|| ProjectError::new(ProjectErrorKind::NotFound, resolved.spelling, "project path has no parent directory"))?
     .to_owned();
-  let bytes = fs::read(&project_path).map_err(|error| io_error("read", &project_path, error))?;
-  let raw = parse_project(&project_path, &bytes)?;
+  let bytes = fs::read(&resolved.identity).map_err(|error| io_error("read", resolved.spelling, error))?;
+  let raw = parse_project(resolved.spelling, &bytes)?;
   let central = discover_central_packages(&project_directory)?;
-  materialize_project(project_path, &project_directory, configuration, raw, central)
+  materialize_project(&resolved.identity, &project_directory, configuration, raw, central)
+    .map_err(|error| error.preserve_input_spelling(&resolved.identity, resolved.spelling))
 }
 
 /// Evaluates one project-reference closure in deterministic root-first order.
@@ -1356,7 +1389,7 @@ pub fn evaluate_project_path(project_path: &Path, configuration: ProjectConfigur
 /// duplicate paths are removed through a sorted command-local path index.
 pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, ProjectError> {
   let configuration = root.configuration();
-  let mut seen = vec![fs::canonicalize(root.project_path()).map_err(|error| io_error("canonicalize", root.project_path(), error))?];
+  let mut seen = vec![root.project_path().to_owned()];
   let mut projects = vec![root];
   let mut cursor = 0usize;
   while cursor < projects.len() {
@@ -1365,13 +1398,14 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
       .map(|reference| projects[cursor].project_directory().join(reference))
       .collect::<Vec<_>>();
     for reference in references {
-      let reference = absolute_path(&reference)?;
-      let key = fs::canonicalize(&reference).map_err(|error| io_error("canonicalize", &reference, error))?;
-      match seen.binary_search(&key) {
+      let resolved = resolve_project_path(&reference)?;
+      let index = match seen.binary_search(&resolved.identity) {
         Ok(_) => continue,
-        Err(index) => seen.insert(index, key),
-      }
-      projects.push(evaluate_project_path(&reference, configuration)?);
+        Err(index) => index,
+      };
+      let project = evaluate_resolved_project_path(&resolved, configuration)?;
+      seen.insert(index, resolved.identity);
+      projects.push(project);
     }
     cursor += 1;
   }
@@ -2029,15 +2063,15 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
 }
 
 fn materialize_project(
-  project_path: PathBuf,
+  project_path: &Path,
   project_directory: &Path,
   configuration: ProjectConfiguration,
   raw: RawProject,
   central: RawCentralPackages,
 ) -> Result<ProjectSpec, ProjectError> {
-  let target_framework = required_property(&project_path, "TargetFramework", raw.target_framework)?;
+  let target_framework = required_property(project_path, "TargetFramework", raw.target_framework)?;
   let parsed_target =
-    TargetFramework::parse(&target_framework).map_err(|error| ProjectError::new(ProjectErrorKind::InvalidProperty, &project_path, error.to_string()))?;
+    TargetFramework::parse(&target_framework).map_err(|error| ProjectError::new(ProjectErrorKind::InvalidProperty, project_path, error.to_string()))?;
 
   let output_type = match raw.output_type.as_deref().unwrap_or("Library") {
     "Exe" => ProjectOutputType::Exe,
@@ -2045,29 +2079,29 @@ fn materialize_project(
     value => {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("OutputType {value:?} is unsupported; use Exe or Library"),
       ));
     },
   };
-  let nullable = parse_toggle(&project_path, "Nullable", raw.nullable.as_deref(), false, true)?;
-  let implicit_usings = parse_toggle(&project_path, "ImplicitUsings", raw.implicit_usings.as_deref(), false, false)?;
-  let deterministic = parse_bool(&project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
-  let self_contained = parse_bool(&project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
-  let nuget_audit_enabled = parse_bool(&project_path, "NuGetAudit", raw.nuget_audit.as_deref(), true)?;
+  let nullable = parse_toggle(project_path, "Nullable", raw.nullable.as_deref(), false, true)?;
+  let implicit_usings = parse_toggle(project_path, "ImplicitUsings", raw.implicit_usings.as_deref(), false, false)?;
+  let deterministic = parse_bool(project_path, "Deterministic", raw.deterministic.as_deref(), true)?;
+  let self_contained = parse_bool(project_path, "SelfContained", raw.self_contained.as_deref(), false)?;
+  let nuget_audit_enabled = parse_bool(project_path, "NuGetAudit", raw.nuget_audit.as_deref(), true)?;
   let restore_package_pruning = parse_bool(
-    &project_path,
+    project_path,
     "RestoreEnablePackagePruning",
     raw.restore_enable_package_pruning.as_deref(),
     parsed_target.family() == FrameworkFamily::Net && parsed_target.major() >= 10,
   )?;
   let allow_missing_prune_package_data = parse_bool(
-    &project_path,
+    project_path,
     "AllowMissingPrunePackageData",
     raw.allow_missing_prune_package_data.as_deref(),
     false,
   )?;
-  let central_path = central.path.as_deref().unwrap_or(&project_path);
+  let central_path = central.path.as_deref().unwrap_or(project_path);
   let central_package_management = central.path.is_some()
     && parse_bool(
       central_path,
@@ -2101,7 +2135,7 @@ fn materialize_project(
     Some(value) => NugetAuditMode::parse(value).ok_or_else(|| {
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("NuGetAuditMode value {value:?} must be direct or all"),
       )
     })?,
@@ -2112,7 +2146,7 @@ fn materialize_project(
     Some(value) => NugetAuditLevel::parse(value).ok_or_else(|| {
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("NuGetAuditLevel value {value:?} must be low, moderate, high, or critical"),
       )
     })?,
@@ -2121,25 +2155,25 @@ fn materialize_project(
   let target_latest_runtime_patch = raw
     .target_latest_runtime_patch
     .as_deref()
-    .map(|value| parse_bool(&project_path, "TargetLatestRuntimePatch", Some(value), false))
+    .map(|value| parse_bool(project_path, "TargetLatestRuntimePatch", Some(value), false))
     .transpose()?;
   let roll_forward = match raw.roll_forward.as_deref() {
     Some(value) => RuntimeRollForward::parse(value).ok_or_else(|| {
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("RollForward value {value:?} is unsupported"),
       )
     })?,
     None => RuntimeRollForward::Minor,
   };
-  validate_optional_version(&project_path, "RuntimeFrameworkVersion", raw.runtime_framework_version.as_deref())?;
-  let selected_runtime = parse_runtime_identifier(&project_path, raw.runtime_identifier.as_deref())?;
-  let mut runtime_dimensions = parse_runtime_identifiers(&project_path, raw.runtime_identifiers.as_deref())?;
+  validate_optional_version(project_path, "RuntimeFrameworkVersion", raw.runtime_framework_version.as_deref())?;
+  let selected_runtime = parse_runtime_identifier(project_path, raw.runtime_identifier.as_deref())?;
+  let mut runtime_dimensions = parse_runtime_identifiers(project_path, raw.runtime_identifiers.as_deref())?;
   let runtime_identifiers_len = u32::try_from(runtime_dimensions.len()).map_err(|_| {
     ProjectError::new(
       ProjectErrorKind::Unsupported,
-      &project_path,
+      project_path,
       "RuntimeIdentifiers contains more than 4 billion target dimensions",
     )
   })?;
@@ -2150,14 +2184,14 @@ fn materialize_project(
       if runtime_dimensions.len() == NO_RUNTIME_IDENTIFIER as usize {
         return Err(ProjectError::new(
           ProjectErrorKind::Unsupported,
-          &project_path,
+          project_path,
           "runtime target dimensions exhaust the compact selected-index space",
         ));
       }
       let index = u32::try_from(runtime_dimensions.len()).map_err(|_| {
         ProjectError::new(
           ProjectErrorKind::Unsupported,
-          &project_path,
+          project_path,
           "runtime target dimensions exceed the compact 32-bit index space",
         )
       })?;
@@ -2170,12 +2204,12 @@ fn materialize_project(
   let default_name = project_path
     .file_stem()
     .and_then(|value| value.to_str())
-    .ok_or_else(|| ProjectError::new(ProjectErrorKind::NonUnicodePath, &project_path, "project file name is not valid Unicode"))?;
+    .ok_or_else(|| ProjectError::new(ProjectErrorKind::NonUnicodePath, project_path, "project file name is not valid Unicode"))?;
   let assembly_name = raw.assembly_name.as_deref().unwrap_or(default_name);
   if assembly_name.is_empty() || assembly_name.contains("$(") {
     return Err(ProjectError::new(
       ProjectErrorKind::InvalidProperty,
-      &project_path,
+      project_path,
       "AssemblyName must be a non-empty literal",
     ));
   }
@@ -2183,7 +2217,7 @@ fn materialize_project(
   if root_namespace.is_empty() || root_namespace.contains("$(") {
     return Err(ProjectError::new(
       ProjectErrorKind::InvalidProperty,
-      &project_path,
+      project_path,
       "RootNamespace must be a non-empty literal",
     ));
   }
@@ -2195,8 +2229,8 @@ fn materialize_project(
   };
   let mut project_references = Vec::with_capacity(raw.project_references.len());
   for reference in raw.project_references {
-    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
-      project_references.push(normalize_project_reference(&project_path, &reference.path)?);
+    if reference_conditions_match(project_path, &raw.conditions, reference.conditions, &condition_context)? {
+      project_references.push(normalize_project_reference(project_path, &reference.path)?);
     }
   }
   let mut selected_central_versions = Vec::with_capacity(central.versions.len() + central.globals.len());
@@ -2266,12 +2300,12 @@ fn materialize_project(
   );
   let mut selected_package_references = Vec::with_capacity(raw.package_references.len() + selected_global_references.len());
   for mut reference in raw.package_references {
-    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+    if reference_conditions_match(project_path, &raw.conditions, reference.conditions, &condition_context)? {
       if let Some(version_override) = reference.version_override.take() {
         if central_package_management && !central_version_override_enabled {
           return Err(ProjectError::new(
             ProjectErrorKind::InvalidProperty,
-            &project_path,
+            project_path,
             format!("package {:?} cannot use VersionOverride because central overrides are disabled", reference.id),
           ));
         }
@@ -2280,7 +2314,7 @@ fn materialize_project(
         if reference.version.is_some() {
           return Err(ProjectError::new(
             ProjectErrorKind::InvalidProperty,
-            &project_path,
+            project_path,
             format!(
               "centrally managed package {:?} must use PackageVersion or VersionOverride instead of Version",
               reference.id
@@ -2294,7 +2328,7 @@ fn materialize_project(
         if reference.version.is_none() {
           return Err(ProjectError::new(
             ProjectErrorKind::InvalidProperty,
-            &project_path,
+            project_path,
             format!("centrally managed package {:?} has no selected PackageVersion", reference.id),
           ));
         }
@@ -2305,14 +2339,14 @@ fn materialize_project(
   selected_package_references.extend(selected_global_references);
   let mut selected_framework_references = Vec::with_capacity(raw.framework_references.len());
   for reference in raw.framework_references {
-    if reference_conditions_match(&project_path, &raw.conditions, reference.conditions, &condition_context)? {
+    if reference_conditions_match(project_path, &raw.conditions, reference.conditions, &condition_context)? {
       selected_framework_references.push(reference);
     }
   }
 
-  let sources = collect_sources(project_directory, &project_path)?;
-  let project_path_text = unicode_path(&project_path, &project_path)?;
-  let project_directory_text = unicode_path(project_directory, &project_path)?;
+  let sources = collect_sources(project_directory, project_path)?;
+  let project_path_text = unicode_path(project_path, project_path)?;
+  let project_directory_text = unicode_path(project_directory, project_path)?;
   let estimated_text = project_path_text.len()
     + project_directory_text.len()
     + target_framework.len()
@@ -2343,27 +2377,27 @@ fn materialize_project(
       })
       .sum::<usize>();
   let mut table = TextTable::with_capacity(estimated_text);
-  let project_path_span = table.push(project_path_text, &project_path)?;
-  let project_directory_span = table.push(project_directory_text, &project_path)?;
-  let target_framework_span = table.push(&target_framework, &project_path)?;
-  let assembly_name_span = table.push(assembly_name, &project_path)?;
-  let root_namespace_span = table.push(root_namespace, &project_path)?;
+  let project_path_span = table.push(project_path_text, project_path)?;
+  let project_directory_span = table.push(project_directory_text, project_path)?;
+  let target_framework_span = table.push(&target_framework, project_path)?;
+  let assembly_name_span = table.push(assembly_name, project_path)?;
+  let root_namespace_span = table.push(root_namespace, project_path)?;
   let runtime_dimension_spans = runtime_dimensions
     .iter()
-    .map(|value| table.push(value, &project_path))
+    .map(|value| table.push(value, project_path))
     .collect::<Result<Box<_>, _>>()?;
-  let source_spans = sources.iter().map(|source| table.push(source, &project_path)).collect::<Result<Box<_>, _>>()?;
+  let source_spans = sources.iter().map(|source| table.push(source, project_path)).collect::<Result<Box<_>, _>>()?;
   let reference_spans = project_references
     .iter()
-    .map(|reference| table.push(reference, &project_path))
+    .map(|reference| table.push(reference, project_path))
     .collect::<Result<Box<_>, _>>()?;
-  let central_package_fingerprint_span = table.push(&central_package_fingerprint, &project_path)?;
+  let central_package_fingerprint_span = table.push(&central_package_fingerprint, project_path)?;
   let central_package_versions = selected_central_versions
     .iter()
     .map(|package| {
       Ok(CentralPackageVersion {
-        id: table.push(&package.id, &project_path)?,
-        version: table.push(package.version.as_deref().expect("selected central versions were validated"), &project_path)?,
+        id: table.push(&package.id, project_path)?,
+        version: table.push(package.version.as_deref().expect("selected central versions were validated"), project_path)?,
       })
     })
     .collect::<Result<Box<_>, ProjectError>>()?;
@@ -2372,14 +2406,14 @@ fn materialize_project(
     let version = package.version.ok_or_else(|| {
       ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("package {:?} requires a Version", package.id),
       )
     })?;
     if !is_literal_package_version(&version) {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("package {:?} version {version:?} is not a literal version or range", package.id),
       ));
     }
@@ -2393,10 +2427,10 @@ fn materialize_project(
     } else {
       PackageAssetFlags::ALL
     };
-    let include_assets = parse_package_assets(&project_path, "IncludeAssets", package.include_assets.as_deref(), default_include_assets)?;
-    let exclude_assets = parse_package_assets(&project_path, "ExcludeAssets", package.exclude_assets.as_deref(), PackageAssetFlags::NONE)?;
+    let include_assets = parse_package_assets(project_path, "IncludeAssets", package.include_assets.as_deref(), default_include_assets)?;
+    let exclude_assets = parse_package_assets(project_path, "ExcludeAssets", package.exclude_assets.as_deref(), PackageAssetFlags::NONE)?;
     let private_assets = parse_package_assets(
-      &project_path,
+      project_path,
       "PrivateAssets",
       package.private_assets.as_deref(),
       if package.central_global {
@@ -2405,23 +2439,23 @@ fn materialize_project(
         PackageAssetFlags::DEFAULT_PRIVATE
       },
     )?;
-    let no_warn = optional_literal_metadata(&project_path, "NoWarn", package.no_warn.as_deref())?
-      .map(|value| table.push(value, &project_path))
+    let no_warn = optional_literal_metadata(project_path, "NoWarn", package.no_warn.as_deref())?
+      .map(|value| table.push(value, project_path))
       .transpose()?
       .unwrap_or(NO_TEXT);
-    let aliases = optional_literal_metadata(&project_path, "Aliases", package.aliases.as_deref())?
-      .map(|value| table.push(value, &project_path))
+    let aliases = optional_literal_metadata(project_path, "Aliases", package.aliases.as_deref())?
+      .map(|value| table.push(value, project_path))
       .transpose()?
       .unwrap_or(NO_TEXT);
     let generate_path_property = parse_bool(
-      &project_path,
+      project_path,
       "GeneratePathProperty",
       package.generate_path_property.as_deref().filter(|value| !value.trim().is_empty()),
       false,
     )?;
     package_references.push(PackageReference {
-      id: table.push(&package.id, &project_path)?,
-      version: table.push(&version, &project_path)?,
+      id: table.push(&package.id, project_path)?,
+      version: table.push(&version, project_path)?,
       no_warn,
       aliases,
       include_assets,
@@ -2431,7 +2465,7 @@ fn materialize_project(
     });
   }
   let runtime_framework_version_span = match raw.runtime_framework_version.as_deref() {
-    Some(version) => table.push(version, &project_path)?,
+    Some(version) => table.push(version, project_path)?,
     None => NO_TEXT,
   };
   let mut framework_references = Vec::with_capacity(selected_framework_references.len());
@@ -2439,7 +2473,7 @@ fn materialize_project(
     if reference.id.is_empty() || reference.id.contains("$(") {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         "FrameworkReference Include must be a non-empty literal",
       ));
     }
@@ -2450,25 +2484,25 @@ fn materialize_project(
     }) {
       return Err(ProjectError::new(
         ProjectErrorKind::InvalidProperty,
-        &project_path,
+        project_path,
         format!("framework reference {:?} is declared more than once", reference.id),
       ));
     }
-    validate_optional_version(&project_path, "RuntimeFrameworkVersion", reference.runtime_version.as_deref())?;
-    validate_optional_version(&project_path, "TargetingPackVersion", reference.targeting_pack_version.as_deref())?;
+    validate_optional_version(project_path, "RuntimeFrameworkVersion", reference.runtime_version.as_deref())?;
+    validate_optional_version(project_path, "TargetingPackVersion", reference.targeting_pack_version.as_deref())?;
     let target_latest_runtime_patch = reference
       .target_latest_runtime_patch
       .as_deref()
-      .map(|value| parse_bool(&project_path, "TargetLatestRuntimePatch", Some(value), false))
+      .map(|value| parse_bool(project_path, "TargetLatestRuntimePatch", Some(value), false))
       .transpose()?;
     framework_references.push(FrameworkReference {
-      id: table.push(&reference.id, &project_path)?,
+      id: table.push(&reference.id, project_path)?,
       runtime_version: match reference.runtime_version.as_deref() {
-        Some(version) => table.push(version, &project_path)?,
+        Some(version) => table.push(version, project_path)?,
         None => NO_TEXT,
       },
       targeting_pack_version: match reference.targeting_pack_version.as_deref() {
-        Some(version) => table.push(version, &project_path)?,
+        Some(version) => table.push(version, project_path)?,
         None => NO_TEXT,
       },
       target_latest_runtime_patch,
@@ -3172,12 +3206,7 @@ fn is_csproj(path: &Path) -> bool {
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, ProjectError> {
-  let absolute = if path.is_absolute() {
-    path.to_owned()
-  } else {
-    std::path::absolute(path).map_err(|error| io_error("resolve", path, error))?
-  };
-  Ok(absolute.components().collect())
+  absolute_lexical(path).map_err(|error| io_error("resolve", path, error))
 }
 
 fn unicode_path<'a>(path: &'a Path, project_path: &Path) -> Result<&'a str, ProjectError> {
@@ -3805,6 +3834,39 @@ mod tests {
 
     assert_eq!(names, ["App.csproj", "Left.csproj", "Right.csproj", "Shared.csproj"]);
     assert!(projects.iter().all(|project| project.configuration() == ProjectConfiguration::Release));
+  }
+
+  #[test]
+  fn project_errors_keep_input_spelling_while_success_uses_lexical_identity() {
+    let temp = TempDirectory::new();
+    let identity = temp.write("nested/App.csproj", &project_xml("", ""));
+    let successful_spelling = temp.0.join("nested/../nested/App.csproj");
+    let project = evaluate_project_path(&successful_spelling, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(project.project_path(), identity);
+
+    temp.write("nested/Invalid.csproj", &project_xml("<OutputType>Invalid</OutputType>", ""));
+    let invalid_spelling = temp.0.join("nested/../nested/Invalid.csproj");
+
+    let error = evaluate_project_path(&invalid_spelling, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty);
+    assert_eq!(error.path(), invalid_spelling);
+  }
+
+  #[test]
+  fn missing_project_reference_is_not_promoted_to_an_identity() {
+    let temp = TempDirectory::new();
+    let root = temp.write(
+      "App.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="Missing/../Missing/Absent.csproj" /></ItemGroup>"#),
+    );
+    let root = evaluate_project_path(&root, ProjectConfiguration::Debug).unwrap();
+
+    let error = evaluate_project_closure(root).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::NotFound);
+    assert_eq!(error.path(), temp.0.join("Missing/../Missing/Absent.csproj"));
+    assert!(error.to_string().contains("does not exist"));
   }
 
   #[test]

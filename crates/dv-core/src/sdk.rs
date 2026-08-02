@@ -656,6 +656,7 @@ fn discover_host_roots() -> Vec<PathBuf> {
         let root = if cfg!(windows) {
           directory
         } else {
+          // PATH commonly exposes /usr/bin/dotnet as a link; the physical parent owns sdk/.
           fs::canonicalize(&executable)
             .ok()
             .and_then(|path| path.parent().map(Path::to_owned))

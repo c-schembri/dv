@@ -5,7 +5,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use crate::BENCHMARK_CACHE_LINE_BYTES;
+use crate::{BENCHMARK_CACHE_LINE_BYTES, absolute_lexical};
 
 const KIND_COUNT: usize = 5;
 const INLINE_INPUT_CAPACITY: usize = 8;
@@ -568,12 +568,7 @@ fn actual_nuget_spelling(directory: &Path) -> Result<Option<u8>, AncestorInputEr
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, AncestorInputError> {
-  let absolute = if path.is_absolute() {
-    path.to_owned()
-  } else {
-    std::path::absolute(path).map_err(|error| io_error("resolve ancestor input search start", path, error))?
-  };
-  Ok(absolute.components().collect())
+  absolute_lexical(path).map_err(|error| io_error("resolve ancestor input search start", path, error))
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> AncestorInputError {

@@ -216,16 +216,19 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` through `WS-005` are complete: one bounded immediate directory pass
+`WS-001` through `WS-006` are complete: one bounded immediate directory pass
 packs all five project/solution candidate kinds into a stable offset-indexed
 batch, explicit candidate files take a single-metadata-query validation path,
 and exact-one directory selection produces a typed owning result before any
 evaluator is chosen. Repository-root discovery is an independent one-buffer
 ancestor walk with one `.git` metadata probe per level and no project reads.
 One shared request-masked parent walk now discovers the five SDK, NuGet, and
-build inputs with their distinct singleton or root-to-leaf precedence. The next
-workspace work remains `WS-006` through `WS-012`; recursive traversal is not
-silently folded into immediate selection.
+build inputs with their distinct singleton or root-to-leaf precedence. Project
+paths now separate borrowed diagnostic spelling from absolute lexical identity;
+only existing evaluated projects enter the sorted identity batch, and physical
+canonicalization is reserved for the Unix SDK-host symlink where it is required.
+The next workspace work remains `WS-007` through `WS-012`; recursive traversal
+is not silently folded into immediate selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,
 resources, analyzers, options, and output paths match Microsoft oracle data for
