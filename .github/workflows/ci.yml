@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  REFERENCE_DOTNET_SDK: 10.0.x
+
 jobs:
   rust:
     strategy:
@@ -26,6 +29,14 @@ jobs:
         run: cargo test --workspace
       - name: Build release workspace
         run: cargo build --workspace --release
+      - name: Install reference .NET SDK for Windows benchmark
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.REFERENCE_DOTNET_SDK }}
+      - name: Run active filesystem case benchmark smoke test
+        if: runner.os == 'Windows'
+        run: cargo run -p dv-bench -- --case filesystem_case_identity --samples 1 --warmups 0 --output target/benchmark-filesystem-case-smoke.json
 
   benchmark-smoke:
     runs-on: ubuntu-latest
@@ -33,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: ${{ env.REFERENCE_DOTNET_SDK }}
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Run reference benchmark smoke test
@@ -68,8 +79,6 @@ jobs:
         run: cargo run -p dv-bench -- --case path_identity --samples 1 --warmups 0 --output target/benchmark-path-identity-smoke.json
       - name: Run source link traversal benchmark smoke test
         run: cargo run -p dv-bench -- --case source_link_traversal --samples 1 --warmups 0 --output target/benchmark-source-link-smoke.json
-      - name: Run active filesystem case benchmark smoke test
-        run: cargo run -p dv-bench -- --case filesystem_case_identity --samples 1 --warmups 0 --output target/benchmark-filesystem-case-smoke.json
       - name: Run typed transform benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_transform_equivalence --samples 1 --warmups 0 --output target/benchmark-transform-equivalence-smoke.json
       - name: Run invocation mode benchmark smoke test
