@@ -21,7 +21,7 @@ impl CommandSyntaxVersion {
 const _: () = assert!(size_of::<CommandSyntaxVersion>() == 2);
 const _: () = assert!(align_of::<CommandSyntaxVersion>() == 2);
 
-pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(5);
+pub(crate) const COMMAND_SYNTAX_VERSION: CommandSyntaxVersion = CommandSyntaxVersion(6);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -102,6 +102,7 @@ const _: () = assert!(size_of::<[[u8; EXIT_CLASS_COUNT]; INVOCATION_MODE_COUNT]>
 pub(crate) enum CommandKind {
   Help,
   Version,
+  SelfVersion,
   SdkVersion,
   SdkInfo,
   SdkList,
@@ -1027,6 +1028,7 @@ fn classify_native_command(command: &str) -> CommandKind {
   match command {
     "-h" | "--help" | "help" => CommandKind::Help,
     "-V" | "--version" | "version" => CommandKind::Version,
+    "self-version" => CommandKind::SelfVersion,
     "sdk" => CommandKind::Sdk,
     "project" => CommandKind::Project,
     "build" => CommandKind::Build,
@@ -1372,6 +1374,7 @@ mod tests {
       ("-V", CommandKind::Version),
       ("--version", CommandKind::Version),
       ("version", CommandKind::Version),
+      ("self-version", CommandKind::SelfVersion),
       ("sdk", CommandKind::Sdk),
       ("project", CommandKind::Project),
       ("build", CommandKind::Build),
@@ -1647,14 +1650,16 @@ mod tests {
   }
 
   #[test]
-  fn dotnet_information_options_select_typed_queries_without_changing_native_version() {
+  fn native_and_dotnet_version_routes_select_typed_sdk_queries() {
     let native = InvocationBatch::capture([OsString::from("--version")]);
+    let self_version = InvocationBatch::capture([OsString::from("self-version")]);
     let sdk_version = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--version")]);
     let sdk_info = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--info")]);
     let sdk_list = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--list-sdks")]);
     let runtime_list = InvocationBatch::capture([OsString::from("--compat=dotnet"), OsString::from("--list-runtimes")]);
 
     assert_eq!(native.request().command(), CommandKind::Version);
+    assert_eq!(self_version.request().command(), CommandKind::SelfVersion);
     assert_eq!(InvocationBatch::capture([OsString::from("info")]).request().command(), CommandKind::Unknown);
     assert_eq!(sdk_version.request().command(), CommandKind::SdkVersion);
     assert_eq!(sdk_info.request().command(), CommandKind::SdkInfo);

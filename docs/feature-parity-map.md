@@ -264,7 +264,8 @@ contracts.
 
 ## 1. Command And Process Contract
 
-- [x] `CLI-001` Parse help and self-version without project or SDK discovery.
+- [x] `CLI-001` Parse help and explicit `self-version` without project or SDK
+  discovery. Native `version`, `--version`, and `-V` select the active SDK.
 - [x] `CLI-002` Reject non-Unicode command text with a stable diagnostic.
 - [x] `CLI-003` Emit stable exit code 2 for current command failures.
 - [x] `CLI-004` Offer one `--json` event stream for current commands.
@@ -336,7 +337,7 @@ contracts.
   `dv` at `5.503 ms` (`24.4x` faster). `P1`
 - [x] `CLI-014` Install Ctrl+C/SIGINT cancellation before starting work and
   propagate a bounded cancellation deadline to children. Typed invocation is
-  classified before installation so help, version, unknown-command, and
+  classified before installation so help, self-version, unknown-command, and
   global-option failures retain their allocation-free fast path; every
   work-bearing command installs one
   handler before SDK, project, filesystem, process, or network work. One
@@ -352,8 +353,9 @@ contracts.
   tests cover transitions, deadline stability, diagnostics, and the child
   boundary. Thirty warm Windows samples measure cancellation-ready SDK
   selection at `68.400 ms` for Microsoft and `5.302 ms` for `dv` (`12.9x`
-  faster); `dv --version`, which deliberately skips installation, remains
-  `4.330 ms`. `P1`
+  faster). The historical syntax-5 `dv --version` self-version control measured
+  `4.330 ms`; syntax 6 moves that no-work query to `dv self-version` and makes
+  `dv --version` install cancellation before SDK discovery. `P1`
 - [x] `CLI-015` Preserve child exit codes where the command contract requires
   it and distinguish launch failure from child failure. Reaped children now
   produce one eight-byte typed termination record containing an exact `i32`
@@ -376,13 +378,14 @@ contracts.
 - [x] `CLI-017` Version command syntax and JSON compatibility independently so
   a CLI alias does not mutate the event protocol. The 6-byte typed invocation
   request now carries a two-byte syntax-version value while the reporter owns
-  schema version 23. Native `version`, `--version`, and `-V` normalize to one
-  tool-version request; explicit dotnet `--version` instead normalizes to the
-  selected-SDK request required by the reference command. Raw alias arguments
-  remain reporter evidence rather than protocol selection. The
-  structural query measured `4.479 ms` median and `5.593 ms` p95 on Windows;
-  Microsoft has no equivalent dual-version query, so its result is explicitly
-  TBI. The like-for-like SDK control remains `13.1x` faster. `P1`
+  schema version 23. Syntax 6 makes native `version`, `--version`, and `-V`
+  normalize to the selected-SDK request required by `dotnet --version`.
+  `self-version` owns the allocation-free executable/protocol-version query.
+  Raw alias arguments remain reporter evidence rather than protocol selection.
+  Thirty warm Windows samples measured `dotnet --version` at `65.047 ms` and
+  `dv --version` at `5.559 ms`, an `11.7x` median improvement. The structured
+  `dv self-version` query measured `5.037 ms`; Microsoft has no equivalent
+  dual-version query, so its result is explicitly TBI. `P1`
 - [x] `CLI-018` Expose the initial evaluator through human and JSON
   `project inspect` output.
 
@@ -494,9 +497,10 @@ contracts.
   compatibility syntax and canonical `dv` syntax without changing the result
   of reference `--help`, `/?`, or `help` forms. Profile-aware static help
   accepts the pinned root and Phase 1 command aliases without SDK, project, or
-  filesystem discovery. `dotnet --version` and `--info` compatibility syntax
-  normalizes to `dv sdk current` and `dv sdk info`; the selected SDK version is
-  byte-identical for the version query, and info labels both spellings. Static
+  filesystem discovery. `dotnet --version`, native `dv --version`, and
+  `dv sdk current` share one selected-SDK result; compatible `--info`
+  normalizes to `dv sdk info`. The selected SDK version is byte-identical for
+  every version route, and info labels both spellings. Static
   build help measured `135.885 ms` for `dotnet` and `5.518 ms` for `dv`, a
   `24.6x` median improvement. `P1`
 - [ ] `DROP-018` Accept deprecated aliases for as long as the pinned reference

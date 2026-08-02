@@ -1,7 +1,8 @@
 # SDK Discovery And Selection
 
-`dv sdk current` selects a .NET SDK without launching `dotnet`, MSBuild, or any
-managed process. `dv sdk list` exposes the complete installed SDK batch;
+`dv --version` and its explicit `dv sdk current` form select a .NET SDK without
+launching `dotnet`, MSBuild, or any managed process. `dv sdk list` exposes the
+complete installed SDK batch;
 `dv sdk runtimes` exposes installed shared frameworks. The compatible
 `--list-sdks` and `--list-runtimes` forms render the same rows as the .NET 10
 driver and accept its case-insensitive `--arch <arch>` selector.

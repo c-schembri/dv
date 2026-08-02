@@ -68,9 +68,9 @@ framework family, version, and path rows used by the native and compatible
 runtime inventory queries.
 Schema 19 adds the independently versioned command grammar to
 `command_started` and introduces `tool_version`, which reports the executable,
-command-syntax, and event-schema versions without coupling any of them. The
-current version-command aliases normalize before event construction and
-therefore cannot select a different wire shape.
+command-syntax, and event-schema versions without coupling any of them.
+`self-version` emits that payload. Native SDK-version aliases emit the existing
+`sdk_selected` payload because their command meaning is SDK selection.
 Schema 18 changes `command_started.args` to an explicitly reporter-safe view:
 argument count and order remain stable, while sensitive assignments/options
 and credential-bearing URL components are replaced before serialization. The

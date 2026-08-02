@@ -54,8 +54,11 @@ cargo build -p dv-cli --release
 Try the implemented workflows:
 
 ```powershell
-# Show the selected .NET SDK
-target\release\dv.exe sdk current
+# Show the selected .NET SDK (`dotnet --version` compatible)
+target\release\dv.exe --version
+
+# Show dv's own version
+target\release\dv.exe self-version
 
 # List installed SDKs and runtimes
 target\release\dv.exe sdk list
@@ -68,9 +71,6 @@ target\release\dv.exe project inspect path\to\App.csproj
 target\release\dv.exe project root path\to\working-directory
 
 # List controlling global.json, NuGet.Config, and Directory.* inputs
-target\release\dv.exe project inputs path\to\working-directory
-
-# List the ancestor-owned inputs that affect a project
 target\release\dv.exe project inputs path\to\working-directory
 
 # Create a compiler input plan without compiling
@@ -99,7 +99,7 @@ Results from different machines are not directly comparable.
 <!-- LIKE_FOR_LIKE_BENCHMARKS_START -->
 | Operation | Reference command | `dv` command | Reference median | `dv` median | Speedup |
 |---|---|---|---:|---:|---:|
-| Select current SDK | `dotnet --version` | `dv sdk current` | 63.347 ms | 4.501 ms | 14.1x |
+| Select current SDK | `dotnet --version` | `dv --version` | 65.047 ms | 5.559 ms | 11.7x |
 | List installed runtimes | `dotnet --list-runtimes` | `dv --compat dotnet --list-runtimes` | 4.618 ms | 4.551 ms | 1.01x |
 | Print build help | `dotnet build -?` | `dv --compat dotnet build -?` | 135.885 ms | 5.518 ms | 24.6x |
 | Evaluate a project | `dotnet msbuild SmallConsole.csproj` query | `dv project inspect SmallConsole.csproj --json` | 282.186 ms | 3.846 ms | 73.4x |

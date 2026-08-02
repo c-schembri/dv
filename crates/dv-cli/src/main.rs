@@ -44,6 +44,7 @@ Usage:
   dv --version
 
 Commands:
+  self-version Print the dv executable version
   init       Create project files
   add        Add a package reference
   remove     Remove a package reference
@@ -75,8 +76,9 @@ Environment:
                           Add a highest-precedence run/test environment value
 
 Information:
-  dv --version            Print the dv tool version
-  dv sdk current          Print the selected .NET SDK version
+  dv --version            Print the selected .NET SDK version
+  dv self-version         Print the dv executable version
+  dv sdk current          Print the selected .NET SDK version explicitly
   dv sdk list             List installed .NET SDKs
   dv compat manifest      Print the captured compatibility surface
   dv compat check PATH... Statically check scripts and project inputs
@@ -94,6 +96,7 @@ Accepted compatibility syntax:
 Canonical dv syntax:
   dv --help
   dv <command> [options]
+  dv --version
   dv sdk current
   dv sdk info
   dv sdk list
@@ -298,10 +301,27 @@ fn run() -> ExitCode {
           diagnostic("DV0002", problem, None, Some("Use `dv --version` without command operands.")),
         );
       }
+      sdk_current(
+        started,
+        globals,
+        invocation.event_arguments(json),
+        cancellation.as_ref().expect("native SDK version installs cancellation"),
+      )
+    },
+    CommandKind::SelfVersion => {
+      if let Some(problem) = unexpected_leaf_argument(globals, "self-version", command_args) {
+        return reject(
+          started,
+          globals,
+          "self-version",
+          invocation.event_arguments(json),
+          diagnostic("DV0002", problem, None, Some("Use `dv self-version` without command operands.")),
+        );
+      }
       if json {
         succeed(
           started,
-          "version",
+          "self-version",
           invocation.event_arguments(true),
           EventPayload::ToolVersion {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -533,7 +553,8 @@ fn command_requires_cancellation(globals: InvocationOptions, command: CommandKin
   let bounded_project_discovery = command == CommandKind::Project && matches!(command_args.first().and_then(OsStr::to_str), Some("root" | "inputs"));
   let work_command = matches!(
     command,
-    CommandKind::Sdk
+    CommandKind::Version
+      | CommandKind::Sdk
       | CommandKind::SdkVersion
       | CommandKind::SdkInfo
       | CommandKind::Project
@@ -4017,6 +4038,7 @@ mod argument_tests {
     for arguments in [
       &["sdk", "current"][..],
       &["sdk", "list"],
+      &["--version"],
       &["--compat", "dotnet", "--version"],
       &["--compat", "dotnet", "--info"],
       &["project", "inspect", "App.csproj"],
@@ -4030,7 +4052,7 @@ mod argument_tests {
     }
     for arguments in [
       &["--help"][..],
-      &["--version"],
+      &["self-version"],
       &["sdk"],
       &["sdk", "--help"],
       &["sdk", "runtimes"],

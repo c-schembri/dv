@@ -322,6 +322,12 @@ const DOTNET_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "cli_version",
+    kind: CaseKind::Startup,
+    args: &["--version"],
+    implemented: true,
+  },
+  Case {
     name: "cli_protocol_version",
     kind: CaseKind::Startup,
     args: &[],
@@ -1158,7 +1164,7 @@ const DV_CASES: &[Case] = &[
   Case {
     name: "cli_protocol_version",
     kind: CaseKind::Startup,
-    args: &["--json", "--version"],
+    args: &["--json", "self-version"],
     implemented: true,
   },
   Case {
@@ -1568,7 +1574,7 @@ fn run() -> Result<()> {
   if options
     .case
     .as_deref()
-    .is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat" | "cli_cancellation"))
+    .is_none_or(|case| matches!(case, "sdk_current" | "sdk_current_compat" | "cli_version" | "cli_cancellation"))
   {
     verify_sdk_selection(&dv_executable, &fixture)?;
   }
@@ -1815,6 +1821,10 @@ fn verify_sdk_selection(dv_executable: &Path, fixture: &Path) -> Result<()> {
   let compatibility_version = command_text(dv_executable, &["--compat", "dotnet", "--version"], fixture)?;
   if dotnet_version != compatibility_version {
     return Err(format!("compatibility SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {compatibility_version:?}").into());
+  }
+  let native_version = command_text(dv_executable, &["--version"], fixture)?;
+  if dotnet_version != native_version {
+    return Err(format!("native SDK selection mismatch: dotnet selected {dotnet_version:?}, dv selected {native_version:?}").into());
   }
   Ok(())
 }
@@ -2859,11 +2869,11 @@ fn validate_child_exit_output(output: &Output, reference: bool) -> Result<()> {
 }
 
 const EVENT_SCHEMA_VERSION: u64 = 23;
-const COMMAND_SYNTAX_VERSION: u64 = 5;
-const PROTOCOL_VERSION_ALIASES: &[&[&str]] = &[&["--json", "version"], &["--json", "--version"], &["-V", "--json"]];
+const COMMAND_SYNTAX_VERSION: u64 = 6;
+const SELF_VERSION_FORMS: &[&[&str]] = &[&["--json", "self-version"], &["self-version", "--json"]];
 
 fn verify_protocol_version_boundary(dv_executable: &Path, fixture: &Path) -> Result<()> {
-  for arguments in PROTOCOL_VERSION_ALIASES {
+  for arguments in SELF_VERSION_FORMS {
     let output = Command::new(dv_executable).args(*arguments).current_dir(fixture).output()?;
     validate_protocol_version_output(&output, arguments)?;
   }
@@ -2992,7 +3002,7 @@ fn validate_protocol_version_output(output: &Output, expected_arguments: &[&str]
     .and_then(serde_json::Value::as_array)
     .ok_or("dv protocol-version start omitted args")?;
   if started.get("type").and_then(serde_json::Value::as_str) != Some("command_started")
-    || started.get("command").and_then(serde_json::Value::as_str) != Some("version")
+    || started.get("command").and_then(serde_json::Value::as_str) != Some("self-version")
     || started.get("command_syntax_version").and_then(serde_json::Value::as_u64) != Some(COMMAND_SYNTAX_VERSION)
     || arguments.len() != expected_arguments.len()
     || !arguments
@@ -3000,7 +3010,7 @@ fn validate_protocol_version_output(output: &Output, expected_arguments: &[&str]
       .zip(expected_arguments)
       .all(|(actual, expected)| actual.as_str() == Some(*expected))
   {
-    return Err("dv protocol-version start did not preserve the alias under one syntax version".into());
+    return Err("dv protocol-version start did not preserve the self-version form under one syntax version".into());
   }
   let version = &events[1];
   if version.get("type").and_then(serde_json::Value::as_str) != Some("tool_version")
@@ -3012,7 +3022,7 @@ fn validate_protocol_version_output(output: &Output, expected_arguments: &[&str]
   }
   let finished = &events[2];
   if finished.get("type").and_then(serde_json::Value::as_str) != Some("command_finished")
-    || finished.get("command").and_then(serde_json::Value::as_str) != Some("version")
+    || finished.get("command").and_then(serde_json::Value::as_str) != Some("self-version")
     || finished.get("outcome").and_then(serde_json::Value::as_str) != Some("succeeded")
   {
     return Err("dv protocol-version query omitted its successful terminal event".into());
@@ -9701,7 +9711,7 @@ fn case_label(case: &str) -> &str {
     "cli_forwarding" => "Forwarded argument capture (run TBI)",
     "cli_child_exit" => "Child exit policy (run TBI)",
     "cli_cancellation" => "Cancellation-ready SDK selection",
-    "cli_version" => "CLI self-version",
+    "cli_version" => "SDK selection via --version",
     "cli_protocol_version" => "Syntax + JSON protocol versions",
     "cli_compat_manifest" => "Compatibility manifest query",
     "cli_compat_check" => "Static compatibility check",

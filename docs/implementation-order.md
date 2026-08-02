@@ -149,10 +149,10 @@ unsupported, operation, build, restore, test-failure, no-tests, and
 cancellation into one compact exit policy matrix. Inapplicable profile/result
 pairs are explicit. Executed child, test, and signal/cancellation semantics
 remain partial with their owning workflows.
-Command syntax version 5 and JSON event schema version 23 are independent.
-Native tool-version aliases normalize to one typed request and event shape;
-the dotnet `--version` compatibility form selects the SDK exactly like its
-Microsoft reference command. Profile-aware help uses static text before SDK or
+Command syntax version 6 and JSON event schema version 23 are independent.
+Native `version`, `--version`, and `-V` select the SDK exactly like the
+Microsoft reference command; `self-version` is the distinct no-discovery
+executable identity query. Profile-aware help uses static text before SDK or
 project discovery, and SDK info labels both compatibility and canonical syntax.
 The first `DNCLI-001` executable slice maps `--list-sdks` and
 `--list-runtimes` to bounded native inventories with exact .NET 10 text rows.
@@ -162,9 +162,9 @@ surface remains open.
 Compatibility manifest version 1 captures the selected .NET 10 SDK, MSBuild,
 NuGet, and VSTest surface as 115 command, 769 option, 74 argument, and 468
 parity records with explicit per-dimension support state.
-All 21 currently accepted native command spellings normalize to 15 native
+All 22 currently accepted native command spellings normalize to 16 native
 semantic kinds. Profile-aware ambiguous routing expands the exact typed set to
-28 command kinds in the same six-byte request; raw spelling and compatibility
+29 command kinds in the same six-byte request; raw spelling and compatibility
 provenance stay with the cold lossless argument owner.
 The Phase 1 `build`, `restore`, `run`, and `test` spellings plus native `sync`
 now expose one allocation-free borrowed transform view. Exact equality covers

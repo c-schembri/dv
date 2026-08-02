@@ -216,7 +216,7 @@ fn compatibility_manifest_query_writes_the_checked_in_artifact_without_discovery
   let manifest: serde_json::Value = serde_json::from_slice(expected).unwrap();
   assert_eq!(manifest["schema_version"], 1);
   assert_eq!(manifest["manifest_version"], 1);
-  assert_eq!(manifest["command_syntax_version"], 5);
+  assert_eq!(manifest["command_syntax_version"], 6);
   assert_eq!(manifest["event_schema_version"], 23);
   assert!(!manifest["reference"]["dotnet_sdk"].as_str().unwrap().is_empty());
   assert!(manifest["commands"].as_array().unwrap().len() >= 100);
@@ -861,15 +861,27 @@ fn json_failure_is_a_versioned_event_batch() {
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines.len(), 3);
   assert!(lines[0].contains("\"schema_version\":23"));
-  assert!(lines[0].contains("\"command_syntax_version\":5"));
+  assert!(lines[0].contains("\"command_syntax_version\":6"));
   assert!(lines[1].contains("\"code\":\"DV0003\""));
   assert!(lines[2].contains("\"outcome\":\"failed\""));
 }
 
 #[test]
-fn version_aliases_share_one_independently_versioned_json_contract() {
+fn version_aliases_select_the_same_sdk_as_sdk_current() {
+  let temp = TempDirectory::new();
+  fs::create_dir_all(temp.0.join("sdk/9.0.308")).unwrap();
+  temp.write("sdk/9.0.308/dotnet.dll", "");
+  fs::write(temp.0.join(format!("dotnet{}", env::consts::EXE_SUFFIX)), b"not an executable").unwrap();
+
+  for arguments in [&["version"][..], &["--version"], &["-V"]] {
+    let output = dv().args(arguments).current_dir(&temp.0).env("PATH", &temp.0).output().unwrap();
+    assert!(output.status.success(), "arguments={arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "9.0.308\n", "arguments={arguments:?}");
+    assert!(output.stderr.is_empty(), "arguments={arguments:?}");
+  }
+
   for arguments in [&["--json", "version"][..], &["--json", "--version"], &["-V", "--json"]] {
-    let output = dv().args(arguments).output().unwrap();
+    let output = dv().args(arguments).current_dir(&temp.0).env("PATH", &temp.0).output().unwrap();
     assert!(output.status.success(), "arguments={arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
     assert!(output.stderr.is_empty(), "arguments={arguments:?}");
     let events = output
@@ -887,14 +899,44 @@ fn version_aliases_share_one_independently_versioned_json_contract() {
         .all(|event| event.get("schema_version").and_then(serde_json::Value::as_u64) == Some(23))
     );
     assert_eq!(events[0].get("type").and_then(serde_json::Value::as_str), Some("command_started"));
-    assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("version"));
-    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(5));
-    assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
-    assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
-    assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(5));
-    assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(23));
+    assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("sdk current"));
+    assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(6));
+    assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("sdk_selected"));
+    assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some("9.0.308"));
     assert_eq!(events[2].get("type").and_then(serde_json::Value::as_str), Some("command_finished"));
   }
+}
+
+#[test]
+fn self_version_reports_the_dv_executable_and_protocol_versions_without_sdk_discovery() {
+  let temp = TempDirectory::new();
+  let plain = dv().arg("self-version").current_dir(&temp.0).env("PATH", &temp.0).output().unwrap();
+  assert!(plain.status.success());
+  assert_eq!(String::from_utf8(plain.stdout).unwrap(), format!("dv {}\n", env!("CARGO_PKG_VERSION")));
+  assert!(plain.stderr.is_empty());
+
+  let output = dv()
+    .args(["--json", "self-version"])
+    .current_dir(&temp.0)
+    .env("PATH", &temp.0)
+    .output()
+    .unwrap();
+  assert!(output.status.success());
+  let events = output
+    .stdout
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(serde_json::from_slice::<serde_json::Value>)
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+  assert_eq!(events.len(), 3);
+  assert_eq!(events[0].get("command").and_then(serde_json::Value::as_str), Some("self-version"));
+  assert_eq!(events[0].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(6));
+  assert_eq!(events[1].get("type").and_then(serde_json::Value::as_str), Some("tool_version"));
+  assert_eq!(events[1].get("version").and_then(serde_json::Value::as_str), Some(env!("CARGO_PKG_VERSION")));
+  assert_eq!(events[1].get("command_syntax_version").and_then(serde_json::Value::as_u64), Some(6));
+  assert_eq!(events[1].get("event_schema_version").and_then(serde_json::Value::as_u64), Some(23));
+  assert_eq!(events[2].get("command").and_then(serde_json::Value::as_str), Some("self-version"));
 }
 
 #[test]
@@ -1489,7 +1531,7 @@ fn sync_and_restore_share_the_verified_offline_operation() {
 
   assert!(alias.status.success(), "{}", String::from_utf8_lossy(&alias.stderr));
   let stdout = String::from_utf8(alias.stdout).unwrap();
-  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":5,\"command\":\"restore\""));
+  assert!(stdout.contains("\"type\":\"command_started\",\"command_syntax_version\":6,\"command\":\"restore\""));
   assert!(stdout.contains("\"type\":\"package_resolution_created\""));
   assert!(stdout.contains("\"network_requests\":0"));
   assert!(stdout.contains("\"type\":\"command_finished\",\"command\":\"restore\""));

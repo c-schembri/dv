@@ -325,15 +325,16 @@ regresses beyond benchmark noise relative to the prior release baseline.
 
 ## Independent Protocol Versions
 
-`CLI-017` stores command syntax version 5 as a two-byte transparent value in
+`CLI-017` stores command syntax version 6 as a two-byte transparent value in
 the 6-byte invocation request. Event schema version 23 remains a
 reporter constant. Native `version`, `--version`, and `-V` produce the same
-typed tool-version request. `--compat dotnet --version` produces the typed SDK
-selection request required by the Microsoft spelling. Original tokens remain
-only in the reporter-safe argument batch.
+typed SDK-selection request required by the Microsoft spelling. The distinct
+`self-version` command produces the typed tool-version request. Original tokens
+remain only in the reporter-safe argument batch.
 
-Human `dv --version` retains its single-line output and does not allocate an
-event batch. JSON version output materializes three cold events:
+Human `dv self-version` retains the single-line executable identity output and
+does not allocate an event batch. JSON self-version output materializes three
+cold events:
 `command_started` with the syntax version, `tool_version` with the executable
 and both protocol versions, and `command_finished`. The common non-JSON parser
 adds no filesystem access, network request, managed process, dynamic
@@ -343,8 +344,9 @@ rejected by the reporter boundary rather than guessed from an alias.
 
 ## Windows Evidence
 
-Thirty retained samples after three warm-ups on the repository benchmark
-machine measured the isolated `dv --version` path at `6.095 ms` median and
+At command syntax version 5, thirty retained samples after three warm-ups on
+the repository benchmark machine measured the then-isolated `dv --version`
+path at `6.095 ms` median and
 `8.818 ms` p95. It has no like-for-like Microsoft result because the two
 commands report different product versions.
 
@@ -438,8 +440,8 @@ median and `5.980 ms` p95 (`12.2x`). This remains below the earlier published
 startup regression. Raw samples are
 `benchmarks/results/sdk-current-cli013-control.json`.
 
-The `CLI-017` structural query validates all three native version aliases before
-timing `dv --json --version`. Thirty retained samples after five warm-ups
+The syntax-5 `CLI-017` structural query validated all three former native
+self-version aliases before timing `dv --json --version`. Thirty retained samples after five warm-ups
 measured `4.479 ms` median and `5.593 ms` p95. Microsoft has no command that
 reports both its command grammar and dv's JSON event contract, so the harness
 prints TBI rather than manufacturing a comparison. The separate like-for-like
@@ -448,6 +450,15 @@ p95, while `dv sdk current` measured `4.828 ms` median and `5.252 ms` p95,
 leaving `dv` `13.1x` faster at the median. Raw samples are retained as
 `benchmarks/results/2026-08-01-cli-protocol-version-windows.json` and
 `benchmarks/results/2026-08-01-cli-protocol-version-sdk-control-windows.json`.
+
+Command syntax 6 makes the short native route like-for-like: thirty retained
+Windows samples after five warm-ups measured `dotnet --version` at `65.047 ms`
+median and `67.846 ms` p95, while `dv --version` measured `5.559 ms` and
+`6.091 ms`, an `11.7x` median improvement. The separate
+`dv --json self-version` protocol query measured `5.037 ms` median and
+`6.650 ms` p95; Microsoft remains TBI for that non-equivalent query. Raw
+reports are `target/cli-version-syntax6-final.json` and
+`target/cli-self-version-syntax6.json`.
 
 `DROP-002` validates all 19 accepted spellings in unit coverage and measures
 `dotnet restore --definitely-unknown` against normalized `dv sync
