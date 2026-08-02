@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 84 rows are implemented;
+- 85 rows are implemented;
 - 30 rows have partial foundations;
-- 354 rows are missing;
+- 353 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -216,7 +216,7 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` through `WS-009` are complete: one bounded immediate directory pass
+`WS-001` through `WS-010` are complete: one bounded immediate directory pass
 packs all five project/solution candidate kinds into a stable offset-indexed
 batch, explicit candidate files take a single-metadata-query validation path,
 and exact-one directory selection produces a typed owning result before any
@@ -235,7 +235,10 @@ real lookups and existing physical identities, not the Rust compile target;
 case-sensitive collisions remain distinct while no-link aliases collapse.
 Default source traversal now rejects fixed output names, every dot-prefixed
 metadata/cache tree, and five configured output roots before descent or link
-identity work. The next workspace work remains `WS-010` through `WS-012`;
+identity work. Project closures now share one compact offset-indexed path table
+across every root while the zero-reference path allocates no identity state;
+process-persistent capacity remains unjustified without a watch lifetime. The
+next workspace work remains `WS-011` through `WS-012`;
 recursive workspace traversal is not silently folded into immediate selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,

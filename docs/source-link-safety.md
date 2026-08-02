@@ -29,9 +29,10 @@ The source transform is:
 
 Project-reference input is the evaluated literal reference batch. Missing
 paths fail before identity creation. On the first existing reference, closure
-lazily creates a sorted physical-path vector seeded with the root project.
-Each successfully evaluated physical identity is inserted once; a different
-logical spelling that resolves to an existing identity fails as `DV0207`.
+lazily creates one shared encoded-byte table with sorted lexical and physical
+offset indices seeded by the root project. Each successfully evaluated physical
+identity is inserted once; a different logical spelling that resolves to an
+existing identity fails as `DV0207`.
 Lexically explicit `..` references remain valid. A lexically in-directory
 reference whose physical target leaves that directory is an escape.
 
@@ -46,11 +47,11 @@ derive their physical identity by appending the observed entry name; nested
 links alone pay another canonicalization.
 
 Project closure pays physical canonicalization only when references exist. Its
-sorted `Vec<PathBuf>` uses logarithmic lookup and contiguous insertion. Source
-link ancestry uses linear lookup because observed link depths are tiny and the
-batch must preserve stack order. These pointer-bearing cold records are
-justified because platform paths are variable-sized external data; the shared
-offset path table and capacity reuse belong to `WS-010`. No mutable worker
+compact sorted offset indices use logarithmic lookup and contiguous insertion.
+Source link ancestry uses linear lookup because observed link depths are tiny
+and the batch must preserve stack order. These pointer-bearing cold records are
+justified because platform paths are variable-sized external data; project
+identities now use the `WS-010` shared byte arena instead. No mutable worker
 state, alignment boundary, or false-sharing risk is introduced. `ProjectError`
 remains 64 bytes on 64-bit Windows and 56 bytes on other 64-bit targets.
 

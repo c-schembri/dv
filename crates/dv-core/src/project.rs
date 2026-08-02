@@ -77,21 +77,36 @@ const _: () = assert!(size_of::<ResolvedProjectPath<'static>>() == 40);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(align_of::<ResolvedProjectPath<'static>>() == align_of::<usize>());
 
-struct PhysicalProjectIdentity {
-  path: PathBuf,
+#[derive(Clone, Copy)]
+struct PhysicalPathSpan {
+  path: TextSpan,
   project_index: u32,
 }
 
-#[cfg(all(target_pointer_width = "64", windows))]
-const _: () = assert!(size_of::<PhysicalProjectIdentity>() == 40);
-#[cfg(all(target_pointer_width = "64", not(windows)))]
-const _: () = assert!(size_of::<PhysicalProjectIdentity>() == 32);
+const _: () = assert!(size_of::<PhysicalPathSpan>() == 12);
+const _: () = assert!(align_of::<PhysicalPathSpan>() == 4);
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalPathSpan>() == 5);
+
+struct CommandPathTable {
+  bytes: Vec<u8>,
+  lexical: Vec<TextSpan>,
+  physical: Vec<PhysicalPathSpan>,
+}
+
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(align_of::<PhysicalProjectIdentity>() == align_of::<usize>());
-#[cfg(all(target_pointer_width = "64", windows))]
-const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 1);
-#[cfg(all(target_pointer_width = "64", not(windows)))]
-const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 2);
+const _: () = assert!(size_of::<CommandPathTable>() == 72);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<CommandPathTable>() == align_of::<usize>());
+
+/// One command-local, incrementally populated project-closure batch.
+pub struct ProjectClosureBatch {
+  table: Option<CommandPathTable>,
+  projects: Vec<ProjectSpec>,
+  cursor: usize,
+  root_capacity: usize,
+  pushed_roots: usize,
+  configuration: Option<ProjectConfiguration>,
+}
 
 struct SourceExclusionBatch {
   paths: [PathBuf; MAX_CONFIGURED_SOURCE_EXCLUSIONS],
@@ -1171,6 +1186,78 @@ impl TextTable {
   }
 }
 
+impl CommandPathTable {
+  fn with_capacity(path_capacity: usize, byte_capacity: usize) -> Self {
+    Self {
+      bytes: Vec::with_capacity(byte_capacity),
+      lexical: Vec::with_capacity(path_capacity),
+      physical: Vec::with_capacity(path_capacity),
+    }
+  }
+
+  fn lexical_search(&self, path: &Path) -> std::result::Result<usize, usize> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    self.lexical.binary_search_by(|span| self.path(*span).cmp(bytes))
+  }
+
+  fn physical_search(&self, path: &Path) -> std::result::Result<usize, usize> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    self.physical.binary_search_by(|row| self.path(row.path).cmp(bytes))
+  }
+
+  fn physical_project(&self, index: usize) -> usize {
+    usize::try_from(self.physical[index].project_index).expect("u32 project indices fit usize")
+  }
+
+  fn insert_lexical(&mut self, index: usize, path: &Path, diagnostic_path: &Path) -> Result<(), ProjectError> {
+    let span = self.append(path, diagnostic_path)?;
+    self.lexical.insert(index, span);
+    Ok(())
+  }
+
+  fn insert_project(
+    &mut self,
+    lexical_index: usize,
+    lexical: &Path,
+    physical_index: usize,
+    physical: &Path,
+    project_index: u32,
+    diagnostic_path: &Path,
+  ) -> Result<(), ProjectError> {
+    let same_path = lexical.as_os_str().as_encoded_bytes() == physical.as_os_str().as_encoded_bytes();
+    let lexical = self.append(lexical, diagnostic_path)?;
+    let physical = if same_path { lexical } else { self.append(physical, diagnostic_path)? };
+    self.lexical.insert(lexical_index, lexical);
+    self.physical.insert(physical_index, PhysicalPathSpan { path: physical, project_index });
+    Ok(())
+  }
+
+  fn append(&mut self, path: &Path, diagnostic_path: &Path) -> Result<TextSpan, ProjectError> {
+    let value = path.as_os_str().as_encoded_bytes();
+    let start =
+      u32::try_from(self.bytes.len()).map_err(|_| ProjectError::new(ProjectErrorKind::Unsupported, diagnostic_path, "command path table exceeds 4 GiB"))?;
+    let len = u32::try_from(value.len()).map_err(|_| ProjectError::new(ProjectErrorKind::Unsupported, diagnostic_path, "one command path exceeds 4 GiB"))?;
+    let next = self
+      .bytes
+      .len()
+      .checked_add(value.len())
+      .ok_or_else(|| ProjectError::new(ProjectErrorKind::Unsupported, diagnostic_path, "command path table size overflows the platform"))?;
+    if next > u32::MAX as usize {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        diagnostic_path,
+        "command path table exceeds 4 GiB",
+      ));
+    }
+    self.bytes.extend_from_slice(value);
+    Ok(TextSpan { start, len })
+  }
+
+  fn path(&self, span: TextSpan) -> &[u8] {
+    &self.bytes[span.start as usize..span.start as usize + span.len as usize]
+  }
+}
+
 /// Selects exactly one project or solution in a directory and evaluates a C# project.
 pub fn evaluate_project(start_directory: &Path, configuration: ProjectConfiguration) -> Result<ProjectSpec, ProjectError> {
   let selection = select_workspace(start_directory)?;
@@ -1456,41 +1543,160 @@ fn evaluate_resolved_project_path(resolved: &ResolvedProjectPath<'_>, configurat
 /// Evaluates one project-reference closure in deterministic root-first order.
 ///
 /// Each project path is evaluated once. Reference order is preserved while
-/// duplicate paths are removed through a sorted command-local path index.
+/// duplicate paths are removed through the shared command-local path table.
 pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, ProjectError> {
-  let configuration = root.configuration();
-  let mut seen = vec![root.project_path().to_owned()];
-  let mut physical_seen = None::<Vec<PhysicalProjectIdentity>>;
-  let mut projects = vec![root];
-  let mut cursor = 0usize;
-  while cursor < projects.len() {
-    let references = projects[cursor]
+  let mut batch = ProjectClosureBatch::with_root_capacity(1);
+  batch.push(root)?;
+  Ok(batch.into_projects())
+}
+
+/// Evaluates project-reference closures for one ordered root batch.
+///
+/// Roots and references share one lexical/physical identity table. Each root's
+/// closure remains root-first before the next distinct root is appended.
+pub fn evaluate_project_closures(roots: Vec<ProjectSpec>) -> Result<Vec<ProjectSpec>, ProjectError> {
+  let mut batch = ProjectClosureBatch::with_root_capacity(roots.len());
+  for root in roots {
+    batch.push(root)?;
+  }
+  Ok(batch.into_projects())
+}
+
+impl ProjectClosureBatch {
+  /// Creates one command-local batch with a root-count capacity hint.
+  pub fn with_root_capacity(root_capacity: usize) -> Self {
+    Self {
+      table: None,
+      projects: Vec::with_capacity(root_capacity),
+      cursor: 0,
+      root_capacity,
+      pushed_roots: 0,
+      configuration: None,
+    }
+  }
+
+  /// Appends one evaluated root and immediately completes its distinct closure.
+  pub fn push(&mut self, root: ProjectSpec) -> Result<(), ProjectError> {
+    let configuration = match self.configuration {
+      Some(configuration) if root.configuration() != configuration => {
+        return Err(ProjectError::new(
+          ProjectErrorKind::InvalidProperty,
+          root.project_path(),
+          "one project-closure batch cannot mix build configurations",
+        ));
+      },
+      Some(configuration) => configuration,
+      None => {
+        self.configuration = Some(root.configuration());
+        root.configuration()
+      },
+    };
+    let compare_root_physical_identity = self.pushed_roots != 0;
+    self.pushed_roots += 1;
+
+    if self.table.is_none() && self.projects.is_empty() && root.project_references().len() == 0 {
+      self.projects.push(root);
+      self.cursor = self.projects.len();
+      return Ok(());
+    }
+    if self.table.is_none() {
+      self.initialize_table(&root)?;
+    }
+    let table = self.table.as_mut().expect("the command path table was initialized");
+    let lexical_index = match table.lexical_search(root.project_path()) {
+      Ok(_) => return Ok(()),
+      Err(index) => index,
+    };
+    let physical = fs::canonicalize(root.project_path()).map_err(|error| unsafe_link_identity_error(root.project_path(), root.project_directory(), error))?;
+    let physical_index = match table.physical_search(&physical) {
+      Ok(_) if compare_root_physical_identity => {
+        table.insert_lexical(lexical_index, root.project_path(), root.project_path())?;
+        return Ok(());
+      },
+      Ok(index) => index,
+      Err(index) => index,
+    };
+    let project_index = compact_project_index(self.projects.len(), root.project_path())?;
+    table.insert_project(
+      lexical_index,
+      root.project_path(),
+      physical_index,
+      &physical,
+      project_index,
+      root.project_path(),
+    )?;
+    self.projects.push(root);
+    expand_project_closure(&mut self.projects, &mut self.cursor, configuration, table)
+  }
+
+  /// Returns the deterministic root-first project batch.
+  pub fn into_projects(self) -> Vec<ProjectSpec> {
+    self.projects
+  }
+
+  fn initialize_table(&mut self, incoming: &ProjectSpec) -> Result<(), ProjectError> {
+    let path_capacity = self
+      .root_capacity
+      .saturating_add(self.projects.len())
+      .saturating_add(incoming.project_references().len());
+    self.projects.reserve(path_capacity.saturating_sub(self.projects.len()));
+    let byte_capacity = self
+      .projects
+      .iter()
+      .fold(incoming.project_path().as_os_str().as_encoded_bytes().len(), |bytes, project| {
+        bytes.saturating_add(project.project_path().as_os_str().as_encoded_bytes().len())
+      })
+      .saturating_mul(2);
+    let mut table = CommandPathTable::with_capacity(path_capacity, byte_capacity);
+    for (index, project) in self.projects.iter().enumerate() {
+      let physical =
+        fs::canonicalize(project.project_path()).map_err(|error| unsafe_link_identity_error(project.project_path(), project.project_directory(), error))?;
+      let lexical_index = table
+        .lexical_search(project.project_path())
+        .expect_err("seed projects have distinct lexical identities");
+      let physical_index = table.physical_search(&physical).expect_err("seed projects have distinct physical identities");
+      table.insert_project(
+        lexical_index,
+        project.project_path(),
+        physical_index,
+        &physical,
+        compact_project_index(index, project.project_path())?,
+        project.project_path(),
+      )?;
+    }
+    self.table = Some(table);
+    Ok(())
+  }
+}
+
+fn expand_project_closure(
+  projects: &mut Vec<ProjectSpec>,
+  cursor: &mut usize,
+  configuration: ProjectConfiguration,
+  table: &mut CommandPathTable,
+) -> Result<(), ProjectError> {
+  while *cursor < projects.len() {
+    let references = projects[*cursor]
       .project_references()
-      .map(|reference| projects[cursor].project_directory().join(reference))
+      .map(|reference| projects[*cursor].project_directory().join(reference))
       .collect::<Vec<_>>();
     for reference in references {
       let resolved = resolve_project_path(&reference)?;
-      let index = match seen.binary_search(&resolved.identity) {
+      let lexical_index = match table.lexical_search(&resolved.identity) {
         Ok(_) => continue,
         Err(index) => index,
       };
       let physical =
-        fs::canonicalize(&resolved.identity).map_err(|error| unsafe_link_identity_error(&reference, projects[cursor].project_directory(), error))?;
-      if physical_seen.is_none() {
-        let root = fs::canonicalize(projects[0].project_path())
-          .map_err(|error| unsafe_link_identity_error(projects[0].project_path(), projects[0].project_directory(), error))?;
-        physical_seen = Some(vec![PhysicalProjectIdentity { path: root, project_index: 0 }]);
-      }
-      let physical_seen = physical_seen.as_mut().expect("the physical project identity batch was initialized");
-      let physical_index = match physical_seen.binary_search_by(|candidate| candidate.path.cmp(&physical)) {
+        fs::canonicalize(&resolved.identity).map_err(|error| unsafe_link_identity_error(&reference, projects[*cursor].project_directory(), error))?;
+      let physical_index = match table.physical_search(&physical) {
         Ok(existing) => {
-          let existing_project = usize::try_from(physical_seen[existing].project_index).expect("u32 project indices fit usize");
+          let existing_project = table.physical_project(existing);
           if !path_alias_uses_link(
             projects[existing_project].project_path(),
             &resolved.identity,
-            projects[cursor].project_directory(),
+            projects[*cursor].project_directory(),
           )? {
-            seen.insert(index, resolved.identity);
+            table.insert_lexical(lexical_index, &resolved.identity, &reference)?;
             continue;
           }
           return Err(
@@ -1502,14 +1708,14 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
                 reference.display()
               ),
             )
-            .with_context("workspace_root", projects[cursor].project_directory().display().to_string())
-            .with_context("referring_project", projects[cursor].project_path().display().to_string())
+            .with_context("workspace_root", projects[*cursor].project_directory().display().to_string())
+            .with_context("referring_project", projects[*cursor].project_path().display().to_string())
             .with_context("resolved_target", physical.display().to_string()),
           );
         },
         Err(index) => index,
       };
-      let referring_directory = projects[cursor].project_directory();
+      let referring_directory = projects[*cursor].project_directory();
       if resolved.identity.starts_with(referring_directory) {
         let physical_directory =
           fs::canonicalize(referring_directory).map_err(|error| unsafe_link_identity_error(referring_directory, referring_directory, error))?;
@@ -1529,21 +1735,18 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
           );
         }
       }
-      let project_index = u32::try_from(projects.len()).map_err(|_| {
-        ProjectError::new(
-          ProjectErrorKind::Unsupported,
-          &reference,
-          "project-reference closure exceeds 4,294,967,295 projects",
-        )
-      })?;
       let project = evaluate_resolved_project_path(&resolved, configuration)?;
-      seen.insert(index, resolved.identity);
-      physical_seen.insert(physical_index, PhysicalProjectIdentity { path: physical, project_index });
+      let project_index = compact_project_index(projects.len(), &reference)?;
+      table.insert_project(lexical_index, &resolved.identity, physical_index, &physical, project_index, &reference)?;
       projects.push(project);
     }
-    cursor += 1;
+    *cursor += 1;
   }
-  Ok(projects)
+  Ok(())
+}
+
+fn compact_project_index(index: usize, path: &Path) -> Result<u32, ProjectError> {
+  u32::try_from(index).map_err(|_| ProjectError::new(ProjectErrorKind::Unsupported, path, "project-reference closure exceeds 4,294,967,295 projects"))
 }
 
 fn path_alias_uses_link(existing: &Path, candidate: &Path, workspace_root: &Path) -> Result<bool, ProjectError> {
@@ -4574,6 +4777,82 @@ mod tests {
 
     assert_eq!(names, ["App.csproj", "Left.csproj", "Right.csproj", "Shared.csproj"]);
     assert!(projects.iter().all(|project| project.configuration() == ProjectConfiguration::Release));
+  }
+
+  #[test]
+  fn project_closure_batch_shares_one_path_table_without_changing_root_order() {
+    let temp = TempDirectory::new();
+    temp.write("Shared/Shared.csproj", &project_xml("", ""));
+    let first = temp.write(
+      "First.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="Shared/Shared.csproj" /></ItemGroup>"#),
+    );
+    let second = temp.write(
+      "Second.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="Shared/Shared.csproj" /></ItemGroup>"#),
+    );
+    let roots = [first, second]
+      .iter()
+      .map(|path| evaluate_project_path(path, ProjectConfiguration::Debug).unwrap())
+      .collect();
+
+    let projects = evaluate_project_closures(roots).unwrap();
+    let names = projects
+      .iter()
+      .map(|project| project.project_path().file_name().unwrap().to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
+
+    assert_eq!(names, ["First.csproj", "Shared.csproj", "Second.csproj"]);
+  }
+
+  #[test]
+  fn empty_and_reference_free_closure_batches_skip_identity_work() {
+    assert!(evaluate_project_closures(Vec::new()).unwrap().is_empty());
+    let temp = TempDirectory::new();
+    let path = temp.write("App.csproj", &project_xml("", ""));
+    let root = evaluate_project_path(&path, ProjectConfiguration::Debug).unwrap();
+
+    let projects = evaluate_project_closures(vec![root]).unwrap();
+
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].project_path(), path);
+  }
+
+  #[test]
+  fn project_closure_batch_rejects_mixed_configurations() {
+    let temp = TempDirectory::new();
+    let first = temp.write("First.csproj", &project_xml("", ""));
+    let second = temp.write("Second.csproj", &project_xml("", ""));
+    let roots = vec![
+      evaluate_project_path(&first, ProjectConfiguration::Debug).unwrap(),
+      evaluate_project_path(&second, ProjectConfiguration::Release).unwrap(),
+    ];
+
+    let error = evaluate_project_closures(roots).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty);
+    assert!(error.to_string().contains("cannot mix build configurations"));
+  }
+
+  #[test]
+  fn command_path_table_uses_one_byte_arena_for_compact_sorted_indices() {
+    let temp = TempDirectory::new();
+    let first = temp.0.join("First.csproj");
+    let second = temp.0.join("Second.csproj");
+    let mut table = CommandPathTable::with_capacity(2, first.as_os_str().as_encoded_bytes().len() * 2);
+    table.insert_project(0, &first, 0, &first, 0, &first).unwrap();
+    let lexical_index = table.lexical_search(&second).unwrap_err();
+    let physical_index = table.physical_search(&second).unwrap_err();
+    table.insert_project(lexical_index, &second, physical_index, &second, 1, &second).unwrap();
+
+    assert_eq!(table.lexical.len(), 2);
+    assert_eq!(table.physical.len(), 2);
+    assert_eq!(table.physical_project(0), 0);
+    assert_eq!(table.physical_project(1), 1);
+    assert_eq!(
+      table.bytes.len(),
+      first.as_os_str().as_encoded_bytes().len() + second.as_os_str().as_encoded_bytes().len()
+    );
   }
 
   #[test]

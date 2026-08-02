@@ -16,8 +16,8 @@ The transform is:
 1. Validate the extension and query metadata using the original spelling.
 2. Reject missing and non-file inputs before identity allocation.
 3. Make an existing path absolute and remove `.` and `..` lexically.
-4. Search the sorted command-local lexical identity vector.
-5. For an existing reference, search the sorted physical identity batch. The
+4. Search the sorted lexical offsets in the shared command-local path table.
+5. For an existing reference, search its sorted physical offsets. The
    active filesystem therefore decides whether differently cased spellings are
    distinct.
 6. Collapse a same-physical no-link alias, reject a link/reparse alias, or
@@ -31,14 +31,13 @@ one evaluation. Successful `ProjectSpec` data owns the normalized identity;
 errors retain the original spelling.
 
 The closure access pattern is linear over each project's reference batch with
-binary search in sorted lexical and physical identity vectors. Existing/missing
+binary search in sorted lexical and physical offset indices. Existing/missing
 and new/already-seen branches are expected to be predictable for ordinary
 graphs. A physical collision alone scans the divergent path components for
-link metadata. The variable-length external physical path plus one compact
-project index occupies 40 bytes on 64-bit Windows or 32 bytes on other 64-bit
-targets, aligned to `usize`; that is one or two records per assumed 64-byte
-cache line. A shared offset path table is deliberately deferred to `WS-010`,
-where reuse can be measured across commands.
+link metadata. `WS-010` stores variable path bytes once in a shared arena with
+8-byte lexical spans and 12-byte physical/project-index rows: eight or five
+rows per assumed 64-byte cache line. Details and persistence evidence are in
+[project-path-table.md](project-path-table.md).
 
 ## Boundaries
 

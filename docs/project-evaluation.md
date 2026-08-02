@@ -106,11 +106,14 @@ link first queries its target type, then canonicalizes the target and lazily
 canonicalizes the project root.
 Directory links use a cold enter/leave work stack plus active physical ancestry,
 so arbitrary graph cycles fail as `DV0207`, not only direct ancestor links.
-Physical targets outside the root also fail. Project closure lazily creates a
-sorted physical-path/project-index batch only after its first reference. The
-active filesystem decides whether case variants canonicalize to one identity.
-No-link aliases enter the lexical index and are skipped; link aliases still
-fail, without changing ordinary `..` reference semantics.
+Physical targets outside the root also fail. Project closure lazily creates one
+command-local encoded-byte arena with sorted lexical and physical offset
+indices only after its first reference or second explicit root. The active
+filesystem decides whether case variants canonicalize to one identity. No-link
+aliases enter the lexical index and are skipped; link aliases still fail,
+without changing ordinary `..` reference semantics. The zero-reference path
+allocates no identity state, and every root pushed by restore shares the same
+table. See [project-path-table.md](project-path-table.md).
 
 The exclusion batch is 168 bytes on 64-bit Windows and 128 bytes on other
 64-bit targets, aligned to `usize`; its five `PathBuf` slots are 32 or 24 bytes,

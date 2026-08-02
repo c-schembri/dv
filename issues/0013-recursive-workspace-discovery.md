@@ -18,6 +18,9 @@ fail closed, and physical identity work remains off link-free source scans.
 `WS-009` now prunes `bin`, `obj`, every dot-prefixed metadata/cache tree, and
 five configured output roots before default-source descent or link resolution.
 Repository-wide candidate discovery remains deliberately separate.
+`WS-010` gives project closures one command-local encoded-byte path table;
+watch/session persistence remains intentionally absent until such a lifetime
+exists and can be measured.
 
 ## Required Evidence
 

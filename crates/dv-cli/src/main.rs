@@ -2,7 +2,6 @@ use std::{
   env,
   ffi::OsStr,
   fmt::Write as _,
-  fs,
   io::{self, IsTerminal, Write},
   path::{Path, PathBuf},
   process,
@@ -26,13 +25,13 @@ use dv_core::{
   DiagnosticCode, DirectPackagePolicyEvent, DotnetArchitecture, Event, EventPayload, FrameworkReferenceError, FrameworkReferenceErrorKind,
   FrameworkReferencePlan, Outcome, PackRequirement, PackageAssetFlags, PackageError, PackageErrorKind, PackageHttpPolicyEvent, PackagePathPropertyEvent,
   PackageResolution, PackageResolveOptions, PackageServiceEndpointEvent, PackageSourceCapabilityEvent, PackageSourceInventory, PackageSourceWorkEvent,
-  ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec, ResolvedFrameworkReferenceEvent,
-  ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory, RuntimePackError, RuntimePackErrorKind,
-  RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity, WorkspaceCandidateKind, discover_ancestor_inputs,
-  discover_installed_sdks, discover_installed_sdks_for_architecture, discover_repository_root, discover_runtimes, discover_runtimes_for_architecture,
-  discover_sdks, evaluate_project, evaluate_project_closure, evaluate_project_path, inspect_package_sources, load_portable_runtime_graph,
-  plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs, resolve_package_inputs_with_runtime_graph,
-  write_json_lines,
+  ProjectClosureBatch, ProjectConfiguration, ProjectError, ProjectErrorKind, ProjectFrameworkReferenceEvent, ProjectPackageEvent, ProjectSpec,
+  ResolvedFrameworkReferenceEvent, ResolvedPackageEvent, RuntimeGraphError, RuntimeGraphErrorKind, RuntimeInstallationEvent, RuntimeInventory,
+  RuntimePackError, RuntimePackErrorKind, RuntimePackPlan, RuntimeTargetEvent, SdkError, SdkErrorKind, SdkInstallationEvent, SdkInventory, Severity,
+  WorkspaceCandidateKind, discover_ancestor_inputs, discover_installed_sdks, discover_installed_sdks_for_architecture, discover_repository_root,
+  discover_runtimes, discover_runtimes_for_architecture, discover_sdks, evaluate_project, evaluate_project_path, inspect_package_sources,
+  load_portable_runtime_graph, plan_compiler_inputs_with_packages, plan_framework_references, plan_runtime_packs, resolve_package_inputs,
+  resolve_package_inputs_with_runtime_graph, write_json_lines,
 };
 
 const HELP: &str = "\
@@ -975,53 +974,18 @@ fn run_package_command(
     },
   };
   let configuration = options.configuration.unwrap_or(ProjectConfiguration::Debug);
-  let mut projects = Vec::with_capacity(options.additional_projects.len() + 1);
-  let mut seen = Vec::<PathBuf>::new();
-  let compare_physical_identity = !options.additional_projects.is_empty();
-  let roots = std::iter::once(options.project.path()).chain(options.additional_projects.iter().copied().map(Some));
-  for requested in roots {
+  let mut projects = ProjectClosureBatch::with_root_capacity(options.additional_projects.len() + 1);
+  let requested_roots = std::iter::once(options.project.path()).chain(options.additional_projects.iter().copied().map(Some));
+  for requested in requested_roots {
     let root = match load_project(&current_directory, requested, configuration) {
       Ok(project) => project,
       Err(error) => return restore_fail(started, globals, command, args, project_diagnostic(error)),
     };
-    let closure = match evaluate_project_closure(root) {
-      Ok(projects) => projects,
-      Err(error) => return restore_fail(started, globals, command, args, project_diagnostic(error)),
-    };
-    for project in closure {
-      let identity = if compare_physical_identity {
-        match fs::canonicalize(project.project_path()) {
-          Ok(identity) => identity,
-          Err(error) => {
-            return restore_fail(
-              started,
-              globals,
-              command,
-              args,
-              diagnostic(
-                "DV0202",
-                format!("failed to resolve project identity {}: {error}", project.project_path().display()),
-                Some(ContextField {
-                  name: "path".into(),
-                  value: project.project_path().display().to_string(),
-                }),
-                None,
-              ),
-            );
-          },
-        }
-      } else {
-        project.project_path().to_owned()
-      };
-      match seen.binary_search(&identity) {
-        Ok(_) => {},
-        Err(index) => {
-          seen.insert(index, identity);
-          projects.push(project);
-        },
-      }
+    if let Err(error) = projects.push(root) {
+      return restore_fail(started, globals, command, args, project_diagnostic(error));
     }
   }
+  let projects = projects.into_projects();
   let options = match normalize_package_options(options, &current_directory, true, cancellation) {
     Ok(options) => options,
     Err(problem) => return reject(started, globals, command, args, diagnostic("DV0002", problem, None, None)),

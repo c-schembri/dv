@@ -43,12 +43,12 @@ probe; absent configs pay three metadata misses. No dynamic allocation or
 branch is added to non-NuGet singleton discovery.
 
 Project-reference access remains linear over each reference batch with binary
-search in contiguous lexical and physical vectors. The physical row contains
-one `PathBuf` and one `u32` project index: 40 bytes on 64-bit Windows and 32
-bytes on other 64-bit targets, aligned to `usize`, or one/two rows per assumed
-64-byte cache line. Only a physical collision scans divergent path components
-for link metadata. Zero-reference workflows retain their prior path exactly.
-Multi-root canonicalization is paid only for explicit root batches.
+search in contiguous lexical and physical offset indices. `WS-010` stores path
+bytes in one command-local arena; lexical spans are 8 bytes and physical spans
+plus project index are 12 bytes, or eight/five rows per assumed 64-byte cache
+line. Only a physical collision scans divergent path components for link
+metadata. Zero-reference workflows allocate no identity table. Multi-root
+canonicalization is paid only for explicit root batches.
 Exact SDK roots and exact NuGet fragment spellings retain their prior
 allocation-free comparison; only a case-only ambiguity pays canonicalization.
 

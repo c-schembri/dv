@@ -787,8 +787,17 @@ contracts.
   cold branch. Thirty warm Windows samples measured Microsoft at `264.677 ms`
   median and `268.625 ms` p95 versus `4.139 ms` and `4.639 ms` for `dv`, a
   `63.9x` median improvement. `P1`
-- [ ] `WS-010` Cache one command-local path table and reuse its capacity across
-  watch/repeated-command sessions if measurements justify persistence. `P2`
+- [x] `WS-010` Cache one command-local path table and reuse its capacity across
+  watch/repeated-command sessions if measurements justify persistence. One
+  opaque encoded-byte arena now backs sorted 8-byte lexical spans and 12-byte
+  physical/project-index rows for every root in the command. The one-root,
+  zero-reference path skips the table; multi-root restore removes its separate
+  merge vector and duplicate shared-reference evaluation. No process-persistent
+  cache is added because no watch/repeated-command lifetime exists to measure.
+  An adjacent 30-sample Windows A/B measured the `WS-009` parent at `5.830 ms`
+  versus `5.684 ms` for the compact table. The current Microsoft comparison was
+  `507.094 ms` median and `532.656 ms` p95 versus `5.684 ms` and `6.429 ms` for
+  `dv`, an `89.2x` median improvement. `P2`
 - [ ] `WS-011` Track file identity, size, timestamp precision, and content hash
   separately so no-op proofs can escalate only when needed. `P1`
 - [ ] `WS-012` Add immutable fixtures for ambiguous directories, nested
