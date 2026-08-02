@@ -68,6 +68,8 @@ jobs:
         run: cargo run -p dv-bench -- --case path_identity --samples 1 --warmups 0 --output target/benchmark-path-identity-smoke.json
       - name: Run source link traversal benchmark smoke test
         run: cargo run -p dv-bench -- --case source_link_traversal --samples 1 --warmups 0 --output target/benchmark-source-link-smoke.json
+      - name: Run active filesystem case benchmark smoke test
+        run: cargo run -p dv-bench -- --case filesystem_case_identity --samples 1 --warmups 0 --output target/benchmark-filesystem-case-smoke.json
       - name: Run typed transform benchmark smoke test
         run: cargo run -p dv-bench -- --case cli_transform_equivalence --samples 1 --warmups 0 --output target/benchmark-transform-equivalence-smoke.json
       - name: Run invocation mode benchmark smoke test

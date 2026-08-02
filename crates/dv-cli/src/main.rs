@@ -2,6 +2,7 @@ use std::{
   env,
   ffi::OsStr,
   fmt::Write as _,
+  fs,
   io::{self, IsTerminal, Write},
   path::{Path, PathBuf},
   process,
@@ -976,6 +977,7 @@ fn run_package_command(
   let configuration = options.configuration.unwrap_or(ProjectConfiguration::Debug);
   let mut projects = Vec::with_capacity(options.additional_projects.len() + 1);
   let mut seen = Vec::<PathBuf>::new();
+  let compare_physical_identity = !options.additional_projects.is_empty();
   let roots = std::iter::once(options.project.path()).chain(options.additional_projects.iter().copied().map(Some));
   for requested in roots {
     let root = match load_project(&current_directory, requested, configuration) {
@@ -987,10 +989,34 @@ fn run_package_command(
       Err(error) => return restore_fail(started, globals, command, args, project_diagnostic(error)),
     };
     for project in closure {
-      match seen.binary_search_by(|path| path.as_path().cmp(project.project_path())) {
+      let identity = if compare_physical_identity {
+        match fs::canonicalize(project.project_path()) {
+          Ok(identity) => identity,
+          Err(error) => {
+            return restore_fail(
+              started,
+              globals,
+              command,
+              args,
+              diagnostic(
+                "DV0202",
+                format!("failed to resolve project identity {}: {error}", project.project_path().display()),
+                Some(ContextField {
+                  name: "path".into(),
+                  value: project.project_path().display().to_string(),
+                }),
+                None,
+              ),
+            );
+          },
+        }
+      } else {
+        project.project_path().to_owned()
+      };
+      match seen.binary_search(&identity) {
         Ok(_) => {},
         Err(index) => {
-          seen.insert(index, project.project_path().to_owned());
+          seen.insert(index, identity);
           projects.push(project);
         },
       }

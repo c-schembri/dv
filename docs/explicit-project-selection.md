@@ -28,8 +28,9 @@ explicit-file path. Wrong-kind candidate paths perform no filesystem I/O.
 
 Safe linked candidate files inside the selected directory are accepted with
 their link spelling; broken identities and targets outside the physical
-directory fail through the `WS-007` policy. Filesystem case semantics remain
-owned by `WS-008`.
+directory fail through the `WS-007` policy. Extension matching is a
+case-insensitive command contract, while file existence and identity now come
+from the active filesystem through `WS-008`.
 
 ## Verification
 

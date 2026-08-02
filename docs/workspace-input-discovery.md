@@ -22,13 +22,15 @@ contents are not opened or parsed by discovery. Missing markers produce empty
 views; a known marker with a non-file type fails instead of falling through to
 a parent file.
 
-On case-sensitive systems NuGet's three recognized ancestor spellings are
-probed in precedence order: `nuget.config`, `NuGet.config`, then
-`NuGet.Config`. Windows needs one case-insensitive probe. macOS performs a
-directory enumeration only after a successful probe to preserve the actual
-entry spelling. Regular files reached through filesystem links retain the link
-spelling. This bounded marker lookup does not recurse through a target
-directory; consumers treat the selected marker as one explicit file input.
+NuGet's three recognized ancestor spellings are probed in precedence order:
+`nuget.config`, `NuGet.config`, then `NuGet.Config`. Each lookup uses the active
+directory's behavior regardless of the executable's compile target. After a
+hit, one directory enumeration preserves the actual recognized entry spelling.
+On a case-insensitive directory the first lookup aliases the single entry; on a
+case-sensitive directory distinct spellings retain their documented priority.
+Regular files reached through filesystem links retain the link spelling. This
+bounded marker lookup does not recurse through a target directory; consumers
+treat the selected marker as one explicit file input.
 
 ## Data Layout
 
@@ -50,8 +52,9 @@ Singleton requests stop as soon as their nearest match is found. SDK selection
 therefore probes only `global.json`; central package discovery probes only
 `Directory.Packages.props`. NuGet configuration alone walks to the root because
 its merge semantics require the full hierarchy. The diagnostic command requests
-all five families in one walk. Metadata probes, visited ancestors, macOS casing
-enumerations, and retained row bytes are explicit bounded evidence.
+all five families in one walk. Metadata probes, visited ancestors, successful
+config-casing enumerations, and retained row bytes are explicit bounded
+evidence.
 
 ## Verification
 

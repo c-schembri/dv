@@ -798,15 +798,19 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
-  if cfg!(windows) {
-    left
-      .as_os_str()
-      .to_string_lossy()
-      .trim_end_matches(['\\', '/'])
-      .eq_ignore_ascii_case(right.as_os_str().to_string_lossy().trim_end_matches(['\\', '/']))
-  } else {
-    left == right
+  let left_text = left.as_os_str().to_string_lossy();
+  let right_text = right.as_os_str().to_string_lossy();
+  let left_text = left_text.trim_end_matches(['\\', '/']);
+  let right_text = right_text.trim_end_matches(['\\', '/']);
+  if left_text == right_text {
+    return true;
   }
+  if !left_text.eq_ignore_ascii_case(right_text) {
+    return false;
+  }
+  fs::canonicalize(left)
+    .and_then(|left| fs::canonicalize(right).map(|right| left == right))
+    .unwrap_or(false)
 }
 
 fn read_global_json(path: &Path) -> Result<GlobalJson, SdkError> {
@@ -1145,6 +1149,21 @@ mod tests {
     fn drop(&mut self) {
       fs::remove_dir_all(&self.0).unwrap();
     }
+  }
+
+  #[test]
+  fn sdk_root_equality_follows_the_active_filesystem() {
+    let temp = TempDirectory::new();
+    let upper = temp.0.join("Root");
+    let lower = temp.0.join("root");
+    fs::create_dir_all(&upper).unwrap();
+    fs::write(upper.join("identity"), b"upper").unwrap();
+    fs::create_dir_all(&lower).unwrap();
+    fs::write(lower.join("identity"), b"lower").unwrap();
+
+    let same_physical_path = fs::read(upper.join("identity")).unwrap() == fs::read(lower.join("identity")).unwrap();
+
+    assert_eq!(paths_equal(&upper, &lower), same_physical_path);
   }
 
   #[test]

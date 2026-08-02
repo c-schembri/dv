@@ -109,6 +109,7 @@ enum CaseKind {
   WorkspaceInputs,
   PathIdentity,
   SourceLinks,
+  FilesystemCase,
   ProjectEvaluate,
   PackageReferenceConditions,
   RuntimeEvaluate,
@@ -168,6 +169,7 @@ struct Fixtures<'a> {
   workspace_inputs: &'a Path,
   path_identity: &'a Path,
   source_links: &'a Path,
+  filesystem_case: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
@@ -382,6 +384,21 @@ const DOTNET_CASES: &[Case] = &[
     name: "source_link_traversal",
     kind: CaseKind::SourceLinks,
     args: &["msbuild", "Root.csproj", "--nologo", "-getItem:Compile"],
+    implemented: true,
+  },
+  Case {
+    name: "filesystem_case_identity",
+    kind: CaseKind::FilesystemCase,
+    args: &[
+      "restore",
+      "Root.csproj",
+      "--nologo",
+      "--configfile",
+      "NuGet.Config",
+      "--packages",
+      ".packages",
+      "--disable-parallel",
+    ],
     implemented: true,
   },
   Case {
@@ -1124,6 +1141,21 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "filesystem_case_identity",
+    kind: CaseKind::FilesystemCase,
+    args: &[
+      "restore",
+      "Root.csproj",
+      "--offline",
+      "--configfile",
+      "NuGet.Config",
+      "--packages",
+      ".packages",
+      "--json",
+    ],
+    implemented: true,
+  },
+  Case {
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
@@ -1531,6 +1563,7 @@ fn run() -> Result<()> {
   let workspace_inputs_fixture = repository.join("benchmarks/fixtures/workspace-inputs");
   let path_identity_fixture = repository.join("benchmarks/fixtures/path-identity");
   let source_links_fixture = repository.join("benchmarks/fixtures/source-links");
+  let filesystem_case_fixture = repository.join("benchmarks/fixtures/filesystem-case");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
@@ -1568,6 +1601,7 @@ fn run() -> Result<()> {
     workspace_inputs: &workspace_inputs_fixture,
     path_identity: &path_identity_fixture,
     source_links: &source_links_fixture,
+    filesystem_case: &filesystem_case_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
@@ -1694,6 +1728,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "source_link_traversal") {
     verify_source_links(&repository, &dv_executable, &source_links_fixture, &workspace.join("verify-source-links"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "filesystem_case_identity") {
+    verify_filesystem_case_identity(&repository, &dv_executable, &filesystem_case_fixture, &workspace.join("verify-filesystem-case"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
@@ -3299,6 +3336,121 @@ fn verify_source_links(repository: &Path, dv_executable: &Path, fixture: &Path, 
   validate_source_link_failure(&output, "outside workspace")?;
   if before != snapshot_tree(&reference_escape_root)? {
     return Err("dv project-reference escape preflight mutated the input workspace".into());
+  }
+  Ok(())
+}
+
+fn verify_filesystem_case_identity(repository: &Path, dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, verification)?;
+  remove_generated_path(verification)?;
+  for (executable, name, arguments, reference) in [
+    (
+      Path::new("dotnet"),
+      "dotnet",
+      &[
+        "restore",
+        "Root.csproj",
+        "--nologo",
+        "--configfile",
+        "NuGet.Config",
+        "--packages",
+        ".packages",
+        "--disable-parallel",
+      ][..],
+      true,
+    ),
+    (
+      dv_executable,
+      "dv",
+      &[
+        "restore",
+        "Root.csproj",
+        "--offline",
+        "--configfile",
+        "NuGet.Config",
+        "--packages",
+        ".packages",
+        "--json",
+      ][..],
+      false,
+    ),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    prepare_filesystem_case_workspace(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_filesystem_case_output(&output, &workspace, reference)?;
+  }
+  Ok(())
+}
+
+fn prepare_filesystem_case_workspace(workspace: &Path) -> Result<()> {
+  let lower_project = workspace.join("library/library.csproj");
+  match fs::metadata(&lower_project) {
+    Ok(metadata) if metadata.is_file() => return Ok(()),
+    Ok(_) => return Err(format!("filesystem-case fixture target {} is not a regular file", lower_project.display()).into()),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+    Err(error) => return Err(format!("inspect filesystem-case fixture target {}: {error}", lower_project.display()).into()),
+  }
+  fs::create_dir_all(lower_project.parent().expect("the lower project has a parent"))?;
+  fs::write(
+    &lower_project,
+    br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>LowerLibrary</AssemblyName><NuGetAudit>false</NuGetAudit></PropertyGroup></Project>"#,
+  )?;
+  fs::write(workspace.join("library/library.cs"), b"internal static class LowerLibrary;\n")?;
+  Ok(())
+}
+
+fn validate_filesystem_case_output(output: &Output, workspace: &Path, reference: bool) -> Result<()> {
+  if !output.status.success() {
+    return Err(
+      format!(
+        "filesystem-case command failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let lower_project = fs::read_to_string(workspace.join("library/library.csproj"))?;
+  let reference_count = if lower_project.contains("<AssemblyName>LowerLibrary</AssemblyName>") {
+    2
+  } else {
+    1
+  };
+  if reference {
+    let assets: serde_json::Value = serde_json::from_slice(&fs::read(workspace.join("obj/project.assets.json"))?)?;
+    let references = assets
+      .pointer("/project/restore/frameworks/net10.0/projectReferences")
+      .and_then(serde_json::Value::as_object)
+      .ok_or("Microsoft filesystem-case restore omitted its project-reference table")?;
+    if references.len() != reference_count {
+      return Err(format!("Microsoft retained {} filesystem-case references; expected {reference_count}", references.len()).into());
+    }
+    return Ok(());
+  }
+
+  let events = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let resolutions = events
+    .iter()
+    .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("package_resolution_created"))
+    .count();
+  if resolutions != reference_count + 1 {
+    return Err(format!("dv retained {resolutions} filesystem-case projects; expected {}", reference_count + 1).into());
+  }
+  if events.iter().any(|event| {
+    event
+      .get("network_requests")
+      .and_then(serde_json::Value::as_u64)
+      .is_some_and(|count| count != 0)
+  }) {
+    return Err("dv filesystem-case restore performed network work".into());
+  }
+  if events.last().and_then(|event| event.get("outcome")).and_then(serde_json::Value::as_str) != Some("succeeded") {
+    return Err("dv filesystem-case restore omitted its successful completion".into());
   }
   Ok(())
 }
@@ -7120,6 +7272,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::WorkspaceInputs
       | CaseKind::PathIdentity
       | CaseKind::SourceLinks
+      | CaseKind::FilesystemCase
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
@@ -8653,6 +8806,10 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::NugetSourceSections
     | CaseKind::NugetStoragePolicy
     | CaseKind::NugetCliOverrides => Ok(()),
+    CaseKind::FilesystemCase => {
+      reset_fixture(fixture, workspace)?;
+      prepare_filesystem_case_workspace(workspace)
+    },
     CaseKind::NuspecFrameworkMetadata => reset_nuspec_framework_metadata_iteration(workspace),
     CaseKind::PackageRidContentCold => reset_package_rid_content_iteration(workspace),
     CaseKind::NugetCredentials
@@ -8730,6 +8887,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::WorkspaceInputs => fixtures.workspace_inputs,
     CaseKind::PathIdentity => fixtures.path_identity,
     CaseKind::SourceLinks => fixtures.source_links,
+    CaseKind::FilesystemCase => fixtures.filesystem_case,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
@@ -8772,6 +8930,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::WorkspaceInputs => Some("workspace-inputs"),
     CaseKind::PathIdentity => Some("path-identity"),
     CaseKind::SourceLinks => Some("source-links"),
+    CaseKind::FilesystemCase => Some("filesystem-case"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
@@ -8881,6 +9040,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_path_identity_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::SourceLinks) {
     validate_source_link_output(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::FilesystemCase) {
+    validate_filesystem_case_output(&output, cwd, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -10096,6 +10257,7 @@ fn case_label(case: &str) -> &str {
     "workspace_inputs" => "Ancestor build input discovery",
     "path_identity" => "Missing reference path identity",
     "source_link_traversal" => "Safe source-link traversal",
+    "filesystem_case_identity" => "Active filesystem case identity",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "workspace_discovery" => "Implicit workspace discovery",

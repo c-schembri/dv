@@ -284,7 +284,7 @@ impl AncestorInputBatch {
     self.ancestor_count
   }
 
-  /// Returns casing-preservation directory enumerations performed on macOS.
+  /// Returns directory enumerations used to preserve discovered filename casing.
   pub const fn directory_enumerations(&self) -> u16 {
     self.directory_enumerations
   }
@@ -484,28 +484,20 @@ fn probe_input(
   metadata_probes: &mut u32,
   directory_enumerations: &mut u16,
 ) -> Result<Option<(u8, u32)>, AncestorInputError> {
-  #[cfg(not(target_os = "macos"))]
-  let _ = directory_enumerations;
   if kind != AncestorInputKind::NugetConfig {
     return probe_file(directory, kind, 0, metadata_probes);
   }
 
-  let spellings: &[u8] = if cfg!(windows) { &[2] } else { &[0, 1, 2] };
-  for spelling in spellings {
-    if let Some((_, file_len)) = probe_file(directory, kind, *spelling, metadata_probes)? {
-      #[cfg(target_os = "macos")]
-      {
-        *directory_enumerations = directory_enumerations.checked_add(1).ok_or_else(|| {
-          AncestorInputError::new(
-            AncestorInputErrorKind::LimitExceeded,
-            directory,
-            "ancestor input discovery exceeds 65,535 directory enumerations",
-          )
-        })?;
-        return actual_nuget_spelling(directory).map(|actual| Some((actual.unwrap_or(*spelling), file_len)));
-      }
-      #[cfg(not(target_os = "macos"))]
-      return Ok(Some((*spelling, file_len)));
+  for spelling in [0, 1, 2] {
+    if let Some((_, file_len)) = probe_file(directory, kind, spelling, metadata_probes)? {
+      *directory_enumerations = directory_enumerations.checked_add(1).ok_or_else(|| {
+        AncestorInputError::new(
+          AncestorInputErrorKind::LimitExceeded,
+          directory,
+          "ancestor input discovery exceeds 65,535 directory enumerations",
+        )
+      })?;
+      return actual_nuget_spelling(directory).map(|actual| Some((actual.unwrap_or(spelling), file_len)));
     }
   }
   Ok(None)
@@ -546,7 +538,6 @@ fn probe_file(directory: &mut PathBuf, kind: AncestorInputKind, spelling: u8, me
   Ok(Some((spelling, file_len)))
 }
 
-#[cfg(target_os = "macos")]
 fn actual_nuget_spelling(directory: &Path) -> Result<Option<u8>, AncestorInputError> {
   let entries = fs::read_dir(directory).map_err(|error| io_error("enumerate NuGet.Config parent", directory, error))?;
   let mut selected = None;
@@ -681,5 +672,17 @@ mod tests {
 
     assert_eq!(error.kind(), AncestorInputErrorKind::UnsupportedFileType);
     assert_eq!(error.path(), temp.0.join("global.json"));
+  }
+
+  #[test]
+  fn nuget_config_preserves_the_entry_spelling_exposed_by_the_active_filesystem() {
+    let temp = TempDirectory::new();
+    let expected = temp.write("NuGet.config");
+
+    let batch = discover_ancestor_inputs(&temp.0, AncestorInputRequest::NUGET_CONFIG).unwrap();
+
+    assert_eq!(batch.inputs(AncestorInputKind::NugetConfig).len(), 1);
+    assert_eq!(batch.path(batch.inputs(AncestorInputKind::NugetConfig)[0]), expected);
+    assert_eq!(batch.directory_enumerations(), 1);
   }
 }

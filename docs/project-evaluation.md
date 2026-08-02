@@ -100,9 +100,10 @@ then canonicalizes the target and lazily canonicalizes the project root.
 Directory links use a cold enter/leave work stack plus active physical ancestry,
 so arbitrary graph cycles fail as `DV0207`, not only direct ancestor links.
 Physical targets outside the root also fail. Project closure lazily creates a
-sorted physical-path batch only after its first reference, preventing alternate
-link spellings from re-entering a project without changing ordinary `..`
-reference semantics.
+sorted physical-path/project-index batch only after its first reference. The
+active filesystem decides whether case variants canonicalize to one identity.
+No-link aliases enter the lexical index and are skipped; link aliases still
+fail, without changing ordinary `..` reference semantics.
 
 `ASSUMPTION: filesystem links are rare in ordinary project trees - affects the
 cold-branch linear identity checks, not correctness.`

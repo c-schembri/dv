@@ -32,11 +32,13 @@ Transform:
 1. Find the nearest `global.json` with an ancestor walk.
 2. Parse its JSON-with-comments SDK policy once.
 3. Resolve ordered search roots, including .NET 10 `paths` and `$host$`.
-4. Enumerate every SDK directory in each root into one contiguous vector.
-5. Parse each valid directory name into numeric major, minor, patch, feature
+4. Deduplicate exact roots directly; a rare case-only ambiguity compares
+   physical identities through the active filesystem.
+5. Enumerate every SDK directory in each root into one contiguous vector.
+6. Parse each valid directory name into numeric major, minor, patch, feature
    band, patch level, and a borrowed range into owned version text.
-6. Sort by root index and semantic version.
-7. Scan each root in order and select the first compatible result.
+7. Sort by root index and semantic version.
+8. Scan each root in order and select the first compatible result.
 
 Outputs:
 
@@ -104,6 +106,9 @@ branches. Selection performs no per-candidate allocation.
 Path buffers and version text are dynamically allocated because they are
 variable-sized external filesystem data that must outlive directory iterators.
 They are cold command-lifetime data, not a build hot-loop representation.
+Exact root comparison remains allocation-free. Only roots whose text differs
+solely by case pay two physical canonicalizations, preventing the compile
+target from deciding equality for a different active filesystem.
 
 Observed on the initial Windows machine:
 

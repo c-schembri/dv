@@ -766,8 +766,18 @@ contracts.
   references remain valid. Thirty warm Windows samples measured Microsoft at
   `301.738 ms` median and `305.440 ms` p95 versus `4.473 ms` and `5.252 ms`
   for `dv`, a `67.5x` median improvement. `P1`
-- [ ] `WS-008` Respect case sensitivity of the active filesystem rather than
-  the compile target. `P1`
+- [x] `WS-008` Respect case sensitivity of the active filesystem rather than
+  the compile target. Ancestor NuGet-config discovery now probes the three
+  recognized spellings in priority order through the active directory and
+  retains the actual entry spelling without an OS branch. NuGet fragment and
+  SDK-root case ambiguities resolve physical identity only on their cold branch.
+  Existing project
+  references use canonical physical identities: distinct case-colliding files
+  remain distinct, no-link casing aliases collapse, and a link/reparse alias
+  still fails as `DV0207`. Multi-root restore performs the same physical merge
+  only when more than one root was requested. Thirty cold Windows samples
+  measured Microsoft at `498.186 ms` median and `503.552 ms` p95 versus
+  `5.541 ms` and `6.146 ms` for `dv`, an `89.9x` median improvement. `P1`
 - [~] `WS-009` Exclude `bin`, `obj`, configured output trees, VCS metadata, and
   tool cache trees from default discovery. `P1`
 - [ ] `WS-010` Cache one command-local path table and reuse its capacity across

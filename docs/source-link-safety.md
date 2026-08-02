@@ -71,8 +71,8 @@ queries.
   transform cannot traverse them.
 - Project-reference aliases cannot re-enter an evaluated physical project.
 - Ordinary explicit `../Library/Library.csproj` references remain valid.
-- Active-filesystem case equivalence is deferred to `WS-008`; physical file
-  metadata beyond path identity belongs to `WS-011`.
+- Active-filesystem case equivalence reuses physical project identities through
+  `WS-008`; physical file metadata beyond path identity belongs to `WS-011`.
 
 Failures use `DV0207` with ordered `path`, `workspace_root`, and
 `resolved_target` context plus a corrective action.

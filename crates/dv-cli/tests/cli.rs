@@ -1366,11 +1366,7 @@ fn project_inputs_report_distinct_ancestor_precedence_without_parsing_files() {
   assert_eq!(configs[configs.len() - 1], temp.0.join("child").join("NuGet.Config").to_string_lossy().as_ref());
   assert!(event["ancestor_count"].as_u64().unwrap() >= 3);
   assert!(event["metadata_probes"].as_u64().unwrap() >= 13);
-  if cfg!(target_os = "macos") {
-    assert!(event["directory_enumerations"].as_u64().unwrap() >= 2);
-  } else {
-    assert_eq!(event["directory_enumerations"], 0);
-  }
+  assert!(event["directory_enumerations"].as_u64().unwrap() >= 2);
 }
 
 #[test]
@@ -1576,6 +1572,30 @@ fn restore_accepts_a_project_batch_and_emits_one_resolution_per_project() {
   assert!(stdout.contains("Left.csproj"));
   assert!(stdout.contains("Right.csproj"));
   assert!(stdout.contains("\"outcome\":\"succeeded\""));
+}
+
+#[test]
+fn restore_project_batch_deduplicates_with_active_filesystem_identity() {
+  let temp = TempDirectory::new();
+  let upper = temp.write(
+    "App.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>UpperApp</AssemblyName><NuGetAudit>false</NuGetAudit></PropertyGroup></Project>"#,
+  );
+  let lower = temp.write(
+    "app.csproj",
+    r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>LowerApp</AssemblyName><NuGetAudit>false</NuGetAudit></PropertyGroup></Project>"#,
+  );
+  let distinct = fs::read(&upper).unwrap() != fs::read(&lower).unwrap();
+
+  let output = dv()
+    .args(["restore", "App.csproj", "app.csproj", "--offline", "--json"])
+    .current_dir(&temp.0)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert_eq!(stdout.matches("\"type\":\"package_resolution_created\"").count(), if distinct { 2 } else { 1 });
 }
 
 #[test]

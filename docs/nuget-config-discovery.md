@@ -39,10 +39,13 @@ Implicit discovery emits paths in this low-to-high order:
 
 Fragment names are ordered deterministically in reverse filesystem order for
 the low-to-high merge, matching NuGet's most-significant-first fragment
-priority. On case-sensitive systems, an ancestor chooses `nuget.config`, then
-`NuGet.config`, then `NuGet.Config`; Windows probes the single
-case-insensitive name. `NuGet.Config` inside the additional-user fragment
-directory is excluded because it is the main-file name, not an add-on.
+priority. Every ancestor probes `nuget.config`, then `NuGet.config`, then
+`NuGet.Config`; the active directory decides whether those are aliases or
+distinct files, and a successful lookup retains the actual recognized entry
+spelling. `NuGet.Config` inside the additional-user fragment directory is
+excluded because it is the main-file name, not an add-on. Non-standard casing
+of that name or a fragment extension is accepted only when it resolves to the
+same physical entry as the canonical spelling on the active filesystem.
 
 Windows uses `%ProgramFiles(x86)%\NuGet\Config` and
 `%APPDATA%\NuGet`. Linux uses `/etc/opt/NuGet/Config`; macOS uses
@@ -71,9 +74,9 @@ increase retained bytes without improving this access pattern.
 
 The simplification pass retained no discovery cache: config files may change
 between commands, while the measured full process is already near the local
-5 ms startup budget. It also removed duplicate Windows casing probes,
-recursive scans, path canonicalization, and an abstraction for unobserved
-configuration locations.
+5 ms startup budget. It removed a global OS case flag, write-based probing,
+recursive scans, and an abstraction for unobserved configuration locations.
+Canonicalization occurs only for an enumerated non-standard case variant.
 
 ## Verification
 

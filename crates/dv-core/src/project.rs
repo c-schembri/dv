@@ -75,6 +75,22 @@ const _: () = assert!(size_of::<ResolvedProjectPath<'static>>() == 40);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(align_of::<ResolvedProjectPath<'static>>() == align_of::<usize>());
 
+struct PhysicalProjectIdentity {
+  path: PathBuf,
+  project_index: u32,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<PhysicalProjectIdentity>() == 40);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<PhysicalProjectIdentity>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<PhysicalProjectIdentity>() == align_of::<usize>());
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 1);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 2);
+
 /// A supported build configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectConfiguration {
@@ -1411,7 +1427,7 @@ fn evaluate_resolved_project_path(resolved: &ResolvedProjectPath<'_>, configurat
 pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, ProjectError> {
   let configuration = root.configuration();
   let mut seen = vec![root.project_path().to_owned()];
-  let mut physical_seen = None::<Vec<PathBuf>>;
+  let mut physical_seen = None::<Vec<PhysicalProjectIdentity>>;
   let mut projects = vec![root];
   let mut cursor = 0usize;
   while cursor < projects.len() {
@@ -1430,11 +1446,20 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
       if physical_seen.is_none() {
         let root = fs::canonicalize(projects[0].project_path())
           .map_err(|error| unsafe_link_identity_error(projects[0].project_path(), projects[0].project_directory(), error))?;
-        physical_seen = Some(vec![root]);
+        physical_seen = Some(vec![PhysicalProjectIdentity { path: root, project_index: 0 }]);
       }
       let physical_seen = physical_seen.as_mut().expect("the physical project identity batch was initialized");
-      let physical_index = match physical_seen.binary_search(&physical) {
-        Ok(_) => {
+      let physical_index = match physical_seen.binary_search_by(|candidate| candidate.path.cmp(&physical)) {
+        Ok(existing) => {
+          let existing_project = usize::try_from(physical_seen[existing].project_index).expect("u32 project indices fit usize");
+          if !path_alias_uses_link(
+            projects[existing_project].project_path(),
+            &resolved.identity,
+            projects[cursor].project_directory(),
+          )? {
+            seen.insert(index, resolved.identity);
+            continue;
+          }
           return Err(
             ProjectError::new(
               ProjectErrorKind::UnsafePath,
@@ -1471,14 +1496,49 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
           );
         }
       }
+      let project_index = u32::try_from(projects.len()).map_err(|_| {
+        ProjectError::new(
+          ProjectErrorKind::Unsupported,
+          &reference,
+          "project-reference closure exceeds 4,294,967,295 projects",
+        )
+      })?;
       let project = evaluate_resolved_project_path(&resolved, configuration)?;
       seen.insert(index, resolved.identity);
-      physical_seen.insert(physical_index, physical);
+      physical_seen.insert(physical_index, PhysicalProjectIdentity { path: physical, project_index });
       projects.push(project);
     }
     cursor += 1;
   }
   Ok(projects)
+}
+
+fn path_alias_uses_link(existing: &Path, candidate: &Path, workspace_root: &Path) -> Result<bool, ProjectError> {
+  let shared_components = existing
+    .components()
+    .zip(candidate.components())
+    .take_while(|(left, right)| left == right)
+    .count();
+  path_suffix_uses_link(existing, shared_components, workspace_root).and_then(|existing_uses_link| {
+    path_suffix_uses_link(candidate, shared_components, workspace_root).map(|candidate_uses_link| existing_uses_link || candidate_uses_link)
+  })
+}
+
+fn path_suffix_uses_link(path: &Path, shared_components: usize, workspace_root: &Path) -> Result<bool, ProjectError> {
+  let mut cursor = PathBuf::new();
+  for (index, component) in path.components().enumerate() {
+    cursor.push(component.as_os_str());
+    if index < shared_components || !matches!(component, Component::Normal(_)) {
+      continue;
+    }
+    let file_type = fs::symlink_metadata(&cursor)
+      .map_err(|error| unsafe_link_identity_error(&cursor, workspace_root, error))?
+      .file_type();
+    if file_type.is_symlink() {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 fn discover_central_packages(project_directory: &Path) -> Result<RawCentralPackages, ProjectError> {
@@ -4240,6 +4300,32 @@ mod tests {
     assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
     assert_eq!(error.path(), temp.0.join("workspace/obj/External.csproj"));
     assert!(error.to_string().contains("outside workspace"));
+  }
+
+  #[test]
+  fn project_reference_identity_follows_the_active_filesystem_case_behavior() {
+    let temp = TempDirectory::new();
+    let root = temp.write(
+      "workspace/App.csproj",
+      &project_xml(
+        "",
+        r#"<ItemGroup><ProjectReference Include="Library/Library.csproj" /><ProjectReference Include="library/library.csproj" /></ItemGroup>"#,
+      ),
+    );
+    let upper = temp.write(
+      "workspace/Library/Library.csproj",
+      &project_xml("<AssemblyName>UpperLibrary</AssemblyName>", ""),
+    );
+    let lower = temp.write(
+      "workspace/library/library.csproj",
+      &project_xml("<AssemblyName>LowerLibrary</AssemblyName>", ""),
+    );
+    let distinct = fs::read(&upper).unwrap() != fs::read(&lower).unwrap();
+    let root = evaluate_project_path(&root, ProjectConfiguration::Debug).unwrap();
+
+    let projects = evaluate_project_closure(root).unwrap();
+
+    assert_eq!(projects.len(), if distinct { 3 } else { 2 });
   }
 
   #[test]

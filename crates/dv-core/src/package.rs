@@ -4851,7 +4851,8 @@ fn append_config_fragments(directory: &Path, paths: &mut Vec<PathBuf>, exclude_d
       .file_type()
       .map_err(|error| package_io("inspect NuGet configuration entry", &entry.path(), error))?;
     let path = entry.path();
-    if (file_type.is_file() || (file_type.is_symlink() && path.is_file())) && is_config_fragment(&path) && !(exclude_default && is_default_config_name(&path)) {
+    if (file_type.is_file() || (file_type.is_symlink() && path.is_file())) && is_config_fragment(&path)? && !(exclude_default && is_default_config_name(&path)?)
+    {
       paths.push(path);
     }
   }
@@ -4859,24 +4860,41 @@ fn append_config_fragments(directory: &Path, paths: &mut Vec<PathBuf>, exclude_d
   Ok(())
 }
 
-fn is_default_config_name(path: &Path) -> bool {
-  path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-    if cfg!(windows) {
-      name.eq_ignore_ascii_case("NuGet.Config")
-    } else {
-      name == "NuGet.Config"
-    }
-  })
+fn is_default_config_name(path: &Path) -> Result<bool, PackageError> {
+  let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    return Ok(false);
+  };
+  if name == "NuGet.Config" {
+    return Ok(true);
+  }
+  if !name.eq_ignore_ascii_case("NuGet.Config") {
+    return Ok(false);
+  }
+  let candidate = path.with_file_name("NuGet.Config");
+  paths_resolve_to_same_identity(path, &candidate)
 }
 
-fn is_config_fragment(path: &Path) -> bool {
+fn is_config_fragment(path: &Path) -> Result<bool, PackageError> {
   let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-    return false;
+    return Ok(false);
   };
-  if cfg!(windows) {
-    extension.eq_ignore_ascii_case("config")
-  } else {
-    matches!(extension, "Config" | "config")
+  if matches!(extension, "Config" | "config") {
+    return Ok(true);
+  }
+  if !extension.eq_ignore_ascii_case("config") {
+    return Ok(false);
+  }
+  let mut candidate = path.to_owned();
+  candidate.set_extension("config");
+  paths_resolve_to_same_identity(path, &candidate)
+}
+
+fn paths_resolve_to_same_identity(left: &Path, right: &Path) -> Result<bool, PackageError> {
+  let left = fs::canonicalize(left).map_err(|error| package_io("resolve NuGet configuration identity", left, error))?;
+  match fs::canonicalize(right) {
+    Ok(right) => Ok(left == right),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+    Err(error) => Err(package_io("resolve NuGet configuration identity", right, error)),
   }
 }
 
@@ -13696,9 +13714,8 @@ mod tests {
     );
   }
 
-  #[cfg(target_os = "macos")]
   #[test]
-  fn nuget_config_discovery_preserves_macos_directory_entry_casing() {
+  fn nuget_config_discovery_preserves_active_directory_entry_casing() {
     let temp = TempDirectory::new();
     temp.write("NuGet.Config", "<configuration />");
 
@@ -13715,6 +13732,21 @@ mod tests {
     .unwrap();
 
     assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("NuGet.Config")));
+  }
+
+  #[test]
+  fn nuget_fragment_matching_uses_active_filesystem_identity() {
+    let temp = TempDirectory::new();
+    let fragment = temp.write("config/Extra.CONFIG", "<configuration />");
+    let default_variant = temp.write("config/nuget.config", "<configuration />");
+    let fragment_aliases_lower = fragment.with_extension("config").is_file();
+    let default_aliases_canonical = default_variant.with_file_name("NuGet.Config").is_file();
+    let mut paths = Vec::new();
+
+    append_config_fragments(&temp.0.join("config"), &mut paths, true).unwrap();
+
+    assert_eq!(paths.contains(&fragment), fragment_aliases_lower);
+    assert_eq!(paths.contains(&default_variant), !default_aliases_canonical);
   }
 
   #[test]

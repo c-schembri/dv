@@ -60,7 +60,9 @@ items.
 
 New variants require a real consumer and a version-compatibility decision.
 Schema 23 adds `workspace_inputs_discovered`, containing the five independently
-ordered ancestor input families and bounded traversal counters. Schema 22 adds
+ordered ancestor input families and bounded traversal counters. Its directory
+enumeration count includes active-filesystem filename-casing preservation on
+every platform. Schema 22 adds
 `repository_root_discovered`, containing the nearest typed repository boundary
 and marker-probe count.
 Schema 21 adds `runtime_inventory`, a single ordered batch of installed shared
