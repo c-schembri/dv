@@ -37,8 +37,8 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 83 rows are implemented;
-- 31 rows have partial foundations;
+- 84 rows are implemented;
+- 30 rows have partial foundations;
 - 354 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
@@ -216,7 +216,7 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` through `WS-008` are complete: one bounded immediate directory pass
+`WS-001` through `WS-009` are complete: one bounded immediate directory pass
 packs all five project/solution candidate kinds into a stable offset-indexed
 batch, explicit candidate files take a single-metadata-query validation path,
 and exact-one directory selection produces a typed owning result before any
@@ -232,9 +232,11 @@ physical identities only on the link branch; cycles, broken identities, and
 physical escapes fail explicitly, and project-reference aliases cannot evade
 the closure identity batch. Filesystem-case behavior now comes from prioritized
 real lookups and existing physical identities, not the Rust compile target;
-case-sensitive collisions remain distinct while no-link aliases collapse. The
-next workspace work remains `WS-009` through `WS-012`; recursive workspace
-traversal is not silently folded into immediate selection.
+case-sensitive collisions remain distinct while no-link aliases collapse.
+Default source traversal now rejects fixed output names, every dot-prefixed
+metadata/cache tree, and five configured output roots before descent or link
+identity work. The next workspace work remains `WS-010` through `WS-012`;
+recursive workspace traversal is not silently folded into immediate selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,
 resources, analyzers, options, and output paths match Microsoft oracle data for

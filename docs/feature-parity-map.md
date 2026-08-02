@@ -778,8 +778,15 @@ contracts.
   only when more than one root was requested. Thirty cold Windows samples
   measured Microsoft at `498.186 ms` median and `503.552 ms` p95 versus
   `5.541 ms` and `6.146 ms` for `dv`, an `89.9x` median improvement. `P1`
-- [~] `WS-009` Exclude `bin`, `obj`, configured output trees, VCS metadata, and
-  tool cache trees from default discovery. `P1`
+- [x] `WS-009` Exclude `bin`, `obj`, configured output trees, VCS metadata, and
+  tool cache trees from default discovery. Fixed names and every dot-prefixed
+  directory are rejected before descent or link resolution. Five configured
+  path properties expand through the bounded selected-project dimensions into
+  a sorted inline path batch; malformed or unknown dynamic paths fail
+  explicitly, and case-only matches use active-filesystem identity only on the
+  cold branch. Thirty warm Windows samples measured Microsoft at `264.677 ms`
+  median and `268.625 ms` p95 versus `4.139 ms` and `4.639 ms` for `dv`, a
+  `63.9x` median improvement. `P1`
 - [ ] `WS-010` Cache one command-local path table and reuse its capacity across
   watch/repeated-command sessions if measurements justify persistence. `P2`
 - [ ] `WS-011` Track file identity, size, timestamp precision, and content hash

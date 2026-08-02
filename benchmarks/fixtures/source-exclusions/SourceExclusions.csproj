@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputPath>generated/output/</OutputPath>
+    <IntermediateOutputPath>generated/intermediate/</IntermediateOutputPath>
+  </PropertyGroup>
+</Project>

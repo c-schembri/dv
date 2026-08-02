@@ -109,6 +109,7 @@ enum CaseKind {
   WorkspaceInputs,
   PathIdentity,
   SourceLinks,
+  SourceExclusions,
   FilesystemCase,
   ProjectEvaluate,
   PackageReferenceConditions,
@@ -169,6 +170,7 @@ struct Fixtures<'a> {
   workspace_inputs: &'a Path,
   path_identity: &'a Path,
   source_links: &'a Path,
+  source_exclusions: &'a Path,
   filesystem_case: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
@@ -384,6 +386,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "source_link_traversal",
     kind: CaseKind::SourceLinks,
     args: &["msbuild", "Root.csproj", "--nologo", "-getItem:Compile"],
+    implemented: true,
+  },
+  Case {
+    name: "source_exclusions",
+    kind: CaseKind::SourceExclusions,
+    args: &["msbuild", "SourceExclusions.csproj", "--nologo", "-getItem:Compile"],
     implemented: true,
   },
   Case {
@@ -1141,6 +1149,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "source_exclusions",
+    kind: CaseKind::SourceExclusions,
+    args: &["project", "inspect", "SourceExclusions.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "filesystem_case_identity",
     kind: CaseKind::FilesystemCase,
     args: &[
@@ -1563,6 +1577,7 @@ fn run() -> Result<()> {
   let workspace_inputs_fixture = repository.join("benchmarks/fixtures/workspace-inputs");
   let path_identity_fixture = repository.join("benchmarks/fixtures/path-identity");
   let source_links_fixture = repository.join("benchmarks/fixtures/source-links");
+  let source_exclusions_fixture = repository.join("benchmarks/fixtures/source-exclusions");
   let filesystem_case_fixture = repository.join("benchmarks/fixtures/filesystem-case");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
@@ -1601,6 +1616,7 @@ fn run() -> Result<()> {
     workspace_inputs: &workspace_inputs_fixture,
     path_identity: &path_identity_fixture,
     source_links: &source_links_fixture,
+    source_exclusions: &source_exclusions_fixture,
     filesystem_case: &filesystem_case_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
@@ -1728,6 +1744,14 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "source_link_traversal") {
     verify_source_links(&repository, &dv_executable, &source_links_fixture, &workspace.join("verify-source-links"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "source_exclusions") {
+    verify_source_exclusions(
+      &repository,
+      &dv_executable,
+      &source_exclusions_fixture,
+      &workspace.join("verify-source-exclusions"),
+    )?;
   }
   if options.case.as_deref().is_none_or(|case| case == "filesystem_case_identity") {
     verify_filesystem_case_identity(&repository, &dv_executable, &filesystem_case_fixture, &workspace.join("verify-filesystem-case"))?;
@@ -3336,6 +3360,40 @@ fn verify_source_links(repository: &Path, dv_executable: &Path, fixture: &Path, 
   validate_source_link_failure(&output, "outside workspace")?;
   if before != snapshot_tree(&reference_escape_root)? {
     return Err("dv project-reference escape preflight mutated the input workspace".into());
+  }
+  Ok(())
+}
+
+fn verify_source_exclusions(repository: &Path, dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, verification)?;
+  remove_generated_path(verification)?;
+  for (executable, name, arguments, reference) in [
+    (
+      Path::new("dotnet"),
+      "dotnet",
+      &["msbuild", "SourceExclusions.csproj", "--nologo", "-getItem:Compile"][..],
+      true,
+    ),
+    (dv_executable, "dv", &["project", "inspect", "SourceExclusions.csproj", "--json"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    prepare_source_exclusion_workspace(&workspace)?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_source_exclusion_output(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} source-exclusion preflight mutated the input workspace").into());
+    }
+  }
+  Ok(())
+}
+
+fn prepare_source_exclusion_workspace(workspace: &Path) -> Result<()> {
+  for relative in ["bin/Excluded.cs", "obj/Excluded.cs", ".git/Excluded.cs"] {
+    let path = workspace.join(relative);
+    fs::create_dir_all(path.parent().expect("generated source exclusions have a parent"))?;
+    fs::write(path, b"internal static class ExcludedGenerated;\n")?;
   }
   Ok(())
 }
@@ -7272,6 +7330,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::WorkspaceInputs
       | CaseKind::PathIdentity
       | CaseKind::SourceLinks
+      | CaseKind::SourceExclusions
       | CaseKind::FilesystemCase
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
@@ -7333,6 +7392,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::SourceLinks) {
     create_directory_link(&workspace.join("Shared"), &workspace.join("Alias"))?;
+  }
+  if matches!(case.kind, CaseKind::SourceExclusions) {
+    prepare_source_exclusion_workspace(workspace)?;
   }
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
@@ -8789,6 +8851,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::WorkspaceInputs
     | CaseKind::PathIdentity
     | CaseKind::SourceLinks
+    | CaseKind::SourceExclusions
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -8887,6 +8950,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::WorkspaceInputs => fixtures.workspace_inputs,
     CaseKind::PathIdentity => fixtures.path_identity,
     CaseKind::SourceLinks => fixtures.source_links,
+    CaseKind::SourceExclusions => fixtures.source_exclusions,
     CaseKind::FilesystemCase => fixtures.filesystem_case,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
@@ -8930,6 +8994,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::WorkspaceInputs => Some("workspace-inputs"),
     CaseKind::PathIdentity => Some("path-identity"),
     CaseKind::SourceLinks => Some("source-links"),
+    CaseKind::SourceExclusions => Some("source-exclusions"),
     CaseKind::FilesystemCase => Some("filesystem-case"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
@@ -9040,6 +9105,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_path_identity_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::SourceLinks) {
     validate_source_link_output(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::SourceExclusions) {
+    validate_source_exclusion_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::FilesystemCase) {
     validate_filesystem_case_output(&output, cwd, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
@@ -9314,20 +9381,48 @@ fn validate_source_link_output(output: &Output, reference: bool) -> Result<()> {
       .into(),
     );
   }
-  let mut sources = if reference {
+  let mut sources = source_batch_from_output(output, reference, "source-link")?;
+  sources.sort_unstable();
+  if sources != ["Alias/Shared.cs", "Program.cs", "Shared/Shared.cs"] {
+    return Err(format!("source-link query returned the wrong logical source batch: {sources:?}").into());
+  }
+  Ok(())
+}
+
+fn validate_source_exclusion_output(output: &Output, reference: bool) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "source-exclusion sample failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let mut sources = source_batch_from_output(output, reference, "source-exclusion")?;
+  sources.sort_unstable();
+  if sources != ["Program.cs", "Source/Feature.cs"] {
+    return Err(format!("source-exclusion query returned the wrong source batch: {sources:?}").into());
+  }
+  Ok(())
+}
+
+fn source_batch_from_output(output: &Output, reference: bool, case: &str) -> Result<Vec<String>> {
+  Ok(if reference {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     document
       .get("Items")
       .and_then(|items| items.get("Compile"))
       .and_then(serde_json::Value::as_array)
-      .ok_or("MSBuild source-link query omitted Compile items")?
+      .ok_or_else(|| format!("MSBuild {case} query omitted Compile items"))?
       .iter()
       .map(|item| {
         item
           .get("Identity")
           .and_then(serde_json::Value::as_str)
           .map(|identity| identity.replace('\\', "/"))
-          .ok_or_else(|| Box::<dyn Error>::from("MSBuild source-link item omitted Identity"))
+          .ok_or_else(|| Box::<dyn Error>::from(format!("MSBuild {case} item omitted Identity")))
       })
       .collect::<Result<Vec<_>>>()?
   } else {
@@ -9339,25 +9434,20 @@ fn validate_source_link_output(output: &Output, reference: bool) -> Result<()> {
       .collect::<std::result::Result<Vec<_>, _>>()?
       .into_iter()
       .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
-      .ok_or("dv source-link query omitted project_evaluated")?;
+      .ok_or_else(|| format!("dv {case} query omitted project_evaluated"))?;
     event
       .get("sources")
       .and_then(serde_json::Value::as_array)
-      .ok_or("dv source-link event omitted sources")?
+      .ok_or_else(|| format!("dv {case} event omitted sources"))?
       .iter()
       .map(|source| {
         source
           .as_str()
           .map(str::to_owned)
-          .ok_or_else(|| Box::<dyn Error>::from("dv source-link event emitted a non-string source"))
+          .ok_or_else(|| Box::<dyn Error>::from(format!("dv {case} event emitted a non-string source")))
       })
       .collect::<Result<Vec<_>>>()?
-  };
-  sources.sort_unstable();
-  if sources != ["Alias/Shared.cs", "Program.cs", "Shared/Shared.cs"] {
-    return Err(format!("source-link query returned the wrong logical source batch: {sources:?}").into());
-  }
-  Ok(())
+  })
 }
 
 fn validate_source_link_failure(output: &Output, expected_message: &str) -> Result<()> {
@@ -10257,6 +10347,7 @@ fn case_label(case: &str) -> &str {
     "workspace_inputs" => "Ancestor build input discovery",
     "path_identity" => "Missing reference path identity",
     "source_link_traversal" => "Safe source-link traversal",
+    "source_exclusions" => "Default source exclusions",
     "filesystem_case_identity" => "Active filesystem case identity",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",

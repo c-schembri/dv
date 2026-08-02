@@ -1,4 +1,5 @@
 use std::{
+  borrow::Cow,
   cmp::Ordering,
   error::Error,
   fmt, fs,
@@ -59,6 +60,7 @@ const MAX_WORKSPACE_CANDIDATES: usize = u16::MAX as usize;
 const MAX_WORKSPACE_DIAGNOSTIC_CANDIDATES: usize = 16;
 const WORKSPACE_CANDIDATE_CAPACITY: usize = 8;
 const WORKSPACE_PATH_CAPACITY: usize = 256;
+const MAX_CONFIGURED_SOURCE_EXCLUSIONS: usize = 5;
 const NO_REFERENCE_CONDITION: u32 = u32::MAX;
 const NO_RUNTIME_IDENTIFIER: u32 = u32::MAX;
 const NO_TEXT: TextSpan = TextSpan { start: u32::MAX, len: 0 };
@@ -90,6 +92,22 @@ const _: () = assert!(align_of::<PhysicalProjectIdentity>() == align_of::<usize>
 const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 1);
 #[cfg(all(target_pointer_width = "64", not(windows)))]
 const _: () = assert!(BENCHMARK_CACHE_LINE_BYTES / size_of::<PhysicalProjectIdentity>() == 2);
+
+struct SourceExclusionBatch {
+  paths: [PathBuf; MAX_CONFIGURED_SOURCE_EXCLUSIONS],
+  len: u8,
+}
+
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<SourceExclusionBatch>() == 168);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<SourceExclusionBatch>() == 128);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<SourceExclusionBatch>() == align_of::<usize>());
+#[cfg(all(target_pointer_width = "64", windows))]
+const _: () = assert!(size_of::<PathBuf>() == 32 && BENCHMARK_CACHE_LINE_BYTES / size_of::<PathBuf>() == 2);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = assert!(size_of::<PathBuf>() == 24 && BENCHMARK_CACHE_LINE_BYTES / size_of::<PathBuf>() == 2);
 
 /// A supported build configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -973,6 +991,11 @@ enum Property {
   ManagePackageVersionsCentrally,
   CentralPackageTransitivePinningEnabled,
   CentralPackageVersionOverrideEnabled,
+  BaseOutputPath,
+  BaseIntermediateOutputPath,
+  OutputPath,
+  IntermediateOutputPath,
+  ArtifactsPath,
 }
 
 #[derive(Clone, Copy)]
@@ -1051,10 +1074,20 @@ struct RawProject {
   manage_package_versions_centrally: Option<String>,
   central_package_transitive_pinning_enabled: Option<String>,
   central_package_version_override_enabled: Option<String>,
+  source_exclusions: RawSourceExclusions,
   conditions: Vec<String>,
   project_references: Vec<RawProjectReference>,
   package_references: Vec<RawPackageReference>,
   framework_references: Vec<RawFrameworkReference>,
+}
+
+#[derive(Default)]
+struct RawSourceExclusions {
+  base_output_path: Option<String>,
+  base_intermediate_output_path: Option<String>,
+  output_path: Option<String>,
+  intermediate_output_path: Option<String>,
+  artifacts_path: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -2148,6 +2181,11 @@ fn finish_element(path: &Path, element: Element, raw: &mut RawProject, text: &st
       Property::ManagePackageVersionsCentrally => raw.manage_package_versions_centrally = Some(text.to_owned()),
       Property::CentralPackageTransitivePinningEnabled => raw.central_package_transitive_pinning_enabled = Some(text.to_owned()),
       Property::CentralPackageVersionOverrideEnabled => raw.central_package_version_override_enabled = Some(text.to_owned()),
+      Property::BaseOutputPath => raw.source_exclusions.base_output_path = Some(text.to_owned()),
+      Property::BaseIntermediateOutputPath => raw.source_exclusions.base_intermediate_output_path = Some(text.to_owned()),
+      Property::OutputPath => raw.source_exclusions.output_path = Some(text.to_owned()),
+      Property::IntermediateOutputPath => raw.source_exclusions.intermediate_output_path = Some(text.to_owned()),
+      Property::ArtifactsPath => raw.source_exclusions.artifacts_path = Some(text.to_owned()),
     },
     Element::PackageMetadata(index, metadata) => {
       let package = &mut raw.package_references[index];
@@ -2350,6 +2388,15 @@ fn materialize_project(
       "RootNamespace must be a non-empty literal",
     ));
   }
+  let source_exclusions = SourceExclusionBatch::from_project(
+    project_path,
+    project_directory,
+    &raw.source_exclusions,
+    configuration,
+    &target_framework,
+    selected_runtime,
+    assembly_name,
+  )?;
 
   let condition_context = ReferenceConditionContext {
     target_framework: &target_framework,
@@ -2473,7 +2520,7 @@ fn materialize_project(
     }
   }
 
-  let sources = collect_sources(project_directory, project_path)?;
+  let sources = collect_sources(project_directory, project_path, &source_exclusions)?;
   let project_path_text = unicode_path(project_path, project_path)?;
   let project_directory_text = unicode_path(project_directory, project_path)?;
   let estimated_text = project_path_text.len()
@@ -2674,7 +2721,234 @@ fn materialize_project(
   })
 }
 
-fn collect_sources(project_directory: &Path, project_path: &Path) -> Result<Vec<String>, ProjectError> {
+impl SourceExclusionBatch {
+  fn from_project(
+    project_path: &Path,
+    project_directory: &Path,
+    raw: &RawSourceExclusions,
+    configuration: ProjectConfiguration,
+    target_framework: &str,
+    runtime_identifier: Option<&str>,
+    assembly_name: &str,
+  ) -> Result<Self, ProjectError> {
+    let mut batch = Self {
+      paths: std::array::from_fn(|_| PathBuf::new()),
+      len: 0,
+    };
+    if raw.base_output_path.is_none()
+      && raw.base_intermediate_output_path.is_none()
+      && raw.output_path.is_none()
+      && raw.intermediate_output_path.is_none()
+      && raw.artifacts_path.is_none()
+    {
+      return Ok(batch);
+    }
+
+    let project_directory_text = project_directory.to_str().ok_or_else(|| {
+      ProjectError::new(
+        ProjectErrorKind::NonUnicodePath,
+        project_path,
+        format!("project directory {} is not valid Unicode", project_directory.display()),
+      )
+    })?;
+    let project_name = project_path
+      .file_stem()
+      .and_then(|name| name.to_str())
+      .ok_or_else(|| ProjectError::new(ProjectErrorKind::NonUnicodePath, project_path, "project file name is not valid Unicode"))?;
+    let mut variables = SourcePathVariables {
+      project_directory: project_directory_text,
+      project_name,
+      configuration: configuration.as_str(),
+      target_framework,
+      runtime_identifier: runtime_identifier.unwrap_or_default(),
+      assembly_name,
+      artifacts_path: "",
+      base_output_path: "bin/",
+      base_intermediate_output_path: "obj/",
+    };
+    let artifacts_path = expand_source_path(project_path, "ArtifactsPath", raw.artifacts_path.as_deref().unwrap_or_default(), &variables)?;
+    variables.artifacts_path = &artifacts_path;
+    let base_output_path = expand_source_path(project_path, "BaseOutputPath", raw.base_output_path.as_deref().unwrap_or("bin/"), &variables)?;
+    variables.base_output_path = &base_output_path;
+    let base_intermediate_output_path = expand_source_path(
+      project_path,
+      "BaseIntermediateOutputPath",
+      raw.base_intermediate_output_path.as_deref().unwrap_or("obj/"),
+      &variables,
+    )?;
+    variables.base_intermediate_output_path = &base_intermediate_output_path;
+    let output_path = expand_source_path(project_path, "OutputPath", raw.output_path.as_deref().unwrap_or_default(), &variables)?;
+    let intermediate_output_path = expand_source_path(
+      project_path,
+      "IntermediateOutputPath",
+      raw.intermediate_output_path.as_deref().unwrap_or_default(),
+      &variables,
+    )?;
+
+    for value in [
+      raw.base_output_path.as_ref().map(|_| base_output_path.as_ref()),
+      raw.base_intermediate_output_path.as_ref().map(|_| base_intermediate_output_path.as_ref()),
+      raw.output_path.as_ref().map(|_| output_path.as_ref()),
+      raw.intermediate_output_path.as_ref().map(|_| intermediate_output_path.as_ref()),
+      raw.artifacts_path.as_ref().map(|_| artifacts_path.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+      batch.insert(project_directory, value)?;
+    }
+    Ok(batch)
+  }
+
+  fn insert(&mut self, project_directory: &Path, value: &str) -> Result<(), ProjectError> {
+    let value = value.trim();
+    if value.is_empty() {
+      return Ok(());
+    }
+    let portable = if value.contains('\\') {
+      Cow::Owned(value.replace('\\', "/"))
+    } else {
+      Cow::Borrowed(value)
+    };
+    let path = Path::new(portable.as_ref());
+    let path = if path.is_absolute() {
+      absolute_lexical(path)
+    } else {
+      absolute_lexical(&project_directory.join(path))
+    }
+    .map_err(|error| io_error("normalize configured source exclusion", project_directory, error))?;
+    let len = usize::from(self.len);
+    let index = match self.paths[..len].binary_search(&path) {
+      Ok(_) => return Ok(()),
+      Err(index) => index,
+    };
+    for cursor in (index..len).rev() {
+      self.paths.swap(cursor, cursor + 1);
+    }
+    self.paths[index] = path;
+    self.len += 1;
+    Ok(())
+  }
+
+  fn excludes(&self, path: &Path, file_name: &std::ffi::OsStr) -> Result<bool, ProjectError> {
+    if is_default_excluded_directory(file_name) {
+      return Ok(true);
+    }
+    self.excludes_configured(path)
+  }
+
+  fn excludes_configured(&self, path: &Path) -> Result<bool, ProjectError> {
+    for exclusion in &self.paths[..usize::from(self.len)] {
+      if path.starts_with(exclusion) {
+        return Ok(true);
+      }
+      if !path_has_ascii_case_variant_prefix(path, exclusion) {
+        continue;
+      }
+      let exclusion_identity = match fs::canonicalize(exclusion) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(error) => return Err(io_error("resolve configured source exclusion", exclusion, error)),
+      };
+      let path_identity = fs::canonicalize(path).map_err(|error| io_error("resolve source directory identity", path, error))?;
+      if path_identity.starts_with(exclusion_identity) {
+        return Ok(true);
+      }
+    }
+    Ok(false)
+  }
+}
+
+struct SourcePathVariables<'a> {
+  project_directory: &'a str,
+  project_name: &'a str,
+  configuration: &'a str,
+  target_framework: &'a str,
+  runtime_identifier: &'a str,
+  assembly_name: &'a str,
+  artifacts_path: &'a str,
+  base_output_path: &'a str,
+  base_intermediate_output_path: &'a str,
+}
+
+fn expand_source_path<'a>(path: &Path, property: &str, value: &'a str, variables: &SourcePathVariables<'_>) -> Result<Cow<'a, str>, ProjectError> {
+  if !value.contains("$(") {
+    validate_source_path_value(path, property, value)?;
+    return Ok(Cow::Borrowed(value));
+  }
+  let mut output = String::with_capacity(value.len());
+  let mut remaining = value;
+  while let Some(start) = remaining.find("$(") {
+    output.push_str(&remaining[..start]);
+    let expression = &remaining[start + 2..];
+    let Some(end) = expression.find(')') else {
+      return Err(ProjectError::new(
+        ProjectErrorKind::InvalidProperty,
+        path,
+        format!("{property} contains an unterminated property expansion"),
+      ));
+    };
+    let name = &expression[..end];
+    let replacement = if name.eq_ignore_ascii_case("MSBuildProjectDirectory") {
+      variables.project_directory
+    } else if name.eq_ignore_ascii_case("MSBuildProjectName") {
+      variables.project_name
+    } else if name.eq_ignore_ascii_case("Configuration") {
+      variables.configuration
+    } else if name.eq_ignore_ascii_case("TargetFramework") {
+      variables.target_framework
+    } else if name.eq_ignore_ascii_case("RuntimeIdentifier") {
+      variables.runtime_identifier
+    } else if name.eq_ignore_ascii_case("AssemblyName") {
+      variables.assembly_name
+    } else if name.eq_ignore_ascii_case("ArtifactsPath") {
+      variables.artifacts_path
+    } else if name.eq_ignore_ascii_case("BaseOutputPath") {
+      variables.base_output_path
+    } else if name.eq_ignore_ascii_case("BaseIntermediateOutputPath") {
+      variables.base_intermediate_output_path
+    } else {
+      return Err(ProjectError::new(
+        ProjectErrorKind::Unsupported,
+        path,
+        format!("{property} uses unsupported property expansion $({name})"),
+      ));
+    };
+    output.push_str(replacement);
+    remaining = &expression[end + 1..];
+  }
+  output.push_str(remaining);
+  validate_source_path_value(path, property, &output)?;
+  Ok(Cow::Owned(output))
+}
+
+fn validate_source_path_value(path: &Path, property: &str, value: &str) -> Result<(), ProjectError> {
+  if value.contains(['*', '?', ';']) {
+    return Err(ProjectError::new(
+      ProjectErrorKind::InvalidProperty,
+      path,
+      format!("{property} must resolve to one directory path"),
+    ));
+  }
+  Ok(())
+}
+
+fn path_has_ascii_case_variant_prefix(path: &Path, prefix: &Path) -> bool {
+  let mut path = path.components();
+  for prefix in prefix.components() {
+    match path.next() {
+      Some(component) if component == prefix => {},
+      Some(component) if component.as_os_str().eq_ignore_ascii_case(prefix.as_os_str()) => {},
+      _ => return false,
+    }
+  }
+  true
+}
+
+fn collect_sources(project_directory: &Path, project_path: &Path, exclusions: &SourceExclusionBatch) -> Result<Vec<String>, ProjectError> {
+  if exclusions.excludes_configured(project_directory)? {
+    return Ok(Vec::new());
+  }
   let mut directories = vec![project_directory.to_owned()];
   let mut physical_root = None;
   let mut sources = Vec::new();
@@ -2685,14 +2959,16 @@ fn collect_sources(project_directory: &Path, project_path: &Path) -> Result<Vec<
       let path = entry.path();
       let file_type = entry.file_type().map_err(|error| io_error("inspect", &path, error))?;
       if file_type.is_dir() {
-        if !is_output_directory(&entry.file_name()) {
+        let file_name = entry.file_name();
+        if !exclusions.excludes(&path, &file_name)? {
           directories.push(path);
         }
       } else if file_type.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
         let relative = path.strip_prefix(project_directory).expect("entries discovered below the project directory");
         sources.push(portable_path(relative, project_path)?);
       } else if file_type.is_symlink() {
-        if is_output_directory(&entry.file_name()) {
+        let file_name = entry.file_name();
+        if exclusions.excludes(&path, &file_name)? {
           continue;
         }
         let target = fs::metadata(&path).map_err(|error| unsafe_link_identity_error(&path, project_directory, error))?;
@@ -2701,10 +2977,10 @@ fn collect_sources(project_directory: &Path, project_path: &Path) -> Result<Vec<
           collect_linked_sources(
             path,
             target,
-            &directory,
             project_directory,
             physical_root.as_deref().expect("link validation initialized the physical root"),
             project_path,
+            exclusions,
             &mut sources,
           )?;
         } else if target.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
@@ -2738,12 +3014,13 @@ enum LinkedSourceWork {
 fn collect_linked_sources(
   logical_root: PathBuf,
   physical_target: PathBuf,
-  current_directory: &Path,
   workspace_root: &Path,
   physical_root: &Path,
   project_path: &Path,
+  exclusions: &SourceExclusionBatch,
   sources: &mut Vec<String>,
 ) -> Result<(), ProjectError> {
+  let current_directory = logical_root.parent().expect("a discovered source link has a parent directory");
   let relative_current = current_directory
     .strip_prefix(workspace_root)
     .expect("source directories are discovered below the project directory");
@@ -2774,10 +3051,10 @@ fn collect_linked_sources(
     for entry in entries {
       let entry = entry.map_err(|error| io_error("enumerate", &logical, error))?;
       let path = entry.path();
-      let file_name = entry.file_name();
       let file_type = entry.file_type().map_err(|error| io_error("inspect", &path, error))?;
       if file_type.is_dir() {
-        if !is_output_directory(&file_name) {
+        let file_name = entry.file_name();
+        if !exclusions.excludes(&path, &file_name)? {
           work.push(LinkedSourceWork::Visit {
             logical: path,
             physical: physical.join(file_name),
@@ -2787,7 +3064,8 @@ fn collect_linked_sources(
         let relative = path.strip_prefix(workspace_root).expect("entries discovered below the project directory");
         sources.push(portable_path(relative, project_path)?);
       } else if file_type.is_symlink() {
-        if is_output_directory(&file_name) {
+        let file_name = entry.file_name();
+        if exclusions.excludes(&path, &file_name)? {
           continue;
         }
         let target = fs::metadata(&path).map_err(|error| unsafe_link_identity_error(&path, workspace_root, error))?;
@@ -2867,8 +3145,8 @@ fn unsafe_link_identity_error(path: &Path, workspace_root: &Path, error: std::io
   .with_context("workspace_root", workspace_root.display().to_string())
 }
 
-fn is_output_directory(name: &std::ffi::OsStr) -> bool {
-  name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("obj")
+fn is_default_excluded_directory(name: &std::ffi::OsStr) -> bool {
+  name.as_encoded_bytes().first() == Some(&b'.') || name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("obj")
 }
 
 fn parse_toggle(path: &Path, property: &str, value: Option<&str>, default: bool, only_enable: bool) -> Result<bool, ProjectError> {
@@ -3271,6 +3549,11 @@ fn property(path: &Path, name: &str) -> Result<Property, ProjectError> {
     "ManagePackageVersionsCentrally" => Ok(Property::ManagePackageVersionsCentrally),
     "CentralPackageTransitivePinningEnabled" => Ok(Property::CentralPackageTransitivePinningEnabled),
     "CentralPackageVersionOverrideEnabled" => Ok(Property::CentralPackageVersionOverrideEnabled),
+    "BaseOutputPath" => Ok(Property::BaseOutputPath),
+    "BaseIntermediateOutputPath" => Ok(Property::BaseIntermediateOutputPath),
+    "OutputPath" => Ok(Property::OutputPath),
+    "IntermediateOutputPath" => Ok(Property::IntermediateOutputPath),
+    "ArtifactsPath" => Ok(Property::ArtifactsPath),
     _ => Err(ProjectError::new(
       ProjectErrorKind::Unsupported,
       path,
@@ -3922,6 +4205,115 @@ mod tests {
   }
 
   #[test]
+  fn default_sources_prune_fixed_and_configured_output_trees_before_descent() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "class Program {}");
+    temp.write("Features/Kept.cs", "class Kept {}");
+    for directory in [
+      "bin",
+      "obj",
+      ".git",
+      ".hg",
+      ".svn",
+      ".vs",
+      ".vscode",
+      ".idea",
+      ".dv",
+      ".nuget",
+      ".cache",
+      "custom-base-output",
+      "custom-base-intermediate",
+      "custom-output",
+      "custom-intermediate",
+      "custom-artifacts",
+    ] {
+      temp.write(&format!("{directory}/Excluded.cs"), "class Excluded {}");
+    }
+    let project = temp.write(
+      "App.csproj",
+      &project_xml(
+        "<BaseOutputPath>custom-base-output/</BaseOutputPath><BaseIntermediateOutputPath>custom-base-intermediate/</BaseIntermediateOutputPath><OutputPath>custom-output/</OutputPath><IntermediateOutputPath>custom-intermediate/</IntermediateOutputPath><ArtifactsPath>custom-artifacts/</ArtifactsPath>",
+        "",
+      ),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.sources().collect::<Vec<_>>(), ["Features/Kept.cs", "Program.cs"]);
+  }
+
+  #[test]
+  fn configured_source_exclusions_expand_selected_project_dimensions() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "class Program {}");
+    temp.write("generated/Debug/net10.0/App/Excluded.cs", "class Excluded {}");
+    temp.write("generated/Release/net10.0/App/Kept.cs", "class Kept {}");
+    let project = temp.write(
+      "App.csproj",
+      &project_xml("<OutputPath>generated/$(Configuration)/$(TargetFramework)/$(AssemblyName)/</OutputPath>", ""),
+    );
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.sources().collect::<Vec<_>>(), ["Program.cs", "generated/Release/net10.0/App/Kept.cs"]);
+  }
+
+  #[test]
+  fn configured_source_exclusion_casing_comes_from_the_active_filesystem() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "class Program {}");
+    temp.write("generated/output/Generated.cs", "class Generated {}");
+    let configured_alias_exists = temp.0.join("Generated/output").is_dir();
+    let project = temp.write("App.csproj", &project_xml("<OutputPath>Generated/output/</OutputPath>", ""));
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    let sources = result.sources().collect::<Vec<_>>();
+
+    assert_eq!(sources.contains(&"generated/output/Generated.cs"), !configured_alias_exists);
+  }
+
+  #[test]
+  fn configured_source_exclusion_can_cover_the_project_root() {
+    let temp = TempDirectory::new();
+    temp.write("Program.cs", "class Program {}");
+    let project = temp.write("App.csproj", &project_xml("<OutputPath>./</OutputPath>", ""));
+
+    let result = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(result.sources().next(), None);
+  }
+
+  #[test]
+  fn configured_source_exclusions_reject_unknown_dynamic_paths() {
+    let temp = TempDirectory::new();
+    let project = temp.write(
+      "App.csproj",
+      &project_xml("<OutputPath>generated/$(UnboundedOutputDimension)/</OutputPath>", ""),
+    );
+
+    let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::Unsupported);
+    assert!(error.to_string().contains("OutputPath uses unsupported property expansion"));
+  }
+
+  #[test]
+  fn configured_source_exclusions_reject_malformed_paths() {
+    let temp = TempDirectory::new();
+    for (value, message) in [
+      ("generated/*/", "must resolve to one directory path"),
+      ("generated/$(Configuration/", "contains an unterminated property expansion"),
+    ] {
+      let project = temp.write("App.csproj", &project_xml(&format!("<OutputPath>{value}</OutputPath>"), ""));
+
+      let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+
+      assert_eq!(error.kind(), ProjectErrorKind::InvalidProperty);
+      assert!(error.to_string().contains(message));
+    }
+  }
+
+  #[test]
   fn retains_a_recognized_legacy_target_for_package_restore() {
     let temp = TempDirectory::new();
     let project = temp.write(
@@ -4233,6 +4625,21 @@ mod tests {
     assert_eq!(error.path(), escaped);
     assert!(error.to_string().contains("outside workspace"));
     assert_eq!(error.diagnostic_context().next().map(|field| field.0), Some("workspace_root"));
+  }
+
+  #[test]
+  fn excluded_source_links_are_dropped_before_identity_resolution() {
+    let temp = TempDirectory::new();
+    let project = temp.write("workspace/App.csproj", &project_xml("<OutputPath>generated/</OutputPath>", ""));
+    temp.write("workspace/Program.cs", "class Program {}");
+    temp.write("outside/External.cs", "class External {}");
+    for directory in ["bin", ".cache", "generated"] {
+      create_test_directory_link(&temp.0.join("outside"), &temp.0.join("workspace").join(directory));
+    }
+
+    let evaluated = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+
+    assert_eq!(evaluated.sources().collect::<Vec<_>>(), ["Program.cs"]);
   }
 
   #[test]

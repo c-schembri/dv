@@ -108,6 +108,7 @@ Results from different machines are not directly comparable.
 | Discover ancestor build inputs | `dotnet msbuild` five-input query | `dv project inputs nested/src --json` | 128.756 ms | 4.155 ms | 31.0x |
 | Reject a missing project reference | `dotnet msbuild Microsoft.proj -t:ResolveProjectIdentities` | `dv restore Root.csproj --offline --json` | 200.255 ms | 5.423 ms | 36.9x |
 | Traverse a safe source junction | `dotnet msbuild Root.csproj -getItem:Compile` | `dv project inspect Root.csproj --json` | 301.738 ms | 4.473 ms | 67.5x |
+| Exclude generated and metadata source trees | `dotnet msbuild SourceExclusions.csproj -getItem:Compile` | `dv project inspect SourceExclusions.csproj --json` | 264.677 ms | 4.139 ms | 63.9x |
 | Resolve filesystem case identity | `dotnet restore Root.csproj` | `dv restore Root.csproj --offline --json` | 498.186 ms | 5.541 ms | 89.9x |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x |
 | Cold one-package restore | `dotnet restore PackageConsole.csproj` | `dv restore PackageConsole.csproj` | 1028.951 ms | 417.981 ms | 2.5x |

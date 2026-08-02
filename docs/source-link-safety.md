@@ -15,7 +15,8 @@ The source transform is:
 
 1. Traverse normal directories with the existing single `Vec<PathBuf>` DFS
    stack and one file-type query per entry.
-2. Drop `bin` and `obj` before inspecting a link target.
+2. Drop `bin`, `obj`, dot-prefixed metadata/cache trees, and configured output
+   roots before inspecting a link target.
 3. For a remaining link, query the target type and establish its physical path.
 4. Lazily establish the physical project root and reject targets outside it.
 5. On the first directory link, seed a cold active-identity vector from the
@@ -67,8 +68,8 @@ queries.
 - Every active physical-ancestry cycle, broken link identity,
   non-file/non-directory target used for traversal, and physical root escape
   fails closed.
-- `bin` and `obj` links are excluded without target resolution because the
-  transform cannot traverse them.
+- Fixed and configured excluded links are dropped without target resolution
+  because the transform cannot traverse them.
 - Project-reference aliases cannot re-enter an evaluated physical project.
 - Ordinary explicit `../Library/Library.csproj` references remain valid.
 - Active-filesystem case equivalence reuses physical project identities through

@@ -15,6 +15,9 @@ does not satisfy repository-wide discovery, watch, or solution-scale inputs.
 `WS-007` separately secures the recursive default-source and project-reference
 transforms: safe in-root links are followed, active cycles and physical escapes
 fail closed, and physical identity work remains off link-free source scans.
+`WS-009` now prunes `bin`, `obj`, every dot-prefixed metadata/cache tree, and
+five configured output roots before default-source descent or link resolution.
+Repository-wide candidate discovery remains deliberately separate.
 
 ## Required Evidence
 
@@ -23,8 +26,8 @@ fail closed, and physical identity work remains off link-free source scans.
    trees, case collisions, and non-Unicode components.
 2. Define platform file-identity records separately from preserved path
    spelling and normalized protocol paths.
-3. Define ordered exclusion inputs for `bin`, `obj`, VCS metadata, tool caches,
-   and configured output/artifacts paths.
+3. Extend the retained default-source exclusion protocol to repository-wide
+   candidate discovery without weakening its fixed/configured ordering.
 4. Measure sequential and bounded-parallel enumeration on representative large
    repositories before adding workers or persistent path caches.
 5. Add positive cycle/escape controls and fail closed when identity cannot be
