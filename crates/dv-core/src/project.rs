@@ -843,6 +843,8 @@ pub enum ProjectErrorKind {
   InvalidProperty,
   /// A required path cannot be represented by the initial UTF-8 path table.
   NonUnicodePath,
+  /// A filesystem link cycles or resolves outside the selected workspace.
+  UnsafePath,
 }
 
 /// A project failure with stable category and path context.
@@ -1161,15 +1163,34 @@ pub fn discover_workspace(directory: &Path) -> Result<WorkspaceInventory, Projec
   let entries = fs::read_dir(&root).map_err(|error| io_error("enumerate", &root, error))?;
   let mut paths = String::new();
   let mut candidates = Vec::new();
+  let mut physical_root = None;
   for entry in entries {
     let entry = entry.map_err(|error| io_error("enumerate", &root, error))?;
-    if !entry.file_type().map_err(|error| io_error("inspect", &entry.path(), error))?.is_file() {
+    let path = entry.path();
+    let file_type = entry.file_type().map_err(|error| io_error("inspect", &path, error))?;
+    if !file_type.is_file() && !file_type.is_symlink() {
       continue;
     }
     let file_name = entry.file_name();
     let Some(kind) = WorkspaceCandidateKind::classify(Path::new(&file_name)) else {
       continue;
     };
+    if file_type.is_symlink() {
+      let target = fs::metadata(&path).map_err(|error| unsafe_link_identity_error(&path, &root, error))?;
+      if !target.is_file() {
+        let resolved = validate_workspace_link(&path, &root, &mut physical_root, &root)?;
+        return Err(
+          ProjectError::new(
+            ProjectErrorKind::UnsafePath,
+            &path,
+            format!("workspace candidate link {} has an unsupported target type", path.display()),
+          )
+          .with_context("workspace_root", root.display().to_string())
+          .with_context("resolved_target", resolved.display().to_string()),
+        );
+      }
+      validate_workspace_link(&path, &root, &mut physical_root, &root)?;
+    }
     if candidates.is_empty() {
       candidates.reserve_exact(WORKSPACE_CANDIDATE_CAPACITY);
       paths.reserve_exact(WORKSPACE_PATH_CAPACITY);
@@ -1390,6 +1411,7 @@ fn evaluate_resolved_project_path(resolved: &ResolvedProjectPath<'_>, configurat
 pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, ProjectError> {
   let configuration = root.configuration();
   let mut seen = vec![root.project_path().to_owned()];
+  let mut physical_seen = None::<Vec<PathBuf>>;
   let mut projects = vec![root];
   let mut cursor = 0usize;
   while cursor < projects.len() {
@@ -1403,8 +1425,55 @@ pub fn evaluate_project_closure(root: ProjectSpec) -> Result<Vec<ProjectSpec>, P
         Ok(_) => continue,
         Err(index) => index,
       };
+      let physical =
+        fs::canonicalize(&resolved.identity).map_err(|error| unsafe_link_identity_error(&reference, projects[cursor].project_directory(), error))?;
+      if physical_seen.is_none() {
+        let root = fs::canonicalize(projects[0].project_path())
+          .map_err(|error| unsafe_link_identity_error(projects[0].project_path(), projects[0].project_directory(), error))?;
+        physical_seen = Some(vec![root]);
+      }
+      let physical_seen = physical_seen.as_mut().expect("the physical project identity batch was initialized");
+      let physical_index = match physical_seen.binary_search(&physical) {
+        Ok(_) => {
+          return Err(
+            ProjectError::new(
+              ProjectErrorKind::UnsafePath,
+              &reference,
+              format!(
+                "project reference {} resolves to an already evaluated project through a filesystem link",
+                reference.display()
+              ),
+            )
+            .with_context("workspace_root", projects[cursor].project_directory().display().to_string())
+            .with_context("referring_project", projects[cursor].project_path().display().to_string())
+            .with_context("resolved_target", physical.display().to_string()),
+          );
+        },
+        Err(index) => index,
+      };
+      let referring_directory = projects[cursor].project_directory();
+      if resolved.identity.starts_with(referring_directory) {
+        let physical_directory =
+          fs::canonicalize(referring_directory).map_err(|error| unsafe_link_identity_error(referring_directory, referring_directory, error))?;
+        if !physical.starts_with(&physical_directory) {
+          return Err(
+            ProjectError::new(
+              ProjectErrorKind::UnsafePath,
+              &reference,
+              format!(
+                "project reference {} resolves outside workspace {}",
+                reference.display(),
+                referring_directory.display()
+              ),
+            )
+            .with_context("workspace_root", referring_directory.display().to_string())
+            .with_context("resolved_target", physical.display().to_string()),
+          );
+        }
+      }
       let project = evaluate_resolved_project_path(&resolved, configuration)?;
       seen.insert(index, resolved.identity);
+      physical_seen.insert(physical_index, physical);
       projects.push(project);
     }
     cursor += 1;
@@ -2547,6 +2616,7 @@ fn materialize_project(
 
 fn collect_sources(project_directory: &Path, project_path: &Path) -> Result<Vec<String>, ProjectError> {
   let mut directories = vec![project_directory.to_owned()];
+  let mut physical_root = None;
   let mut sources = Vec::new();
   while let Some(directory) = directories.pop() {
     let entries = fs::read_dir(&directory).map_err(|error| io_error("enumerate", &directory, error))?;
@@ -2561,11 +2631,180 @@ fn collect_sources(project_directory: &Path, project_path: &Path) -> Result<Vec<
       } else if file_type.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
         let relative = path.strip_prefix(project_directory).expect("entries discovered below the project directory");
         sources.push(portable_path(relative, project_path)?);
+      } else if file_type.is_symlink() {
+        if is_output_directory(&entry.file_name()) {
+          continue;
+        }
+        let target = fs::metadata(&path).map_err(|error| unsafe_link_identity_error(&path, project_directory, error))?;
+        if target.is_dir() {
+          let target = validate_workspace_link(&path, project_directory, &mut physical_root, project_path)?;
+          collect_linked_sources(
+            path,
+            target,
+            &directory,
+            project_directory,
+            physical_root.as_deref().expect("link validation initialized the physical root"),
+            project_path,
+            &mut sources,
+          )?;
+        } else if target.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
+          validate_workspace_link(&path, project_directory, &mut physical_root, project_path)?;
+          let relative = path.strip_prefix(project_directory).expect("entries discovered below the project directory");
+          sources.push(portable_path(relative, project_path)?);
+        } else if !target.is_file() {
+          let resolved = validate_workspace_link(&path, project_directory, &mut physical_root, project_path)?;
+          return Err(
+            ProjectError::new(
+              ProjectErrorKind::UnsafePath,
+              &path,
+              format!("filesystem link {} has an unsupported target type", path.display()),
+            )
+            .with_context("workspace_root", project_directory.display().to_string())
+            .with_context("resolved_target", resolved.display().to_string()),
+          );
+        }
       }
     }
   }
   sources.sort_unstable();
   Ok(sources)
+}
+
+enum LinkedSourceWork {
+  Visit { logical: PathBuf, physical: PathBuf },
+  Leave,
+}
+
+fn collect_linked_sources(
+  logical_root: PathBuf,
+  physical_target: PathBuf,
+  current_directory: &Path,
+  workspace_root: &Path,
+  physical_root: &Path,
+  project_path: &Path,
+  sources: &mut Vec<String>,
+) -> Result<(), ProjectError> {
+  let relative_current = current_directory
+    .strip_prefix(workspace_root)
+    .expect("source directories are discovered below the project directory");
+  let mut active = Vec::with_capacity(relative_current.components().count() + 4);
+  let mut identity = physical_root.to_owned();
+  active.push(identity.clone());
+  for component in relative_current.components() {
+    identity.push(component);
+    active.push(identity.clone());
+  }
+
+  let mut work = vec![LinkedSourceWork::Visit {
+    logical: logical_root,
+    physical: physical_target,
+  }];
+  while let Some(item) = work.pop() {
+    let LinkedSourceWork::Visit { logical, physical } = item else {
+      active.pop();
+      continue;
+    };
+    if active.iter().any(|ancestor| ancestor == &physical) {
+      return Err(source_link_cycle_error(&logical, workspace_root, &physical));
+    }
+    active.push(physical.clone());
+    work.push(LinkedSourceWork::Leave);
+
+    let entries = fs::read_dir(&logical).map_err(|error| io_error("enumerate", &logical, error))?;
+    for entry in entries {
+      let entry = entry.map_err(|error| io_error("enumerate", &logical, error))?;
+      let path = entry.path();
+      let file_name = entry.file_name();
+      let file_type = entry.file_type().map_err(|error| io_error("inspect", &path, error))?;
+      if file_type.is_dir() {
+        if !is_output_directory(&file_name) {
+          work.push(LinkedSourceWork::Visit {
+            logical: path,
+            physical: physical.join(file_name),
+          });
+        }
+      } else if file_type.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
+        let relative = path.strip_prefix(workspace_root).expect("entries discovered below the project directory");
+        sources.push(portable_path(relative, project_path)?);
+      } else if file_type.is_symlink() {
+        if is_output_directory(&file_name) {
+          continue;
+        }
+        let target = fs::metadata(&path).map_err(|error| unsafe_link_identity_error(&path, workspace_root, error))?;
+        if target.is_dir() {
+          let resolved = resolve_workspace_link(&path, workspace_root, physical_root)?;
+          work.push(LinkedSourceWork::Visit {
+            logical: path,
+            physical: resolved,
+          });
+        } else if target.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cs")) {
+          resolve_workspace_link(&path, workspace_root, physical_root)?;
+          let relative = path.strip_prefix(workspace_root).expect("entries discovered below the project directory");
+          sources.push(portable_path(relative, project_path)?);
+        } else if !target.is_file() {
+          let resolved = resolve_workspace_link(&path, workspace_root, physical_root)?;
+          return Err(unsupported_link_target_error(&path, workspace_root, &resolved));
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+fn validate_workspace_link(path: &Path, workspace_root: &Path, physical_root: &mut Option<PathBuf>, project_path: &Path) -> Result<PathBuf, ProjectError> {
+  if physical_root.is_none() {
+    *physical_root = Some(fs::canonicalize(workspace_root).map_err(|error| io_error("resolve workspace identity", project_path, error))?);
+  }
+  resolve_workspace_link(
+    path,
+    workspace_root,
+    physical_root.as_deref().expect("the physical workspace root was initialized"),
+  )
+}
+
+fn resolve_workspace_link(path: &Path, workspace_root: &Path, physical_root: &Path) -> Result<PathBuf, ProjectError> {
+  let target = fs::canonicalize(path).map_err(|error| unsafe_link_identity_error(path, workspace_root, error))?;
+  if !target.starts_with(physical_root) {
+    return Err(
+      ProjectError::new(
+        ProjectErrorKind::UnsafePath,
+        path,
+        format!("filesystem link {} resolves outside workspace {}", path.display(), workspace_root.display()),
+      )
+      .with_context("workspace_root", workspace_root.display().to_string())
+      .with_context("resolved_target", target.display().to_string()),
+    );
+  }
+  Ok(target)
+}
+
+fn source_link_cycle_error(path: &Path, workspace_root: &Path, target: &Path) -> ProjectError {
+  ProjectError::new(
+    ProjectErrorKind::UnsafePath,
+    path,
+    format!("filesystem link {} creates a source traversal cycle", path.display()),
+  )
+  .with_context("workspace_root", workspace_root.display().to_string())
+  .with_context("resolved_target", target.display().to_string())
+}
+
+fn unsupported_link_target_error(path: &Path, workspace_root: &Path, target: &Path) -> ProjectError {
+  ProjectError::new(
+    ProjectErrorKind::UnsafePath,
+    path,
+    format!("filesystem link {} has an unsupported target type", path.display()),
+  )
+  .with_context("workspace_root", workspace_root.display().to_string())
+  .with_context("resolved_target", target.display().to_string())
+}
+
+fn unsafe_link_identity_error(path: &Path, workspace_root: &Path, error: std::io::Error) -> ProjectError {
+  ProjectError::new(
+    ProjectErrorKind::UnsafePath,
+    path,
+    format!("cannot establish filesystem-link identity for {}: {error}", path.display()),
+  )
+  .with_context("workspace_root", workspace_root.display().to_string())
 }
 
 fn is_output_directory(name: &std::ffi::OsStr) -> bool {
@@ -3302,6 +3541,29 @@ mod tests {
     )
   }
 
+  #[cfg(unix)]
+  fn create_test_directory_link(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+  }
+
+  #[cfg(windows)]
+  fn create_test_directory_link(target: &Path, link: &Path) {
+    let target_argument = target.to_string_lossy().replace('/', "\\");
+    let link_argument = link.to_string_lossy().replace('/', "\\");
+    let output = std::process::Command::new("cmd")
+      .args(["/d", "/c", "mklink", "/J"])
+      .arg(&link_argument)
+      .arg(&target_argument)
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "junction creation failed: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+
   #[test]
   fn workspace_inventory_packs_every_candidate_kind_in_stable_path_order() {
     let temp = TempDirectory::new();
@@ -3333,6 +3595,32 @@ mod tests {
       ]
     );
     assert_eq!(inventory.working_set_bytes(), 5 * size_of::<WorkspaceCandidate>() + 35);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn workspace_inventory_accepts_in_root_file_links_and_rejects_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDirectory::new();
+    let workspace = temp.0.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("Backing.project"), b"<Project />").unwrap();
+    symlink(workspace.join("Backing.project"), workspace.join("App.csproj")).unwrap();
+
+    let inventory = discover_workspace(&workspace).unwrap();
+    assert_eq!(inventory.candidates().len(), 1);
+    assert_eq!(inventory.path(inventory.candidates()[0]), "App.csproj");
+
+    let escaped_workspace = temp.0.join("escaped-workspace");
+    fs::create_dir(&escaped_workspace).unwrap();
+    let outside = temp.write("Outside.csproj", "<Project />");
+    let escaped = escaped_workspace.join("Escaped.csproj");
+    symlink(outside, &escaped).unwrap();
+
+    let error = discover_workspace(&escaped_workspace).unwrap_err();
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert_eq!(error.path(), escaped);
   }
 
   #[cfg(target_os = "linux")]
@@ -3854,6 +4142,56 @@ mod tests {
   }
 
   #[test]
+  fn source_links_preserve_spelling_and_reject_active_ancestor_cycles() {
+    let temp = TempDirectory::new();
+    let project = temp.write("workspace/App.csproj", &project_xml("", ""));
+    temp.write("workspace/Program.cs", "class Program {}");
+    temp.write("workspace/Shared/Shared.cs", "class Shared {}");
+    create_test_directory_link(&temp.0.join("workspace/Shared"), &temp.0.join("workspace/Alias"));
+
+    let evaluated = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap();
+    assert_eq!(evaluated.sources().collect::<Vec<_>>(), ["Alias/Shared.cs", "Program.cs", "Shared/Shared.cs"]);
+
+    let cycle = temp.0.join("workspace/Loop");
+    create_test_directory_link(&temp.0.join("workspace"), &cycle);
+    let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert_eq!(error.path(), cycle);
+    assert!(error.to_string().contains("cycle"));
+  }
+
+  #[test]
+  fn source_links_reject_targets_outside_the_project_workspace() {
+    let temp = TempDirectory::new();
+    let project = temp.write("workspace/App.csproj", &project_xml("", ""));
+    temp.write("outside/External.cs", "class External {}");
+    let escaped = temp.0.join("workspace/Escape");
+    create_test_directory_link(&temp.0.join("outside"), &escaped);
+
+    let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert_eq!(error.path(), escaped);
+    assert!(error.to_string().contains("outside workspace"));
+    assert_eq!(error.diagnostic_context().next().map(|field| field.0), Some("workspace_root"));
+  }
+
+  #[test]
+  fn source_links_reject_cycles_between_sibling_directories() {
+    let temp = TempDirectory::new();
+    let project = temp.write("workspace/App.csproj", &project_xml("", ""));
+    temp.write("workspace/Left/Left.cs", "class Left {}");
+    temp.write("workspace/Right/Right.cs", "class Right {}");
+    create_test_directory_link(&temp.0.join("workspace/Right"), &temp.0.join("workspace/Left/ToRight"));
+    create_test_directory_link(&temp.0.join("workspace/Left"), &temp.0.join("workspace/Right/ToLeft"));
+
+    let error = evaluate_project_path(&project, ProjectConfiguration::Debug).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert!(error.to_string().contains("cycle"));
+    assert!(error.path().ends_with("ToLeft") || error.path().ends_with("ToRight"));
+  }
+
+  #[test]
   fn missing_project_reference_is_not_promoted_to_an_identity() {
     let temp = TempDirectory::new();
     let root = temp.write(
@@ -3867,6 +4205,41 @@ mod tests {
     assert_eq!(error.kind(), ProjectErrorKind::NotFound);
     assert_eq!(error.path(), temp.0.join("Missing/../Missing/Absent.csproj"));
     assert!(error.to_string().contains("does not exist"));
+  }
+
+  #[test]
+  fn project_reference_links_reject_physical_cycles_hidden_in_output_trees() {
+    let temp = TempDirectory::new();
+    let root = temp.write(
+      "workspace/App.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="obj/App.csproj" /></ItemGroup>"#),
+    );
+    create_test_directory_link(&temp.0.join("workspace"), &temp.0.join("workspace/obj"));
+    let root = evaluate_project_path(&root, ProjectConfiguration::Debug).unwrap();
+
+    let error = evaluate_project_closure(root).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert_eq!(error.path(), temp.0.join("workspace/obj/App.csproj"));
+    assert!(error.to_string().contains("already evaluated project"));
+  }
+
+  #[test]
+  fn project_reference_links_reject_physical_workspace_escapes() {
+    let temp = TempDirectory::new();
+    let root = temp.write(
+      "workspace/App.csproj",
+      &project_xml("", r#"<ItemGroup><ProjectReference Include="obj/External.csproj" /></ItemGroup>"#),
+    );
+    temp.write("outside/External.csproj", &project_xml("", ""));
+    create_test_directory_link(&temp.0.join("outside"), &temp.0.join("workspace/obj"));
+    let root = evaluate_project_path(&root, ProjectConfiguration::Debug).unwrap();
+
+    let error = evaluate_project_closure(root).unwrap_err();
+
+    assert_eq!(error.kind(), ProjectErrorKind::UnsafePath);
+    assert_eq!(error.path(), temp.0.join("workspace/obj/External.csproj"));
+    assert!(error.to_string().contains("outside workspace"));
   }
 
   #[test]

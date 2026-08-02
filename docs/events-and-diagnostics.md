@@ -175,6 +175,7 @@ Initial codes:
 | `DV0204` | Unsupported project behavior |
 | `DV0205` | Invalid project property |
 | `DV0206` | Project path cannot be represented in the compact UTF-8 table |
+| `DV0207` | Filesystem link cycle or workspace escape |
 | `DV0300` | Compatible target reference pack not found |
 | `DV0301` | Invalid framework-pack manifest |
 | `DV0302` | Required compiler or pack asset missing |

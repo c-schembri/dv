@@ -19,6 +19,8 @@ Observed fixture data:
   ordered runtime expansion dimensions;
 - `multi-project`: three projects, three sources, three project-reference
   edges;
+- `source-links`: three logical sources, two physical source files, and one
+  safe in-root directory junction/symlink;
 - project files are currently below 1 KiB and use one target framework.
 
 The supported property and item subset is:
@@ -35,7 +37,8 @@ The supported property and item subset is:
 - `Nullable` set to `enable` or omitted;
 - `ImplicitUsings` set to `enable`, `disable`, or omitted;
 - `Deterministic` set to `true`, `false`, or omitted;
-- default recursive `.cs` source discovery excluding `bin` and `obj`;
+- default recursive `.cs` source discovery excluding `bin` and `obj`, following
+  safe in-workspace filesystem links while rejecting cycles and escapes;
 - literal C# `ProjectReference` paths;
 - `PackageReference` items with exact, interval, or floating literal versions;
 - nearest `Directory.Packages.props` central versions, overrides, global
@@ -62,7 +65,7 @@ directory or project path
   -> stream XML events through a fixed-depth state machine
   -> evaluate bounded reference conditions against the selected dimensions
   -> discard false branches before reference metadata validation
-  -> scan source directories once
+  -> scan source directories once, resolving physical identity only for links
   -> sort relative source paths
   -> compact text, item, and target-dimension batches
   -> ProjectSpec
@@ -89,6 +92,20 @@ selection.
 The parsed target descriptor is stored once beside its original text and
 shared with package and compiler planning. Compile-time assertions protect the
 compact layouts.
+
+Link-free source traversal retains the original single `Vec<PathBuf>`
+depth-first stack and performs no canonicalization or new allocation inside
+its normal directory/file arms. A followed link first queries its target type,
+then canonicalizes the target and lazily canonicalizes the project root.
+Directory links use a cold enter/leave work stack plus active physical ancestry,
+so arbitrary graph cycles fail as `DV0207`, not only direct ancestor links.
+Physical targets outside the root also fail. Project closure lazily creates a
+sorted physical-path batch only after its first reference, preventing alternate
+link spellings from re-entering a project without changing ordinary `..`
+reference semantics.
+
+`ASSUMPTION: filesystem links are rare in ordinary project trees - affects the
+cold-branch linear identity checks, not correctness.`
 
 `ASSUMPTION: the first benchmark machine has 64-byte cache lines - affects the
 expected eight text spans or four package records per line; this is not a

@@ -108,6 +108,7 @@ enum CaseKind {
   RepositoryRoot,
   WorkspaceInputs,
   PathIdentity,
+  SourceLinks,
   ProjectEvaluate,
   PackageReferenceConditions,
   RuntimeEvaluate,
@@ -166,6 +167,7 @@ struct Fixtures<'a> {
   repository_root: &'a Path,
   workspace_inputs: &'a Path,
   path_identity: &'a Path,
+  source_links: &'a Path,
   argument_forwarding: &'a Path,
   rid_graph: &'a Path,
   runtime: &'a Path,
@@ -374,6 +376,12 @@ const DOTNET_CASES: &[Case] = &[
     name: "path_identity",
     kind: CaseKind::PathIdentity,
     args: &["msbuild", "Microsoft.proj", "--nologo", "-t:ResolveProjectIdentities"],
+    implemented: true,
+  },
+  Case {
+    name: "source_link_traversal",
+    kind: CaseKind::SourceLinks,
+    args: &["msbuild", "Root.csproj", "--nologo", "-getItem:Compile"],
     implemented: true,
   },
   Case {
@@ -1110,6 +1118,12 @@ const DV_CASES: &[Case] = &[
     implemented: true,
   },
   Case {
+    name: "source_link_traversal",
+    kind: CaseKind::SourceLinks,
+    args: &["project", "inspect", "Root.csproj", "--json"],
+    implemented: true,
+  },
+  Case {
     name: "project_evaluate",
     kind: CaseKind::ProjectEvaluate,
     args: &["project", "inspect", "SmallConsole.csproj", "--json"],
@@ -1516,6 +1530,7 @@ fn run() -> Result<()> {
   let repository_root_fixture = repository.join("benchmarks/fixtures/repository-root");
   let workspace_inputs_fixture = repository.join("benchmarks/fixtures/workspace-inputs");
   let path_identity_fixture = repository.join("benchmarks/fixtures/path-identity");
+  let source_links_fixture = repository.join("benchmarks/fixtures/source-links");
   let argument_forwarding_fixture = repository.join("benchmarks/fixtures/argument-forwarding");
   let rid_graph_fixture = repository.join("benchmarks/fixtures/rid-graph-oracle");
   let runtime_fixture = repository.join("benchmarks/fixtures/runtime-project");
@@ -1552,6 +1567,7 @@ fn run() -> Result<()> {
     repository_root: &repository_root_fixture,
     workspace_inputs: &workspace_inputs_fixture,
     path_identity: &path_identity_fixture,
+    source_links: &source_links_fixture,
     argument_forwarding: &argument_forwarding_fixture,
     rid_graph: &rid_graph_fixture,
     runtime: &runtime_fixture,
@@ -1675,6 +1691,9 @@ fn run() -> Result<()> {
   }
   if options.case.as_deref().is_none_or(|case| case == "path_identity") {
     verify_path_identity(&repository, &dv_executable, &path_identity_fixture, &workspace.join("verify-path-identity"))?;
+  }
+  if options.case.as_deref().is_none_or(|case| case == "source_link_traversal") {
+    verify_source_links(&repository, &dv_executable, &source_links_fixture, &workspace.join("verify-source-links"))?;
   }
   if options.case.as_deref().is_none_or(|case| case == "project_evaluate") {
     verify_project_evaluation(&dv_executable, &fixture, ProjectSelectionBenchmark::Positional)?;
@@ -3166,6 +3185,120 @@ fn verify_path_identity(repository: &Path, dv_executable: &Path, fixture: &Path,
     if before != snapshot_tree(&workspace)? {
       return Err(format!("{name} path-identity preflight mutated the input workspace").into());
     }
+  }
+  Ok(())
+}
+
+fn verify_source_links(repository: &Path, dv_executable: &Path, fixture: &Path, verification: &Path) -> Result<()> {
+  ensure_workspace_is_safe(repository, verification)?;
+  remove_generated_path(verification)?;
+  for (executable, name, arguments, reference) in [
+    (
+      Path::new("dotnet"),
+      "dotnet",
+      &["msbuild", "Root.csproj", "--nologo", "-getItem:Compile"][..],
+      true,
+    ),
+    (dv_executable, "dv", &["project", "inspect", "Root.csproj", "--json"][..], false),
+  ] {
+    let workspace = verification.join(name);
+    reset_fixture(fixture, &workspace)?;
+    create_directory_link(&workspace.join("Shared"), &workspace.join("Alias"))?;
+    let before = snapshot_tree(&workspace)?;
+    let output = Command::new(executable).args(arguments).current_dir(&workspace).output()?;
+    validate_source_link_output(&output, reference)?;
+    if before != snapshot_tree(&workspace)? {
+      return Err(format!("{name} source-link preflight mutated the input workspace").into());
+    }
+  }
+
+  let cycle = verification.join("cycle");
+  reset_fixture(fixture, &cycle)?;
+  create_directory_link(&cycle, &cycle.join("Loop"))?;
+  let before = snapshot_tree(&cycle)?;
+  let output = Command::new(dv_executable)
+    .args(["project", "inspect", "Root.csproj", "--json"])
+    .current_dir(&cycle)
+    .output()?;
+  validate_source_link_failure(&output, "cycle")?;
+  if before != snapshot_tree(&cycle)? {
+    return Err("dv source-cycle preflight mutated the input workspace".into());
+  }
+
+  let sibling_cycle = verification.join("sibling-cycle");
+  reset_fixture(fixture, &sibling_cycle)?;
+  fs::create_dir_all(sibling_cycle.join("Left"))?;
+  fs::create_dir_all(sibling_cycle.join("Right"))?;
+  fs::write(sibling_cycle.join("Left/Left.cs"), b"internal static class Left;\n")?;
+  fs::write(sibling_cycle.join("Right/Right.cs"), b"internal static class Right;\n")?;
+  create_directory_link(&sibling_cycle.join("Right"), &sibling_cycle.join("Left/ToRight"))?;
+  create_directory_link(&sibling_cycle.join("Left"), &sibling_cycle.join("Right/ToLeft"))?;
+  let before = snapshot_tree(&sibling_cycle)?;
+  let output = Command::new(dv_executable)
+    .args(["project", "inspect", "Root.csproj", "--json"])
+    .current_dir(&sibling_cycle)
+    .output()?;
+  validate_source_link_failure(&output, "cycle")?;
+  if before != snapshot_tree(&sibling_cycle)? {
+    return Err("dv sibling source-cycle preflight mutated the input workspace".into());
+  }
+
+  let escape_root = verification.join("escape");
+  let escaped_project = escape_root.join("project");
+  let outside = escape_root.join("outside");
+  reset_fixture(fixture, &escaped_project)?;
+  fs::create_dir_all(&outside)?;
+  fs::write(outside.join("External.cs"), b"internal static class External;\n")?;
+  create_directory_link(&outside, &escaped_project.join("Escape"))?;
+  let before = snapshot_tree(&escape_root)?;
+  let output = Command::new(dv_executable)
+    .args(["project", "inspect", "Root.csproj", "--json"])
+    .current_dir(&escaped_project)
+    .output()?;
+  validate_source_link_failure(&output, "outside workspace")?;
+  if before != snapshot_tree(&escape_root)? {
+    return Err("dv source-escape preflight mutated the input workspace".into());
+  }
+
+  let reference_cycle = verification.join("reference-cycle");
+  reset_fixture(fixture, &reference_cycle)?;
+  fs::write(
+    reference_cycle.join("ReferenceCycle.csproj"),
+    br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><ProjectReference Include="obj/ReferenceCycle.csproj" /></ItemGroup></Project>"#,
+  )?;
+  create_directory_link(&reference_cycle, &reference_cycle.join("obj"))?;
+  let before = snapshot_tree(&reference_cycle)?;
+  let output = Command::new(dv_executable)
+    .args(["restore", "ReferenceCycle.csproj", "--offline", "--json"])
+    .current_dir(&reference_cycle)
+    .output()?;
+  validate_source_link_failure(&output, "already evaluated project")?;
+  if before != snapshot_tree(&reference_cycle)? {
+    return Err("dv project-reference cycle preflight mutated the input workspace".into());
+  }
+
+  let reference_escape_root = verification.join("reference-escape");
+  let reference_escape = reference_escape_root.join("project");
+  let reference_outside = reference_escape_root.join("outside");
+  reset_fixture(fixture, &reference_escape)?;
+  fs::write(
+    reference_escape.join("ReferenceEscape.csproj"),
+    br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><ProjectReference Include="obj/External.csproj" /></ItemGroup></Project>"#,
+  )?;
+  fs::create_dir_all(&reference_outside)?;
+  fs::write(
+    reference_outside.join("External.csproj"),
+    br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup></Project>"#,
+  )?;
+  create_directory_link(&reference_outside, &reference_escape.join("obj"))?;
+  let before = snapshot_tree(&reference_escape_root)?;
+  let output = Command::new(dv_executable)
+    .args(["restore", "ReferenceEscape.csproj", "--offline", "--json"])
+    .current_dir(&reference_escape)
+    .output()?;
+  validate_source_link_failure(&output, "outside workspace")?;
+  if before != snapshot_tree(&reference_escape_root)? {
+    return Err("dv project-reference escape preflight mutated the input workspace".into());
   }
   Ok(())
 }
@@ -6986,6 +7119,7 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
       | CaseKind::RepositoryRoot
       | CaseKind::WorkspaceInputs
       | CaseKind::PathIdentity
+      | CaseKind::SourceLinks
       | CaseKind::ProjectEvaluate
       | CaseKind::PackageReferenceConditions
       | CaseKind::RuntimeEvaluate
@@ -7043,6 +7177,9 @@ fn prepare_persistent_case(executable: &Path, case: &Case, fixture: &Path, works
   }
   if matches!(case.kind, CaseKind::RepositoryRoot) {
     fs::write(workspace.join(".git"), b"gitdir: benchmark-marker")?;
+  }
+  if matches!(case.kind, CaseKind::SourceLinks) {
+    create_directory_link(&workspace.join("Shared"), &workspace.join("Alias"))?;
   }
   if matches!(case.kind, CaseKind::RidGraph) && is_dotnet(executable) {
     prepare_rid_oracle(executable, workspace)?;
@@ -8498,6 +8635,7 @@ fn prepare_iteration(executable: &Path, case: &Case, fixture: &Path, workspace: 
     | CaseKind::RepositoryRoot
     | CaseKind::WorkspaceInputs
     | CaseKind::PathIdentity
+    | CaseKind::SourceLinks
     | CaseKind::ProjectEvaluate
     | CaseKind::PackageReferenceConditions
     | CaseKind::RuntimeEvaluate
@@ -8591,6 +8729,7 @@ fn case_fixture<'a>(case: &Case, fixtures: &Fixtures<'a>) -> &'a Path {
     CaseKind::RepositoryRoot => fixtures.repository_root,
     CaseKind::WorkspaceInputs => fixtures.workspace_inputs,
     CaseKind::PathIdentity => fixtures.path_identity,
+    CaseKind::SourceLinks => fixtures.source_links,
     CaseKind::RuntimeEvaluate => fixtures.runtime,
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => fixtures.runtime_pack,
     CaseKind::FrameworkReferencePlan => fixtures.framework_reference,
@@ -8632,6 +8771,7 @@ fn fixture_name(case: &Case) -> Option<&'static str> {
     CaseKind::RepositoryRoot => Some("repository-root"),
     CaseKind::WorkspaceInputs => Some("workspace-inputs"),
     CaseKind::PathIdentity => Some("path-identity"),
+    CaseKind::SourceLinks => Some("source-links"),
     CaseKind::RuntimeEvaluate => Some("runtime-project"),
     CaseKind::RuntimePackPlan | CaseKind::RuntimePackInventoryCold => Some("runtime-pack-project"),
     CaseKind::FrameworkReferencePlan => Some("framework-reference-project"),
@@ -8739,6 +8879,8 @@ fn measure(executable: &Path, case: &Case, cwd: &Path) -> Result<Measurement> {
     validate_workspace_inputs_output(&output, cwd, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PathIdentity) {
     validate_path_identity_failure(&output, is_dotnet(executable))?;
+  } else if matches!(case.kind, CaseKind::SourceLinks) {
+    validate_source_link_output(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::NugetSourceMapping) {
     validate_source_mapping_failure(&output, is_dotnet(executable))?;
   } else if matches!(case.kind, CaseKind::PackageDiagnostics) {
@@ -8996,6 +9138,109 @@ fn validate_path_identity_failure(output: &Output, reference: bool) -> Result<()
     || finished.get("outcome").and_then(serde_json::Value::as_str) != Some("failed")
   {
     return Err(format!("dv path-identity sample omitted its failed completion: {finished}").into());
+  }
+  Ok(())
+}
+
+fn validate_source_link_output(output: &Output, reference: bool) -> Result<()> {
+  if !output.status.success() || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "source-link sample failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let mut sources = if reference {
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    document
+      .get("Items")
+      .and_then(|items| items.get("Compile"))
+      .and_then(serde_json::Value::as_array)
+      .ok_or("MSBuild source-link query omitted Compile items")?
+      .iter()
+      .map(|item| {
+        item
+          .get("Identity")
+          .and_then(serde_json::Value::as_str)
+          .map(|identity| identity.replace('\\', "/"))
+          .ok_or_else(|| Box::<dyn Error>::from("MSBuild source-link item omitted Identity"))
+      })
+      .collect::<Result<Vec<_>>>()?
+  } else {
+    let event = output
+      .stdout
+      .split(|byte| *byte == b'\n')
+      .filter(|line| !line.is_empty())
+      .map(serde_json::from_slice::<serde_json::Value>)
+      .collect::<std::result::Result<Vec<_>, _>>()?
+      .into_iter()
+      .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
+      .ok_or("dv source-link query omitted project_evaluated")?;
+    event
+      .get("sources")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("dv source-link event omitted sources")?
+      .iter()
+      .map(|source| {
+        source
+          .as_str()
+          .map(str::to_owned)
+          .ok_or_else(|| Box::<dyn Error>::from("dv source-link event emitted a non-string source"))
+      })
+      .collect::<Result<Vec<_>>>()?
+  };
+  sources.sort_unstable();
+  if sources != ["Alias/Shared.cs", "Program.cs", "Shared/Shared.cs"] {
+    return Err(format!("source-link query returned the wrong logical source batch: {sources:?}").into());
+  }
+  Ok(())
+}
+
+fn validate_source_link_failure(output: &Output, expected_message: &str) -> Result<()> {
+  if output.status.code() != Some(2) || !output.stderr.is_empty() {
+    return Err(
+      format!(
+        "dv source-link boundary returned an unstable process result: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let events = std::str::from_utf8(&output.stdout)?
+    .lines()
+    .map(serde_json::from_str::<serde_json::Value>)
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+  let diagnostic = events
+    .iter()
+    .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("diagnostic"))
+    .and_then(|event| event.get("diagnostic"))
+    .ok_or("dv source-link boundary omitted its diagnostic")?;
+  let message = diagnostic.get("message").and_then(serde_json::Value::as_str).unwrap_or_default();
+  let context = diagnostic
+    .get("context")
+    .and_then(serde_json::Value::as_array)
+    .ok_or("dv source-link diagnostic omitted context")?;
+  let has_context = |name| context.iter().any(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(name));
+  if diagnostic.get("code").and_then(serde_json::Value::as_str) != Some("DV0207")
+    || !message.contains(expected_message)
+    || !has_context("path")
+    || !has_context("workspace_root")
+    || !has_context("resolved_target")
+  {
+    return Err(format!("dv source-link diagnostic did not expose its stable safety boundary: {diagnostic}").into());
+  }
+  if events
+    .iter()
+    .any(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("project_evaluated"))
+  {
+    return Err("dv source-link failure emitted a successful project evaluation".into());
+  }
+  if events.last().and_then(|event| event.get("outcome")).and_then(serde_json::Value::as_str) != Some("failed") {
+    return Err("dv source-link boundary omitted its failed completion".into());
   }
   Ok(())
 }
@@ -9505,6 +9750,36 @@ fn nuget_cli_command_text(executable: &Path, args: &[&str], cwd: &Path) -> Resul
   Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
+  std::os::unix::fs::symlink(target, link)?;
+  Ok(())
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
+  let target_argument = target.to_string_lossy().replace('/', "\\");
+  let link_argument = link.to_string_lossy().replace('/', "\\");
+  let output = Command::new("cmd")
+    .args(["/d", "/c", "mklink", "/J"])
+    .arg(&link_argument)
+    .arg(&target_argument)
+    .output()?;
+  if !output.status.success() {
+    return Err(
+      format!(
+        "could not create benchmark junction {} -> {}: stdout={} stderr={}",
+        link.display(),
+        target.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  Ok(())
+}
+
 fn reset_fixture(source: &Path, destination: &Path) -> Result<()> {
   remove_generated_path(destination)?;
   copy_directory(source, destination)
@@ -9518,7 +9793,12 @@ fn snapshot_tree(root: &Path) -> Result<TreeSnapshot> {
       let entry = entry?;
       let path = entry.path();
       let relative = path.strip_prefix(root)?.to_owned();
-      if entry.file_type()?.is_dir() {
+      let file_type = entry.file_type()?;
+      if file_type.is_symlink() {
+        let mut identity = b"link\0".to_vec();
+        identity.extend_from_slice(fs::read_link(&path)?.to_string_lossy().as_bytes());
+        entries.push((relative, Some(identity)));
+      } else if file_type.is_dir() {
         entries.push((relative, None));
         visit(root, &path, entries)?;
       } else {
@@ -9815,6 +10095,7 @@ fn case_label(case: &str) -> &str {
     "repository_root" => "Repository root discovery",
     "workspace_inputs" => "Ancestor build input discovery",
     "path_identity" => "Missing reference path identity",
+    "source_link_traversal" => "Safe source-link traversal",
     "project_evaluate" => "Project evaluation",
     "project_select_named" => "Named project selection",
     "workspace_discovery" => "Implicit workspace discovery",

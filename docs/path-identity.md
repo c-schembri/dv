@@ -39,8 +39,9 @@ deliberately deferred to `WS-010`, where reuse can be measured across commands.
   invalid properties fail with typed diagnostics using input spelling.
 - A missing reference never enters the identity vector and reports `DV0200`,
   not a canonicalization I/O failure.
-- Lexical normalization does not resolve symlinks or junctions. Cycle and
-  workspace-escape policy belongs to `WS-007`; active-filesystem case behavior
+- Lexical normalization itself does not resolve symlinks or junctions.
+  `WS-007` now resolves physical identity only when source traversal or project
+  closure requires a cycle/escape proof; active-filesystem case behavior
   belongs to `WS-008`.
 - Physical canonicalization remains in Unix SDK discovery because a PATH host
   such as `/usr/bin/dotnet` must resolve to the installation containing `sdk/`.

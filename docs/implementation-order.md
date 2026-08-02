@@ -37,9 +37,9 @@ has not passed.
 
 The ordering input is one 468-row parity ledger:
 
-- 80 rows are implemented;
+- 82 rows are implemented;
 - 31 rows have partial foundations;
-- 357 rows are missing;
+- 355 rows are missing;
 - framework/runtime/pack resolution is substantially present;
 - NuGet configuration and source handling is present;
 - package resolution, assets, cache, and lock handling have a strong initial
@@ -216,7 +216,7 @@ Order:
 5. Make `COMP-007` through `COMP-010` and `COMP-016` complete for the two
    target fixtures.
 
-`WS-001` through `WS-006` are complete: one bounded immediate directory pass
+`WS-001` through `WS-007` are complete: one bounded immediate directory pass
 packs all five project/solution candidate kinds into a stable offset-indexed
 batch, explicit candidate files take a single-metadata-query validation path,
 and exact-one directory selection produces a typed owning result before any
@@ -227,8 +227,12 @@ build inputs with their distinct singleton or root-to-leaf precedence. Project
 paths now separate borrowed diagnostic spelling from absolute lexical identity;
 only existing evaluated projects enter the sorted identity batch, and physical
 canonicalization is reserved for the Unix SDK-host symlink where it is required.
-The next workspace work remains `WS-007` through `WS-012`; recursive traversal
-is not silently folded into immediate selection.
+Default source traversal now follows safe in-workspace links while resolving
+physical identities only on the link branch; cycles, broken identities, and
+physical escapes fail explicitly, and project-reference aliases cannot evade
+the closure identity batch. The next workspace work remains `WS-008` through
+`WS-012`; recursive workspace traversal is not silently folded into immediate
+selection.
 
 Exit gate: the normalized evaluator, package plan, reference set, source set,
 resources, analyzers, options, and output paths match Microsoft oracle data for

@@ -26,9 +26,10 @@ and then queried the same C# path again in the evaluator. Candidate-kind
 classification now removes that redundant metadata operation from the common
 explicit-file path. Wrong-kind candidate paths perform no filesystem I/O.
 
-Symlink identity, canonicalization, workspace escape, and filesystem case
-semantics remain owned by `WS-006` through `WS-008`; this transform does not
-silently choose those policies.
+Safe linked candidate files inside the selected directory are accepted with
+their link spelling; broken identities and targets outside the physical
+directory fail through the `WS-007` policy. Filesystem case semantics remain
+owned by `WS-008`.
 
 ## Verification
 

@@ -12,6 +12,9 @@ escaping the selected workspace or duplicating file identities?
 follow directory entries, so cycles and workspace escape cannot occur in that
 transform. This matches the current single-project implicit-selection stage but
 does not satisfy repository-wide discovery, watch, or solution-scale inputs.
+`WS-007` separately secures the recursive default-source and project-reference
+transforms: safe in-root links are followed, active cycles and physical escapes
+fail closed, and physical identity work remains off link-free source scans.
 
 ## Required Evidence
 

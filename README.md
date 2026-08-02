@@ -107,6 +107,7 @@ Results from different machines are not directly comparable.
 | Find the nearest repository root | `dotnet msbuild` ancestor query | `dv project root nested/src` | 137.639 ms | 5.007 ms | 27.5x |
 | Discover ancestor build inputs | `dotnet msbuild` five-input query | `dv project inputs nested/src --json` | 139.917 ms | 4.845 ms | 28.9x |
 | Reject a missing project reference | `dotnet msbuild Microsoft.proj -t:ResolveProjectIdentities` | `dv restore Root.csproj --offline --json` | 200.255 ms | 5.423 ms | 36.9x |
+| Traverse a safe source junction | `dotnet msbuild Root.csproj -getItem:Compile` | `dv project inspect Root.csproj --json` | 301.738 ms | 4.473 ms | 67.5x |
 | Plan compiler inputs | `dotnet msbuild SmallConsole.csproj -t:ResolveReferences` query | `dv build --plan SmallConsole.csproj --json` | 368.952 ms | 4.979 ms | 74.1x |
 | Cold one-package restore | `dotnet restore PackageConsole.csproj` | `dv restore PackageConsole.csproj` | 1028.951 ms | 417.981 ms | 2.5x |
 | Cold 50-package restore | `dotnet restore LargePackageGraph.csproj` | `dv restore LargePackageGraph.csproj` | 1425.299 ms | 632.458 ms | 2.3x |

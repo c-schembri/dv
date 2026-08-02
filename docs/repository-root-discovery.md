@@ -36,7 +36,8 @@ path buffer is reused for every probe, with no per-ancestor dynamic allocation.
 
 - Missing starts, non-file/non-directory starts, marker I/O failures, invalid
   marker types, absent roots, and the probe-count bound are distinct failures.
-- Symlink markers are rejected until `WS-007` defines link and escape policy.
+- Symlink markers are rejected as unsupported. Root discovery never follows a
+  marker path, so the marker cannot introduce a traversal cycle or escape.
 - Path spelling is preserved lexically; canonical identity belongs to
   `WS-006`.
 - Only Git is supported in this slice. Other repository systems remain

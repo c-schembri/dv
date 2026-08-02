@@ -26,8 +26,9 @@ On case-sensitive systems NuGet's three recognized ancestor spellings are
 probed in precedence order: `nuget.config`, `NuGet.config`, then
 `NuGet.Config`. Windows needs one case-insensitive probe. macOS performs a
 directory enumeration only after a successful probe to preserve the actual
-entry spelling. Regular files reached through filesystem links retain the
-link spelling; cycle and workspace-escape policy remains owned by `WS-007`.
+entry spelling. Regular files reached through filesystem links retain the link
+spelling. This bounded marker lookup does not recurse through a target
+directory; consumers treat the selected marker as one explicit file input.
 
 ## Data Layout
 

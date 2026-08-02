@@ -3127,12 +3127,14 @@ fn project_diagnostic(error: ProjectError) -> Diagnostic {
     ProjectErrorKind::Unsupported => "DV0204",
     ProjectErrorKind::InvalidProperty => "DV0205",
     ProjectErrorKind::NonUnicodePath => "DV0206",
+    ProjectErrorKind::UnsafePath => "DV0207",
   };
   let help = match error.kind() {
     ProjectErrorKind::NotFound => Some("Pass a path to one SDK-style C# project."),
     ProjectErrorKind::Ambiguous => Some("Pass one project or solution path explicitly."),
     ProjectErrorKind::Unsupported | ProjectErrorKind::InvalidProperty => Some("Use the supported single-target Microsoft.NET.Sdk project subset."),
     ProjectErrorKind::InvalidXml => Some("Correct the project XML and try again."),
+    ProjectErrorKind::UnsafePath => Some("Remove the link or retarget it inside the selected workspace."),
     ProjectErrorKind::Io | ProjectErrorKind::NonUnicodePath => None,
   };
   let mut result = diagnostic(
@@ -3156,6 +3158,7 @@ fn repository_root_diagnostic(error: ProjectError) -> Diagnostic {
     ProjectErrorKind::Io => "DV0202",
     ProjectErrorKind::Unsupported => "DV0204",
     ProjectErrorKind::NonUnicodePath => "DV0206",
+    ProjectErrorKind::UnsafePath => "DV0207",
     ProjectErrorKind::Ambiguous | ProjectErrorKind::InvalidXml | ProjectErrorKind::InvalidProperty => "DV0204",
   };
   let help = match error.kind() {

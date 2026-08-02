@@ -756,8 +756,16 @@ contracts.
   warm Windows samples measured Microsoft at `200.255 ms` median and
   `221.558 ms` p95 versus `5.423 ms` and `6.631 ms` for `dv`, a `36.9x`
   median improvement. `P1`
-- [ ] `WS-007` Detect symlink/junction cycles and workspace escape attempts.
-  `P1`
+- [x] `WS-007` Detect symlink/junction cycles and workspace escape attempts.
+  Default source discovery follows safe in-workspace file and directory links
+  while preserving logical source spelling. Physical root, target, and current
+  directory identities are resolved only on the cold link branch; active
+  ancestor cycles, broken identities, and physical escapes fail as `DV0207`.
+  Project-reference closure keeps a lazily allocated sorted physical-identity
+  batch so aliases cannot evade cycle removal, while ordinary lexical `..`
+  references remain valid. Thirty warm Windows samples measured Microsoft at
+  `301.738 ms` median and `305.440 ms` p95 versus `4.473 ms` and `5.252 ms`
+  for `dv`, a `67.5x` median improvement. `P1`
 - [ ] `WS-008` Respect case sensitivity of the active filesystem rather than
   the compile target. `P1`
 - [~] `WS-009` Exclude `bin`, `obj`, configured output trees, VCS metadata, and
